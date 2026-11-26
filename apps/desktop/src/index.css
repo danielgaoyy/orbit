@@ -491,6 +491,14 @@
     0 2px 8px 0 oklch(0 0 0 / 24%);
 }
 
+/* Unified borderless, shadowless lifted surface for all actively dragged items
+   (Sidebar Projects/Pinned/Conversations, Side Panel tabs, Terminal tabs, Queue rows) */
+.drag-lifted-surface {
+  background: var(--surface-overlay);
+  border-color: transparent;
+  box-shadow: none;
+}
+
 /* Inset optical rim on the light and dark backdrops. */
 .orbit-avatar-frame {
   background: var(--av-light);

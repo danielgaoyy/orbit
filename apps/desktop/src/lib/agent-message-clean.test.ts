@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   extractCleanAgentMessageBody,
+  extractDirectAgentMessagePresentation,
   formatCleanAgentMessagePreview,
+  parseOrbitSystemEnvelope,
+  stripLeadingOrbitProtocolBlocks,
 } from "./agent-message-clean.ts";
 
 describe("extractCleanAgentMessageBody", () => {
@@ -123,5 +126,64 @@ describe("extractCleanAgentMessageBody", () => {
       formatCleanAgentMessagePreview(bullet),
       "Fixed scrollbar gap in subagents-track.tsx",
     );
+  });
+});
+
+describe("extractDirectAgentMessagePresentation", () => {
+  it("unwraps <orbit-system kind='agent-message'> and extracts readable body + source metadata", () => {
+    const raw = [
+      '<orbit-system version="1" kind="agent-message" source-agent-id="ag_router" source-host-id="host_mac" source-agent-title="Personal Router" message-id="am_1">',
+      "Please fix &lt;UserPromptBubble&gt; &amp; verify tests.",
+      "</orbit-system>",
+    ].join("\n");
+
+    const env = parseOrbitSystemEnvelope(raw);
+    assert.equal(env?.kind, "agent-message");
+    assert.equal(env?.sourceAgentId, "ag_router");
+    assert.equal(env?.sourceHostId, "host_mac");
+    assert.equal(env?.sourceTitle, "Personal Router");
+
+    const res = extractDirectAgentMessagePresentation(raw);
+    assert.equal(res.isSystemNoise, false);
+    assert.equal(res.strippedEnvelope, true);
+    assert.equal(res.cleanText, "Please fix <UserPromptBubble> & verify tests.");
+    assert.equal(res.sourceAgentId, "ag_router");
+    assert.equal(res.sourceHostId, "host_mac");
+    assert.equal(res.sourceTitle, "Personal Router");
+  });
+
+  it("strips leading <orbit-fleet-state> and <orbit-fleet-delta> while preserving inline mentions", () => {
+    const withFleet = [
+      '<orbit-fleet-delta rev="4">',
+      "- @worker1 running",
+      "</orbit-fleet-delta>",
+      "",
+      "Check `<orbit-fleet-delta>` handling in personal_router.rs.",
+    ].join("\n");
+    const res = extractDirectAgentMessagePresentation(withFleet);
+    assert.equal(res.isSystemNoise, false);
+    assert.equal(res.strippedEnvelope, true);
+    assert.equal(res.cleanText, "Check `<orbit-fleet-delta>` handling in personal_router.rs.");
+
+    assert.deepEqual(
+      stripLeadingOrbitProtocolBlocks("Mention <orbit-fleet-state> mid-sentence."),
+      { text: "Mention <orbit-fleet-state> mid-sentence.", stripped: false },
+    );
+  });
+
+  it("marks pure fleet/system control envelopes as system noise so they never render as bubbles", () => {
+    for (const raw of [
+      "",
+      "   \n  ",
+      '<orbit-fleet-state rev="1" scope="All">\n- worker1\n</orbit-fleet-state>',
+      '<orbit-fleet-delta rev="2">\n- worker1 idle\n</orbit-fleet-delta>',
+      '<orbit-system version="1" kind="agent-message" source-agent-id="ag_router">\n&lt;orbit-fleet-delta rev=&quot;3&quot;&gt;\n- worker1\n&lt;/orbit-fleet-delta&gt;\n</orbit-system>',
+      '<orbit-system version="1" kind="agent-notification" source-agent-id="ag_w1" event="finished">\nAgent ag_w1 finished.\n</orbit-system>',
+      '<orbit-system version="1" kind="heartbeat" message-id="hb_1">\nCheck timers\n</orbit-system>',
+    ]) {
+      const res = extractDirectAgentMessagePresentation(raw);
+      assert.equal(res.isSystemNoise, true, `expected system noise for: ${raw}`);
+      assert.equal(res.cleanText, "");
+    }
   });
 });

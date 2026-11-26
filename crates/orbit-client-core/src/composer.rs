@@ -15,6 +15,7 @@ use crate::stage::basename_of_path;
 #[serde(rename_all = "kebab-case")]
 pub enum SlashDirective {
     Plan,
+    Goal,
     Review,
     Compact,
     Orbit,
@@ -27,6 +28,7 @@ impl SlashDirective {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Plan => "plan",
+            Self::Goal => "goal",
             Self::Review => "review",
             Self::Compact => "compact",
             Self::Orbit => "orbit",
@@ -39,6 +41,7 @@ impl SlashDirective {
     pub fn badge_label(self) -> &'static str {
         match self {
             Self::Plan => "/plan",
+            Self::Goal => "/goal",
             Self::Review => "/review",
             Self::Compact => "/compact",
             Self::Orbit => "/orbit",
@@ -132,9 +135,8 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
         SlashCommandView {
             id: "goal".into(),
             command: "/goal".into(),
-            label: "Autonomous Goal Loop".into(),
-            description: "Run unattended verification iterations until criteria or command passes"
-                .into(),
+            label: "Set Session Goal".into(),
+            description: "Keep working until verified; supports /goal edit and /goal clear".into(),
             shortcut_key: None,
             icon_key: "goal".into(),
             keywords: vec![
@@ -143,6 +145,7 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
                 "unattended".into(),
                 "loop".into(),
                 "verify".into(),
+                "overnight".into(),
             ],
             desktop_only: false,
         },
@@ -482,6 +485,7 @@ pub fn parse_leading_slash_directive(raw_text: &str) -> (Option<SlashDirective>,
         ("/orbit-advisor", SlashDirective::OrbitAdvisor),
         ("/orbit", SlashDirective::Orbit),
         ("/plan", SlashDirective::Plan),
+        ("/goal", SlashDirective::Goal),
         ("/review", SlashDirective::Review),
         ("/compact", SlashDirective::Compact),
     ] {
@@ -603,6 +607,15 @@ pub fn build_workflow_instruction(directive: SlashDirective) -> &'static str {
             "First inspect and verify the relevant codebase files, architecture, and constraints.\n",
             "Clarify any critical ambiguities if needed, then present a concise, structured, step-by-step implementation plan.\n",
             "Do NOT modify files or run mutating commands until the user approves the plan.\n",
+            "</WORKFLOW_INSTRUCTION>"
+        ),
+        SlashDirective::Goal => concat!(
+            "<WORKFLOW_INSTRUCTION command=\"/goal\">\n",
+            "A persistent autonomous Goal is active for this session. Work end-to-end without pausing to ask unnecessary questions.\n",
+            "Fidelity & verification rules:\n",
+            "- Keep the full objective intact; never silently narrow scope or declare victory early.\n",
+            "- Verify every requirement against authoritative current-state evidence (files, test/build outputs, runtime behavior).\n",
+            "- Use `orbit_goal(action=\"get_goal\")` to re-read the goal after compaction, `orbit_goal(action=\"update_goal\", criteria_updates=[...])` to track criteria, `orbit_goal(action=\"pause_goal\", reason=\"...\")` ONLY when genuinely blocked on user input/credentials/external state, and `orbit_goal(action=\"complete_goal\", summary=\"...\")` ONLY once real evidence proves every requirement is satisfied.\n",
             "</WORKFLOW_INSTRUCTION>"
         ),
         SlashDirective::Review => concat!(
@@ -2431,6 +2444,79 @@ mod tests {
             build_workflow_instruction(SlashDirective::OrbitAdvisor)
                 .contains("command=\"/orbit-advisor\"")
         );
+        assert!(build_workflow_instruction(SlashDirective::Goal).contains("command=\"/goal\""));
+        assert!(build_workflow_instruction(SlashDirective::Goal).contains("orbit_goal"));
+
+        let goal_composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Codex,
+                raw_text: "/goal Fix all failing tests and open a PR".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            goal_composed.effective_directive,
+            Some(SlashDirective::Goal)
+        );
+        assert_eq!(
+            goal_composed.display_prompt,
+            "Fix all failing tests and open a PR"
+        );
+        assert!(
+            goal_composed
+                .badges
+                .iter()
+                .any(|b| b.kind == "slash" && b.label == "/goal")
+        );
+        assert!(goal_composed.wire_prompt.contains("command=\"/goal\""));
+        assert!(
+            !goal_composed.display_prompt.contains("Budget:"),
+            "user display bubble must never leak internal budget scaffolding"
+        );
+    }
+
+    #[test]
+    fn escaped_leading_slash_commands_bypass_dispatch_verbatim() {
+        // Matches Claude Code & Codex behavior: leading `\/...` skips slash command dispatch and
+        // preserves the user's text verbatim so underlying provider CLIs (`claude`, `agy`, `codex`,
+        // `pi`) also do not re-interpret `/compact`, `/plan`, or `/goal` as native slash commands.
+        for raw in [
+            "\\/plan explain how plan mode works",
+            "\\/btw what is btw?",
+            "\\/goal compare clients",
+            "\\/fork not a fork",
+            "\\/fast not fast mode",
+            "\\/compact",
+            "\\/compact not compact",
+            "explain /goal and /plan in prose",
+        ] {
+            let composed = compose_prompt(
+                &ComposePromptRequest {
+                    provider: ProviderKind::Antigravity,
+                    raw_text: raw.into(),
+                    explicit_directive: None,
+                    host_id: None,
+                    cwd: None,
+                    contexts: Vec::new(),
+                    pastes: Vec::new(),
+                    quotes: Vec::new(),
+                },
+                None,
+                None,
+            );
+            assert_eq!(composed.effective_directive, None, "raw={raw}");
+            assert!(!composed.is_btw && !composed.is_fork && !composed.is_compact);
+            assert_eq!(composed.fast_mode_action, None);
+            assert_eq!(composed.display_prompt, raw);
+            assert_eq!(composed.wire_prompt, raw);
+        }
     }
 
     #[test]

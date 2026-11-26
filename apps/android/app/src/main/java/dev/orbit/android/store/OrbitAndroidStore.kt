@@ -2493,6 +2493,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     private fun parseSlashDirectiveEnum(raw: String?): FfiSlashDirective? =
         when (raw?.trim()?.lowercase()?.removePrefix("/")) {
             "plan" -> FfiSlashDirective.PLAN
+            "goal" -> FfiSlashDirective.GOAL
             "review" -> FfiSlashDirective.REVIEW
             "compact" -> FfiSlashDirective.COMPACT
             "orbit" -> FfiSlashDirective.ORBIT
@@ -2882,11 +2883,17 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
+    private fun matchesLeadingSlashCommand(text: String, command: String): Boolean {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith(command, ignoreCase = true)) return false
+        return trimmed.length == command.length || trimmed[command.length].isWhitespace()
+    }
+
     private fun dispatchQueuedPromptItem(hostId: String, agentId: String, item: QueuedPromptItem) {
         val cur = _state.value
         val key = agentQueueKey(hostId, agentId)
         val needsGitDiff = item.activeSlashCommand.equals("/review", ignoreCase = true) ||
-            item.text.trim().lowercase().startsWith("/review") ||
+            matchesLeadingSlashCommand(item.text, "/review") ||
             item.includeGitDiff || item.includeStagedDiff ||
             item.inlineMentions.any { it.kind == "git_diff" && item.text.contains(it.token) }
         var effectiveReview = cur.gitReview
@@ -2992,7 +2999,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 clearSubmittedDraftIfUnchanged(draft, clearAttachments = true)
 
                 val needsGitDiff = draft.activeSlashCommand.equals("/review", ignoreCase = true) ||
-                    draft.text.trim().lowercase().startsWith("/review") ||
+                    matchesLeadingSlashCommand(draft.text, "/review") ||
                     draft.includeGitDiff || draft.includeStagedDiff ||
                     draft.inlineMentions.any { it.kind == "git_diff" && draft.text.contains(it.token) }
                 var effectiveReview = cur.gitReview
@@ -4756,6 +4763,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         verifyCommand = verifyCommand?.trim()?.ifEmpty { null },
                         maxIterations = maxIterations,
                         maxDurationSecs = null,
+                        replaceExisting = false,
+                        dispatchInitialPrompt = null,
                     )
                 )
                 refreshAutomations()

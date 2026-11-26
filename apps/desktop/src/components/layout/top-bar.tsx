@@ -24,7 +24,12 @@ import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import { useActionShortcutDisplay } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import { usePersonalAgentBriefing } from "@/components/personal-agent/use-personal-agent-briefing";
 import { SubagentCrewMiniDock } from "@/components/stage/subagent-crew-dock";
+import {
+  isDefaultPersonalAgentTitle,
+  selectIsSelectedAgentPersonalAgent,
+} from "@/state/selectors/personal-agent-selectors";
 import { IconButton } from "@/components/ui/icon-button";
 import {
   DropdownMenu,
@@ -69,6 +74,7 @@ export const TopBar = memo(function TopBar() {
   const overviewVisible = useOrbitSelector((s) =>
     s.stageCanDockOverview ? s.overviewDesktopOpenPref : s.overviewPopoverOpen,
   );
+  const isPersonalAgentSession = useOrbitSelector(selectIsSelectedAgentPersonalAgent);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
@@ -127,6 +133,10 @@ export const TopBar = memo(function TopBar() {
   );
 
   const needsTopBarActivity = hasActiveSession && !overviewVisible;
+  const { briefing: personalAgentBriefing } = usePersonalAgentBriefing({
+    enabled: isPersonalAgentSession && needsTopBarActivity,
+    includeActivity: false,
+  });
 
   const insightSubagents = useOrbitSelector((s) =>
     needsTopBarActivity && s.selectedHostId && s.selectedAgentId
@@ -162,6 +172,7 @@ export const TopBar = memo(function TopBar() {
       : EMPTY_FLEET_HOSTS,
   );
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const insightBackgroundTasks = useOrbitSelector((s) =>
     needsTopBarActivity && s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.background_tasks ??
@@ -189,8 +200,9 @@ export const TopBar = memo(function TopBar() {
         projects: [],
       },
       archivedSubagents,
+      archivedThreads,
     }),
-    [scopedHostDetails, crossHostFleetHosts, archivedSubagents],
+    [scopedHostDetails, crossHostFleetHosts, archivedSubagents, archivedThreads],
   );
 
   const subagentSummary = useMemo(
@@ -246,14 +258,20 @@ export const TopBar = memo(function TopBar() {
     const ag =
       detail?.agents.find((a) => a.agent_id === s.selectedAgentId) ??
       s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.agent;
+    if (
+      selectIsSelectedAgentPersonalAgent(s) &&
+      isDefaultPersonalAgentTitle(ag?.title)
+    ) {
+      return "__PERSONAL_AGENT__";
+    }
     return ag?.title || "__NEW_CONVERSATION__";
   });
 
   const headerTitle =
     rawHeaderTitle === "__AUTOMATIONS__"
       ? t("common.automations")
-      : rawHeaderTitle === "__OVERVIEW__"
-        ? t("overview.title")
+      : rawHeaderTitle === "__OVERVIEW__" || rawHeaderTitle === "__PERSONAL_AGENT__"
+        ? t("sidebar.personalRouter")
         : rawHeaderTitle === "__NEW_CONVERSATION__"
           ? t("common.newConversation")
           : rawHeaderTitle;
@@ -271,21 +289,31 @@ export const TopBar = memo(function TopBar() {
     Boolean(selectedAgentId) &&
     (subagentSummary?.visible.length ?? 0) > 0;
 
+  const briefingNeedsYouCount = isPersonalAgentSession
+    ? (personalAgentBriefing?.counts.needs_you ?? 0)
+    : 0;
+  const briefingRunningCount = isPersonalAgentSession
+    ? (personalAgentBriefing?.counts.running ?? 0)
+    : 0;
+
   const indicatorDotTone = overviewVisible
     ? "none"
-    : overviewIndicatorTone === "approval"
+    : briefingNeedsYouCount > 0 || overviewIndicatorTone === "approval"
       ? "warning"
-      : overviewIndicatorTone === "running"
+      : overviewIndicatorTone === "running" || briefingRunningCount > 0
         ? "success"
         : overviewIndicatorTone === "goal"
           ? "info"
           : "none";
 
   const overviewTooltip = overviewVisible
-    ? t("topbar.hideOverview")
-    : overviewIndicatorReason === "approval"
+    ? isPersonalAgentSession
+      ? t("briefing.hideBriefing")
+      : t("topbar.hideOverview")
+    : briefingNeedsYouCount > 0 || overviewIndicatorReason === "approval"
       ? t("topbar.showOverviewApproval")
-      : overviewIndicatorReason === "subagent"
+      : overviewIndicatorReason === "subagent" ||
+          (isPersonalAgentSession && briefingRunningCount > 0)
         ? t("topbar.showOverviewSubagent")
         : overviewIndicatorReason === "background_task"
           ? t("topbar.showOverviewBackground")
@@ -293,7 +321,9 @@ export const TopBar = memo(function TopBar() {
             ? t("topbar.showOverviewGoal")
             : overviewIndicatorReason === "timer"
               ? t("topbar.showOverviewTimer")
-              : t("topbar.showOverview");
+              : isPersonalAgentSession
+                ? t("briefing.showBriefing")
+                : t("topbar.showOverview");
 
   return (
     <header
@@ -503,7 +533,15 @@ export const TopBar = memo(function TopBar() {
               indicatorTone={indicatorDotTone}
               tooltip={overviewTooltip}
               shortcut={overviewShortcut}
-              aria-label={overviewVisible ? t("topbar.hideOverview") : t("topbar.showOverview")}
+              aria-label={
+                isPersonalAgentSession
+                  ? overviewVisible
+                    ? t("briefing.hideBriefing")
+                    : t("briefing.showBriefing")
+                  : overviewVisible
+                    ? t("topbar.hideOverview")
+                    : t("topbar.showOverview")
+              }
               onClick={() => orbitActions.toggleOverviewPanel()}
             >
               <LayoutList className="size-[15px] stroke-[1.75]" />

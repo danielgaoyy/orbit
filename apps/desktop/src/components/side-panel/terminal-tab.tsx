@@ -1,6 +1,7 @@
 import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Columns2, PictureInPicture2, Plus, Rows2, X } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { DragShield } from "@/components/ui/drag-feedback";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -10,11 +11,14 @@ import {
   DropdownMenuTrigger,
   SimpleTooltip,
 } from "@/components/ui/overlays";
+import { ResizeSash } from "@/components/ui/resize-sash";
+import { useInlineSortable } from "@/lib/drag/use-inline-sortable";
 import { modSymbol } from "@/lib/keybindings";
 import { type TerminalSummary, orbitIpc } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { adjustSplitPaneRatios } from "@/lib/xterm-osc133";
 import {
+  type SidePanelTab,
   type TerminalSplitDirection,
   orbitActions,
   useOrbitSelector,
@@ -37,24 +41,27 @@ function shortDir(p: string): string {
  * instances preserve full scrollback and interactive processes without respawning.
  */
 export const TerminalTab = memo(function TerminalTab({
-  selectedHostId,
+  tab,
+  selectedHostId: propHostId,
   visible,
 }: {
+  tab?: SidePanelTab;
   selectedHostId: string;
   visible: boolean;
 }) {
+  const selectedHostId = tab?.hostId ?? propHostId;
   const { t } = useI18n();
   const mod = modSymbol();
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const terminalSplits = useOrbitSelector((s) => s.terminalSplits);
   const activeTerminalTabKey = useOrbitSelector((s) => s.activeTerminalTabKey);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const selectedCwd = tab?.cwd ?? "~";
   const hostTerminals = useOrbitSelector((s) =>
     selectedHostId ? (s.hostDetails[selectedHostId]?.terminals ?? EMPTY_TERMINALS) : EMPTY_TERMINALS,
   );
 
   const splitContainerRef = useRef<HTMLDivElement | null>(null);
-  const [draggingDividerIdx, setDraggingDividerIdx] = useState<number | null>(null);
+  const terminalTabStripRef = useRef<HTMLDivElement | null>(null);
 
   const [pendingCloseTab, setPendingCloseTab] = useState<{
     key: string;
@@ -124,50 +131,16 @@ export const TerminalTab = memo(function TerminalTab({
     orbitActions.splitActiveTerminalPane(direction);
   }, []);
 
-  const handleDividerPointerDown = useCallback(
-    (dividerIdx: number, e: React.PointerEvent<HTMLDivElement>) => {
-      if (!activeSplit) return;
-      const container = splitContainerRef.current;
-      if (!container) return;
-      e.preventDefault();
-      e.stopPropagation();
-
-      const targetEl = e.currentTarget;
-      try {
-        targetEl.setPointerCapture(e.pointerId);
-      } catch {
-        // Ignore if pointer capture is unavailable in headless environments
-      }
-
-      const isVertical = activeSplit.direction === "vertical";
-      const totalSpan = isVertical ? container.clientHeight : container.clientWidth;
-      if (totalSpan <= 0) return;
-
-      const startPos = isVertical ? e.clientY : e.clientX;
-      const startRatios = activeSplit.ratios.slice();
-      const splitId = activeSplit.id;
-      setDraggingDividerIdx(dividerIdx);
-
-      const onPointerMove = (moveEv: PointerEvent) => {
-        const currentPos = isVertical ? moveEv.clientY : moveEv.clientX;
-        const deltaRatio = (currentPos - startPos) / totalSpan;
-        const nextRatios = adjustSplitPaneRatios(startRatios, dividerIdx, deltaRatio, 0.18);
-        orbitActions.setTerminalSplitRatios(splitId, nextRatios);
-      };
-
-      const onPointerUp = () => {
-        setDraggingDividerIdx(null);
-        window.removeEventListener("pointermove", onPointerMove);
-        window.removeEventListener("pointerup", onPointerUp);
-        window.removeEventListener("pointercancel", onPointerUp);
-      };
-
-      window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
-      window.addEventListener("pointercancel", onPointerUp);
+  const hostTabKeys = useMemo(() => hostTabs.map((tab) => tab.key), [hostTabs]);
+  const termTabSortable = useInlineSortable({
+    axis: "x",
+    itemIds: hostTabKeys,
+    scrollViewportRef: terminalTabStripRef,
+    ignoreSelector: "button",
+    onCommit: (fromIdx, toIdx) => {
+      orbitActions.reorderTerminalTabs(selectedHostId, fromIdx, toIdx);
     },
-    [activeSplit],
-  );
+  });
 
   const splitRightShortcut = mod === "⌘" ? "⌘⇧D" : "Ctrl+Shift+D";
   const splitDownShortcut = mod === "⌘" ? "⌘⌥D" : "Ctrl+Alt+D";
@@ -179,24 +152,61 @@ export const TerminalTab = memo(function TerminalTab({
         !visible && "hidden",
       )}
     >
+      <DragShield active={termTabSortable.isDragging} cursor="grabbing" />
+
       {/* Compact PTY Session Sub-Bar — seamless with Workbench chrome */}
       <div className="border-border-subtle bg-surface-base flex h-[36px] shrink-0 items-center justify-between gap-1.5 border-b px-2.5">
-        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-          {hostTabs.map((tab) => {
+        <div
+          ref={terminalTabStripRef}
+          onWheel={(e) => {
+            const el = terminalTabStripRef.current;
+            if (!el || el.scrollWidth <= el.clientWidth) return;
+            if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+              el.scrollLeft += e.deltaY;
+            }
+          }}
+          className="flex h-full min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
+          {hostTabs.map((tab, idx) => {
             const focused = tab.key === activeHostTab?.key;
             const visibleInSplit = Boolean(activeSplit && activeSplit.paneKeys.includes(tab.key));
             const splitDir = splitKeyToDirection.get(tab.key);
+            const isDragged = termTabSortable.sortState?.fromIndex === idx;
+            const isSettling = isDragged && termTabSortable.sortState?.phase === "settling";
+
             return (
               <div
                 key={tab.key}
-                onClick={() => orbitActions.setActiveTerminalTab(tab.key)}
+                ref={(el) => termTabSortable.registerItem(tab.key, el)}
+                onPointerDown={
+                  hostTabs.length > 1
+                    ? (e) => termTabSortable.handlePointerDown(e, idx)
+                    : undefined
+                }
+                onDragStart={(e) => e.preventDefault()}
+                onClick={() => {
+                  if (termTabSortable.shouldSuppressClick()) return;
+                  orbitActions.setActiveTerminalTab(tab.key);
+                }}
+                style={termTabSortable.getNeighborStyle(idx)}
                 className={cn(
-                  "group inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11px] whitespace-nowrap transition-colors",
-                  focused
-                    ? "border-border-default bg-surface-raised text-ink-primary font-medium"
-                    : visibleInSplit
-                      ? "border-border-subtle bg-surface-recessed/70 text-ink-secondary"
-                      : "text-ink-tertiary hover:bg-accent hover:text-ink-primary border-transparent",
+                  "group relative inline-flex h-[24px] shrink-0 touch-none cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11px] whitespace-nowrap [-webkit-user-drag:none]",
+                  isDragged
+                    ? cn(
+                        "drag-lifted-surface border-transparent text-ink-primary z-10",
+                        focused && "font-medium",
+                        !isSettling && "cursor-grabbing",
+                      )
+                    : cn(
+                        termTabSortable.isActive
+                          ? "transition-transform duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none"
+                          : "transition-colors",
+                        focused
+                          ? "border-border-default bg-surface-raised text-ink-primary font-medium"
+                          : visibleInSplit
+                            ? "border-border-subtle bg-surface-recessed/70 text-ink-secondary"
+                            : "text-ink-tertiary hover:bg-accent hover:text-ink-primary border-transparent",
+                      ),
                 )}
               >
                 <span
@@ -218,6 +228,7 @@ export const TerminalTab = memo(function TerminalTab({
                   type="button"
                   title={t("terminal.closePane")}
                   aria-label={`Close ${tab.title}`}
+                  onPointerDown={(e) => e.stopPropagation()}
                   onClick={(e) => {
                     e.stopPropagation();
                     setPendingCloseTab({
@@ -227,7 +238,10 @@ export const TerminalTab = memo(function TerminalTab({
                       cwd: tab.cwd,
                     });
                   }}
-                  className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
+                  className={cn(
+                    "rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15",
+                    termTabSortable.isActive && "pointer-events-none",
+                  )}
                 >
                   <X className="h-[11px] w-[11px]" />
                 </button>
@@ -427,42 +441,54 @@ export const TerminalTab = memo(function TerminalTab({
             {activeSplit &&
               activeSplit.paneKeys.slice(0, -1).map((paneKey, idx) => {
                 const isVertical = activeSplit.direction === "vertical";
-                const isDragging = draggingDividerIdx === idx;
                 return (
-                  <div
+                  <ResizeSash
                     key={`divider:${activeSplit.id}:${paneKey}`}
-                    role="separator"
-                    aria-orientation={isVertical ? "horizontal" : "vertical"}
-                    aria-label={t("terminal.resizeSplit")}
-                    title={t("terminal.resizeSplitHint")}
+                    orientation={isVertical ? "horizontal" : "vertical"}
+                    variant="split"
                     style={{ order: idx * 2 + 1 }}
-                    onPointerDown={(e) => handleDividerPointerDown(idx, e)}
-                    onDoubleClick={() => {
+                    ariaLabel={t("terminal.resizeSplit")}
+                    title={t("terminal.resizeSplitHint")}
+                    onDragStart={() => {
+                      const container = splitContainerRef.current;
+                      if (!container) return null;
+                      const totalSpan = isVertical ? container.clientHeight : container.clientWidth;
+                      if (totalSpan <= 0) return null;
+                      return {
+                        splitId: activeSplit.id,
+                        startRatios: activeSplit.ratios.slice(),
+                        totalSpan,
+                      };
+                    }}
+                    onDragMove={(delta, snap) => {
+                      const next = adjustSplitPaneRatios(
+                        snap.startRatios,
+                        idx,
+                        delta / snap.totalSpan,
+                        0.18,
+                      );
+                      orbitActions.setTerminalSplitRatios(snap.splitId, next);
+                    }}
+                    onDragCancel={(snap) => {
+                      orbitActions.setTerminalSplitRatios(snap.splitId, snap.startRatios);
+                    }}
+                    onReset={() => {
                       const equal = Array.from(
                         { length: activeSplit.paneKeys.length },
                         () => 1 / activeSplit.paneKeys.length,
                       );
                       orbitActions.setTerminalSplitRatios(activeSplit.id, equal);
                     }}
-                    className={cn(
-                      "group relative z-10 shrink-0 transition-colors",
-                      isVertical
-                        ? "h-[5px] w-full cursor-row-resize"
-                        : "h-full w-[5px] cursor-col-resize",
-                    )}
-                  >
-                    <div
-                      className={cn(
-                        "pointer-events-none absolute transition-colors",
-                        isVertical
-                          ? "inset-x-0 top-1/2 h-px -translate-y-1/2"
-                          : "inset-y-0 left-1/2 w-px -translate-x-1/2",
-                        isDragging
-                          ? "bg-border-strong"
-                          : "bg-border-default group-hover:bg-border-strong",
-                      )}
-                    />
-                  </div>
+                    onKeyboardStep={(mult) => {
+                      const next = adjustSplitPaneRatios(
+                        activeSplit.ratios,
+                        idx,
+                        mult * 0.04,
+                        0.18,
+                      );
+                      orbitActions.setTerminalSplitRatios(activeSplit.id, next);
+                    }}
+                  />
                 );
               })}
           </Suspense>

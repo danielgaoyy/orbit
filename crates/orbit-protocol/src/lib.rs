@@ -915,6 +915,107 @@ impl TimelineOutlinePrompt {
         };
         Some(Self { seq, preview })
     }
+
+    /// Project a bounded outline preview for a visible direct agent-to-agent dispatch prompt,
+    /// skipping notifications, heartbeats, permission checkpoints, and pure protocol noise.
+    pub fn from_agent_message(
+        seq: u64,
+        kind: AgentMessageKind,
+        raw: &str,
+        has_permission_context: bool,
+    ) -> Option<Self> {
+        if kind != AgentMessageKind::DirectMessage || has_permission_context {
+            return None;
+        }
+        let cleaned = clean_agent_message_display_body(raw)?;
+        let preview = outline_preview(cleaned.split_whitespace());
+        if preview.is_empty() {
+            None
+        } else {
+            Some(Self { seq, preview })
+        }
+    }
+}
+
+fn unescape_basic_xml_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Extract clean human-readable message text from an agent-dispatched or protocol-wrapped prompt.
+///
+/// Strips leading Orbit context/fleet envelopes (`<orbit-fleet-state>`, `<orbit-fleet-delta>`,
+/// `<orbit-workspace>`, `<orbit-workspace-delta>`, `<orbit-context>`, `<WORKSPACE_RULES>`,
+/// `<ATTACHED_CONTEXT>`), unwraps `<orbit-system ...>...</orbit-system>` (returning `None` for
+/// pure control notifications like `kind="agent-notification"` or `kind="heartbeat"`), and returns
+/// `None` when no human-readable body remains.
+pub fn clean_agent_message_display_body(raw: &str) -> Option<String> {
+    fn strip_leading_context_blocks(mut rest: &str) -> &str {
+        rest = rest.trim();
+        while let Some(tag) = rest.strip_prefix('<') {
+            let name = tag
+                .split(['>', ' ', '\n', '\t', '\r'])
+                .next()
+                .unwrap_or_default();
+            let close = match name {
+                "orbit-context" => "</orbit-context>",
+                "orbit-workspace" => "</orbit-workspace>",
+                "orbit-workspace-delta" => "</orbit-workspace-delta>",
+                "orbit-fleet-state" => "</orbit-fleet-state>",
+                "orbit-fleet-delta" => "</orbit-fleet-delta>",
+                "WORKSPACE_RULES" => "</WORKSPACE_RULES>",
+                "WORKFLOW_INSTRUCTION" => "</WORKFLOW_INSTRUCTION>",
+                "ATTACHED_CONTEXT" => "</ATTACHED_CONTEXT>",
+                _ => break,
+            };
+            let Some((_, tail)) = tag.split_once(close) else {
+                break;
+            };
+            rest = tail.trim_start();
+        }
+        rest.trim()
+    }
+
+    let after_leading = strip_leading_context_blocks(raw);
+    let unwrapped_owned: String;
+    let body = if let Some(rest) = after_leading.strip_prefix("<orbit-system")
+        && rest.starts_with([' ', '>', '\n', '\t', '\r'])
+        && let Some((opening, after_open)) = rest.split_once('>')
+    {
+        if let Some(kind_tail) = opening.split_once("kind=\"").map(|(_, t)| t)
+            && let Some((kind_val, _)) = kind_tail.split_once('"')
+            && matches!(kind_val, "agent-notification" | "heartbeat")
+        {
+            return None;
+        }
+        let inner_raw = after_open
+            .trim_end()
+            .strip_suffix("</orbit-system>")
+            .unwrap_or(after_open)
+            .trim();
+        unwrapped_owned = unescape_basic_xml_entities(inner_raw);
+        strip_leading_context_blocks(&unwrapped_owned)
+    } else {
+        after_leading
+    };
+
+    let body = body
+        .strip_prefix("<USER_REQUEST>")
+        .and_then(|inner| inner.strip_suffix("</USER_REQUEST>"))
+        .unwrap_or(body)
+        .trim();
+
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
 }
 
 fn outline_preview<'a>(words: impl Iterator<Item = &'a str>) -> String {
@@ -2030,6 +2131,8 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_host_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_id: Option<String>,
         #[serde(default)]
         background: bool,
@@ -2102,6 +2205,10 @@ pub enum WireMessage {
         message_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_host_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notify_on_finish: Option<bool>,
     },
@@ -2286,6 +2393,28 @@ pub enum WireMessage {
         /// and human-only plan approval gates).
         #[serde(default, skip_serializing_if = "wire_is_false")]
         agent_originated: bool,
+    },
+    /// Attach a Personal Agent recommendation (`allow` or `deny` + reason) to a pending
+    /// permission without resolving the underlying driver gate.
+    RecommendPermission {
+        request_id: Uuid,
+        agent_id: String,
+        permission_request_id: String,
+        decision: String,
+        reason: String,
+    },
+    /// List recent Personal Agent / Guardian / permission-rule decisions from the host's
+    /// signed security audit chain (`category = "personal_agent_decision"`).
+    ListPersonalAgentActivity {
+        request_id: Uuid,
+        limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_ms: Option<i64>,
+    },
+    /// Response to `ListPersonalAgentActivity`, ordered newest-first (`seq DESC`).
+    PersonalAgentActivitySnapshot {
+        request_id: Uuid,
+        entries: Vec<PersonalAgentActivityEntry>,
     },
     /// Resolve a pending structured plan approval gate (`ExitPlanMode`, Codex Plan Mode,
     /// Antigravity plan review, or ACP plan approval).
@@ -3701,6 +3830,10 @@ pub enum WireMessage {
         max_iterations: Option<u32>,
         #[serde(default)]
         max_duration_secs: Option<u64>,
+        #[serde(default)]
+        replace_existing: bool,
+        #[serde(default)]
+        dispatch_initial_prompt: Option<bool>,
     },
     ListGoalRuns {
         request_id: Uuid,
@@ -3711,6 +3844,20 @@ pub enum WireMessage {
         request_id: Uuid,
         goal_id: String,
         action: GoalControlAction,
+    },
+    UpdateGoalRun {
+        request_id: Uuid,
+        goal_id: String,
+        #[serde(default)]
+        objective: Option<String>,
+        #[serde(default)]
+        criteria: Option<Vec<String>>,
+        #[serde(default)]
+        verify_command: Option<Option<String>>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
+        #[serde(default)]
+        max_duration_secs: Option<u64>,
     },
     GoalRunUpdated {
         request_id: Uuid,
@@ -4399,6 +4546,52 @@ mod tests {
                 .preview,
             literal
         );
+
+        let wrapped = "<orbit-system version=\"1\" kind=\"agent-message\" source-agent-id=\"ag_router\">\n&lt;orbit-fleet-delta rev=&quot;2&quot;&gt;\n- w1\n&lt;/orbit-fleet-delta&gt;\n\nFix &lt;Badge&gt; &amp; tests\n</orbit-system>";
+        assert_eq!(
+            clean_agent_message_display_body(wrapped).as_deref(),
+            Some("Fix <Badge> & tests")
+        );
+        assert_eq!(
+            TimelineOutlinePrompt::from_agent_message(
+                12,
+                AgentMessageKind::DirectMessage,
+                wrapped,
+                false,
+            )
+            .expect("agent message outline")
+            .preview,
+            "Fix <Badge> & tests"
+        );
+        for noise in [
+            "<orbit-fleet-state rev=\"1\">\n- w1\n</orbit-fleet-state>",
+            "<orbit-fleet-delta rev=\"2\">\n- w1\n</orbit-fleet-delta>",
+            "<orbit-system version=\"1\" kind=\"agent-notification\" event=\"finished\">\nDone\n</orbit-system>",
+            "<orbit-system version=\"1\" kind=\"heartbeat\">\nPing\n</orbit-system>",
+        ] {
+            assert!(
+                clean_agent_message_display_body(noise).is_none(),
+                "expected None for protocol noise: {noise}"
+            );
+            assert!(
+                TimelineOutlinePrompt::from_agent_message(
+                    13,
+                    AgentMessageKind::DirectMessage,
+                    noise,
+                    false,
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            TimelineOutlinePrompt::from_agent_message(
+                14,
+                AgentMessageKind::FinishNotification,
+                "Finished",
+                false,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -4419,6 +4612,7 @@ mod tests {
             workspace_id: None,
             parent_agent_id: None,
             parent_host_id: None,
+            parent_title: None,
             profile_id: None,
             background: false,
             auto_archive: false,
@@ -6000,6 +6194,9 @@ mod tests {
             last_verify_exit_code: Some(1),
             last_verify_output: Some("1 failed".into()),
             consecutive_identical_failures: 1,
+            pause_reason: None,
+            paused_by_user: false,
+            active_duration_secs: 42,
             started_at_ms: 1_760_000_000_000,
             updated_at_ms: 1_760_000_005_000,
             finished_at_ms: None,
@@ -6030,6 +6227,8 @@ mod tests {
                 verify_command: Some("cargo test".into()),
                 max_iterations: Some(10),
                 max_duration_secs: Some(3600),
+                replace_existing: true,
+                dispatch_initial_prompt: Some(false),
             },
             WireMessage::ListGoalRuns {
                 request_id: req_id,
@@ -6039,6 +6238,15 @@ mod tests {
                 request_id: req_id,
                 goal_id: "goal_abc".into(),
                 action: GoalControlAction::VerifyNow,
+            },
+            WireMessage::UpdateGoalRun {
+                request_id: req_id,
+                goal_id: "goal_abc".into(),
+                objective: Some("Updated objective".into()),
+                criteria: Some(vec!["cargo test exits 0".into()]),
+                verify_command: Some(Some("cargo test".into())),
+                max_iterations: Some(25),
+                max_duration_secs: Some(0),
             },
             WireMessage::GoalRunUpdated {
                 request_id: req_id,

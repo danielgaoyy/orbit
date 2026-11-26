@@ -432,6 +432,126 @@ export interface PrimaryRouterSelection {
   updated_at_ms: number;
 }
 
+export interface RouterRecommendation {
+  decision: "allow" | "deny";
+  reason: string;
+  created_at: string;
+}
+
+export interface PersonalAgentActivityEntry {
+  seq: number;
+  timestamp_ms: number;
+  actor: string;
+  decision: string;
+  host_id?: string | null;
+  agent_id?: string | null;
+  agent_title: string;
+  summary: string;
+  risk_level?: string | null;
+  reason: string;
+  request_id?: string | null;
+}
+
+export interface BriefingAgentRef {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  title: string;
+  provider: ProviderKind;
+  status_label: string;
+  is_busy: boolean;
+  is_awaiting: boolean;
+}
+
+export type BriefingDecisionKind = "plan" | "permission" | "awaiting" | "error";
+
+export interface BriefingDecision {
+  key: string;
+  kind: BriefingDecisionKind;
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  agent_title: string;
+  request_id: string | null;
+  summary: string;
+  risk_level: string | null;
+  human_only: boolean;
+  batch_eligible: boolean;
+  router_recommendation: RouterRecommendation | null;
+  dispatched_by_personal_agent: boolean;
+  updated_at_ms: number;
+}
+
+export type BriefingWorkerState = "running" | "awaiting" | "error" | "done" | "idle";
+
+export interface BriefingWorker {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  title: string;
+  provider: ProviderKind;
+  state: BriefingWorkerState;
+  step_preview: string;
+  worktree_branch: string | null;
+  updated_at_ms: number;
+}
+
+export type BriefingMissionState = "running" | "awaiting" | "error" | "done";
+
+export interface BriefingMission {
+  key: string;
+  root: BriefingWorker;
+  workers: BriefingWorker[];
+  host_names: string[];
+  done: number;
+  total: number;
+  state: BriefingMissionState;
+  updated_at_ms: number;
+}
+
+export type BriefingWaitKind = "timer" | "goal" | "background";
+
+export interface BriefingWaitItem {
+  key: string;
+  kind: BriefingWaitKind;
+  host_id: string;
+  agent_id: string;
+  title: string;
+  detail: string;
+  due_at_ms: number | null;
+}
+
+export interface BriefingHost {
+  host_id: string;
+  name: string;
+  online: boolean;
+  is_personal_agent_host: boolean;
+}
+
+export interface BriefingCounts {
+  needs_you: number;
+  running: number;
+  done_recent: number;
+  hosts_online: number;
+  hosts_total: number;
+}
+
+export interface BriefingSinceLastVisit {
+  completed: number;
+  auto_handled: number;
+}
+
+export interface PersonalAgentBriefingView {
+  personal_agent: BriefingAgentRef | null;
+  needs_you: BriefingDecision[];
+  missions: BriefingMission[];
+  other_active: BriefingWorker[];
+  waiting: BriefingWaitItem[];
+  hosts: BriefingHost[];
+  counts: BriefingCounts;
+  since_last_visit: BriefingSinceLastVisit;
+}
+
 export interface ImChannelRecord {
   channel_id: string;
   name: string;
@@ -1044,6 +1164,7 @@ export interface PendingPermissionSummary {
   guardian_assessment?: GuardianAssessment | null;
   plan_approval?: PlanApprovalPayload | null;
   human_only?: boolean;
+  router_recommendation?: RouterRecommendation | null;
   created_at: string;
 }
 
@@ -1727,6 +1848,9 @@ export interface GoalRunRecord {
   last_verify_exit_code?: number | null;
   last_verify_output?: string | null;
   consecutive_identical_failures: number;
+  pause_reason?: string | null;
+  paused_by_user?: boolean;
+  active_duration_secs?: number;
   started_at_ms: number;
   updated_at_ms: number;
   finished_at_ms?: number | null;
@@ -3008,6 +3132,7 @@ export interface ResolvedModelSelectionView {
 export type ClientPlatform = "desktop" | "ios" | "android" | "harmony" | "web";
 export type SlashDirective =
   | "plan"
+  | "goal"
   | "review"
   | "compact"
   | "orbit"
@@ -6746,6 +6871,50 @@ export const orbitIpc = {
     }
     return invoke<PrimaryRouterSelection | null>("set_primary_router_selection", { selection });
   },
+
+  getPersonalAgentBriefing: async (
+    primaryHostId?: string | null,
+  ): Promise<PersonalAgentBriefingView> => {
+    if (!transport()) {
+      return {
+        personal_agent: null,
+        needs_you: [],
+        missions: [],
+        other_active: [],
+        waiting: [],
+        hosts: [],
+        counts: {
+          needs_you: 0,
+          running: 0,
+          done_recent: 0,
+          hosts_online: 0,
+          hosts_total: 0,
+        },
+        since_last_visit: {
+          completed: 0,
+          auto_handled: 0,
+        },
+      };
+    }
+    return invoke<PersonalAgentBriefingView>("get_personal_agent_briefing", {
+      primaryRouterHostId: primaryHostId ?? null,
+    });
+  },
+
+  listPersonalAgentActivity: async (
+    hostId: string,
+    limit = 50,
+    sinceMs?: number | null,
+  ): Promise<PersonalAgentActivityEntry[]> => {
+    if (!transport()) {
+      return [];
+    }
+    return invoke<PersonalAgentActivityEntry[]>("list_personal_agent_activity", {
+      hostId,
+      limit,
+      sinceMs: sinceMs ?? null,
+    });
+  },
   highlightWorkspaceCode: async (
     language: string,
     content: string,
@@ -7290,6 +7459,8 @@ export const orbitIpc = {
     verifyCommand?: string | null;
     maxIterations?: number | null;
     maxDurationSecs?: number | null;
+    replaceExisting?: boolean;
+    dispatchInitialPrompt?: boolean | null;
   }): Promise<GoalRunRecord> => {
     return invoke<GoalRunRecord>("start_goal_run", {
       hostId: req.hostId,
@@ -7297,6 +7468,29 @@ export const orbitIpc = {
       objective: req.objective,
       criteria: req.criteria ?? null,
       verifyCommand: req.verifyCommand?.trim() ? req.verifyCommand.trim() : null,
+      maxIterations: req.maxIterations ?? null,
+      maxDurationSecs: req.maxDurationSecs ?? null,
+      replaceExisting: req.replaceExisting ?? false,
+      dispatchInitialPrompt:
+        req.dispatchInitialPrompt === undefined ? null : req.dispatchInitialPrompt,
+    });
+  },
+
+  updateGoalRun: async (req: {
+    hostId: string;
+    goalId: string;
+    objective?: string | null;
+    criteria?: string[] | null;
+    verifyCommand?: string | null;
+    maxIterations?: number | null;
+    maxDurationSecs?: number | null;
+  }): Promise<GoalRunRecord> => {
+    return invoke<GoalRunRecord>("update_goal_run", {
+      hostId: req.hostId,
+      goalId: req.goalId,
+      objective: req.objective ?? null,
+      criteria: req.criteria ?? null,
+      verifyCommand: req.verifyCommand === undefined ? null : req.verifyCommand,
       maxIterations: req.maxIterations ?? null,
       maxDurationSecs: req.maxDurationSecs ?? null,
     });

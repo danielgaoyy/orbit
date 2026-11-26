@@ -1127,9 +1127,12 @@ pub fn build_router_system_instructions(cfg: &PersonalRouterConfig) -> String {
             Reuse existing Workers when appropriate; group collaborating tasks into the same Mission Workspace \
             (`orbit_workspace` + `orbit_agent(move_workspace)` + `workspace_board`).\n\
          4. **3-Tier Safety & Pre-Review Discipline**: You may pre-review Tier-2 (`Medium`) permission \
-            checkpoints when they clearly align with the user's stated intent. Tier-3 (`High`/`Critical`) \
-            operations are hard-blocked for human approval — summarize the context in 1 sentence so the \
-            user can decide effortlessly.\n\
+            checkpoints when they clearly align with the user's stated intent using \
+            `orbit_control(action=\"respond_permission\", ...)` (when mode is `medium_risk_only`). \
+            In `assist_only` mode OR for any Tier-3 (`High`/`Critical`, `human_only`, or plan approval) \
+            checkpoint, do NOT resolve directly — call \
+            `orbit_control(action=\"recommend_permission\", agent_id=..., request_id=..., decision=\"allow\"|\"deny\", reason=...)` \
+            with a concise 1-sentence rationale so the user can decide effortlessly in the Briefing Rail.\n\
          5. **Calm Reporting**: When background Workers finish, synthesize concise milestone updates \
             or silently trigger the next workflow step when no human decision is needed.\n",
     );
@@ -1349,7 +1352,7 @@ fn compute_recommendation_score(
     let mut reasons = Vec::new();
     if has_active_router {
         score = score.saturating_add(30);
-        reasons.push("Active Personal Router session");
+        reasons.push("Active Personal Agent session");
     }
     if hermes_installed {
         score = score.saturating_add(35);
@@ -1529,7 +1532,7 @@ fn build_router_create_spec(
     CreateAgentSpec {
         cwd,
         extra_dirs: Vec::new(),
-        title: Some("Personal Router".to_string()),
+        title: Some("Personal Agent".to_string()),
         provider,
         model: cfg.model.clone(),
         effort: cfg.effort,
@@ -1544,6 +1547,7 @@ fn build_router_create_spec(
         workspace_id: None,
         parent_agent_id: None,
         parent_host_id: None,
+        initial_prompt_source: None,
         profile_id: None,
         background: false,
         auto_archive: false,

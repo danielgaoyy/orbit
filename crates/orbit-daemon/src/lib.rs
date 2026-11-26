@@ -681,6 +681,21 @@ impl DaemonRuntime {
 
         let host_id = keypair.host_id()?;
         let store = open_signed_store(home_dir, &keypair)?;
+        match store.reconcile_failed_launch_provider_subagents() {
+            Ok(healed) if healed > 0 => {
+                tracing::info!(
+                    healed,
+                    "reconciled stale running provider subagents whose launch tool call failed"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to reconcile stale provider subagents on startup"
+                );
+            }
+        }
         sandbox::register(home_dir, &store);
         let scripts = WorkspaceScriptRegistry::new();
         let keep_awake = Arc::new(KeepAwakeManager::new(keep_awake_enabled));
@@ -752,6 +767,9 @@ impl DaemonRuntime {
             delivery.clone(),
             keep_awake.clone(),
         );
+        goals.set_evaluator(Arc::new(crate::goals::HardenedCliGoalEvaluator::new(Some(
+            provider_catalogs.clone(),
+        ))));
         let triggers = EventTriggerEngine::new(
             store.clone(),
             orchestrator.clone(),
@@ -5428,6 +5446,7 @@ async fn handle_wire_rpc(
             workspace_id,
             parent_agent_id,
             parent_host_id,
+            parent_title,
             profile_id,
             background,
             auto_archive,
@@ -5499,7 +5518,52 @@ async fn handle_wire_rpc(
             let subs = Arc::clone(subscribed_agents);
             let parent_id_for_watch = parent_agent_id.clone();
             let parent_host_for_watch = parent_host_id.clone();
+            let initial_goal_objective = initial_badges
+                .iter()
+                .any(|b| b.kind == "slash" && b.label.eq_ignore_ascii_case("/goal"))
+                .then(|| {
+                    initial_display_prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| initial_prompt.trim())
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty());
             tokio::spawn(async move {
+                let initial_prompt_source = parent_agent_id.as_ref().map(|pid| {
+                    let resolved_title = parent_title.clone().or_else(|| {
+                        let is_local_parent = parent_host_id
+                            .as_deref()
+                            .is_none_or(|h| h == rt.host_info.host_id);
+                        if is_local_parent {
+                            rt.store.get_agent(pid).ok().flatten().map(|a| {
+                                if a.is_personal_router() {
+                                    a.title
+                                } else {
+                                    a.handle
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|h| !h.is_empty())
+                                        .map(|h| format!("@{h}"))
+                                        .unwrap_or(a.title)
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    AgentPromptSource {
+                        kind: AgentMessageKind::DirectMessage,
+                        source_agent_id: Some(pid.clone()),
+                        source_host_id: parent_host_id
+                            .clone()
+                            .or_else(|| Some(rt.host_info.host_id.clone())),
+                        source_title: resolved_title,
+                        event: Some("initial_prompt".into()),
+                        permission_context: None,
+                    }
+                });
                 let reply = match rt
                     .orchestrator
                     .create_and_start_agent(CreateAgentSpec {
@@ -5518,6 +5582,7 @@ async fn handle_wire_rpc(
                         workspace_id,
                         parent_agent_id,
                         parent_host_id,
+                        initial_prompt_source,
                         profile_id,
                         background,
                         auto_archive,
@@ -5532,6 +5597,21 @@ async fn handle_wire_rpc(
                     .await
                 {
                     Ok(agent) => {
+                        if let Some(goal_obj) = initial_goal_objective {
+                            let _ = rt
+                                .goals
+                                .start_goal(StartGoalSpec {
+                                    agent_id: agent.agent_id.clone(),
+                                    objective: goal_obj,
+                                    criteria: Vec::new(),
+                                    verify_command: None,
+                                    max_iterations: None,
+                                    max_duration_secs: None,
+                                    dispatch_initial_prompt: false,
+                                    replace_existing: false,
+                                })
+                                .await;
+                        }
                         // Subscribe before sending `AgentCreated` so no subsequent `TimelineLive`
                         // frames for the newly created agent are filtered out on this session.
                         subs.lock()
@@ -5623,6 +5703,8 @@ async fn handle_wire_rpc(
             active_turn_behavior,
             message_id,
             caller_agent_id,
+            caller_host_id,
+            caller_title,
             notify_on_finish,
         } => {
             subscribed_agents
@@ -5630,13 +5712,29 @@ async fn handle_wire_rpc(
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(agent_id.clone());
             if let Some(caller_id) = caller_agent_id {
-                let caller_title = runtime
-                    .store
-                    .get_agent(&caller_id)
-                    .ok()
-                    .flatten()
-                    .map(|a| a.title);
+                let is_local_caller = caller_host_id
+                    .as_deref()
+                    .is_none_or(|h| h == runtime.host_info.host_id);
+                let resolved_title = caller_title.or_else(|| {
+                    if is_local_caller {
+                        runtime.store.get_agent(&caller_id).ok().flatten().map(|a| {
+                            if a.is_personal_router() {
+                                a.title
+                            } else {
+                                a.handle
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|h| !h.is_empty())
+                                    .map(|h| format!("@{h}"))
+                                    .unwrap_or(a.title)
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                });
                 if notify_on_finish == Some(true)
+                    && is_local_caller
                     && runtime.store.get_agent(&caller_id).ok().flatten().is_some()
                 {
                     let _ = runtime
@@ -5655,8 +5753,10 @@ async fn handle_wire_rpc(
                     source: AgentPromptSource {
                         kind: AgentMessageKind::DirectMessage,
                         source_agent_id: Some(caller_id),
-                        source_host_id: Some(runtime.host_info.host_id.clone()),
-                        source_title: caller_title,
+                        source_host_id: Some(
+                            caller_host_id.unwrap_or_else(|| runtime.host_info.host_id.clone()),
+                        ),
+                        source_title: resolved_title,
                         event: None,
                         permission_context: None,
                     },
@@ -5687,6 +5787,7 @@ async fn handle_wire_rpc(
                     .await
                 {
                     Ok(()) => {
+                        runtime.goals.on_user_prompt_sent(&agent_id).await;
                         if let Some(body) = broadcast_body
                             && let Ok(Some(cur_ag)) = runtime.store.get_agent(&agent_id)
                             && let Ok(peers) = runtime.store.list_agents_filtered(
@@ -5744,7 +5845,10 @@ async fn handle_wire_rpc(
                 .enqueue_user_prompt(&agent_id, prompt, display_prompt, badges, queue_id)
                 .await
             {
-                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Ok(()) => {
+                    runtime.goals.on_user_prompt_sent(&agent_id).await;
+                    Some(WireMessage::Ack { request_id })
+                }
                 Err(e) => Some(rpc_err(request_id, "enqueue_prompt_failed", e)),
             }
         }
@@ -5819,7 +5923,12 @@ async fn handle_wire_rpc(
             .interrupt_agent_with_options(&agent_id, preserve_queue)
             .await
         {
-            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Ok(()) => {
+                if !preserve_queue {
+                    runtime.goals.on_agent_interrupted(&agent_id).await;
+                }
+                Some(WireMessage::Ack { request_id })
+            }
             Err(e) => Some(rpc_err(request_id, "interrupt_failed", e)),
         },
         WireMessage::SetSessionMode {
@@ -6212,6 +6321,52 @@ async fn handle_wire_rpc(
                 Ok(()) => Some(WireMessage::Ack { request_id }),
                 Err(e) => Some(rpc_err(request_id, "resolve_permission_failed", e)),
             }
+        }
+        WireMessage::RecommendPermission {
+            request_id,
+            agent_id,
+            permission_request_id,
+            decision,
+            reason,
+        } => match runtime
+            .orchestrator
+            .recommend_permission(&agent_id, &permission_request_id, decision, reason)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "recommend_permission_failed", e)),
+        },
+        WireMessage::ListPersonalAgentActivity {
+            request_id,
+            limit,
+            since_ms,
+        } => {
+            let store = Arc::clone(&runtime.store);
+            let clamped = limit.min(200);
+            Some(
+                match tokio::task::spawn_blocking(move || {
+                    store.list_audit_events_since(
+                        clamped,
+                        Some(orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION),
+                        since_ms,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(rows)) => {
+                        let entries = rows
+                            .into_iter()
+                            .map(audit_entry_to_personal_agent_activity)
+                            .collect();
+                        WireMessage::PersonalAgentActivitySnapshot {
+                            request_id,
+                            entries,
+                        }
+                    }
+                    Ok(Err(e)) => rpc_err(request_id, "list_personal_agent_activity_failed", e),
+                    Err(e) => rpc_err(request_id, "list_personal_agent_activity_failed", e),
+                },
+            )
         }
         WireMessage::ResolvePlanApproval {
             request_id,
@@ -7537,6 +7692,8 @@ async fn handle_wire_rpc(
             verify_command,
             max_iterations,
             max_duration_secs,
+            replace_existing,
+            dispatch_initial_prompt,
         } => {
             let goals = Arc::clone(&runtime.goals);
             let tx = out_tx.clone();
@@ -7550,7 +7707,8 @@ async fn handle_wire_rpc(
                         verify_command,
                         max_iterations,
                         max_duration_secs,
-                        dispatch_initial_prompt: true,
+                        dispatch_initial_prompt: dispatch_initial_prompt.unwrap_or(true),
+                        replace_existing,
                     })
                     .await
                 {
@@ -7596,6 +7754,40 @@ async fn handle_wire_rpc(
                 let reply = match goals.control_goal(&goal_id, action).await {
                     Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
                     Err(e) => rpc_err(request_id, "control_goal_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::UpdateGoalRun {
+            request_id,
+            goal_id,
+            objective,
+            criteria,
+            verify_command,
+            max_iterations,
+            max_duration_secs,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals
+                    .update_goal_spec(
+                        &goal_id,
+                        crate::goals::UpdateGoalSpec {
+                            objective,
+                            criteria,
+                            verify_command,
+                            max_iterations,
+                            max_duration_secs,
+                        },
+                    )
+                    .await
+                {
+                    Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
+                    Err(e) => rpc_err(request_id, "update_goal_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -10046,6 +10238,42 @@ fn rpc_err(request_id: uuid::Uuid, code: &str, message: impl ToString) -> WireMe
         request_id: Some(request_id),
         code: code.to_string(),
         message: message.to_string(),
+    }
+}
+
+pub(crate) fn audit_entry_to_personal_agent_activity(
+    row: orbit_store::audit_chain::AuditEntry,
+) -> orbit_protocol::PersonalAgentActivityEntry {
+    let details: serde_json::Value =
+        serde_json::from_str(&row.details_json).unwrap_or(serde_json::Value::Null);
+    let str_field = |key: &str| -> Option<String> {
+        details
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let agent_title = str_field("agent_title")
+        .or_else(|| row.agent_id.clone())
+        .unwrap_or_default();
+    let summary = str_field("summary").unwrap_or_default();
+    let risk_level = str_field("risk_level");
+    let reason = str_field("reason").unwrap_or_default();
+    let request_id = str_field("request_id");
+
+    orbit_protocol::PersonalAgentActivityEntry {
+        seq: row.seq,
+        timestamp_ms: row.timestamp_ms,
+        actor: row.actor,
+        decision: row.action,
+        host_id: row.host_id,
+        agent_id: row.agent_id,
+        agent_title,
+        summary,
+        risk_level,
+        reason,
+        request_id,
     }
 }
 

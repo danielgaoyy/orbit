@@ -309,25 +309,23 @@ const InlineArtifactCommentComposer = memo(function InlineArtifactCommentCompose
 });
 
 export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanelTab }) {
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const isDark = resolvedTheme === "dark";
   const { t } = useI18n();
 
-  // Prefer active composer's host so multi-host comments/actions always match the active session
-  const hostId = selectedHostId || tab.hostId || "";
+  const hostId = tab.hostId ?? "";
+  const tabAgentId = tab.agentId ?? null;
   const hostDetail = useOrbitSelector((s) => (hostId ? (s.hostDetails[hostId] ?? null) : null));
 
-  const activeAgent = useMemo(
+  const boundAgent = useMemo(
     () =>
-      selectedAgentId
-        ? (hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ?? null)
+      tabAgentId
+        ? (hostDetail?.agents.find((a) => a.agent_id === tabAgentId) ?? null)
         : null,
-    [hostDetail, selectedAgentId],
+    [hostDetail, tabAgentId],
   );
-  const scopedWorkspaceId = activeAgent?.workspace_id || tab.workspaceId || "";
-  const cwd = activeAgent?.cwd || "~";
+  const scopedWorkspaceId = tab.workspaceId || boundAgent?.workspace_id || "";
+  const cwd = tab.cwd || boundAgent?.cwd || "~";
 
   // Show workspace-scoped artifacts first; if none in active workspace, fall back to host artifacts
   const artifacts = useMemo<ArtifactSummary[]>(() => {

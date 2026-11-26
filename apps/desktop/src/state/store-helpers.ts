@@ -458,6 +458,27 @@ export function collectRemotelyArchivedDraftScopes(
   return keysToPrune;
 }
 
+export function collectRemotelyArchivedAgentScopes(
+  details: Iterable<readonly [string, HostDetailView]>,
+  activeScopeKey: string | null,
+): {
+  keys: Set<string>;
+  agents: Array<{ hostId: string; agentId: string }>;
+} {
+  const keys = new Set<string>();
+  const agents: Array<{ hostId: string; agentId: string }> = [];
+  for (const [hostId, detail] of details) {
+    for (const ag of detail.agents) {
+      if (!ag.archived_at_rfc3339 || isAgentForegroundRunning(ag)) continue;
+      const scopeKey = threadScopeKey(hostId, ag.agent_id);
+      if (scopeKey === activeScopeKey) continue;
+      keys.add(scopeKey);
+      agents.push({ hostId, agentId: ag.agent_id });
+    }
+  }
+  return { keys, agents };
+}
+
 export function resolveSettingsSectionTarget(
   s: OrbitUiState,
   section?: SettingsSectionTarget,
@@ -539,6 +560,7 @@ export function createDefaultInitialState(
     diffQuotes: OrbitUiState["diffQuotes"];
     sideQuestionDrafts: OrbitUiState["sideQuestionDrafts"];
   },
+  initialSidePanelByScope: OrbitUiState["sidePanelByScope"] = {},
 ): OrbitUiState {
   const initialDesktopSidebarOpenPref = initialPrefs.sidebarOpen ?? true;
   const initialIsCompactViewport =
@@ -551,6 +573,7 @@ export function createDefaultInitialState(
     fleetHydrated: false,
     bootstrapError: null,
     hostDetails: {},
+    primaryRouterHostId: null,
     selectedHostId: null,
     instructionsTarget: null,
     selectedAgentId: null,
@@ -603,6 +626,13 @@ export function createDefaultInitialState(
     sidePanelTabs: [],
     activeSidePanelTabId: null,
     sidePanelSplit: null,
+    sidePanelByScope: initialSidePanelByScope,
+    sidePanelScopeKey: null,
+    sidePanelUserDismissed: false,
+    sidePanelClosedTabs: [],
+    sidePanelUnseenTabIds: [],
+    sidePanelCollapsedByResize: false,
+    sidePanelScopeSwitchNonce: 0,
     fileViewCache: {},
     fileEditorDrafts: {},
     pendingUnsavedFileAction: null,
@@ -638,6 +668,12 @@ export function createDefaultInitialState(
       artifacts: initialPrefs.overviewCollapsedSections?.artifacts ?? false,
       links: initialPrefs.overviewCollapsedSections?.links ?? false,
       touched_files: initialPrefs.overviewCollapsedSections?.touched_files ?? true,
+      briefing_needs_you: initialPrefs.overviewCollapsedSections?.briefing_needs_you ?? false,
+      briefing_in_progress: initialPrefs.overviewCollapsedSections?.briefing_in_progress ?? false,
+      briefing_waiting: initialPrefs.overviewCollapsedSections?.briefing_waiting ?? false,
+      briefing_completed: initialPrefs.overviewCollapsedSections?.briefing_completed ?? false,
+      briefing_handled: initialPrefs.overviewCollapsedSections?.briefing_handled ?? false,
+      briefing_hosts: initialPrefs.overviewCollapsedSections?.briefing_hosts ?? false,
     },
     sessionCreatedPrs: {},
     quickOpenFilesOpen: false,
@@ -675,7 +711,6 @@ export function createDefaultInitialState(
 
     activeView: "workspace",
     workspacePanel: "conversation",
-    overviewPinnedLanes: [],
     settingsSection: "general",
     commandPaletteOpen: false,
     onboardingOpen: false,
@@ -683,6 +718,8 @@ export function createDefaultInitialState(
     relayDialogOpen: false,
     remoteFolderPickerHostId: null,
     exportDialogTarget: null,
+    goalEditDialogTarget: null,
+    goalReplaceConfirmTarget: null,
     copyCodeBlocksTarget: null,
     handoffDialogTarget: null,
     mediaPreviewTarget: null,

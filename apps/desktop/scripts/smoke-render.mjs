@@ -198,6 +198,35 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return null;
         case "discover_fleet_router_hosts":
           return [routerHost];
+        case "get_personal_agent_briefing":
+          return {
+            personal_agent: null,
+            needs_you: [],
+            missions: [],
+            other_active: [],
+            waiting: [],
+            hosts: [
+              {
+                host_id: mockHost.host_id,
+                name: mockHost.display_name,
+                online: true,
+                is_personal_agent_host: false,
+              },
+            ],
+            counts: {
+              needs_you: 0,
+              running: 0,
+              done_recent: 0,
+              hosts_online: 1,
+              hosts_total: 1,
+            },
+            since_last_visit: {
+              completed: 0,
+              auto_handled: 0,
+            },
+          };
+        case "list_personal_agent_activity":
+          return [];
         case "get_personal_router_status":
           return {
             config: { enabled: false, provider: "codex", scope: "global_fleet",

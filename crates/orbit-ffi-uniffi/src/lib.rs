@@ -40,9 +40,9 @@ use orbit_client_core::contract::{
     ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
     ModelSelectionRequest, PreviewWorktreeHandoffRequest, ReadWorkspaceFileRequest,
     RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView, RewindAgentRequest,
-    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateHostConfigRequest,
-    UpsertArtifactRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
-    WriteWorkspaceFileRequest,
+    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateGoalRunRequest,
+    UpdateHostConfigRequest, UpsertArtifactRequest, WorkspaceEntryMutationResultView,
+    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
@@ -1628,6 +1628,9 @@ pub struct FfiGoalRunRecord {
     pub last_verify_exit_code: Option<i32>,
     pub last_verify_output: Option<String>,
     pub consecutive_identical_failures: u32,
+    pub pause_reason: Option<String>,
+    pub paused_by_user: bool,
+    pub active_duration_secs: u64,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -1649,6 +1652,9 @@ impl From<GoalRunRecord> for FfiGoalRunRecord {
             last_verify_exit_code: v.last_verify_exit_code,
             last_verify_output: v.last_verify_output,
             consecutive_identical_failures: v.consecutive_identical_failures,
+            pause_reason: v.pause_reason,
+            paused_by_user: v.paused_by_user,
+            active_duration_secs: v.active_duration_secs,
             started_at_ms: v.started_at_ms,
             updated_at_ms: v.updated_at_ms,
             finished_at_ms: v.finished_at_ms,
@@ -4270,6 +4276,7 @@ impl From<FfiClientPlatform> for ClientPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiSlashDirective {
     Plan,
+    Goal,
     Review,
     Compact,
     Orbit,
@@ -4282,6 +4289,7 @@ impl From<SlashDirective> for FfiSlashDirective {
     fn from(v: SlashDirective) -> Self {
         match v {
             SlashDirective::Plan => Self::Plan,
+            SlashDirective::Goal => Self::Goal,
             SlashDirective::Review => Self::Review,
             SlashDirective::Compact => Self::Compact,
             SlashDirective::Orbit => Self::Orbit,
@@ -4296,6 +4304,7 @@ impl From<FfiSlashDirective> for SlashDirective {
     fn from(v: FfiSlashDirective) -> Self {
         match v {
             FfiSlashDirective::Plan => Self::Plan,
+            FfiSlashDirective::Goal => Self::Goal,
             FfiSlashDirective::Review => Self::Review,
             FfiSlashDirective::Compact => Self::Compact,
             FfiSlashDirective::Orbit => Self::Orbit,
@@ -6843,6 +6852,36 @@ impl OrbitMobileCore {
         .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_goal_run(
+        &self,
+        host_id: String,
+        goal_id: String,
+        objective: Option<String>,
+        criteria: Option<Vec<String>>,
+        verify_command: Option<String>,
+        clear_verify_command: bool,
+        max_iterations: Option<u32>,
+        max_duration_secs: Option<u64>,
+    ) -> Result<FfiGoalRunRecord, FfiOrbitError> {
+        let verify_patch = if clear_verify_command {
+            Some(None)
+        } else {
+            verify_command.map(Some)
+        };
+        block_on_oneshot_future(self.inner.update_goal_run_on_host(UpdateGoalRunRequest {
+            host_id,
+            goal_id,
+            objective,
+            criteria,
+            verify_command: verify_patch,
+            max_iterations,
+            max_duration_secs,
+        }))
+        .map(Into::into)
+        .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
     pub fn list_monitor_watches(
         &self,
         host_id: String,
@@ -7416,6 +7455,9 @@ mod tests {
             last_verify_exit_code: Some(0),
             last_verify_output: Some("ok".into()),
             consecutive_identical_failures: 0,
+            pause_reason: None,
+            paused_by_user: false,
+            active_duration_secs: 15,
             started_at_ms: 1000,
             updated_at_ms: 2000,
             finished_at_ms: None,

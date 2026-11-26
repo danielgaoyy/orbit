@@ -136,9 +136,14 @@ describe("Non-settings bug fix & DOM cleanliness guardrails", () => {
   });
 
   it("uses a native non-passive wheel listener in ImageLightbox", () => {
-    const src = readFileSync(path.join(desktopSrcDir, "components/viewers/image-lightbox.tsx"), "utf8");
-    assert.match(src, /addEventListener\("wheel",\s*handleWheel,\s*\{\s*passive:\s*false\s*\}\)/);
-    assert.doesNotMatch(src, /onWheel=/);
+    const lightboxSrc = readFileSync(
+      path.join(desktopSrcDir, "components/viewers/image-lightbox.tsx"),
+      "utf8",
+    );
+    const panZoomSrc = readFileSync(path.join(desktopSrcDir, "lib/drag/use-pan-zoom.ts"), "utf8");
+    assert.match(lightboxSrc, /\busePanZoom\(/);
+    assert.doesNotMatch(lightboxSrc, /onWheel=/);
+    assert.match(panZoomSrc, /addEventListener\("wheel",\s*handleWheel,\s*\{\s*passive:\s*false\s*\}\)/);
   });
 
   it("renders common.connecting instead of common.sync for connecting single host in FleetSidebar", () => {

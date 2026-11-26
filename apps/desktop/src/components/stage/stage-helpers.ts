@@ -20,7 +20,13 @@ import {
   type ResolvedSubagentItem,
   type SubagentNameMatcher,
 } from "../../lib/subagents.ts";
-import { isTimelineAgentMessageHidden } from "../../lib/turn-delegation-split.ts";
+import {
+  extractDirectAgentMessagePresentation,
+} from "../../lib/agent-message-clean.ts";
+import {
+  isDirectAgentPromptBubble,
+  isTimelineAgentMessageHidden,
+} from "../../lib/turn-delegation-split.ts";
 import {
   selectPendingDecisions,
   selectSessionSubagents,
@@ -266,10 +272,20 @@ export function updateStageTimingHistory(
   return next;
 }
 
+export interface PromptSourceMeta {
+  agentId?: string | null;
+  hostId?: string | null;
+  title?: string | null;
+  handle?: string | null;
+  isPersonalAgent?: boolean;
+}
+
 export interface UserPromptPresentation {
   cleanText: string;
   badges: PromptBadge[];
   sanitizedLegacy: boolean;
+  isSystemNoise?: boolean;
+  inferredSource?: PromptSourceMeta | null;
 }
 
 export interface PromptImagePreviewTarget {
@@ -740,10 +756,27 @@ export function extractUserPromptPresentation(
   if (cached) return cached;
 
   if (item.badges && item.badges.length > 0) {
+    const trimmed = item.text.trim();
+    let cleanText = trimmed;
+    let sanitizedLegacy = false;
+    let inferredSource: PromptSourceMeta | null = null;
+    if (/^<(?:orbit-|WORKSPACE_RULES|WORKFLOW_INSTRUCTION|ATTACHED_CONTEXT)/i.test(trimmed)) {
+      const parsed = extractDirectAgentMessagePresentation(trimmed);
+      cleanText = parsed.cleanText;
+      sanitizedLegacy = parsed.strippedEnvelope;
+      if (parsed.sourceAgentId || parsed.sourceTitle) {
+        inferredSource = {
+          agentId: parsed.sourceAgentId,
+          hostId: parsed.sourceHostId,
+          title: parsed.sourceTitle,
+        };
+      }
+    }
     const res: UserPromptPresentation = {
-      cleanText: item.text.trim(),
+      cleanText,
       badges: item.badges,
-      sanitizedLegacy: false,
+      sanitizedLegacy,
+      inferredSource,
     };
     const nextByLocale = byLocale ?? {};
     nextByLocale[locale] = res;
@@ -754,6 +787,35 @@ export function extractUserPromptPresentation(
   let working = item.text;
   const inferredBadges: PromptBadge[] = [];
   let sanitized = false;
+  let inferredSource: PromptSourceMeta | null = null;
+
+  if (/^\s*<(?:orbit-|WORKSPACE_RULES|WORKFLOW_INSTRUCTION|ATTACHED_CONTEXT)/i.test(working)) {
+    const parsed = extractDirectAgentMessagePresentation(working);
+    if (parsed.isSystemNoise) {
+      const res: UserPromptPresentation = {
+        cleanText: "",
+        badges: [],
+        sanitizedLegacy: true,
+        isSystemNoise: true,
+        inferredSource: null,
+      };
+      const nextByLocale = byLocale ?? {};
+      nextByLocale[locale] = res;
+      if (!byLocale) promptPresentationCache.set(item, nextByLocale);
+      return res;
+    }
+    if (parsed.strippedEnvelope) {
+      working = parsed.cleanText;
+      sanitized = true;
+    }
+    if (parsed.sourceAgentId || parsed.sourceTitle) {
+      inferredSource = {
+        agentId: parsed.sourceAgentId,
+        hostId: parsed.sourceHostId,
+        title: parsed.sourceTitle,
+      };
+    }
+  }
 
   working = working.replace(/^Attached image file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
     sanitized = true;
@@ -863,6 +925,7 @@ export function extractUserPromptPresentation(
     cleanText: working,
     badges: inferredBadges,
     sanitizedLegacy: sanitized,
+    inferredSource,
   };
   const nextByLocale = byLocale ?? {};
   nextByLocale[locale] = res;
@@ -1197,11 +1260,15 @@ export function getTurnFooter(
   let content = footerContentCache.get(turn);
   if (content === undefined) {
     // A turn made up entirely of suppressed wakeups, hidden inter-agent messages,
-    // or an opening prompt has no footer slot.
+    // or an opening/inline prompt bubble without assistant output has no footer slot.
     const hasBody = !isCompactionMarkerTurn(turn) && turn.live_segments.some((seg) => {
       if (seg.kind === "wakeup") return !isHiddenWakeupLabel(seg.label);
       if (seg.kind === "agent_message") {
-        return seg.item.item_type === "agent_message" && !isTimelineAgentMessageHidden(seg.item);
+        return (
+          seg.item.item_type === "agent_message" &&
+          !isTimelineAgentMessageHidden(seg.item) &&
+          !isDirectAgentPromptBubble(seg.item)
+        );
       }
       return true;
     });
@@ -1222,7 +1289,11 @@ export function getTurnFooter(
 /** The preceding historical footer already supplies 26px (or 30px after changes bar) of separation. */
 export function getTurnTopGapPx(turn: StageTurnView, previousHasFooter: boolean | undefined): number {
   if (previousHasFooter === undefined) return 0;
-  if (turn.user_prompt !== null) return previousHasFooter ? 14 : TURN_LIST_GAP_PX;
+  const hasOpeningBubble =
+    turn.user_prompt !== null ||
+    (turn.agent_message?.item_type === "agent_message" &&
+      isDirectAgentPromptBubble(turn.agent_message));
+  if (hasOpeningBubble) return previousHasFooter ? 14 : TURN_LIST_GAP_PX;
   return previousHasFooter ? 8 : CONTINUATION_TURN_GAP_PX;
 }
 

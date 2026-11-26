@@ -22,7 +22,7 @@ import {
 } from "@/lib/file-prefetch";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { useI18n } from "@/lib/i18n";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const EMPTY_FILES: readonly string[] = [];
@@ -127,10 +127,10 @@ interface DeleteConfirmTarget {
   isDir: boolean;
 }
 
-export const FilesExplorerTab = memo(function FilesExplorerTab() {
+export const FilesExplorerTab = memo(function FilesExplorerTab({ tab }: { tab: SidePanelTab }) {
   const { t } = useI18n();
-  const hostId = useOrbitSelector((s) => s.selectedHostId);
-  const cwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const hostId = tab.hostId ?? null;
+  const cwd = tab.cwd ?? "";
   const cacheKey = hostId && cwd ? `${hostId}::${cwd}` : "";
   const files = useOrbitSelector((s) =>
     cacheKey ? (s.workspaceFilesCache[cacheKey] ?? EMPTY_FILES) : EMPTY_FILES,
@@ -165,8 +165,10 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const ime = useImeCompositionGuard();
 
-  // Reset inline mutation UI whenever active host or workspace changes (prevents cross-workspace mutations)
+  // Reset inline mutation UI & local filter/tree state whenever active host or workspace changes
   useEffect(() => {
+    setQuery("");
+    setExpandedDirs({});
     setCreateMode(null);
     setCreateValue("");
     setRenamingPath(null);

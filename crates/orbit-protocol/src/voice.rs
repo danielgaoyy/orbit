@@ -189,6 +189,7 @@ mod tests {
             guardian_assessment: None,
             plan_approval: None,
             human_only: false,
+            router_recommendation: None,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(

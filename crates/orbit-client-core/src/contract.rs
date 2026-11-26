@@ -606,6 +606,10 @@ pub struct StartGoalRunRequest {
     pub max_iterations: Option<u32>,
     #[serde(default)]
     pub max_duration_secs: Option<u64>,
+    #[serde(default)]
+    pub replace_existing: bool,
+    #[serde(default)]
+    pub dispatch_initial_prompt: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,6 +617,22 @@ pub struct ControlGoalRunRequest {
     pub host_id: String,
     pub goal_id: String,
     pub action: orbit_protocol::GoalControlAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateGoalRunRequest {
+    pub host_id: String,
+    pub goal_id: String,
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub criteria: Option<Vec<String>>,
+    #[serde(default)]
+    pub verify_command: Option<Option<String>>,
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

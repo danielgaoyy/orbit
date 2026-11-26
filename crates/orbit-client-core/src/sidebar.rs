@@ -682,6 +682,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 needs_attention.push(conv.clone());
             }
 
+            // The Personal Agent has its own top-level sidebar entry, so its conversation is
+            // never listed under Pinned or Projects (it still surfaces in Needs Attention).
+            if crate::personal_agent::is_personal_agent_card(&agent) {
+                continue;
+            }
+
             // Collapse same-host managed subagents under their parent's Subagents Track (even if parent moved workspace)
             if let Some(ref parent_id) = agent.parent_agent_id
                 && agent.parent_host_id.is_none()
@@ -2387,6 +2393,110 @@ mod tests {
             active_cwd: None,
         });
         assert_eq!(onboarding.projects.len(), 2);
+    }
+
+    #[test]
+    fn personal_agent_conversation_is_hidden_from_pinned_and_projects() {
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        // The Personal Agent usually runs in the bare home directory; hiding it must not leave
+        // behind an empty "Workspace (~)" project group.
+        let mut pa = sample_agent(
+            "ag_pa",
+            "/Users/dev",
+            "2026-01-01T00:00:10Z",
+            true,
+            false,
+            false,
+            true,
+        );
+        pa.labels.insert(
+            orbit_protocol::LABEL_AGENT_ROLE.into(),
+            orbit_protocol::AGENT_ROLE_PERSONAL_ROUTER.into(),
+        );
+        let worker = sample_agent(
+            "ag_worker",
+            "/Users/dev/code/orbit",
+            "2026-01-01T00:00:05Z",
+            true,
+            false,
+            false,
+            false,
+        );
+
+        // Mirrors real data: the Personal Agent's own non-curated workspace rooted at `~`.
+        let home_ws = vec![WorkspaceSummary {
+            workspace_id: "ws_1".into(),
+            title: "Personal Agent".into(),
+            mission_goal: None,
+            cwd: "/Users/dev".into(),
+            project_root: Some("/Users/dev".into()),
+            git_branch: None,
+            is_worktree: false,
+            updated_at: chrono::Utc::now(),
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: false,
+        }];
+
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 1,
+            hosts: vec![SidebarHostInput {
+                host_id: "h_local",
+                host_name: "Mac Studio",
+                workspaces: &home_ws,
+                discovered_projects: &[],
+                agents: vec![(pa, 1), (worker, 2)],
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &[],
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h_local"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        let pinned: Vec<&str> = view
+            .pinned_conversations
+            .iter()
+            .map(|c| c.agent.agent_id.as_str())
+            .collect();
+        assert_eq!(pinned, vec!["ag_worker"]);
+        let in_projects = view
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.conversations
+                    .iter()
+                    .chain(p.unclassified_conversations.iter())
+            })
+            .any(|c| c.agent.agent_id == "ag_pa");
+        assert!(
+            !in_projects,
+            "Personal Agent must not appear under Projects"
+        );
+        assert!(
+            view.projects.iter().all(|p| !p.is_home_workspace),
+            "hiding the Personal Agent must not leave an empty Workspace (~) group"
+        );
+        // A Personal Agent awaiting approval still surfaces in Needs Attention.
+        assert!(
+            view.needs_attention
+                .iter()
+                .any(|c| c.agent.agent_id == "ag_pa")
+        );
     }
 
     #[test]

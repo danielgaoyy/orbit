@@ -300,6 +300,12 @@ struct AutomationsSheet: View {
                                 .foregroundStyle(code == 0 ? palette.direct : palette.danger)
                         }
                     }
+                    if goal.status == .paused, let reason = goal.pauseReason, !reason.isEmpty {
+                        Text(reason)
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.warning)
+                            .lineLimit(2)
+                    }
                 }
                 Spacer(minLength: 4)
             }

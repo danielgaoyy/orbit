@@ -68,7 +68,7 @@ flowchart TB
 ## 核心差异化特性
 
 ### Personal Agent 全局调度与零 Webhook IM 闭环
-- 在线舰队中任意指定一台常驻机器作为全局 **Personal Router**（`AgentRole::PersonalRouter`）：持续聚合全舰队 `<orbit-fleet-state>` / `<orbit-fleet-delta>`，免 SSH 通过 `orbit_control` 探测远端仓库上下文，在独立 Git Worktree 并行分派专家（支持 `BOARD.md` CAS 乐观锁与历史 `@handle` 别名），并以非打断排队与空闲条件定时器协同推进。
+- 在线舰队中任意指定一台常驻机器作为全局 **Personal Agent**（`AgentRole::PersonalRouter`）：持续聚合全舰队 `<orbit-fleet-state>` / `<orbit-fleet-delta>`，免 SSH 通过 `orbit_control` 探测远端仓库上下文，在独立 Git Worktree 并行分派专家（支持 `BOARD.md` CAS 乐观锁与历史 `@handle` 别名），并以非打断排队与空闲条件定时器协同推进。
 - 内置纯 Rust 主动出站长连接，无需公网域名或暴露端口即可在 NAT 后直连 **飞书 / Lark WebSocket**、**Slack Socket Mode** 与 **Discord Gateway v10**，将协议硬阻断的 Tier-3 风险审批以交互卡片直推手机。
 
 ### 单一静态二进制与零中断 Shim 热升级隔离

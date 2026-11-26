@@ -14,7 +14,8 @@ import {
   ConversationStatusGlyph,
   SidebarRelativeTime,
 } from "@/components/sidebar/sidebar-primitives";
-import type { ThreadDragSource } from "@/components/sidebar/use-sidebar-drag";
+import type { PinnedDragSource, ThreadDragSource } from "@/components/sidebar/use-sidebar-drag";
+import { DropIndicatorLine } from "@/components/ui/drag-feedback";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { IconButton } from "@/components/ui/icon-button";
 import { orbitActions, useHasThreadDraft } from "@/state/orbit-store";
@@ -58,6 +59,15 @@ export interface SidebarConversationRowProps {
   dragScopeKey?: string;
   dragWorkspaceId?: string | null;
   isDragging?: boolean;
+  /** True when the dragged row is lifted in a portal and this in-flow row acts as the vacated slot */
+  isDragPlaceholder?: boolean;
+  /** True when this row itself is actively lifted inline (e.g. Pinned section) */
+  isDragLiftedInline?: boolean;
+  isDragSettling?: boolean;
+  /** True when any sibling in this row's scope is currently sorting */
+  isDragSorting?: boolean;
+  /** Live vertical displacement offset (px) while a sibling is dragged past this row */
+  dragOffsetY?: number;
   dropIndicator?: "before" | "after" | null;
   onRegisterNavRow?: (navId: string, el: HTMLElement | null) => void;
   onRegisterThreadRow?: (
@@ -72,6 +82,8 @@ export interface SidebarConversationRowProps {
     el: HTMLDivElement | null,
   ) => void;
   onStartThreadDrag?: (e: React.PointerEvent<HTMLDivElement>, source: ThreadDragSource) => void;
+  onRegisterPinnedRow?: (threadKey: string, el: HTMLDivElement | null) => void;
+  onStartPinnedDrag?: (e: React.PointerEvent<HTMLDivElement>, source: PinnedDragSource) => void;
   shouldSuppressClick?: () => boolean;
   onOpenMenu: (
     threadKey: string,
@@ -122,10 +134,17 @@ function areSidebarConversationRowPropsEqual(
     prev.dragScopeKey !== next.dragScopeKey ||
     prev.dragWorkspaceId !== next.dragWorkspaceId ||
     prev.isDragging !== next.isDragging ||
+    prev.isDragPlaceholder !== next.isDragPlaceholder ||
+    prev.isDragLiftedInline !== next.isDragLiftedInline ||
+    prev.isDragSettling !== next.isDragSettling ||
+    prev.isDragSorting !== next.isDragSorting ||
+    prev.dragOffsetY !== next.dragOffsetY ||
     prev.dropIndicator !== next.dropIndicator ||
     prev.onRegisterNavRow !== next.onRegisterNavRow ||
     prev.onRegisterThreadRow !== next.onRegisterThreadRow ||
     prev.onStartThreadDrag !== next.onStartThreadDrag ||
+    prev.onRegisterPinnedRow !== next.onRegisterPinnedRow ||
+    prev.onStartPinnedDrag !== next.onStartPinnedDrag ||
     prev.shouldSuppressClick !== next.shouldSuppressClick ||
     prev.onOpenMenu !== next.onOpenMenu ||
     prev.onStartRename !== next.onStartRename ||
@@ -182,10 +201,17 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   dragScopeKey,
   dragWorkspaceId = null,
   isDragging = false,
+  isDragPlaceholder = false,
+  isDragLiftedInline = false,
+  isDragSettling = false,
+  isDragSorting = false,
+  dragOffsetY = 0,
   dropIndicator = null,
   onRegisterNavRow,
   onRegisterThreadRow,
   onStartThreadDrag,
+  onRegisterPinnedRow,
+  onStartPinnedDrag,
   shouldSuppressClick,
   onOpenMenu,
   onStartRename,
@@ -232,11 +258,16 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           el,
         );
       }
+      if (onRegisterPinnedRow) {
+        onRegisterPinnedRow(threadKey, el);
+      }
     },
     [
       onRegisterNavRow,
       navId,
       onRegisterThreadRow,
+      onRegisterPinnedRow,
+      threadKey,
       dragProjectId,
       dragScopeKey,
       dragWorkspaceId,
@@ -247,19 +278,30 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
 
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
-      if (isRenaming || !onStartThreadDrag || !dragProjectId || !dragScopeKey) return;
-      onStartThreadDrag(e, {
-        hostId: host.host_id,
-        projectId: dragProjectId,
-        agentId: agent.agent_id,
-        title: effectiveTitle,
-        scopeKey: dragScopeKey,
-        workspaceId: dragWorkspaceId,
-      });
+      if (isRenaming) return;
+      if (onStartThreadDrag && dragProjectId && dragScopeKey) {
+        onStartThreadDrag(e, {
+          hostId: host.host_id,
+          projectId: dragProjectId,
+          agentId: agent.agent_id,
+          title: effectiveTitle,
+          scopeKey: dragScopeKey,
+          workspaceId: dragWorkspaceId,
+        });
+        return;
+      }
+      if (onStartPinnedDrag) {
+        onStartPinnedDrag(e, {
+          threadKey,
+          title: effectiveTitle,
+        });
+      }
     },
     [
       isRenaming,
       onStartThreadDrag,
+      onStartPinnedDrag,
+      threadKey,
       dragProjectId,
       dragScopeKey,
       dragWorkspaceId,
@@ -292,26 +334,23 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
     .filter(Boolean)
     .join("\n");
 
+  const inlineShiftStyle =
+    !isDragLiftedInline && isDragSorting
+      ? { transform: `translate3d(0, ${dragOffsetY}px, 0)` }
+      : undefined;
+
   return (
     <div
       ref={setCombinedRef}
-      onPointerDown={onStartThreadDrag ? handlePointerDown : undefined}
+      onPointerDown={onStartThreadDrag || onStartPinnedDrag ? handlePointerDown : undefined}
+      onDragStart={(e) => e.preventDefault()}
       title={hoverTooltip}
+      style={inlineShiftStyle}
       onClick={(e) => {
         if (shouldSuppressClick?.()) return;
         if (!isRenaming) {
           if (e.metaKey || e.ctrlKey) {
-            const snap = orbitActions.getSnapshot();
-            if (
-              snap.workspacePanel === "conversation" &&
-              !snap.isDraftNewSession &&
-              snap.selectedHostId &&
-              snap.selectedAgentId &&
-              (snap.selectedHostId !== host.host_id || snap.selectedAgentId !== agent.agent_id)
-            ) {
-              orbitActions.pinOverviewLane(snap.selectedHostId, snap.selectedAgentId);
-            }
-            orbitActions.pinOverviewLane(host.host_id, agent.agent_id);
+            orbitActions.openPeerSplitTab(host.host_id, agent.agent_id, effectiveTitle);
           } else {
             orbitActions.selectAgent(host.host_id, agent.agent_id);
           }
@@ -328,30 +367,38 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         });
       }}
       className={cn(
-        "group/item relative flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 transition-[background-color,color,opacity] duration-150",
+        "group/item relative flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 [-webkit-user-drag:none]",
         isChild && !inGroupRail && "border-border-subtle ml-[24px] border-l pl-2.5",
-        isDragging && "opacity-45",
-        selected
-          ? "bg-accent text-ink-primary font-medium"
-          : isUnread
-            ? "text-ink-primary hover:bg-accent/55 font-medium"
-            : isRunning ||
-                agent.is_awaiting_permission ||
-                agent.status_label === "Error"
-              ? "text-ink-primary hover:bg-accent/55"
-              : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
-        keyboardFocused && "bg-accent text-ink-primary ring-border-strong ring-1 ring-inset",
+        isDragLiftedInline
+          ? cn("drag-lifted-surface text-ink-primary z-20", !isDragSettling && "cursor-grabbing")
+          : isDragPlaceholder
+            ? "pointer-events-none"
+            : cn(
+                isDragSorting
+                  ? "transition-transform duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none"
+                  : "transition-[background-color,color,opacity] duration-150",
+                isDragging && "opacity-45",
+                selected
+                  ? "bg-accent text-ink-primary font-medium"
+                  : isUnread
+                    ? "text-ink-primary hover:bg-accent/55 font-medium"
+                    : isRunning ||
+                        agent.is_awaiting_permission ||
+                        agent.status_label === "Error"
+                      ? "text-ink-primary hover:bg-accent/55"
+                      : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+                keyboardFocused && "bg-accent text-ink-primary ring-border-strong ring-1 ring-inset",
+              ),
       )}
     >
-      {dropIndicator === "before" && (
-        <div className="bg-signal-info pointer-events-none absolute -top-[1px] right-1.5 left-1.5 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
-      )}
-      {dropIndicator === "after" && (
-        <div className="bg-signal-info pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
-      )}
+      {dropIndicator && <DropIndicatorLine orientation="horizontal" edge={dropIndicator} />}
 
       <div
-        className={cn("flex min-w-0 flex-1 items-center", inGroupRail || isChild ? "gap-1.5" : "gap-2.5")}
+        className={cn(
+          "flex min-w-0 flex-1 items-center",
+          inGroupRail || isChild ? "gap-1.5" : "gap-2.5",
+          isDragPlaceholder && "opacity-0",
+        )}
       >
         <span className="inline-flex size-4 shrink-0 items-center justify-center">
           <ConversationStatusGlyph agent={agent} isWorktree={isWorktree} isUnread={isUnread} />
@@ -406,8 +453,13 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         )}
       </div>
 
-      {!isRenaming && (
-        <div className="grid shrink-0 items-center justify-items-end">
+      {!isRenaming && !isDragPlaceholder && (
+        <div
+          className={cn(
+            "grid shrink-0 items-center justify-items-end",
+            isDragLiftedInline && "pointer-events-none",
+          )}
+        >
           <div
             className={cn(
               "col-start-1 row-start-1 flex items-center gap-1.5 transition-opacity duration-150 ease-[var(--ease-out-quart)]",

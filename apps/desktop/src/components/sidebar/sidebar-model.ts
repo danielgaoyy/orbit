@@ -15,6 +15,7 @@ import type {
 } from "../../state/store-types.ts";
 
 export const MAX_VISIBLE_CONVERSATIONS_PER_PROJECT = 6;
+export const PINNED_MANUAL_ORDER_SCOPE = "__pinned__";
 
 function threadKey(hostId: string, agentId: string): string {
   return `${hostId}::${agentId}`;
@@ -498,6 +499,21 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
       effectiveTitle,
       titleIndices: m.titleIndices,
     });
+  }
+
+  const pinnedManualOrder = threadManualOrder[PINNED_MANUAL_ORDER_SCOPE];
+  if (pinnedManualOrder && pinnedManualOrder.length > 0 && filteredPinnedEntries.length > 1) {
+    const rank = new Map<string, number>();
+    pinnedManualOrder.forEach((k, idx) => rank.set(k, idx));
+    const orderedPinned = filteredPinnedEntries
+      .map((entry, idx) => ({
+        entry,
+        idx,
+        order: rank.get(entry.key) ?? Number.MAX_SAFE_INTEGER,
+      }))
+      .sort((a, b) => (a.order !== b.order ? a.order - b.order : a.idx - b.idx))
+      .map((item) => item.entry);
+    filteredPinnedEntries.splice(0, filteredPinnedEntries.length, ...orderedPinned);
   }
 
   const promotedThreadKeySet = new Set<string>([

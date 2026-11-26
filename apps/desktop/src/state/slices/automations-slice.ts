@@ -44,6 +44,9 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  resolveSidePanelScopeKey,
+} from "../side-panel-scope";
+import {
   fileCacheKey,
   upsertLruRecord,
 } from "../store-helpers";
@@ -1432,6 +1435,34 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
     ): Promise<LspLocation | null> {
       if (!hostId || !cwd || cwd === "~" || !path || line < 1 || col < 1) return null;
       const seq = ++nextLspGotoSeq;
+      const originState = getState();
+      const originScopeKey =
+        originState.sidePanelScopeKey ??
+        resolveSidePanelScopeKey({
+          selectedHostId: originState.selectedHostId,
+          selectedAgentId: originState.selectedAgentId,
+          isDraftNewSession: originState.isDraftNewSession,
+          hostDetails: originState.hostDetails,
+          archivedThreads: originState.archivedThreads,
+        });
+      const isStaleTarget = (): boolean => {
+        const cur = getState();
+        const curScopeKey =
+          cur.sidePanelScopeKey ??
+          resolveSidePanelScopeKey({
+            selectedHostId: cur.selectedHostId,
+            selectedAgentId: cur.selectedAgentId,
+            isDraftNewSession: cur.isDraftNewSession,
+            hostDetails: cur.hostDetails,
+            archivedThreads: cur.archivedThreads,
+          });
+        return (
+          seq !== nextLspGotoSeq ||
+          !cur.sidePanelOpen ||
+          cur.selectedHostId !== hostId ||
+          (originScopeKey !== null && curScopeKey !== originScopeKey)
+        );
+      };
       try {
         const locations = await orbitIpc.lspGotoDefinition({
           hostId,
@@ -1440,7 +1471,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
           line,
           col,
         });
-        if (seq !== nextLspGotoSeq || !getState().sidePanelOpen || getState().selectedHostId !== hostId) {
+        if (isStaleTarget()) {
           return null;
         }
         const first = locations[0] ?? null;
@@ -1456,7 +1487,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
         });
         return first;
       } catch {
-        if (seq !== nextLspGotoSeq || !getState().sidePanelOpen || getState().selectedHostId !== hostId) {
+        if (isStaleTarget()) {
           return null;
         }
         notifyToast("No definition found");
@@ -1473,14 +1504,71 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       verifyCommand?: string | null;
       maxIterations?: number | null;
       maxDurationSecs?: number | null;
+      replaceExisting?: boolean;
+      dispatchInitialPrompt?: boolean | null;
+      silentToast?: boolean;
     }): Promise<GoalRunRecord | null> {
       try {
         const goal = await orbitIpc.startGoalRun(req);
-        notifyToast("Goal loop started");
+        setState((s) => {
+          const detail = s.hostDetails[req.hostId];
+          if (!detail) return s;
+          const prev = detail.goal_runs ?? [];
+          const next = [
+            goal,
+            ...prev.filter((g) => g.goal_id !== goal.goal_id),
+          ];
+          return {
+            ...s,
+            hostDetails: {
+              ...s.hostDetails,
+              [req.hostId]: { ...detail, goal_runs: next },
+            },
+          };
+        });
+        if (!req.silentToast) {
+          notifyToast("Goal loop started");
+        }
         void ctx.actions.reloadHostDetail(req.hostId, true);
         return goal;
       } catch (err) {
         notifyToast(`Failed to start goal: ${String(err)}`);
+        return null;
+      }
+    },
+
+
+    async updateGoalRun(req: {
+      hostId: string;
+      goalId: string;
+      objective?: string | null;
+      criteria?: string[] | null;
+      verifyCommand?: string | null;
+      maxIterations?: number | null;
+      maxDurationSecs?: number | null;
+    }): Promise<GoalRunRecord | null> {
+      try {
+        const goal = await orbitIpc.updateGoalRun(req);
+        setState((s) => {
+          const detail = s.hostDetails[req.hostId];
+          if (!detail) return s;
+          const prev = detail.goal_runs ?? [];
+          const exists = prev.some((g) => g.goal_id === goal.goal_id);
+          const next = exists
+            ? prev.map((g) => (g.goal_id === goal.goal_id ? goal : g))
+            : [goal, ...prev];
+          return {
+            ...s,
+            hostDetails: {
+              ...s.hostDetails,
+              [req.hostId]: { ...detail, goal_runs: next },
+            },
+          };
+        });
+        void ctx.actions.reloadHostDetail(req.hostId, true);
+        return goal;
+      } catch (err) {
+        notifyToast(`Failed to update goal: ${String(err)}`);
         return null;
       }
     },
@@ -1493,6 +1581,22 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
     ): Promise<GoalRunRecord | null> {
       try {
         const goal = await orbitIpc.controlGoalRun(hostId, goalId, action);
+        setState((s) => {
+          const detail = s.hostDetails[hostId];
+          if (!detail) return s;
+          const prev = detail.goal_runs ?? [];
+          const exists = prev.some((g) => g.goal_id === goal.goal_id);
+          const next = exists
+            ? prev.map((g) => (g.goal_id === goal.goal_id ? goal : g))
+            : [goal, ...prev];
+          return {
+            ...s,
+            hostDetails: {
+              ...s.hostDetails,
+              [hostId]: { ...detail, goal_runs: next },
+            },
+          };
+        });
         const label =
           action === "pause"
             ? "Goal paused"
@@ -1510,6 +1614,40 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
         notifyToast(`Goal action failed: ${String(err)}`);
         return null;
       }
+    },
+
+
+    openGoalEditDialog(hostId: string, goal: GoalRunRecord): void {
+      setState((s) => ({
+        ...s,
+        goalEditDialogTarget: { hostId, goal },
+      }));
+    },
+
+
+    closeGoalEditDialog(): void {
+      setState((s) => (s.goalEditDialogTarget ? { ...s, goalEditDialogTarget: null } : s));
+    },
+
+
+    openGoalReplaceConfirm(target: {
+      hostId: string;
+      agentId: string;
+      currentGoal: GoalRunRecord;
+      newObjective: string;
+      onConfirm: () => Promise<void>;
+    }): void {
+      setState((s) => ({
+        ...s,
+        goalReplaceConfirmTarget: target,
+      }));
+    },
+
+
+    closeGoalReplaceConfirm(): void {
+      setState((s) =>
+        s.goalReplaceConfirmTarget ? { ...s, goalReplaceConfirmTarget: null } : s,
+      );
     },
 
 

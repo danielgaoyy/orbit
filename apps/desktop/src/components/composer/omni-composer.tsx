@@ -54,6 +54,7 @@ import {
   detectActiveTriggerKind,
   resolveComposerActionMode,
 } from "@/lib/composer-input";
+import { useFileDrop } from "@/lib/drag/use-file-drop";
 import { translate, useI18n, useLocale } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -331,12 +332,16 @@ export interface OmniComposerProps {
   variant?: "hero" | "docked";
   occluding?: boolean;
   hasPendingDecisions?: boolean;
+  stageDraggingFiles?: boolean;
+  externalDropSurface?: boolean;
 }
 
 export const OmniComposer = memo(function OmniComposer({
   variant = "docked",
   occluding = false,
   hasPendingDecisions = false,
+  stageDraggingFiles = false,
+  externalDropSurface = false,
 }: OmniComposerProps) {
   const locale = useLocale();
   const t = useMemo(() => translate.bind(null, locale), [locale]);
@@ -570,7 +575,6 @@ export const OmniComposer = memo(function OmniComposer({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [menuHighlightIdx, setMenuHighlightIdx] = useState<number>(0);
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
-  const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [rankedMentions, setRankedMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
   const [symbolMentions, setSymbolMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
@@ -718,7 +722,7 @@ export const OmniComposer = memo(function OmniComposer({
   const cursorOffset = cursor.text === draftText ? cursor.offset : 0;
   const triggerKind = useMemo(() => detectActiveTriggerKind(draftText, cursorOffset), [draftText, cursorOffset]);
   const slashTrigger = useMemo(() => {
-    if (triggerKind !== "slash") return null;
+    if (slashDirective || triggerKind !== "slash") return null;
     const slashIndex = draftText.lastIndexOf("/", cursorOffset - 1);
     const query = draftText.slice(slashIndex + 1, cursorOffset);
     const tokenKey = `slash:${slashIndex}:${query}`;
@@ -728,7 +732,7 @@ export const OmniComposer = memo(function OmniComposer({
     const items = filterSlashCommands(commands, query, t);
     if (items.length === 0) return null;
     return { slashIndex, endIndex: cursorOffset, query, tokenKey, items };
-  }, [triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
+  }, [slashDirective, triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
 
   const mentionTrigger = useMemo(() => {
     if (triggerKind !== "mention") return null;
@@ -964,12 +968,6 @@ export const OmniComposer = memo(function OmniComposer({
         }
         break;
       case "goal":
-        if (isDraft || !hasCurrentAgent) {
-          orbitActions.showToast(t("composer.toastSessionRequiredGoal"));
-          break;
-        }
-        orbitActions.setSlashDirective(cmd.id);
-        break;
       case "btw":
       case "plan":
       case "review":
@@ -1403,15 +1401,14 @@ export const OmniComposer = memo(function OmniComposer({
     }
   };
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDraggingOver(false);
-    const files = Array.from(e.dataTransfer.files ?? []);
-    for (const file of files) {
-      void orbitActions.stageAndAttachFile(file);
-    }
-    textareaRef.current?.focus();
-  };
+  const { isDraggingFiles: isDraggingOver, dropHandlers: fileDropHandlers } = useFileDrop({
+    onDropFiles: (files) => {
+      for (const file of files) {
+        void orbitActions.stageAndAttachFile(file);
+      }
+      textareaRef.current?.focus();
+    },
+  });
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (ime.shouldIgnoreKeyDown(e)) {
@@ -1454,7 +1451,11 @@ export const OmniComposer = memo(function OmniComposer({
         executeSlashCommand(slashTrigger.items[safeIdx]);
         return;
       }
-      if (e.key === " ") {
+      if (
+        e.key === " " &&
+        !slashDirective &&
+        !/\S/.test(draftText.slice(0, slashTrigger.slashIndex))
+      ) {
         const exactCmd = slashTrigger.items.find(
           (c) =>
             isComposerInlineDirective(c.id) &&
@@ -2165,19 +2166,7 @@ export const OmniComposer = memo(function OmniComposer({
         <ComposerQueueStrip />
 
         {/* Relative Anchor for Floating `/` & `@` Menus + Single-Rim Tactile Composer Card */}
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            if (!isDraggingOver) setIsDraggingOver(true);
-          }}
-          onDragLeave={(e) => {
-            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-              setIsDraggingOver(false);
-            }
-          }}
-          onDrop={handleDrop}
-          className="relative"
-        >
+        <div {...fileDropHandlers} className="relative">
           {slashTrigger && (
             <SlashCommandMenu
               items={slashTrigger.items}
@@ -2209,18 +2198,22 @@ export const OmniComposer = memo(function OmniComposer({
             data-dock-active={hasPendingDecisions ? "true" : undefined}
             className={cn(
               "composer-surface relative rounded-[20px]",
-              isDraggingOver && "ring-signal-info/25 border-signal-info ring-2",
+              isDraggingOver
+                ? "ring-signal-info/25 border-signal-info ring-2"
+                : stageDraggingFiles && "ring-signal-info/18 border-signal-info/70 ring-1",
             )}
           >
-            <div
-              aria-hidden={!isDraggingOver}
-              className={cn(
-                "bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px] transition-opacity duration-[140ms] ease-[var(--ease-out-quart)] select-none",
-                isDraggingOver ? "opacity-100" : "opacity-0",
-              )}
-            >
-              {t("composer.dropToAttach")}
-            </div>
+            {!externalDropSurface && (
+              <div
+                aria-hidden={!isDraggingOver}
+                className={cn(
+                  "bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px] transition-opacity duration-[140ms] ease-[var(--ease-out-quart)] select-none motion-reduce:transition-none",
+                  isDraggingOver ? "opacity-100" : "opacity-0",
+                )}
+              >
+                {t("composer.dropToAttach")}
+              </div>
+            )}
 
             {/* Unified Context Tray — attachments, active atomic `@` mention chips, diff quotes & large pastes */}
             <ContextTray

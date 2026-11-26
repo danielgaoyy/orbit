@@ -72,6 +72,7 @@ use orbit_client_core::desktop_ops::{
 use orbit_client_core::export::{
     ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
 };
+use orbit_client_core::personal_agent::PersonalAgentBriefingView;
 use orbit_client_core::render::{
     HighlightedLineView, RichBlockView, highlight_code_lines_capped, parse_markdown_blocks,
 };
@@ -3478,6 +3479,32 @@ fn set_primary_router_selection(
 }
 
 #[tauri::command]
+async fn get_personal_agent_briefing(
+    state: State<'_, DesktopAppState>,
+    primary_router_host_id: Option<String>,
+) -> Result<PersonalAgentBriefingView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.personal_agent_briefing(primary_router_host_id)
+    })
+    .await
+    .map_err(|e| format!("personal agent briefing task error: {e}"))
+}
+
+#[tauri::command]
+async fn list_personal_agent_activity(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    limit: Option<u32>,
+    since_ms: Option<i64>,
+) -> Result<Vec<orbit_protocol::PersonalAgentActivityEntry>, String> {
+    state
+        .core
+        .list_personal_agent_activity(&host_id, limit.unwrap_or(50), since_ms)
+        .await
+}
+
+#[tauri::command]
 fn focus_main_window(app: AppHandle) -> Result<(), String> {
     tray::focus_main_window_impl(&app)
 }
@@ -3571,6 +3598,8 @@ async fn start_goal_run(
     verify_command: Option<String>,
     max_iterations: Option<u32>,
     max_duration_secs: Option<u64>,
+    replace_existing: Option<bool>,
+    dispatch_initial_prompt: Option<bool>,
 ) -> Result<orbit_protocol::GoalRunRecord, String> {
     state
         .core
@@ -3582,6 +3611,8 @@ async fn start_goal_run(
             verify_command,
             max_iterations,
             max_duration_secs,
+            replace_existing: replace_existing.unwrap_or(false),
+            dispatch_initial_prompt,
         })
         .await
 }
@@ -3608,6 +3639,32 @@ async fn control_goal_run(
             host_id,
             goal_id,
             action,
+        })
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn update_goal_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    goal_id: String,
+    objective: Option<String>,
+    criteria: Option<Vec<String>>,
+    verify_command: Option<Option<String>>,
+    max_iterations: Option<u32>,
+    max_duration_secs: Option<u64>,
+) -> Result<orbit_protocol::GoalRunRecord, String> {
+    state
+        .core
+        .update_goal_run_on_host(orbit_client_core::contract::UpdateGoalRunRequest {
+            host_id,
+            goal_id,
+            objective,
+            criteria,
+            verify_command,
+            max_iterations,
+            max_duration_secs,
         })
         .await
 }
@@ -5426,6 +5483,8 @@ pub fn run() {
             export_hermes_bridge_config,
             get_primary_router_selection,
             set_primary_router_selection,
+            get_personal_agent_briefing,
+            list_personal_agent_activity,
             focus_main_window,
             update_tray_status,
             probe_local_provider_readiness,
@@ -5438,6 +5497,7 @@ pub fn run() {
             start_goal_run,
             list_goal_runs,
             control_goal_run,
+            update_goal_run,
             start_monitor_watch,
             list_monitor_watches,
             stop_monitor_watch,

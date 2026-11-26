@@ -134,6 +134,7 @@ public struct HostDaemonUpgradeState: Equatable {
 
 public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     case plan
+    case goal
     case review
     case compact
     case orbit
@@ -148,6 +149,7 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     public var title: String {
         switch self {
         case .plan: return "Plan Architecture"
+        case .goal: return "Autonomous Goal"
         case .review: return "Review Changes"
         case .compact: return "Compact Context"
         case .orbit: return "Orbit Multi-Agent"
@@ -160,6 +162,7 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     public var subtitle: String {
         switch self {
         case .plan: return "Draft step-by-step plan first"
+        case .goal: return "Work autonomously until the goal is achieved"
         case .review: return "Audit working tree changes"
         case .compact: return "Compress session context"
         case .orbit: return "Coordinate specialist agents across profiles"
@@ -172,6 +175,7 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     public var icon: String {
         switch self {
         case .plan: return "checklist"
+        case .goal: return "target"
         case .review: return "doc.text.magnifyingglass"
         case .compact: return "rectangle.compress.vertical"
         case .orbit: return "square.3.layers.3d"
@@ -184,6 +188,7 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     public var ffiValue: FfiSlashDirective {
         switch self {
         case .plan: return .plan
+        case .goal: return .goal
         case .review: return .review
         case .compact: return .compact
         case .orbit: return .orbit
@@ -197,6 +202,7 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         guard let ffiValue else { return nil }
         switch ffiValue {
         case .plan: self = .plan
+        case .goal: self = .goal
         case .review: self = .review
         case .compact: self = .compact
         case .orbit: self = .orbit
@@ -211,6 +217,7 @@ public extension OrbitSlashDirective {
     static func iconName(forSlashCommandId id: String) -> String {
         switch id {
         case "plan": return "checklist"
+        case "goal": return "target"
         case "review": return "doc.text.magnifyingglass"
         case "diff": return "arrow.left.arrow.right"
         case "btw": return "bubble.left.and.text.bubble.right"
@@ -3549,7 +3556,7 @@ public final class OrbitIosStore: ObservableObject {
         quotes: [QuotedDiffSnippet]
     ) {
         let needsGitDiff = explicitDirective == .review
-            || rawInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("/review")
+            || OrbitComposerLogic.matchesLeadingSlashCommand(rawInput, command: "/review")
             || contexts.contains {
                 if case .gitDiff = $0 { return true }
                 return false

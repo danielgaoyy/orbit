@@ -76,9 +76,8 @@ export interface AgentStagePaneProps {
 
 /**
  * Shared self-contained live agent viewport pane (streaming turns + PlanReviewCard +
- * DecisionDock + inline quick reply) reused identically across:
- * - Right Side Panel `PeerSplitTab`
- * - `PersonalAgentControlView` side-by-side live watch lanes
+ * DecisionDock + inline quick reply) reused across Right Side Panel `PeerSplitTab`
+ * and Personal Agent Briefing Rail worker previews.
  */
 export const AgentStagePane = memo(function AgentStagePane({
   hostId,

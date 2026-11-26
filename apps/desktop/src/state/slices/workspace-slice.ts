@@ -29,6 +29,15 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  EMPTY_SIDE_PANEL_UNSEEN_IDS,
+  applyOpenSidePanelTab,
+  applyReopenClosedSidePanelTab,
+  normalizeSidePanelSplit,
+  pushClosedSidePanelTab,
+  resolveCurrentTabScope,
+  resolveSidebarYieldForSidePanel,
+} from "../side-panel-scope";
+import {
   MAX_FILE_CACHE_BYTES,
   MAX_FILE_CACHE_ENTRIES,
   basenameFromPath,
@@ -47,6 +56,7 @@ import type {
   FileViewCacheEntry,
   OverviewSectionId,
   ReviewScope,
+  SidePanelOpenSource,
   SidePanelTab,
   SideQuestionEntry,
 } from "../store-types";
@@ -214,28 +224,19 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       const nextOpen = openOverride ?? !wasOpen;
 
       setState((s) => {
-        let nextSidebarOpen = s.sidebarOpen;
-        let nextYielded = s.sidebarAutoYieldedForSidePanel;
-
-        if (nextOpen) {
-          if (s.isTightForDualSidebars && s.sidebarOpen) {
-            nextSidebarOpen = false;
-            nextYielded = true;
-          }
-        } else if (s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport) {
-          nextSidebarOpen = s.sidebarDesktopOpenPref;
-          nextYielded = false;
-        }
-
+        const sidebarPatch = resolveSidebarYieldForSidePanel(s, nextOpen);
         const willShowLaunchpad =
           nextOpen && (s.sidePanelTabs.length === 0 || !s.activeSidePanelTabId);
 
         return {
           ...s,
           sidePanelOpen: nextOpen,
+          sidePanelUserDismissed: nextOpen ? false : true,
+          sidePanelCollapsedByResize: false,
+          sidePanelUnseenTabIds: nextOpen ? EMPTY_SIDE_PANEL_UNSEEN_IDS : s.sidePanelUnseenTabIds,
           overviewPopoverOpen: nextOpen ? false : s.overviewPopoverOpen,
-          sidebarOpen: nextSidebarOpen,
-          sidebarAutoYieldedForSidePanel: nextYielded,
+          sidebarOpen: sidebarPatch.sidebarOpen,
+          sidebarAutoYieldedForSidePanel: sidebarPatch.sidebarAutoYieldedForSidePanel,
           terminalFocused: nextOpen ? s.terminalFocused : false,
           sidePanelLaunchpadFocusNonce: willShowLaunchpad
             ? s.sidePanelLaunchpadFocusNonce + 1
@@ -259,17 +260,20 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
 
     openSidePanelNewTab(_opts?: { skipUnsavedGuard?: boolean }): void {
       setState((s) => {
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+        const sidebarPatch = resolveSidebarYieldForSidePanel(s, true);
         return {
           ...s,
           sidePanelOpen: true,
+          sidePanelUserDismissed: false,
+          sidePanelCollapsedByResize: false,
+          sidePanelUnseenTabIds: EMPTY_SIDE_PANEL_UNSEEN_IDS,
           overviewPopoverOpen: false,
           activeSidePanelTabId: null,
           terminalFocused: false,
           pendingUnsavedFileAction: null,
           sidePanelLaunchpadFocusNonce: s.sidePanelLaunchpadFocusNonce + 1,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+          sidebarOpen: sidebarPatch.sidebarOpen,
+          sidebarAutoYieldedForSidePanel: sidebarPatch.sidebarAutoYieldedForSidePanel,
         };
       });
 
@@ -344,7 +348,7 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       const target = getState().sidePanelTabs.find((t) => t.id === tabId);
       if (!target) return;
       setState((s) => {
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+        const sidebarPatch = resolveSidebarYieldForSidePanel(s, true);
         const nextTerminalFocused =
           s.terminalFocused &&
           hasVisibleActiveTerminal({
@@ -357,36 +361,40 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         return {
           ...s,
           sidePanelOpen: true,
+          sidePanelUserDismissed: false,
+          sidePanelCollapsedByResize: false,
+          sidePanelUnseenTabIds: EMPTY_SIDE_PANEL_UNSEEN_IDS,
           overviewPopoverOpen: false,
           activeSidePanelTabId: tabId,
           terminalFocused: nextTerminalFocused,
           pendingUnsavedFileAction: null,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+          sidebarOpen: sidebarPatch.sidebarOpen,
+          sidebarAutoYieldedForSidePanel: sidebarPatch.sidebarAutoYieldedForSidePanel,
         };
       });
 
       const afterFocus = getState();
-      if (target.kind === "review" && afterFocus.selectedHostId && afterFocus.selectedWorkspaceCwd) {
+      const targetHostId = target.hostId ?? afterFocus.selectedHostId;
+      const targetCwd = target.cwd ?? afterFocus.selectedWorkspaceCwd;
+      if (target.kind === "review" && targetHostId && targetCwd) {
         void ctx.actions.refreshGit(
-          afterFocus.selectedHostId,
-          afterFocus.selectedWorkspaceCwd,
+          targetHostId,
+          targetCwd,
           null,
           afterFocus.diffStaged,
         );
-      } else if (target.kind === "files" && afterFocus.selectedHostId && afterFocus.selectedWorkspaceCwd) {
-        void ctx.actions.ensureWorkspaceFiles(afterFocus.selectedHostId, afterFocus.selectedWorkspaceCwd);
-      } else if (target.kind === "terminal" && afterFocus.selectedHostId) {
-        const hostTabs = afterFocus.terminalTabs.filter((t) => t.hostId === afterFocus.selectedHostId);
+      } else if (target.kind === "files" && targetHostId && targetCwd) {
+        void ctx.actions.ensureWorkspaceFiles(targetHostId, targetCwd);
+      } else if (target.kind === "terminal" && targetHostId) {
+        const hostTabs = afterFocus.terminalTabs.filter((t) => t.hostId === targetHostId);
         if (hostTabs.length === 0) {
-          ctx.actions.spawnNewTerminalTab(afterFocus.selectedHostId, afterFocus.selectedWorkspaceCwd || "~");
+          ctx.actions.spawnNewTerminalTab(targetHostId, targetCwd || "~");
         } else if (!hostTabs.some((t) => t.key === afterFocus.activeTerminalTabKey)) {
           setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
         }
       } else if (target.kind === "subagent") {
-        const subHostId = target.hostId ?? afterFocus.selectedHostId;
-        if (subHostId && target.childAgentId) {
-          void hydrateSubagentStage(subHostId, target.childAgentId).catch(() => undefined);
+        if (targetHostId && target.childAgentId) {
+          void hydrateSubagentStage(targetHostId, target.childAgentId).catch(() => undefined);
         }
       }
     },
@@ -396,8 +404,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       const closingTab = getState().sidePanelTabs.find((t) => t.id === tabId);
       if (!opts?.skipUnsavedGuard && closingTab?.kind === "file" && closingTab.filePath) {
         const closingKey = fileCacheKey(
-          closingTab.hostId ?? getState().selectedHostId ?? "",
-          closingTab.cwd ?? getState().selectedWorkspaceCwd ?? "~",
+          closingTab.hostId ?? "",
+          closingTab.cwd ?? "~",
           closingTab.filePath,
         );
         if (getState().fileEditorDrafts[closingKey]?.dirty) {
@@ -423,8 +431,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         let nextDrafts = s.fileEditorDrafts;
         if (targetTab.kind === "file" && targetTab.filePath) {
           const k = fileCacheKey(
-            targetTab.hostId ?? s.selectedHostId ?? "",
-            targetTab.cwd ?? s.selectedWorkspaceCwd ?? "~",
+            targetTab.hostId ?? "",
+            targetTab.cwd ?? "~",
             targetTab.filePath,
           );
           if (k in s.fileEditorDrafts) {
@@ -448,10 +456,17 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         }
         const shouldClosePanel = remaining.length === 0;
         closedPanel = shouldClosePanel;
-        const shouldRestoreSidebar =
-          shouldClosePanel && s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport;
+        const sidebarPatch = shouldClosePanel
+          ? resolveSidebarYieldForSidePanel(s, false)
+          : {
+              sidebarOpen: s.sidebarOpen,
+              sidebarAutoYieldedForSidePanel: s.sidebarAutoYieldedForSidePanel,
+            };
         const showingLaunchpad = !shouldClosePanel && nextActive === null;
         const nextSidePanelOpen = shouldClosePanel ? false : s.sidePanelOpen;
+        const nextUnseen = s.sidePanelUnseenTabIds.includes(tabId)
+          ? s.sidePanelUnseenTabIds.filter((id) => id !== tabId)
+          : s.sidePanelUnseenTabIds;
         const nextTerminalFocused =
           s.terminalFocused &&
           hasVisibleActiveTerminal({
@@ -464,10 +479,13 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         return {
           ...s,
           sidePanelOpen: nextSidePanelOpen,
-          sidebarOpen: shouldRestoreSidebar ? s.sidebarDesktopOpenPref : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldRestoreSidebar
-            ? false
-            : s.sidebarAutoYieldedForSidePanel,
+          sidePanelUserDismissed: shouldClosePanel ? true : s.sidePanelUserDismissed,
+          sidePanelCollapsedByResize: shouldClosePanel ? false : s.sidePanelCollapsedByResize,
+          sidePanelClosedTabs: pushClosedSidePanelTab(s.sidePanelClosedTabs, targetTab),
+          sidePanelUnseenTabIds:
+            nextUnseen.length > 0 ? nextUnseen : EMPTY_SIDE_PANEL_UNSEEN_IDS,
+          sidebarOpen: sidebarPatch.sidebarOpen,
+          sidebarAutoYieldedForSidePanel: sidebarPatch.sidebarAutoYieldedForSidePanel,
           sidePanelTabs: remaining,
           activeSidePanelTabId: nextActive,
           sidePanelSplit: nextSplit,
@@ -483,6 +501,45 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       const afterClose = getState();
       if (!closedPanel && afterClose.selectedHostId && afterClose.selectedWorkspaceCwd) {
         void ctx.actions.ensureWorkspaceFiles(afterClose.selectedHostId, afterClose.selectedWorkspaceCwd);
+      }
+    },
+
+
+    reopenClosedSidePanelTab(): void {
+      let reopened: SidePanelTab | null = null;
+      setState((s) => {
+        const res = applyReopenClosedSidePanelTab(s);
+        reopened = res.reopenedTab;
+        return res.state;
+      });
+      const tab = reopened as SidePanelTab | null;
+      if (!tab) return;
+
+      const afterSnap = getState();
+      const targetHostId = tab.hostId ?? afterSnap.selectedHostId;
+      const targetCwd = tab.cwd ?? afterSnap.selectedWorkspaceCwd;
+      if (tab.kind === "review" && targetHostId && targetCwd) {
+        void ctx.actions.refreshGit(targetHostId, targetCwd, null, afterSnap.diffStaged);
+      } else if (tab.kind === "files" && targetHostId && targetCwd) {
+        void ctx.actions.ensureWorkspaceFiles(targetHostId, targetCwd);
+      } else if (tab.kind === "file" && targetHostId && tab.filePath) {
+        void ctx.actions.loadWorkspaceFile(targetHostId, targetCwd || "~", tab.filePath, false);
+      } else if (tab.kind === "terminal" && targetHostId) {
+        const hostTabs = afterSnap.terminalTabs.filter((t) => t.hostId === targetHostId);
+        if (hostTabs.length === 0) {
+          ctx.actions.spawnNewTerminalTab(targetHostId, targetCwd || "~");
+        } else if (!hostTabs.some((t) => t.key === afterSnap.activeTerminalTabKey)) {
+          setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
+        }
+      } else if (tab.kind === "subagent" && targetHostId && tab.childAgentId) {
+        void hydrateSubagentStage(targetHostId, tab.childAgentId).catch(() => undefined);
+      } else if (tab.kind === "peer" && targetHostId && tab.peerAgentId) {
+        void orbitIpc.openAgentTimeline(targetHostId, tab.peerAgentId);
+        void ctx.actions.pullStageDelta(targetHostId, tab.peerAgentId, true);
+      } else if (tab.kind === "board" && targetHostId && tab.workspaceId) {
+        void ctx.actions.fetchWorkspaceBoardAndEvents(targetHostId, tab.workspaceId);
+      } else if (tab.kind === "artifacts" && targetHostId) {
+        void orbitIpc.listArtifacts(targetHostId, null, null).catch(() => {});
       }
     },
 
@@ -583,38 +640,37 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    openReviewTab(opts?: { path?: string | null; scope?: ReviewScope }): void {
+    openReviewTab(opts?: {
+      path?: string | null;
+      scope?: ReviewScope;
+      source?: SidePanelOpenSource;
+      activate?: boolean;
+    }): void {
       const tabId = "tab:review";
-      setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTabs = exists
-          ? s.sidePanelTabs
-          : [...s.sidePanelTabs, { id: tabId, kind: "review" as const, title: "Review" }];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          reviewScope: opts?.scope ?? s.reviewScope,
-          selectedDiffPath: opts?.path !== undefined ? opts.path : s.selectedDiffPath,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          { id: tabId, kind: "review", title: "Review" },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            patch: {
+              reviewScope: opts?.scope ?? s.reviewScope,
+              selectedDiffPath: opts?.path !== undefined ? opts.path : s.selectedDiffPath,
+            },
+          },
+        ),
+      );
 
       const afterReview = getState();
+      const reviewTab = afterReview.sidePanelTabs.find((t) => t.id === tabId);
+      const targetHostId = reviewTab?.hostId ?? afterReview.selectedHostId;
+      const targetCwd = reviewTab?.cwd ?? afterReview.selectedWorkspaceCwd;
       const effectiveScope = opts?.scope ?? afterReview.reviewScope;
-      if (
-        effectiveScope === "working_tree" &&
-        afterReview.selectedHostId &&
-        afterReview.selectedWorkspaceCwd
-      ) {
+      if (effectiveScope === "working_tree" && targetHostId && targetCwd) {
         void ctx.actions.refreshGit(
-          afterReview.selectedHostId,
-          afterReview.selectedWorkspaceCwd,
+          targetHostId,
+          targetCwd,
           null,
           afterReview.diffStaged,
         );
@@ -645,29 +701,22 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    openFilesExplorerTab(): void {
+    openFilesExplorerTab(opts?: { source?: SidePanelOpenSource; activate?: boolean }): void {
       const tabId = "tab:files";
-      setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTabs = exists
-          ? s.sidePanelTabs
-          : [...s.sidePanelTabs, { id: tabId, kind: "files" as const, title: "Files" }];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          { id: tabId, kind: "files", title: "Files" },
+          { source: opts?.source, activate: opts?.activate },
+        ),
+      );
 
       const afterSnap = getState();
-      if (afterSnap.selectedHostId && afterSnap.selectedWorkspaceCwd) {
-        void ctx.actions.ensureWorkspaceFiles(afterSnap.selectedHostId, afterSnap.selectedWorkspaceCwd);
+      const filesTab = afterSnap.sidePanelTabs.find((t) => t.id === tabId);
+      const targetHostId = filesTab?.hostId ?? afterSnap.selectedHostId;
+      const targetCwd = filesTab?.cwd ?? afterSnap.selectedWorkspaceCwd;
+      if (targetHostId && targetCwd) {
+        void ctx.actions.ensureWorkspaceFiles(targetHostId, targetCwd);
       }
     },
 
@@ -682,14 +731,18 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         fallbackPath?: string;
         initialMode?: "view" | "edit";
         skipUnsavedGuard?: boolean;
+        source?: SidePanelOpenSource;
+        activate?: boolean;
       },
     ): void {
-      const hostId = opts?.hostId ?? getState().selectedHostId;
-      const cwd = opts?.cwd ?? getState().selectedWorkspaceCwd ?? "~";
+      const snap = getState();
+      const scope = resolveCurrentTabScope(snap);
+      const hostId = opts?.hostId ?? scope.hostId ?? snap.selectedHostId;
+      const cwd = opts?.cwd ?? scope.cwd ?? snap.selectedWorkspaceCwd ?? "~";
       const normalizedCandidate = normalizeWorkspacePathCandidate(rawPath, cwd);
       if (!hostId || !normalizedCandidate) return;
 
-      const cachedFiles = getState().workspaceFilesCache[`${hostId}::${cwd}`];
+      const cachedFiles = snap.workspaceFilesCache[`${hostId}::${cwd}`];
       const resolvedFromCache =
         !normalizedCandidate.startsWith("/") && !normalizedCandidate.startsWith("~/")
           ? resolveUniqueWorkspaceFileSuffix(normalizedCandidate, cachedFiles)
@@ -703,49 +756,36 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       const tabId = `tab:file:${hostId}::${cwd}::${cleanPath}`;
       const title = basenameFromPath(cleanPath) || cleanPath;
 
-      setState((s) => {
-        const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
-        let nextTabs = s.sidePanelTabs;
-        if (existingIdx >= 0) {
-          if (hasExplicitFocus) {
-            nextTabs = [...s.sidePanelTabs];
-            nextTabs[existingIdx] = {
-              ...nextTabs[existingIdx],
-              focusLine: focusRange.startLine,
-              focusEndLine: focusRange.endLine,
-              ...(focusNonce !== undefined ? { focusNonce } : {}),
-            };
-          }
-        } else {
-          nextTabs = [
-            ...s.sidePanelTabs,
-            {
-              id: tabId,
-              kind: "file" as const,
-              title,
-              filePath: cleanPath,
-              hostId,
-              cwd,
-              focusLine: focusRange.startLine,
-              focusEndLine: focusRange.endLine,
-              focusNonce,
-            },
-          ];
-        }
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          quickOpenFilesOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          pendingUnsavedFileAction: null,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          {
+            id: tabId,
+            kind: "file",
+            title,
+            filePath: cleanPath,
+            hostId,
+            cwd,
+            focusLine: focusRange.startLine,
+            focusEndLine: focusRange.endLine,
+            focusNonce,
+          },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            updateExisting: (existing) =>
+              hasExplicitFocus
+                ? {
+                    ...existing,
+                    focusLine: focusRange.startLine,
+                    focusEndLine: focusRange.endLine,
+                    ...(focusNonce !== undefined ? { focusNonce } : {}),
+                  }
+                : existing,
+            patch: { quickOpenFilesOpen: false },
+          },
+        ),
+      );
 
       const replaceFailedFileTab = (resolvedAltPath: string) => {
         const nextTabId = `tab:file:${hostId}::${cwd}::${resolvedAltPath}`;
@@ -776,11 +816,24 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
                     }
                   : t,
               );
+          const nextActiveTabId =
+            s.activeSidePanelTabId === tabId ? nextTabId : s.activeSidePanelTabId;
+          const mappedSplit =
+            s.sidePanelSplit && s.sidePanelSplit.secondaryTabId === tabId
+              ? { ...s.sidePanelSplit, secondaryTabId: nextTabId }
+              : s.sidePanelSplit;
+          const nextSplit = normalizeSidePanelSplit(nextTabs, nextActiveTabId, mappedSplit);
+          const nextUnseen = s.sidePanelUnseenTabIds.includes(tabId)
+            ? Array.from(
+                new Set(s.sidePanelUnseenTabIds.map((id) => (id === tabId ? nextTabId : id))),
+              )
+            : s.sidePanelUnseenTabIds;
           return {
             ...s,
             sidePanelTabs: nextTabs,
-            activeSidePanelTabId:
-              s.activeSidePanelTabId === tabId ? nextTabId : s.activeSidePanelTabId,
+            activeSidePanelTabId: nextActiveTabId,
+            sidePanelSplit: nextSplit,
+            sidePanelUnseenTabIds: nextUnseen,
           };
         });
       };
@@ -1496,24 +1549,27 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         const prevEmptyDirs = s.workspaceEmptyDirsCache[wsKey] ?? [];
         const nextEmptyDirs = prevEmptyDirs.map((d) => remapPath(d) ?? d);
 
-        const nextTabs = s.sidePanelTabs.map((t) => {
+        const tabIdRemap = new Map<string, string>();
+        const remapFileTab = (t: SidePanelTab): SidePanelTab => {
           if (t.kind !== "file" || !t.filePath) return t;
-          const tHost = t.hostId ?? s.selectedHostId;
-          const tCwd = t.cwd ?? s.selectedWorkspaceCwd;
-          if (tHost !== hostId || tCwd !== cwd) return t;
+          if (t.hostId !== hostId || t.cwd !== cwd) return t;
           const mapped = remapPath(t.filePath);
           if (!mapped) return t;
           const oldKey = `${hostId}::${cwd}::${t.filePath}`;
           if (extOf(t.filePath) !== extOf(mapped) && !s.fileEditorDrafts[oldKey]?.dirty) {
             pathsNeedingHighlightReload.push(mapped);
           }
+          const nextId = `tab:file:${hostId}::${cwd}::${mapped}`;
+          tabIdRemap.set(t.id, nextId);
           return {
             ...t,
-            id: `tab:file:${hostId}::${cwd}::${mapped}`,
+            id: nextId,
             title: basenameFromPath(mapped) || mapped,
             filePath: mapped,
           };
-        });
+        };
+        const nextTabs = s.sidePanelTabs.map(remapFileTab);
+        const nextClosedTabs = s.sidePanelClosedTabs.map(remapFileTab);
 
         let nextActiveTabId = s.activeSidePanelTabId;
         for (let i = 0; i < s.sidePanelTabs.length; i += 1) {
@@ -1522,6 +1578,18 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
             break;
           }
         }
+        const remappedSplit =
+          s.sidePanelSplit && tabIdRemap.has(s.sidePanelSplit.secondaryTabId)
+            ? {
+                ...s.sidePanelSplit,
+                secondaryTabId: tabIdRemap.get(s.sidePanelSplit.secondaryTabId)!,
+              }
+            : s.sidePanelSplit;
+        const nextSplit = normalizeSidePanelSplit(nextTabs, nextActiveTabId, remappedSplit);
+        const nextUnseen =
+          tabIdRemap.size > 0
+            ? s.sidePanelUnseenTabIds.map((id) => tabIdRemap.get(id) ?? id)
+            : s.sidePanelUnseenTabIds;
 
         const prefix = `${hostId}::${cwd}::`;
         const nextCache: Record<string, FileViewCacheEntry> = {};
@@ -1569,6 +1637,9 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
           },
           sidePanelTabs: nextTabs,
           activeSidePanelTabId: nextActiveTabId,
+          sidePanelSplit: nextSplit,
+          sidePanelClosedTabs: nextClosedTabs,
+          sidePanelUnseenTabIds: nextUnseen,
           fileViewCache: nextCache,
           fileEditorDrafts: nextDrafts,
           pendingUnsavedFileAction: nextPending,
@@ -1617,9 +1688,12 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
 
         const remainingTabs = s.sidePanelTabs.filter((t) => {
           if (t.kind !== "file" || !t.filePath) return true;
-          const tHost = t.hostId ?? s.selectedHostId;
-          const tCwd = t.cwd ?? s.selectedWorkspaceCwd;
-          if (tHost !== hostId || tCwd !== cwd) return true;
+          if (t.hostId !== hostId || t.cwd !== cwd) return true;
+          return !matchesDeleted(t.filePath);
+        });
+        const remainingClosedTabs = s.sidePanelClosedTabs.filter((t) => {
+          if (t.kind !== "file" || !t.filePath) return true;
+          if (t.hostId !== hostId || t.cwd !== cwd) return true;
           return !matchesDeleted(t.filePath);
         });
 
@@ -1627,6 +1701,17 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         const nextActive = activeRemoved
           ? (remainingTabs[remainingTabs.length - 1]?.id ?? null)
           : s.activeSidePanelTabId;
+        const nextSplit = normalizeSidePanelSplit(remainingTabs, nextActive, s.sidePanelSplit);
+        const closedAll = remainingTabs.length !== s.sidePanelTabs.length && remainingTabs.length === 0;
+        const nextSidePanelOpen = closedAll ? false : s.sidePanelOpen;
+        const sidebarPatch = closedAll
+          ? resolveSidebarYieldForSidePanel(s, false)
+          : {
+              sidebarOpen: s.sidebarOpen,
+              sidebarAutoYieldedForSidePanel: s.sidebarAutoYieldedForSidePanel,
+            };
+        const remainingIds = new Set(remainingTabs.map((t) => t.id));
+        const nextUnseen = s.sidePanelUnseenTabIds.filter((id) => remainingIds.has(id));
 
         const nextCache: Record<string, FileViewCacheEntry> = {};
         for (const [k, v] of Object.entries(s.fileViewCache)) {
@@ -1653,8 +1738,15 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
             ...s.workspaceEmptyDirsCache,
             [wsKey]: nextEmptyDirs,
           },
+          sidePanelOpen: nextSidePanelOpen,
           sidePanelTabs: remainingTabs,
           activeSidePanelTabId: nextActive,
+          sidePanelSplit: nextSplit,
+          sidePanelClosedTabs: remainingClosedTabs,
+          sidePanelUnseenTabIds:
+            nextUnseen.length > 0 ? nextUnseen : EMPTY_SIDE_PANEL_UNSEEN_IDS,
+          sidebarOpen: sidebarPatch.sidebarOpen,
+          sidebarAutoYieldedForSidePanel: sidebarPatch.sidebarAutoYieldedForSidePanel,
           fileViewCache: nextCache,
           fileEditorDrafts: nextDrafts,
           pendingUnsavedFileAction: nextPending,
@@ -1668,7 +1760,10 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    openBrowserTab(initialUrl?: string): void {
+    openBrowserTab(
+      initialUrl?: string,
+      opts?: { source?: SidePanelOpenSource; activate?: boolean },
+    ): void {
       const tabId = "tab:browser";
       const rawUrl = initialUrl?.trim() ?? "";
       let cleanUrl = "";
@@ -1682,40 +1777,22 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
           cleanUrl = "";
         }
       }
-      setState((s) => {
-        const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
-        let nextTabs = s.sidePanelTabs;
-        if (existingIdx >= 0) {
-          if (cleanUrl) {
-            nextTabs = [...s.sidePanelTabs];
-            nextTabs[existingIdx] = {
-              ...nextTabs[existingIdx],
-              url: cleanUrl,
-            };
-          }
-        } else {
-          nextTabs = [
-            ...s.sidePanelTabs,
-            {
-              id: tabId,
-              kind: "browser" as const,
-              title: "Browser",
-              url: cleanUrl,
-            },
-          ];
-        }
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          {
+            id: tabId,
+            kind: "browser",
+            title: "Browser",
+            url: cleanUrl,
+          },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            updateExisting: (existing) => (cleanUrl ? { ...existing, url: cleanUrl } : existing),
+          },
+        ),
+      );
     },
 
 
@@ -1740,41 +1817,37 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    openSideQuestionTab(opts?: { entryId?: string }): void {
+    openSideQuestionTab(opts?: {
+      entryId?: string;
+      source?: SidePanelOpenSource;
+      activate?: boolean;
+    }): void {
       const tabId = "tab:side_question";
       setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTabs = exists
-          ? s.sidePanelTabs.map((t) =>
-              t.id === tabId
-                ? {
-                    ...t,
-                    sideQuestionEntryId:
-                      opts?.entryId !== undefined ? opts.entryId : t.sideQuestionEntryId,
-                  }
-                : t,
-            )
-          : [
-              ...s.sidePanelTabs,
-              {
-                id: tabId,
-                kind: "side_question" as const,
-                title: "Side Question",
-                sideQuestionEntryId: opts?.entryId,
-              },
-            ];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          sideQuestionFocusNonce: s.sideQuestionFocusNonce + 1,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
+        const next = applyOpenSidePanelTab(
+          s,
+          {
+            id: tabId,
+            kind: "side_question",
+            title: "Side Question",
+            sideQuestionEntryId: opts?.entryId,
+          },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            updateExisting: (existing) =>
+              opts?.entryId !== undefined
+                ? { ...existing, sideQuestionEntryId: opts.entryId }
+                : existing,
+          },
+        );
+        if (next.sidePanelOpen && next.activeSidePanelTabId === tabId) {
+          return {
+            ...next,
+            sideQuestionFocusNonce: s.sideQuestionFocusNonce + 1,
+          };
+        }
+        return next;
       });
     },
 
@@ -1790,8 +1863,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    setSideQuestionDraft(text: string): void {
-      const scope = sideQuestionScopeKey(getState());
+    setSideQuestionDraft(text: string, scopeOverride?: string): void {
+      const scope = scopeOverride ?? sideQuestionScopeKey(getState());
       setState((s) => ({
         ...s,
         sideQuestionDrafts: { ...s.sideQuestionDrafts, [scope]: text },
@@ -1799,8 +1872,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    clearSideQuestions(): void {
-      const scope = sideQuestionScopeKey(getState());
+    clearSideQuestions(scopeOverride?: string): void {
+      const scope = scopeOverride ?? sideQuestionScopeKey(getState());
       for (const e of getState().sideQuestionsByScope[scope] ?? []) {
         if (e.status === "streaming") cancelledSideQuestionIds.add(e.id);
       }
@@ -1843,10 +1916,10 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    promoteSideQuestionToComposer(text: string): void {
+    promoteSideQuestionToComposer(text: string, scopeOverride?: string): void {
       const trimmed = text.trim();
       if (!trimmed) return;
-      const key = composerScopeKey(getState());
+      const key = scopeOverride ?? composerScopeKey(getState());
       const existing = (getState().composerDrafts[key] ?? "").trim();
       const nextDraft = existing ? `${existing}\n\n${trimmed}` : trimmed;
       setState((s) => ({
@@ -1951,7 +2024,7 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         (getState().isDraftNewSession || !getState().selectedAgentId) === (isDraft || !targetAgentId) &&
         (isDraft || !targetAgentId || getState().selectedAgentId === targetAgentId);
       if (!targetOverride || stillViewingTarget) {
-        ctx.actions.openSideQuestionTab();
+        ctx.actions.openSideQuestionTab({ source: "auto" });
       }
       setState((s) => ({
         ...s,
@@ -2071,46 +2144,65 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       promptPreview: string;
       childAgentId: string | null;
       childHostId?: string | null;
+      parentHostId?: string | null;
       providerSubagentId?: string | null;
       parentAgentId?: string | null;
+      source?: SidePanelOpenSource;
+      activate?: boolean;
     }): void {
       const snap = getState();
-      const parentHostId = snap.selectedHostId;
+      const scope = resolveCurrentTabScope(snap);
+      const parentHostId = params.parentHostId ?? scope.hostId ?? snap.selectedHostId;
       const targetHostId = params.childHostId ?? parentHostId;
-      const parentAgentId = params.parentAgentId ?? snap.selectedAgentId;
+      const parentAgentId = params.parentAgentId ?? scope.agentId ?? snap.selectedAgentId;
+      const managedChild =
+        targetHostId && params.childAgentId
+          ? snap.hostDetails[targetHostId]?.agents.find((a) => a.agent_id === params.childAgentId)
+          : undefined;
       const hasManagedChild = Boolean(
         targetHostId &&
           params.childAgentId &&
-          (snap.stages[`${targetHostId}::${params.childAgentId}`]?.turns.length ||
-            snap.hostDetails[targetHostId]?.agents.some((a) => a.agent_id === params.childAgentId)),
+          (snap.stages[`${targetHostId}::${params.childAgentId}`]?.turns.length || managedChild),
       );
       const effectiveChildAgentId = hasManagedChild ? params.childAgentId : null;
       const effectiveProviderSubagentId =
         params.providerSubagentId ?? (!hasManagedChild ? params.childAgentId : null);
       const tabHostId = hasManagedChild ? targetHostId : parentHostId;
-      setState((s) => {
-        const { tabs: nextTabs, activeTabId } = upsertSubagentSidePanelTab(s.sidePanelTabs, {
-          callId: params.callId,
-          role: params.role,
-          promptPreview: params.promptPreview,
-          tabHostId,
-          parentHostId,
-          parentAgentId,
-          effectiveChildAgentId,
-          effectiveProviderSubagentId,
-        });
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: activeTabId,
-          terminalFocused: false,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      const tabCwd = managedChild?.cwd || scope.cwd || snap.selectedWorkspaceCwd || "~";
+
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          {
+            id: `tab:subagent:call:${params.callId}`,
+            kind: "subagent",
+            title: params.role || "Subagent",
+            hostId: tabHostId ?? undefined,
+            parentHostId: parentHostId ?? undefined,
+            agentId: parentAgentId,
+            parentAgentId,
+            cwd: tabCwd,
+          },
+          {
+            source: params.source,
+            activate: params.activate,
+            upsertTabs: (existingTabs) => {
+              const res = upsertSubagentSidePanelTab(existingTabs, {
+                callId: params.callId,
+                role: params.role,
+                promptPreview: params.promptPreview,
+                tabHostId,
+                parentHostId,
+                parentAgentId,
+                cwd: tabCwd,
+                effectiveChildAgentId,
+                effectiveProviderSubagentId,
+              });
+              return { tabs: res.tabs, tabId: res.activeTabId };
+            },
+          },
+        ),
+      );
 
       if (tabHostId && effectiveChildAgentId) {
         void hydrateSubagentStage(tabHostId, effectiveChildAgentId).catch(() => undefined);
@@ -2231,13 +2323,19 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    setReviewScope(scope: ReviewScope): void {
+    setReviewScope(
+      scope: ReviewScope,
+      target?: { hostId?: string | null; cwd?: string | null },
+    ): void {
       setState((s) => ({ ...s, reviewScope: scope, selectedDiffPath: null }));
       const snap = getState();
-      if (scope === "working_tree" && snap.selectedHostId && snap.selectedWorkspaceCwd) {
+      const reviewTab = snap.sidePanelTabs.find((t) => t.kind === "review");
+      const targetHostId = target?.hostId ?? reviewTab?.hostId ?? snap.selectedHostId;
+      const targetCwd = target?.cwd ?? reviewTab?.cwd ?? snap.selectedWorkspaceCwd;
+      if (scope === "working_tree" && targetHostId && targetCwd) {
         void ctx.actions.refreshGit(
-          snap.selectedHostId,
-          snap.selectedWorkspaceCwd,
+          targetHostId,
+          targetCwd,
           null,
           snap.diffStaged,
         );
@@ -2245,13 +2343,19 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    setDiffStaged(staged: boolean): void {
+    setDiffStaged(
+      staged: boolean,
+      target?: { hostId?: string | null; cwd?: string | null },
+    ): void {
       setState((s) => ({ ...s, diffStaged: staged, selectedDiffPath: null }));
       const snap = getState();
-      if (snap.selectedHostId && snap.selectedWorkspaceCwd) {
+      const reviewTab = snap.sidePanelTabs.find((t) => t.kind === "review");
+      const targetHostId = target?.hostId ?? reviewTab?.hostId ?? snap.selectedHostId;
+      const targetCwd = target?.cwd ?? reviewTab?.cwd ?? snap.selectedWorkspaceCwd;
+      if (targetHostId && targetCwd) {
         void ctx.actions.refreshGit(
-          snap.selectedHostId,
-          snap.selectedWorkspaceCwd,
+          targetHostId,
+          targetCwd,
           null,
           staged,
         );
@@ -2264,15 +2368,21 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    selectDiffFile(path: string | null): void {
+    selectDiffFile(
+      path: string | null,
+      target?: { hostId?: string | null; cwd?: string | null },
+    ): void {
       setState((s) => ({ ...s, selectedDiffPath: path }));
       const snap = getState();
+      const reviewTab = snap.sidePanelTabs.find((t) => t.kind === "review");
+      const targetHostId = target?.hostId ?? reviewTab?.hostId ?? snap.selectedHostId;
+      const targetCwd = target?.cwd ?? reviewTab?.cwd ?? snap.selectedWorkspaceCwd;
       if (
         snap.reviewScope === "working_tree" &&
-        snap.selectedHostId &&
-        snap.selectedWorkspaceCwd
+        targetHostId &&
+        targetCwd
       ) {
-        const rKey = `${snap.selectedHostId}::${snap.selectedWorkspaceCwd}`;
+        const rKey = `${targetHostId}::${targetCwd}`;
         const cached = snap.gitReviews[rKey];
         // Fast-path: if we already have the full diff cached and the requested file is present
         // (or user clicked "All"), filter client-side in 0ms without spawning git subprocesses.
@@ -2288,8 +2398,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
           return;
         }
         void ctx.actions.refreshGit(
-          snap.selectedHostId,
-          snap.selectedWorkspaceCwd,
+          targetHostId,
+          targetCwd,
           path,
           snap.diffStaged,
         );
@@ -2389,125 +2499,122 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       hostId?: string;
       workspaceId?: string;
       artifactId?: string;
+      source?: SidePanelOpenSource;
+      activate?: boolean;
     }): void {
-      const resolvedHostId = opts?.hostId || getState().selectedHostId || "";
-      const detail = resolvedHostId ? getState().hostDetails[resolvedHostId] : null;
+      const snap = getState();
+      const scope = resolveCurrentTabScope(snap);
+      const resolvedHostId = opts?.hostId || scope.hostId || snap.selectedHostId || "";
+      const detail = resolvedHostId ? snap.hostDetails[resolvedHostId] : null;
       const activeAgent =
-        !getState().isDraftNewSession && getState().selectedAgentId
-          ? detail?.agents.find((a) => a.agent_id === getState().selectedAgentId) ?? null
+        scope.agentId
+          ? (detail?.agents.find((a) => a.agent_id === scope.agentId) ?? null)
           : null;
       const resolvedWorkspaceId = opts?.workspaceId ?? activeAgent?.workspace_id ?? "";
+      const resolvedCwd = activeAgent?.cwd || scope.cwd || "~";
       const tabId = "tab:artifacts";
       const nonce = Date.now();
 
-      setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTab: SidePanelTab = {
-          id: tabId,
-          kind: "artifacts",
-          title: "Artifacts",
-          hostId: resolvedHostId || undefined,
-          workspaceId: resolvedWorkspaceId || undefined,
-          artifactId: opts?.artifactId,
-          focusNonce: nonce,
-        };
-        const nextTabs = exists
-          ? s.sidePanelTabs.map((t) =>
-              t.id === tabId
-                ? {
-                    ...t,
-                    hostId: resolvedHostId || t.hostId,
-                    workspaceId: resolvedWorkspaceId || t.workspaceId,
-                    artifactId: opts?.artifactId ?? t.artifactId,
-                    focusNonce: nonce,
-                  }
-                : t,
-            )
-          : [...s.sidePanelTabs, nextTab];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          {
+            id: tabId,
+            kind: "artifacts",
+            title: "Artifacts",
+            hostId: resolvedHostId || undefined,
+            agentId: scope.agentId,
+            workspaceId: resolvedWorkspaceId || undefined,
+            cwd: resolvedCwd,
+            artifactId: opts?.artifactId,
+            focusNonce: nonce,
+          },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            updateExisting: (existing) => ({
+              ...existing,
+              hostId: resolvedHostId || existing.hostId,
+              agentId: existing.agentId !== undefined ? existing.agentId : scope.agentId,
+              workspaceId: resolvedWorkspaceId || existing.workspaceId,
+              cwd: existing.cwd || resolvedCwd,
+              artifactId: opts?.artifactId ?? existing.artifactId,
+              focusNonce: nonce,
+            }),
+          },
+        ),
+      );
       if (resolvedHostId) {
         void orbitIpc.listArtifacts(resolvedHostId, null, null).catch(() => {});
       }
     },
 
 
-    openWorkspaceBoardTab(hostId: string, workspaceId: string, title?: string): void {
+    openWorkspaceBoardTab(
+      hostId: string,
+      workspaceId: string,
+      title?: string,
+      opts?: { source?: SidePanelOpenSource; activate?: boolean },
+    ): void {
       const tabId = `tab:board:${hostId}::${workspaceId}`;
       const resolvedTitle = title ? `Board · ${title}` : "Workspace Board";
-      setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTabs = exists
-          ? s.sidePanelTabs.map((t) => (t.id === tabId ? { ...t, title: resolvedTitle } : t))
-          : [
-              ...s.sidePanelTabs,
-              {
-                id: tabId,
-                kind: "board" as const,
-                title: resolvedTitle,
-                hostId,
-                workspaceId,
-              },
-            ];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          {
+            id: tabId,
+            kind: "board",
+            title: resolvedTitle,
+            hostId,
+            workspaceId,
+          },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            updateExisting: (existing) => ({ ...existing, title: resolvedTitle }),
+          },
+        ),
+      );
       void ctx.actions.fetchWorkspaceBoardAndEvents(hostId, workspaceId);
     },
 
 
-    openPeerSplitTab(hostId: string, peerAgentId: string, title?: string): void {
+    openPeerSplitTab(
+      hostId: string,
+      peerAgentId: string,
+      title?: string,
+      opts?: { source?: SidePanelOpenSource; activate?: boolean },
+    ): void {
       const detail = getState().hostDetails[hostId];
       const peer = detail?.agents.find((a) => a.agent_id === peerAgentId);
       const tabId = `tab:peer:${hostId}::${peerAgentId}`;
       const resolvedTitle =
         title ?? (peer?.handle ? `@${peer.handle}` : peer?.title ?? "Peer");
       setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTabs = exists
-          ? s.sidePanelTabs.map((t) => (t.id === tabId ? { ...t, title: resolvedTitle } : t))
-          : [
-              ...s.sidePanelTabs,
-              {
-                id: tabId,
-                kind: "peer" as const,
-                title: resolvedTitle,
-                hostId,
-                peerAgentId,
-                workspaceId: peer?.workspace_id,
-                cwd: peer?.cwd,
-              },
-            ];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          terminalFocused: false,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
+        const ownerScope = resolveCurrentTabScope(s);
+        const ownerHostId = ownerScope.hostId ?? s.selectedHostId ?? undefined;
+        return applyOpenSidePanelTab(
+          s,
+          {
+            id: tabId,
+            kind: "peer",
+            title: resolvedTitle,
+            hostId,
+            parentHostId: ownerHostId,
+            peerAgentId,
+            workspaceId: peer?.workspace_id,
+            cwd: peer?.cwd,
+          },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            updateExisting: (existing) => ({
+              ...existing,
+              title: resolvedTitle,
+              parentHostId: existing.parentHostId ?? ownerHostId,
+            }),
+          },
+        );
       });
       void orbitIpc.openAgentTimeline(hostId, peerAgentId);
       void ctx.actions.pullStageDelta(hostId, peerAgentId, true);
@@ -2615,6 +2722,95 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       targetWorkspaceId?: string | null,
       opts?: { newWorkspaceTitle?: string | null; makeUnclassified?: boolean },
     ): Promise<void> {
+      const prevSidebarView = getState().sidebarView;
+      const canOptimisticallyMove = Boolean(targetWorkspaceId || opts?.makeUnclassified);
+      let appliedOptimistic = false;
+
+      if (canOptimisticallyMove && prevSidebarView) {
+        let changed = false;
+        const nextProjects = prevSidebarView.projects.map((proj) => {
+          if (proj.host_id !== hostId) return proj;
+          const existingConv =
+            proj.conversations.find((c) => c.agent.agent_id === agentId) ??
+            proj.unclassified_conversations?.find((c) => c.agent.agent_id === agentId) ??
+            proj.workspaces
+              ?.flatMap((w) => w.conversations)
+              .find((c) => c.agent.agent_id === agentId);
+          if (!existingConv) return proj;
+
+          if (
+            targetWorkspaceId &&
+            !(proj.workspaces ?? []).some((w) => w.workspace_id === targetWorkspaceId)
+          ) {
+            return proj;
+          }
+
+          const updatedConv = targetWorkspaceId
+            ? {
+                ...existingConv,
+                agent: { ...existingConv.agent, workspace_id: targetWorkspaceId },
+              }
+            : existingConv;
+
+          const nextWorkspaces = proj.workspaces?.map((ws) => {
+            const filtered = ws.conversations.filter((c) => c.agent.agent_id !== agentId);
+            const nextConvs =
+              targetWorkspaceId && ws.workspace_id === targetWorkspaceId
+                ? [...filtered, updatedConv]
+                : filtered;
+            if (
+              nextConvs.length === ws.conversations.length &&
+              nextConvs.every((c, i) => c === ws.conversations[i])
+            ) {
+              return ws;
+            }
+            return {
+              ...ws,
+              conversations: nextConvs,
+              peer_count: nextConvs.length,
+              unread_count: nextConvs.filter((c) => c.is_unread).length,
+            };
+          });
+
+          const nextUnclassified =
+            proj.unclassified_conversations !== undefined
+              ? opts?.makeUnclassified
+                ? [
+                    ...proj.unclassified_conversations.filter((c) => c.agent.agent_id !== agentId),
+                    updatedConv,
+                  ]
+                : proj.unclassified_conversations.filter((c) => c.agent.agent_id !== agentId)
+              : undefined;
+
+          const nextConversations = targetWorkspaceId
+            ? proj.conversations.map((c) => (c.agent.agent_id === agentId ? updatedConv : c))
+            : proj.conversations;
+
+          changed = true;
+          return {
+            ...proj,
+            conversations: nextConversations,
+            ...(nextWorkspaces !== undefined ? { workspaces: nextWorkspaces } : {}),
+            ...(nextUnclassified !== undefined
+              ? { unclassified_conversations: nextUnclassified }
+              : {}),
+          };
+        });
+
+        if (changed) {
+          appliedOptimistic = true;
+          setState(
+            (s) => ({
+              ...s,
+              sidebarView: s.sidebarView
+                ? { ...s.sidebarView, projects: nextProjects }
+                : s.sidebarView,
+            }),
+            false,
+          );
+        }
+      }
+
       try {
         await orbitIpc.moveAgentToWorkspace(hostId, agentId, targetWorkspaceId ?? null, opts);
         ctx.actions.refreshSidebarView();
@@ -2628,6 +2824,9 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
                 : t("store.movedToStandaloneWorkspace"),
         );
       } catch (err) {
+        if (appliedOptimistic && prevSidebarView) {
+          setState((s) => ({ ...s, sidebarView: prevSidebarView }), false);
+        }
         notifyToast(t("store.failedMoveConversation", { detail: String(err) }));
       }
     },
@@ -2718,6 +2917,7 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
           req.host_id,
           optimisticId,
           req.handle ? `@${req.handle}` : undefined,
+          { source: "auto" },
         );
       }
       return optimisticId;

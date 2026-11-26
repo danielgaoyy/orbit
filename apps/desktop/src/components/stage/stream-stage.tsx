@@ -7,7 +7,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type CSSProperties,
 } from "react";
 import {
@@ -17,7 +16,8 @@ import {
   type ReactVirtualizer,
   type Virtualizer,
 } from "@tanstack/react-virtual";
-import { ArrowDown, GitBranch, RotateCcw, RotateCw } from "lucide-react";
+import { GitBranch, RotateCcw } from "lucide-react";
+import { ComposerGoalShelf } from "@/components/composer/composer-goal-shelf";
 import { ComposerPlanShelf } from "@/components/composer/composer-plan-shelf";
 import { planSourceTurn } from "@/components/composer/composer-plan-shelf-model";
 import { OmniComposer } from "@/components/composer/omni-composer";
@@ -26,10 +26,22 @@ import { useViewportTracking } from "@/components/conversation/conversation-view
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
 import { StageFindBar } from "@/components/stage/stage-find-bar";
 import { useStageFind } from "@/components/stage/use-stage-find";
-import { ChatOutlineRail, type OutlinePromptItem } from "@/components/stage/stage-outline-rail";
+import { type OutlinePromptItem } from "@/components/stage/stage-outline-rail";
 import { resolveOutlinePrompts } from "@/lib/outline-rail";
+import {
+  PersonalAgentBriefingRail,
+  PersonalAgentStageAwayBanner,
+} from "@/components/personal-agent/personal-agent-briefing-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
+import {
+  StageBottomViewportOverlay,
+  StageDockedComposer,
+  StageHydratingFallback,
+  StageOutlineRailBridge,
+} from "@/components/stage/stage-viewport-chrome";
 import { StreamStageActivityWave } from "@/components/stage/stage-activity-wave";
+import { selectIsSelectedAgentPersonalAgent } from "@/state/selectors/personal-agent-selectors";
+import { FileDropOverlay } from "@/components/ui/drag-feedback";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -40,6 +52,7 @@ import {
   type TimelineItemView,
   isAgentForegroundRunning,
 } from "@/lib/orbit-ipc";
+import { useFileDrop } from "@/lib/drag/use-file-drop";
 import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import {
@@ -113,226 +126,36 @@ interface TurnJump {
   behavior: "auto" | "smooth";
 }
 
-const StageHydratingFallback = memo(function StageHydratingFallback({
-  bootstrapError,
-}: {
-  bootstrapError: string | null;
-}) {
-  const { t } = useI18n();
-  const [showIndicator, setShowIndicator] = useState(false);
-  const [showSlowRetry, setShowSlowRetry] = useState(false);
-  const [retrying, setRetrying] = useState(false);
-
-  useEffect(() => {
-    const showTimer = window.setTimeout(() => setShowIndicator(true), 350);
-    const slowTimer = window.setTimeout(() => setShowSlowRetry(true), 5000);
-    return () => {
-      window.clearTimeout(showTimer);
-      window.clearTimeout(slowTimer);
-    };
-  }, []);
-
-  if (!bootstrapError && !showIndicator) {
-    return <div className="flex-1" />;
-  }
-
-  const needsRetry = Boolean(bootstrapError) || showSlowRetry;
-
-  return (
-    <div className="orbit-stage-enter text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2.5 px-6 text-[13px] select-none">
-      <div className="flex items-center gap-2">
-        {!bootstrapError && (
-          <OrbitSpinner size={13} className="text-muted-foreground/75 shrink-0" />
-        )}
-        <span className="text-muted-foreground/85">
-          {bootstrapError
-            ? t("stage.loadWorkspaceError")
-            : showSlowRetry
-              ? t("stage.connectionSlow")
-              : t("stage.connecting")}
-        </span>
-      </div>
-      {needsRetry && (
-        <button
-          type="button"
-          disabled={retrying}
-          onClick={() => {
-            setRetrying(true);
-            setShowSlowRetry(false);
-            void orbitActions.retryBootstrap().finally(() => {
-              setRetrying(false);
-            });
-          }}
-          className="border-border/80 text-foreground/80 hover:bg-accent hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors disabled:opacity-50"
-        >
-          <RotateCw className={cn("size-3", retrying && "animate-spin")} />
-          <span>{t(retrying ? "stage.retrying" : "common.retry")}</span>
-        </button>
-      )}
-    </div>
-  );
-});
+function stageDroppedComposerFiles(files: File[], container: HTMLElement | null) {
+  for (const file of files) void orbitActions.stageAndAttachFile(file);
+  container?.querySelector<HTMLTextAreaElement>('[data-orbit-composer-input="true"]')?.focus();
+}
 
 const NewSessionLaunchpad = memo(function NewSessionLaunchpad() {
   const { t } = useI18n();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const { isDraggingFiles, dropHandlers } = useFileDrop({
+    onDropFiles: (files) => stageDroppedComposerFiles(files, containerRef.current),
+  });
   return (
-    <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]">
+    <div
+      ref={containerRef}
+      {...dropHandlers}
+      className="orbit-stage-enter relative flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]"
+    >
       <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] flex-col gap-6">
         <h1 className="text-ink-primary px-1 text-center text-[24px] font-medium tracking-[-0.02em]">
           {t("composer.heroTitle")}
         </h1>
-
-        <OmniComposer variant="hero" />
+        <OmniComposer variant="hero" stageDraggingFiles={isDraggingFiles} externalDropSurface />
       </div>
+      <FileDropOverlay visible={isDraggingFiles} label={t("composer.dropToAttach")} />
     </div>
-  );
-});
-
-const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
-  scrollUiStore,
-  prompts,
-  jumpingToSeq,
-  onJumpToSeq,
-  visible,
-  offsetPx,
-  offsetTransition,
-  isAnimating,
-}: {
-  scrollUiStore: StageScrollUiStore;
-  prompts: readonly OutlinePromptItem[];
-  jumpingToSeq: number | null;
-  onJumpToSeq: (seq: number) => void;
-  visible: boolean;
-  offsetPx: number;
-  offsetTransition: string;
-  isAnimating: boolean;
-}) {
-  const activePromptSeq = useSyncExternalStore(
-    scrollUiStore.subscribe,
-    () => scrollUiStore.getSnapshot().activePromptSeq,
-    () => scrollUiStore.getSnapshot().activePromptSeq,
-  );
-  return (
-    <ChatOutlineRail
-      prompts={prompts}
-      activeSeq={activePromptSeq ?? prompts[prompts.length - 1]?.seq ?? null}
-      jumpingToSeq={jumpingToSeq}
-      onJumpToSeq={onJumpToSeq}
-      visible={visible}
-      offsetPx={offsetPx}
-      offsetTransition={offsetTransition}
-      isAnimating={isAnimating}
-    />
   );
 });
 
 const STAGE_TOP_PAGINATE_THRESHOLD_PX = 480;
 const EMPTY_PLAN_STEPS: readonly SessionPlanStepView[] = [];
-
-const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
-  scrollUiStore,
-  stagePushStyle,
-  overviewReservePx,
-  overviewReserveTransition,
-  onJumpLatest,
-  isGenerating,
-}: {
-  scrollUiStore: StageScrollUiStore;
-  stagePushStyle: CSSProperties;
-  overviewReservePx: number;
-  overviewReserveTransition: string;
-  onJumpLatest: () => void;
-  isGenerating: boolean;
-}) {
-  const { t } = useI18n();
-  const snap = useSyncExternalStore(
-    scrollUiStore.subscribe,
-    scrollUiStore.getSnapshot,
-    scrollUiStore.getSnapshot,
-  );
-  const showFadeMask = snap.showJumpLatest || snap.isOccludingText;
-
-  return (
-    <div className="pointer-events-none absolute right-0 bottom-0 left-0 z-10">
-      {/* Subtle 24px bottom feather above Composer — never obscures streaming lines */}
-      <div
-        style={{
-          paddingRight: `${Math.max(20, overviewReservePx)}px`,
-          transition: overviewReserveTransition,
-        }}
-        className="pointer-events-none absolute right-0 bottom-0 left-0"
-      >
-        <div
-          className={cn(
-            "from-surface-base via-surface-base/75 h-6 w-full bg-gradient-to-t to-transparent transition-opacity duration-200 ease-out",
-            showFadeMask ? "opacity-100" : "opacity-0",
-          )}
-        />
-      </div>
-
-      {/* Centered Jump-to-Latest circular button — zero collision since Subagent capsule moved to Overview/TopBar */}
-      <div
-        style={{
-          paddingRight: `${overviewReservePx}px`,
-          transition: overviewReserveTransition,
-        }}
-        className="pointer-events-none relative"
-      >
-        <div style={stagePushStyle} className="pointer-events-none relative px-[24px]">
-          <div className="pointer-events-none relative mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] items-end justify-center">
-            <div
-              className={cn(
-                "pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 transition-[opacity,scale,translate]",
-                snap.showJumpLatest
-                  ? "translate-y-0 scale-100 opacity-100 duration-[160ms] ease-[var(--ease-out-expo)]"
-                  : "translate-y-1 scale-95 opacity-0 duration-[115ms] ease-[var(--ease-exit)]",
-              )}
-            >
-              <button
-                type="button"
-                aria-label={t("stage.scrollToLatest")}
-                aria-description={isGenerating ? t("sidebar.running") : undefined}
-                aria-hidden={!snap.showJumpLatest}
-                tabIndex={snap.showJumpLatest ? 0 : -1}
-                onClick={onJumpLatest}
-                className={cn(
-                  "orbit-press border-border-default bg-surface-raised text-ink-tertiary hover:text-ink-primary hover:border-border-strong floating-surface relative inline-flex size-[32px] cursor-pointer items-center justify-center rounded-full border",
-                  snap.showJumpLatest ? "pointer-events-auto" : "pointer-events-none",
-                )}
-              >
-                {snap.showJumpLatest && isGenerating && (
-                  <OrbitSpinner size={30} className="text-ink-muted pointer-events-none absolute opacity-75 motion-reduce:animate-none" />
-                )}
-                <ArrowDown className="size-[16px] stroke-[1.9]" />
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-});
-
-const StageDockedComposer = memo(function StageDockedComposer({
-  scrollUiStore,
-  hasPendingDecisions,
-}: {
-  scrollUiStore: StageScrollUiStore;
-  hasPendingDecisions: boolean;
-}) {
-  const isOccludingText = useSyncExternalStore(
-    scrollUiStore.subscribe,
-    () => scrollUiStore.getSnapshot().isOccludingText,
-    () => scrollUiStore.getSnapshot().isOccludingText,
-  );
-  return (
-    <OmniComposer
-      variant="docked"
-      occluding={isOccludingText}
-      hasPendingDecisions={hasPendingDecisions}
-    />
-  );
-});
 
 const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedHostId,
@@ -928,6 +751,7 @@ export function StreamStage() {
   const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const isPersonalAgentSession = useOrbitSelector(selectIsSelectedAgentPersonalAgent);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
@@ -2170,6 +1994,12 @@ export function StreamStage() {
     [overviewReservePx, overviewReserveTransition],
   );
 
+  const { isDraggingFiles: isStageDraggingFiles, dropHandlers: stageFileDropHandlers } =
+    useFileDrop({
+      disabled: !selectedHostId || isDraft || !selectedAgentId,
+      onDropFiles: (files) => stageDroppedComposerFiles(files, stageContainerRef.current),
+    });
+
   if (!selectedHostId) {
     if (!fleetHydrated) {
       return <StageHydratingFallback bootstrapError={bootstrapError} />;
@@ -2226,6 +2056,7 @@ export function StreamStage() {
   return (
     <div
       ref={stageContainerRef}
+      {...stageFileDropHandlers}
       data-orbit-stage="true"
       tabIndex={-1}
       style={
@@ -2262,6 +2093,17 @@ export function StreamStage() {
             <ForkedFromBanner hostId={selectedHostId} agent={currentAgent} />
           </div>
         </div>
+      )}
+
+      {/* Dismissible 1-line "While you were away" summary when viewing Personal Agent */}
+      {isPersonalAgentSession && selectedHostId && selectedAgentId && (
+        <PersonalAgentStageAwayBanner
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          overviewReservePx={overviewReservePx}
+          overviewReserveTransition={overviewReserveTransition}
+          stagePushStyle={stagePushStyle}
+        />
       )}
 
       {/* 1. Unified Scrollable Conversation Viewport + Floating Overlays */}
@@ -2437,6 +2279,14 @@ export function StreamStage() {
               subagentPermissions={subagentPermissions}
             />
             {stageView && (
+              <ComposerGoalShelf
+                hostId={selectedHostId}
+                agentId={selectedAgentId}
+                latestTurnAnchorSeq={latestTurn?.anchor_seq ?? null}
+                hasPendingDecisions={hasPendingDecisions}
+              />
+            )}
+            {stageView && (
               <ComposerPlanShelf
                 hostId={selectedHostId}
                 agentId={selectedAgentId}
@@ -2450,22 +2300,32 @@ export function StreamStage() {
             <StageDockedComposer
               scrollUiStore={scrollUiStore}
               hasPendingDecisions={hasPendingDecisions}
+              stageDraggingFiles={isStageDraggingFiles}
             />
           </div>
         </div>
       </div>
 
-      {/* 3. Top-Right Viewport-Anchored Overview Card Overlay (to the left of the far-right scrollbar) */}
-      <StageOverviewPanel
-        canDock={canDockOverview}
-        hostId={selectedHostId}
-        agentId={selectedAgentId}
-        cwd={effectiveCwd}
-        insights={stageInsights}
-        sessionTurnDiffs={sessionTurnDiffs}
-        currentAgent={currentAgent}
-        stageContainerRef={stageContainerRef}
-      />
+      {/* 3. Top-Right Viewport-Anchored Rail (Personal Agent Briefing Rail vs Session Overview HUD) */}
+      {isPersonalAgentSession ? (
+        <PersonalAgentBriefingRail
+          canDock={canDockOverview}
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          stageContainerRef={stageContainerRef}
+        />
+      ) : (
+        <StageOverviewPanel
+          canDock={canDockOverview}
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          cwd={effectiveCwd}
+          insights={stageInsights}
+          sessionTurnDiffs={sessionTurnDiffs}
+          currentAgent={currentAgent}
+          stageContainerRef={stageContainerRef}
+        />
+      )}
 
       <RewindTurnDialog
         hostId={selectedHostId}
@@ -2481,6 +2341,8 @@ export function StreamStage() {
         target={imagePreviewTarget}
         onClose={handleCloseImagePreview}
       />
+
+      <FileDropOverlay visible={isStageDraggingFiles} label={t("composer.dropToAttach")} />
     </div>
   );
 }

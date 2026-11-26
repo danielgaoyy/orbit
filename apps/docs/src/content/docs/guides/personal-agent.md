@@ -3,9 +3,19 @@ title: Personal Agent & IM Dispatch
 description: Orchestrate Claude Code, Codex, Antigravity, and ACP subagents across every host through one persistent Personal Agent connected to Slack, Discord, and Feishu / Lark.
 ---
 
-Orbit centers multi-host engineering around **Personal Router (`AgentRole::PersonalRouter`)** — one persistent **Personal Agent** that coordinates work across your entire fleet.
+Orbit centers multi-host engineering around **Personal Agent** (`AgentRole::PersonalRouter`) — one persistent coordinator that orchestrates work across your entire fleet.
 
 Instead of opening separate SSH shells and copying context by hand between Claude Code on your Mac, Codex on a Linux build server, and Antigravity on a cloud GPU, you talk to **one persistent coordinator**. It sees every online machine, chains specialist agents in parallel or in sequence, arms conditional wakeup timers, and interrupts you only for high-signal human decisions.
+
+## Personal Agent Home & Briefing Rail
+
+Opening **Personal Agent** in Orbit Desktop (from the sidebar or `⌘⇧O` / `Ctrl+Shift+O`) brings you directly into your live Personal Agent conversation (`740px` reading column with full Composer) paired with a docked `304px` **Briefing Rail** on the right:
+
+- **Needs you**: Surfaces Tier-3 / `human_only` approvals, plan reviews, and errored workers with one-click Allow / Deny / View actions, safe batch approval for multiple low-risk requests, and inline **PA recommendations** (`recommend_permission`) explaining why your Personal Agent suggests allowing or denying a request.
+- **In progress**: Groups active cross-host missions dispatched by your Personal Agent with involved hosts, `done/total` progress, live diff stats, and latest step previews. Clicking any worker previews its live stream in the Right Side Panel without leaving your Personal Agent conversation (`⌘/Ctrl+Click` jumps directly to the session).
+- **Handled for you**: Audits decisions automatically resolved by your Personal Agent, Guardian Tier-1, or persistent permission rules — with timestamp, worker, summary, risk, actor, reason, and one-click session inspection.
+- **Waiting & Hosts**: Tracks armed conditional timers, active goals, background tasks, and a live `online/total` host strip marking the active Personal Agent host.
+- **While you were away & adaptive layout**: Displays a dismissible 1-line catch-up summary (`completed` tasks and `auto-handled` decisions) when you return, collapses cleanly into a compact TopBar capsule popover (`N needs you · M active`) on narrow windows, and guides first-time setup with a one-click recommended host card when no Personal Agent is configured yet.
 
 ## Global fleet election & cross-host context
 

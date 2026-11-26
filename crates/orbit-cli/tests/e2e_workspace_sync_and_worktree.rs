@@ -400,6 +400,7 @@ async fn test_01_non_git_worktree_guard_and_nested_git_repo_folding() {
                 workspace_id: None,
                 parent_agent_id: None,
                 parent_host_id: None,
+                parent_title: None,
                 profile_id: None,
                 background: false,
                 auto_archive: false,

@@ -433,6 +433,7 @@ async fn create_agent_rpc(
                 workspace_id: None,
                 parent_agent_id,
                 parent_host_id: None,
+                parent_title: None,
                 profile_id,
                 background: false,
                 auto_archive: false,

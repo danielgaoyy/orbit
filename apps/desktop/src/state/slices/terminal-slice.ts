@@ -3,10 +3,17 @@ import {
 } from "@/lib/orbit-ipc";
 import { t as translateGlobal } from "@/lib/i18n";
 import {
+  applyOpenSidePanelTab,
+} from "../side-panel-scope";
+import {
   hasVisibleActiveTerminal,
 } from "../store-helpers";
 import type { OrbitStoreContext } from "../store-runtime";
-import type { TerminalSplitDirection, TerminalSplitGroup } from "../store-types";
+import type {
+  SidePanelOpenSource,
+  TerminalSplitDirection,
+  TerminalSplitGroup,
+} from "../store-types";
 
 const MAX_SPLIT_PANES = 4;
 const PENDING_SPLIT_TTL_MS = 15_000;
@@ -69,30 +76,32 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
   return {
 
 
-    openTerminalTab(opts?: { spawnIfEmpty?: boolean }): void {
+    openTerminalTab(opts?: {
+      spawnIfEmpty?: boolean;
+      source?: SidePanelOpenSource;
+      activate?: boolean;
+    }): void {
       const tabId = "tab:terminal";
-      setState((s) => {
-        const exists = s.sidePanelTabs.some((t) => t.id === tabId);
-        const nextTabs = exists
-          ? s.sidePanelTabs
-          : [...s.sidePanelTabs, { id: tabId, kind: "terminal" as const, title: "Terminal" }];
-        const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
-        return {
-          ...s,
-          sidePanelOpen: true,
-          overviewPopoverOpen: false,
-          sidePanelTabs: nextTabs,
-          activeSidePanelTabId: tabId,
-          sidebarOpen: shouldYield ? false : s.sidebarOpen,
-          sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
-        };
-      });
+      setState((s) =>
+        applyOpenSidePanelTab(
+          s,
+          { id: tabId, kind: "terminal", title: "Terminal" },
+          {
+            source: opts?.source,
+            activate: opts?.activate,
+            terminalFocused: true,
+          },
+        ),
+      );
 
       const snap = getState();
-      if (opts?.spawnIfEmpty !== false && snap.selectedHostId) {
-        const hostTabs = snap.terminalTabs.filter((t) => t.hostId === snap.selectedHostId);
+      const termTab = snap.sidePanelTabs.find((t) => t.id === tabId);
+      const targetHostId = termTab?.hostId ?? snap.selectedHostId;
+      const targetCwd = termTab?.cwd ?? snap.selectedWorkspaceCwd ?? "~";
+      if (opts?.spawnIfEmpty !== false && targetHostId) {
+        const hostTabs = snap.terminalTabs.filter((t) => t.hostId === targetHostId);
         if (hostTabs.length === 0) {
-          ctx.actions.spawnNewTerminalTab(snap.selectedHostId, snap.selectedWorkspaceCwd || "~");
+          ctx.actions.spawnNewTerminalTab(targetHostId, targetCwd || "~");
         } else if (!hostTabs.some((t) => t.key === snap.activeTerminalTabKey)) {
           setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
         }
@@ -281,6 +290,7 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
       cwd: string,
       title: string,
       preferredSlot?: number | null,
+      source: SidePanelOpenSource = "user",
     ): Promise<void> {
       detachedTerminalIds.delete(`${hostId}::${terminalId}`);
       const existing = getState().terminalTabs.find(
@@ -288,7 +298,7 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
       );
       if (existing) {
         setState((s) => ({ ...s, activeTerminalTabKey: existing.key }));
-        ctx.actions.openTerminalTab({ spawnIfEmpty: false });
+        ctx.actions.openTerminalTab({ spawnIfEmpty: false, source });
         return;
       }
 
@@ -306,7 +316,7 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
       );
       if (existingAfterResolve) {
         setState((s) => ({ ...s, activeTerminalTabKey: existingAfterResolve.key }));
-        ctx.actions.openTerminalTab({ spawnIfEmpty: false });
+        ctx.actions.openTerminalTab({ spawnIfEmpty: false, source });
         return;
       }
 
@@ -337,7 +347,7 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
           activeTerminalTabKey: tabKey,
         };
       });
-      ctx.actions.openTerminalTab({ spawnIfEmpty: false });
+      ctx.actions.openTerminalTab({ spawnIfEmpty: false, source });
       if (shouldDispatchLegacyAttach) {
         void orbitIpc.attachTerminal(hostId, terminalId, slot);
       }
@@ -405,6 +415,31 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
 
     setActiveTerminalTab(tabKey: string): void {
       setState((s) => ({ ...s, activeTerminalTabKey: tabKey }));
+    },
+
+
+    reorderTerminalTabs(hostId: string, fromHostIndex: number, toHostIndex: number): void {
+      if (!hostId || fromHostIndex === toHostIndex || fromHostIndex < 0 || toHostIndex < 0) return;
+      setState((s) => {
+        const hostIndices: number[] = [];
+        for (let i = 0; i < s.terminalTabs.length; i += 1) {
+          if (s.terminalTabs[i].hostId === hostId) hostIndices.push(i);
+        }
+        if (
+          fromHostIndex >= hostIndices.length ||
+          toHostIndex >= hostIndices.length
+        ) {
+          return s;
+        }
+        const hostTabs = hostIndices.map((idx) => s.terminalTabs[idx]);
+        const [moved] = hostTabs.splice(fromHostIndex, 1);
+        hostTabs.splice(toHostIndex, 0, moved);
+        const nextTabs = [...s.terminalTabs];
+        for (let i = 0; i < hostIndices.length; i += 1) {
+          nextTabs[hostIndices[i]] = hostTabs[i];
+        }
+        return { ...s, terminalTabs: nextTabs };
+      });
     },
 
 

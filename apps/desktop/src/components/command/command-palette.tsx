@@ -5,6 +5,7 @@ import {
   AtSign,
   Blocks,
   BookOpen,
+  Bot,
   Clock,
   Code2,
   Compass,
@@ -64,6 +65,7 @@ import { getActionShortcutDisplay, modSymbol } from "@/lib/keybindings";
 import { isMacDesktop, type ConversationSearchHit, orbitIpc } from "@/lib/orbit-ipc";
 import type { ShortcutActionId } from "@/lib/shortcut-registry";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
+import { selectPersonalAgentRef } from "@/state/selectors/personal-agent-selectors";
 import { cn } from "@/lib/utils";
 
 type PaletteMode = "all" | "commands" | "threads" | "files";
@@ -268,6 +270,7 @@ function CommandPaletteDialog() {
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
+  const activePersonalAgent = useOrbitSelector(selectPersonalAgentRef);
   const ime = useImeCompositionGuard();
 
   const activeCwd = useOrbitSelector((s) => {
@@ -451,9 +454,12 @@ function CommandPaletteDialog() {
         sectionKey: "palette.sectionActions",
         section: actionsSection,
         title: t("overview.globalOverviewTooltip"),
-        keywords: "overview fleet inbox triage personal agent control monitor lanes",
+        subtitle: activePersonalAgent
+          ? activePersonalAgent.hostName
+          : t("briefing.setupTitle"),
+        keywords: "overview briefing fleet inbox triage personal agent router control",
         shortcut: shortcutOf("open_global_overview"),
-        icon: <Compass className="size-3.5" />,
+        icon: <Bot className="size-3.5" />,
         run: () => orbitActions.openGlobalOverview(),
       },
       {
@@ -674,6 +680,17 @@ function CommandPaletteDialog() {
         shortcut: shortcutOf("toggle_side_question"),
         icon: <MessageCircleQuestion className="size-3.5" />,
         run: () => orbitActions.openSideQuestionTab(),
+      },
+      {
+        id: "act-reopen-closed-side-tab",
+        kind: "command",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("palette.reopenClosedSideTab"),
+        keywords: "reopen undo closed side panel tab restore",
+        shortcut: shortcutOf("reopen_closed_side_tab"),
+        icon: <History className="size-3.5" />,
+        run: () => orbitActions.reopenClosedSidePanelTab(),
       },
       {
         id: "act-toggle-sidebar",
@@ -952,6 +969,7 @@ function CommandPaletteDialog() {
     isDraftNewSession,
     threadCustomTitles,
     archivedThreads,
+    activePersonalAgent,
     activeWorkspaceId,
     workspaceScripts,
     mod,

@@ -780,6 +780,14 @@ export struct AutomationsSheet {
                 Text(`Iteration ${goal.current_iteration} / ${goal.max_iterations}`)
                   .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
 
+                if (goal.status === 'paused' && goal.pause_reason && goal.pause_reason.length > 0) {
+                  Text(goal.pause_reason)
+                    .attributeModifier(orbitTextMeta(this.store.palette.statusWarning))
+                    .maxLines(2)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .width('100%')
+                }
+
                 if (goal.criteria.length > 0) {
                   Column({ space: 4 }) {
                     ForEach(

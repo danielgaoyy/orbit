@@ -1551,6 +1551,7 @@ impl ImChannelBridge {
                 workspace_id: None,
                 parent_agent_id: None,
                 parent_host_id: None,
+                initial_prompt_source: None,
                 profile_id: None,
                 background: false,
                 auto_archive: false,
@@ -4802,6 +4803,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -4863,6 +4865,7 @@ mod tests {
                     guardian_assessment: None,
                     plan_approval: None,
                     human_only: false,
+                    router_recommendation: None,
                     created_at: Utc::now(),
                 })
                 .await;
@@ -5077,6 +5080,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -5133,6 +5137,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -5291,6 +5296,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -5572,6 +5578,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
                 created_at: Utc::now(),
             })
             .await;

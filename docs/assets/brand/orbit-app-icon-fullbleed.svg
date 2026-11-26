@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <!-- Orbit app icon, full-bleed opaque square for platforms that apply their own mask (iOS, Android, HarmonyOS). -->
+  <defs>
+    <linearGradient id="orbit-bg" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#272A35"/><stop offset="1" stop-color="#121318"/>
+    </linearGradient>
+    <linearGradient id="orbit-ring" x1="320" y1="300" x2="700" y2="730" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#8B91A5"/>
+    </linearGradient>
+    <clipPath id="orbit-ring-area"><circle cx="512" cy="512" r="246"/></clipPath>
+    <filter id="orbit-soft" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="24"/></filter>
+  </defs>
+  <g transform="translate(512 512) scale(1.24272) translate(-512 -512)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#orbit-bg)"/>
+  <path d="M183.54 686.64A372 98 -28 0 1 840.46 337.36" stroke="#F1F2F7" stroke-opacity=".35" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="512" cy="530" r="205" stroke="#000" stroke-opacity=".35" stroke-width="80" filter="url(#orbit-soft)"/>
+  <circle cx="512" cy="512" r="205" stroke="url(#orbit-ring)" stroke-width="80"/>
+  <path d="M840.46 337.36A372 98 -28 0 1 183.54 686.64" stroke="#1B1C23" stroke-width="40" clip-path="url(#orbit-ring-area)"/>
+  <path d="M840.46 337.36A372 98 -28 0 1 183.54 686.64" stroke="#F1F2F7" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="830.86" cy="327.01" r="46" fill="#3ED598" fill-opacity=".5" filter="url(#orbit-soft)"/>
+  <circle cx="830.86" cy="327.01" r="30" fill="#3ED598"/>
+  </g>
+</svg>

@@ -50,20 +50,28 @@ public final class OrbitKeychain: @unchecked Sendable {
     }
 
     /// Loads or generates the 32-byte master key for `OrbitMobileCore.newWithMasterKey`.
-    /// Never overwrites an existing key; if the Keychain is unavailable in an unsigned sandbox,
-    /// falls back cleanly to a 0600 backup-excluded file inside `fallbackDirectory`.
+    /// Never overwrites an existing key; if the Keychain is unavailable in an unsigned sandbox
+    /// or transiently unreadable, falls back cleanly to a 0600 backup-excluded file inside `fallbackDirectory`.
     public func loadOrCreateMasterKey(fallbackDirectory: URL? = nil) throws -> MasterKeyResult {
-        if let existing = try readKeychainData(account: Self.masterKeyAccount) {
-            guard existing.count == Self.masterKeyByteCount else {
-                throw OrbitKeychainError.invalidKeyLength(existing.count)
+        var keychainUnavailable = false
+        do {
+            if let existing = try readKeychainData(account: Self.masterKeyAccount) {
+                guard existing.count == Self.masterKeyByteCount else {
+                    throw OrbitKeychainError.invalidKeyLength(existing.count)
+                }
+                return MasterKeyResult(key: existing, source: .hardwareKeychain, newlyGenerated: false)
             }
-            return MasterKeyResult(key: existing, source: .hardwareKeychain, newlyGenerated: false)
+        } catch {
+            if fallbackDirectory == nil {
+                throw error
+            }
+            keychainUnavailable = true
         }
 
         // If a protected fallback key already exists (e.g. from an unsigned local build),
-        // prefer migrating it into Keychain rather than generating a conflicting new key.
+        // prefer reusing it directly rather than generating a conflicting new key.
         if let dir = fallbackDirectory, let migrated = readProtectedFallbackKey(in: dir) {
-            if (try? writeKeychainData(migrated, account: Self.masterKeyAccount)) != nil {
+            if !keychainUnavailable, (try? writeKeychainData(migrated, account: Self.masterKeyAccount)) != nil {
                 try? FileManager.default.removeItem(at: fallbackKeyURL(in: dir))
                 return MasterKeyResult(key: migrated, source: .hardwareKeychain, newlyGenerated: false)
             }
@@ -71,17 +79,26 @@ public final class OrbitKeychain: @unchecked Sendable {
         }
 
         let fresh = try Self.generateRandomBytes(count: Self.masterKeyByteCount)
-        do {
-            try writeKeychainData(fresh, account: Self.masterKeyAccount)
-            return MasterKeyResult(key: fresh, source: .hardwareKeychain, newlyGenerated: true)
-        } catch {
-            // Unsigned simulator/unit-test environments often return errSecMissingEntitlement (-34018).
-            if let dir = fallbackDirectory {
-                try writeProtectedFallbackKey(fresh, in: dir)
-                return MasterKeyResult(key: fresh, source: .protectedFileFallback, newlyGenerated: true)
+        if !keychainUnavailable {
+            do {
+                try writeKeychainData(fresh, account: Self.masterKeyAccount)
+                return MasterKeyResult(key: fresh, source: .hardwareKeychain, newlyGenerated: true)
+            } catch {
+                if let dir = fallbackDirectory {
+                    try writeProtectedFallbackKey(fresh, in: dir)
+                    return MasterKeyResult(key: fresh, source: .protectedFileFallback, newlyGenerated: true)
+                }
+                throw error
             }
-            throw error
+        } else if let dir = fallbackDirectory {
+            try writeProtectedFallbackKey(fresh, in: dir)
+            return MasterKeyResult(key: fresh, source: .protectedFileFallback, newlyGenerated: true)
         }
+        throw OrbitKeychainError.keychainStatus(errSecMissingEntitlement)
+    }
+
+    public func readExistingProtectedFallbackKey(in directory: URL) -> Data? {
+        readProtectedFallbackKey(in: directory)
     }
 
     /// Returns a stable per-install push device identifier persisted in Keychain (or UserDefaults fallback).

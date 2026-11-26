@@ -836,6 +836,102 @@ pub enum ToolCallStatus {
     Denied,
 }
 
+/// Returns true when `detail` is a low-information fallback (`Generic { tool_name: "tool", arguments_json: "{}" }`
+/// or result-only fallback without a real tool name) produced when a late `tool_result` arrives after cache reset.
+pub fn is_placeholder_generic_tool_detail(detail: &ToolCallDetail) -> bool {
+    match detail {
+        ToolCallDetail::Generic {
+            tool_name,
+            arguments_json,
+        } => {
+            let trimmed_name = tool_name.trim();
+            let trimmed_args = arguments_json.trim();
+            trimmed_name.is_empty()
+                || trimmed_name.eq_ignore_ascii_case("tool")
+                || trimmed_args == "{}" && trimmed_name.eq_ignore_ascii_case("tool")
+        }
+        _ => false,
+    }
+}
+
+/// Preserve rich metadata (`Shell`, `FileEdit`, `FileRead`, `Search`, `Subagent`, named `Generic`)
+/// when coalescing or overwriting a `ToolCall` payload with a degraded `"tool"` fallback.
+pub fn merge_tool_call_payload(
+    previous: TimelinePayload,
+    incoming: TimelinePayload,
+) -> TimelinePayload {
+    let TimelinePayload::ToolCall {
+        call_id: prev_cid,
+        detail: prev_detail,
+        background_task: prev_bg,
+        ..
+    } = previous
+    else {
+        return incoming;
+    };
+    let TimelinePayload::ToolCall {
+        call_id,
+        status,
+        detail: inc_detail,
+        background_task,
+    } = incoming
+    else {
+        return incoming;
+    };
+    if call_id != prev_cid && !prev_cid.is_empty() && !call_id.is_empty() {
+        return TimelinePayload::ToolCall {
+            call_id,
+            status,
+            detail: inc_detail,
+            background_task,
+        };
+    }
+
+    let merged_detail = if !is_placeholder_generic_tool_detail(&prev_detail)
+        && is_placeholder_generic_tool_detail(&inc_detail)
+    {
+        let fallback_output = match &inc_detail {
+            ToolCallDetail::Generic { arguments_json, .. } => {
+                serde_json::from_str::<serde_json::Value>(arguments_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("output_preview")
+                            .and_then(|s| s.as_str())
+                            .map(ToOwned::to_owned)
+                    })
+            }
+            _ => None,
+        };
+        match prev_detail {
+            ToolCallDetail::Shell {
+                command,
+                cwd,
+                exit_code,
+                output_preview,
+            } => ToolCallDetail::Shell {
+                command,
+                cwd,
+                exit_code: exit_code.or(match status {
+                    ToolCallStatus::Completed => Some(0),
+                    ToolCallStatus::Failed | ToolCallStatus::Denied => Some(1),
+                    ToolCallStatus::Running => None,
+                }),
+                output_preview: output_preview.or(fallback_output),
+            },
+            other => other,
+        }
+    } else {
+        inc_detail
+    };
+
+    TimelinePayload::ToolCall {
+        call_id,
+        status,
+        detail: merged_detail,
+        background_task: background_task.or(prev_bg),
+    }
+}
+
 /// Structured metadata identifying a genuine asynchronous background task
 /// (e.g., Antigravity `run_command` promoted to a background task, or Claude Code
 /// `Bash(run_in_background: true)` / `local_bash` task).
@@ -7016,6 +7112,60 @@ mod tests {
         match decoded_wire {
             WireMessage::InterruptTurn { preserve_queue, .. } => assert!(preserve_queue),
             other => panic!("unexpected wire: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_tool_call_payload_preserves_rich_detail_on_placeholder_result() {
+        let rich = TimelinePayload::ToolCall {
+            call_id: "toolu_123".into(),
+            status: ToolCallStatus::Running,
+            detail: ToolCallDetail::Shell {
+                command: "cargo test --lib".into(),
+                cwd: Some("/workspace/repo".into()),
+                exit_code: None,
+                output_preview: None,
+            },
+            background_task: None,
+        };
+        let placeholder_result = TimelinePayload::ToolCall {
+            call_id: "toolu_123".into(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::Generic {
+                tool_name: "tool".into(),
+                arguments_json: serde_json::json!({
+                    "output_preview": "test result: ok. 12 passed"
+                })
+                .to_string(),
+            },
+            background_task: None,
+        };
+
+        let merged = merge_tool_call_payload(rich, placeholder_result);
+        match merged {
+            TimelinePayload::ToolCall {
+                call_id,
+                status,
+                detail:
+                    ToolCallDetail::Shell {
+                        command,
+                        cwd,
+                        exit_code,
+                        output_preview,
+                    },
+                ..
+            } => {
+                assert_eq!(call_id, "toolu_123");
+                assert_eq!(status, ToolCallStatus::Completed);
+                assert_eq!(command, "cargo test --lib");
+                assert_eq!(cwd.as_deref(), Some("/workspace/repo"));
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(
+                    output_preview.as_deref(),
+                    Some("test result: ok. 12 passed")
+                );
+            }
+            other => panic!("expected preserved Shell detail, got {other:?}"),
         }
     }
 }

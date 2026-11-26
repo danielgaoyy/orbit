@@ -453,14 +453,33 @@ public enum OrbitMotion {
 }
 
 public enum OrbitL10n {
-    /// Looks up a localized string from `Localizable.xcstrings` (`en`, `zh-Hans`, `ja`) with English fallback.
+    private static let languageDefaultsKey = "orbit.ios.preferredLanguage"
+
+    public static var effectiveLocale: Locale {
+        if let code = UserDefaults.standard.string(forKey: languageDefaultsKey), !code.isEmpty {
+            return Locale(identifier: code)
+        }
+        return Locale.current
+    }
+
+    private static var activeBundle: Bundle {
+        if let code = UserDefaults.standard.string(forKey: languageDefaultsKey),
+           !code.isEmpty,
+           let path = Bundle.main.path(forResource: code, ofType: "lproj"),
+           let localized = Bundle(path: path) {
+            return localized
+        }
+        return .main
+    }
+
+    /// Looks up a localized string from `Localizable.xcstrings` (`en`, `zh-Hans`, `ja`) with optional in-app language override.
     public static func tr(_ key: String) -> String {
-        NSLocalizedString(key, tableName: nil, bundle: .main, value: key, comment: "")
+        NSLocalizedString(key, tableName: nil, bundle: activeBundle, value: key, comment: "")
     }
 
     public static func fmt(_ key: String, _ args: CVarArg...) -> String {
         let format = tr(key)
-        return String(format: format, locale: Locale.current, arguments: args)
+        return String(format: format, locale: effectiveLocale, arguments: args)
     }
 }
 
@@ -658,16 +677,15 @@ public enum OrbitFormatters {
     }
 
     public static func normalizePermissionMode(_ mode: FfiSessionMode) -> FfiSessionMode {
-        if case .plan = mode {
-            return .default
-        }
-        return mode
+        mode
     }
 
     public static func sessionModeLabel(_ mode: FfiSessionMode) -> String {
         switch normalizePermissionMode(mode) {
-        case .default, .plan:
+        case .default:
             return "Always Ask"
+        case .plan:
+            return "Plan Mode"
         case .acceptEdits:
             return "Accept Edits"
         case .auto:
@@ -681,8 +699,10 @@ public enum OrbitFormatters {
 
     public static func sessionModeIcon(_ mode: FfiSessionMode) -> String {
         switch normalizePermissionMode(mode) {
-        case .default, .plan, .custom:
+        case .default, .custom:
             return "shield"
+        case .plan:
+            return "list.bullet.clipboard"
         case .acceptEdits:
             return "checkmark.shield"
         case .auto:
@@ -1210,6 +1230,94 @@ public extension View {
                 .environment(\.orbitPalette, palette)
                 .presentationCompactAdaptation(.popover)
         }
+    }
+}
+
+/// Flow-wrapping layout for compact Launchpad pills & tags that automatically wraps onto new rows
+/// within tight phone viewports instead of clipping past the trailing screen edge.
+public struct OrbitFlowLayout: Layout {
+    public var spacing: CGFloat
+    public var rowSpacing: CGFloat
+    public var alignment: HorizontalAlignment
+
+    public init(spacing: CGFloat = 8, rowSpacing: CGFloat = 8, alignment: HorizontalAlignment = .center) {
+        self.spacing = spacing
+        self.rowSpacing = rowSpacing
+        self.alignment = alignment
+    }
+
+    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth: CGFloat = {
+            if let w = proposal.width, w.isFinite, w > 1 {
+                return w
+            }
+            return .infinity
+        }()
+        let rows = computeRows(maxWidth: maxWidth, subviews: subviews)
+        let height = rows.enumerated().reduce(CGFloat(0)) { total, item in
+            let rowHeight = item.element.map(\.size.height).max() ?? 0
+            return total + rowHeight + (item.offset > 0 ? rowSpacing : 0)
+        }
+        let maxRowWidth = rows.map { row in
+            row.enumerated().reduce(CGFloat(0)) { w, elem in
+                w + elem.element.size.width + (elem.offset > 0 ? spacing : 0)
+            }
+        }.max() ?? 0
+        let resolvedWidth = maxWidth.isFinite ? maxWidth : maxRowWidth
+        return CGSize(width: resolvedWidth, height: height)
+    }
+
+    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = computeRows(maxWidth: max(1, bounds.width), subviews: subviews)
+        var y = bounds.minY
+        for row in rows {
+            let rowWidth = row.enumerated().reduce(CGFloat(0)) { w, elem in
+                w + elem.element.size.width + (elem.offset > 0 ? spacing : 0)
+            }
+            let rowHeight = row.map(\.size.height).max() ?? 0
+            var x: CGFloat = {
+                switch alignment {
+                case .leading: return bounds.minX
+                case .trailing: return bounds.maxX - rowWidth
+                default: return bounds.minX + max(0, (bounds.width - rowWidth) / 2)
+                }
+            }()
+            for item in row {
+                item.subview.place(
+                    at: CGPoint(x: x, y: y + (rowHeight - item.size.height) / 2),
+                    proposal: ProposedViewSize(item.size)
+                )
+                x += item.size.width + spacing
+            }
+            y += rowHeight + rowSpacing
+        }
+    }
+
+    private func computeRows(maxWidth: CGFloat, subviews: Subviews) -> [[(subview: LayoutSubview, size: CGSize)]] {
+        var rows: [[(subview: LayoutSubview, size: CGSize)]] = []
+        var currentRow: [(subview: LayoutSubview, size: CGSize)] = []
+        var currentWidth: CGFloat = 0
+        let itemProposal = maxWidth.isFinite ? ProposedViewSize(width: maxWidth, height: nil) : .unspecified
+
+        for subview in subviews {
+            var size = subview.sizeThatFits(itemProposal)
+            if maxWidth.isFinite, size.width > maxWidth {
+                size.width = maxWidth
+            }
+            let needed = currentRow.isEmpty ? size.width : currentWidth + spacing + size.width
+            if !currentRow.isEmpty && needed > maxWidth {
+                rows.append(currentRow)
+                currentRow = [(subview, size)]
+                currentWidth = size.width
+            } else {
+                currentRow.append((subview, size))
+                currentWidth = needed
+            }
+        }
+        if !currentRow.isEmpty {
+            rows.append(currentRow)
+        }
+        return rows
     }
 }
 

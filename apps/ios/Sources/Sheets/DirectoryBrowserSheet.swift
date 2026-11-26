@@ -9,6 +9,8 @@ struct DirectoryBrowserSheet: View {
     @State private var isEditingPath = false
     @State private var filterQuery = ""
     @State private var didRequestInitialListing = false
+    @State private var pendingRequestedPath: String? = nil
+    @State private var manualPathError: String? = nil
     @FocusState private var isPathFieldFocused: Bool
 
     private var groupedBackground: Color {
@@ -111,6 +113,39 @@ struct DirectoryBrowserSheet: View {
                 topNavigationControls
                 OrbitHairline()
 
+                let displayedError = manualPathError ?? store.lastError
+                if let err = displayedError, !err.isEmpty {
+                    HStack(spacing: OrbitSpacing.sm) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(palette.danger)
+                        Text(err)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.fgPrimary)
+                            .lineLimit(2)
+                        Spacer()
+                        Button {
+                            manualPathError = nil
+                            store.clearError()
+                            let trimmed = manualPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let retryTarget: String? = (!trimmed.isEmpty && trimmed != "~")
+                                ? trimmed
+                                : (currentPath == "~" ? nil : currentPath)
+                            pendingRequestedPath = retryTarget
+                            store.listRemoteDirectory(retryTarget)
+                        } label: {
+                            Text(OrbitL10n.tr("Retry"))
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.primary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, OrbitSpacing.lg)
+                    .padding(.vertical, OrbitSpacing.xs + 2)
+                    .background(palette.danger.opacity(0.10))
+                    OrbitHairline()
+                }
+
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: OrbitSpacing.xl) {
                         foldersSection
@@ -151,6 +186,18 @@ struct DirectoryBrowserSheet: View {
         }
         .onChange(of: listing?.currentPath) { newPath in
             if let path = newPath, !path.isEmpty {
+                if let requested = pendingRequestedPath {
+                    pendingRequestedPath = nil
+                    let normalizedReq = requested.hasSuffix("/") && requested.count > 1 ? String(requested.dropLast()) : requested
+                    let normalizedResp = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
+                    if normalizedReq != "~" && normalizedResp != normalizedReq {
+                        manualPathError = OrbitL10n.fmt("Directory not found: %@", requested)
+                        manualPathInput = requested
+                        isEditingPath = true
+                        return
+                    }
+                }
+                manualPathError = nil
                 manualPathInput = path
             }
         }
@@ -337,9 +384,13 @@ struct DirectoryBrowserSheet: View {
         let trimmed = manualPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
         store.hapticLight()
         filterQuery = ""
+        manualPathError = nil
+        pendingRequestedPath = (trimmed.isEmpty || trimmed == "~") ? nil : trimmed
         store.listRemoteDirectory(trimmed.isEmpty ? nil : trimmed)
-        isEditingPath = false
         isPathFieldFocused = false
+        if pendingRequestedPath == nil {
+            isEditingPath = false
+        }
     }
 
     // MARK: - Grouped Folders Section

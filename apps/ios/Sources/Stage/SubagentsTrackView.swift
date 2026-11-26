@@ -413,12 +413,25 @@ struct SubagentsListSheet: View {
             }
 
             HStack(spacing: OrbitSpacing.sm) {
+                if child.isForegroundRunning || child.isAwaitingPermission {
+                    Button {
+                        store.interruptAgent(agentId: child.agentId, hostId: store.selectedHostId)
+                    } label: {
+                        Label(OrbitL10n.tr("Stop"), systemImage: "stop.circle")
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.warning)
+                            .frame(minHeight: 34)
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 Button {
                     store.detachAgent(child.agentId)
                 } label: {
                     Label("Detach", systemImage: "arrow.up.right.square")
                         .font(OrbitTypography.meta(.medium))
                         .foregroundStyle(palette.fgSecondary)
+                        .frame(minHeight: 34)
                 }
                 .buttonStyle(.plain)
 
@@ -430,6 +443,7 @@ struct SubagentsListSheet: View {
                     Label("Archive", systemImage: "archivebox")
                         .font(OrbitTypography.meta(.medium))
                         .foregroundStyle(palette.danger)
+                        .frame(minHeight: 34)
                 }
                 .buttonStyle(.plain)
             }
@@ -492,7 +506,20 @@ struct SubagentsListSheet: View {
                 }
                 .buttonStyle(.plain)
 
-                if sub.status != .running {
+                if sub.status == .running {
+                    Button {
+                        store.interruptActiveAgent()
+                    } label: {
+                        Label(OrbitL10n.tr("Stop"), systemImage: "stop.circle")
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.warning)
+                            .padding(.horizontal, 8)
+                            .frame(height: 28)
+                            .background(palette.warning.opacity(0.12), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Stop Running Subagent")
+                } else {
                     Button {
                         store.archiveNativeSubagent(sub.subagentId)
                     } label: {
@@ -513,19 +540,24 @@ struct SubagentsListSheet: View {
                         .font(OrbitTypography.meta(.regular))
                         .foregroundStyle(palette.fgMuted)
                 } else {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(events.suffix(12)), id: \.seq) { ev in
-                            HStack(alignment: .top, spacing: 6) {
-                                Text("#\(ev.seq)")
-                                    .font(OrbitTypography.code(.regular))
-                                    .foregroundStyle(palette.fgMuted)
-                                Text(ev.summaryText)
-                                    .font(OrbitTypography.meta(.regular))
-                                    .foregroundStyle(palette.fgSecondary)
-                                    .lineLimit(3)
+                    let dedupedEvents = deduplicatedNativeEvents(events)
+                    ScrollView(.vertical, showsIndicators: true) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(dedupedEvents.suffix(30)), id: \.seq) { ev in
+                                HStack(alignment: .top, spacing: 6) {
+                                    Text("#\(ev.seq)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                    Text(ev.summaryText)
+                                        .font(OrbitTypography.meta(.regular))
+                                        .foregroundStyle(palette.fgSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .frame(maxHeight: 240)
                 }
             }
         }
@@ -536,6 +568,22 @@ struct SubagentsListSheet: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(palette.hairline, lineWidth: 0.5)
         )
+    }
+
+    private func deduplicatedNativeEvents(_ raw: [FfiProviderSubagentEvent]) -> [FfiProviderSubagentEvent] {
+        var out: [FfiProviderSubagentEvent] = []
+        var lastText: String? = nil
+        for ev in raw {
+            let trimmed = ev.summaryText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            if let prev = lastText, prev == trimmed {
+                if !out.isEmpty { out[out.count - 1] = ev }
+                continue
+            }
+            lastText = trimmed
+            out.append(ev)
+        }
+        return out
     }
 
     @ViewBuilder

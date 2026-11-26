@@ -203,24 +203,43 @@ struct PlanReviewCardView: View {
                 .buttonStyle(.plain)
 
                 if isFeedbackOpen {
-                    let canSend = !feedbackText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isModified
-                    Button {
-                        let cleanFb = feedbackText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        onResolvePlan(
-                            .requestChanges,
-                            isModified ? editedMarkdown : nil,
-                            cleanFb.isEmpty ? nil : cleanFb,
-                            nil
-                        )
-                    } label: {
-                        Text(OrbitL10n.tr("Send Revisions"))
-                            .font(OrbitTypography.subhead(.semibold))
-                            .foregroundStyle(canSend ? palette.onPrimary : palette.fgMuted)
-                            .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
-                            .background(canSend ? palette.primary : palette.subtleFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    HStack(spacing: OrbitSpacing.xs) {
+                        Button {
+                            withAnimation(OrbitMotion.ui) {
+                                isFeedbackOpen = false
+                                feedbackText = ""
+                            }
+                        } label: {
+                            Text(OrbitL10n.tr("Cancel"))
+                                .font(OrbitTypography.subhead(.medium))
+                                .foregroundStyle(palette.fgSecondary)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: OrbitSpacing.hitTarget)
+                                .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        let canSend = !feedbackText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isModified
+                        Button {
+                            let cleanFb = feedbackText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            onResolvePlan(
+                                .requestChanges,
+                                isModified ? editedMarkdown : nil,
+                                cleanFb.isEmpty ? nil : cleanFb,
+                                nil
+                            )
+                        } label: {
+                            Text(OrbitL10n.tr("Send Revisions"))
+                                .font(OrbitTypography.subhead(.semibold))
+                                .foregroundStyle(canSend ? palette.onPrimary : palette.fgMuted)
+                                .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                                .background(canSend ? palette.primary : palette.subtleFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canSend)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend)
                 } else {
                     Button {
                         withAnimation(OrbitMotion.ui) {
@@ -269,7 +288,7 @@ struct PlanReviewCardView: View {
         )
         .onAppear {
             editedMarkdown = plan.planMarkdown
-            targetMode = OrbitFormatters.normalizePermissionMode(store.selectedMode)
+            targetMode = store.selectedMode == .plan ? .acceptEdits : OrbitFormatters.normalizePermissionMode(store.selectedMode)
         }
         .onChange(of: plan.requestId) { _ in
             editedMarkdown = plan.planMarkdown
@@ -311,11 +330,17 @@ struct PlanReviewCardView: View {
 /// Calm collapsible Session Plan Shelf docked above the composer (matching Desktop `ComposerPlanShelf`).
 struct SessionPlanShelfView: View {
     @ObservedObject var store: OrbitIosStore
+    @ObservedObject private var stageState: OrbitStageStreamState
     @Environment(\.orbitPalette) private var palette
     @State private var isExpanded: Bool = false
 
+    init(store: OrbitIosStore) {
+        self.store = store
+        self._stageState = ObservedObject(wrappedValue: store.stageState)
+    }
+
     private var planSteps: [SessionPlanStepView] {
-        store.agentStage?.insights.planSteps ?? []
+        stageState.agentStage?.insights.planSteps ?? []
     }
 
     private var completedCount: Int {
@@ -328,8 +353,8 @@ struct SessionPlanShelfView: View {
 
     private var shouldShowShelf: Bool {
         guard !planSteps.isEmpty else { return false }
-        let hasPendingDecisions = !(store.agentStage?.pendingPermissions.isEmpty ?? true)
-            || !(store.agentStage?.pendingQuestions.isEmpty ?? true)
+        let hasPendingDecisions = !(stageState.agentStage?.pendingPermissions.isEmpty ?? true)
+            || !(stageState.agentStage?.pendingQuestions.isEmpty ?? true)
         if hasPendingDecisions { return false }
         return completedCount < planSteps.count || store.isActiveAgentTurnBusy
     }

@@ -43,12 +43,22 @@ struct ComposerTextView: UIViewRepresentable {
     let firstLineHeadIndent: CGFloat
     let textColor: UIColor
     let tintColor: UIColor
+    var maxLines: Int = 6
+    var customMaxHeight: CGFloat? = nil
     let onBackspaceAtStart: () -> Bool
     var onPasteImage: ((UIImage) -> Void)? = nil
     var onLargeTextPaste: ((String) -> Void)? = nil
 
     static let bodyFont: UIFont = .systemFont(ofSize: 15, weight: .regular)
     static let lineSpacing: CGFloat = 4
+
+    private var resolvedMaxHeight: CGFloat {
+        let cap = ceil((Self.bodyFont.lineHeight + Self.lineSpacing) * CGFloat(max(1, maxLines))) + 6
+        if let customMaxHeight {
+            return min(cap, max(ceil(Self.bodyFont.lineHeight) + 8, customMaxHeight))
+        }
+        return cap
+    }
 
     static func inlineDirectiveIndent(for directive: OrbitSlashDirective?) -> CGFloat {
         guard let directive else { return 0 }
@@ -170,7 +180,7 @@ struct ComposerTextView: UIViewRepresentable {
     private func updateScrollEnabledIfNeeded(_ uiView: OrbitComposerUITextView) {
         let width = uiView.bounds.width
         guard width > 0 else { return }
-        let maxHeight = ceil((Self.bodyFont.lineHeight + Self.lineSpacing) * 6) + 6
+        let maxHeight = resolvedMaxHeight
         let contentHeight = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
         let needsScroll = contentHeight > maxHeight + 1
         if uiView.isScrollEnabled != needsScroll {
@@ -187,7 +197,7 @@ struct ComposerTextView: UIViewRepresentable {
         guard width > 0 else { return nil }
 
         let minHeight = ceil(Self.bodyFont.lineHeight) + 4
-        let maxHeight = ceil((Self.bodyFont.lineHeight + Self.lineSpacing) * 6) + 6
+        let maxHeight = resolvedMaxHeight
         let fitting: CGSize
         if !uiView.isScrollEnabled {
             fitting = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))

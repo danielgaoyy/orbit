@@ -237,6 +237,28 @@ struct WorkspacePeerStripView: View {
                     }
                     .buttonStyle(.plain)
                 }
+
+                // 6. Worktree Handoff Button
+                if let ws = activeWorkspace,
+                   (ws.isWorktree || activeAgent?.worktreeBranch != nil || peers.contains(where: { $0.worktreeBranch != nil })) {
+                    Button {
+                        store.hapticLight()
+                        store.activeSheet = .worktreeHandoff(workspaceId: ws.workspaceId)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.swap")
+                                .font(.system(size: 10.5, weight: .semibold))
+                            Text("Handoff")
+                                .font(OrbitTypography.meta(.semibold))
+                        }
+                        .foregroundStyle(palette.accentSky)
+                        .padding(.horizontal, 9)
+                        .frame(height: 28)
+                        .background(palette.accentSky.opacity(0.12), in: Capsule())
+                        .overlay(Capsule().strokeBorder(palette.accentSky.opacity(0.28), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(.horizontal, OrbitSpacing.lg)
             .padding(.vertical, 6)
@@ -244,12 +266,15 @@ struct WorkspacePeerStripView: View {
     }
 
     private func peerTabPill(peer: FfiAgentCard, isActive: Bool) -> some View {
-        let label = OrbitFormatters.semanticAgentTabLabel(
-            handle: peer.handle,
-            title: peer.title,
-            taskSummary: peer.taskSummary,
-            agentId: peer.agentId
-        )
+        let trimmedHandle = peer.handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let label = !trimmedHandle.isEmpty
+            ? "@\(trimmedHandle.replacingOccurrences(of: "^@+", with: "", options: .regularExpression))"
+            : OrbitFormatters.semanticAgentTabLabel(
+                handle: peer.handle,
+                title: peer.title,
+                taskSummary: peer.taskSummary,
+                agentId: peer.agentId
+            )
         return Button {
             if !isActive {
                 store.selectAgent(peer.agentId)

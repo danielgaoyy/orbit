@@ -38,7 +38,9 @@ public struct RawPtyInputView: UIViewRepresentable {
 
         if isFirstResponder && !uiView.isFirstResponder {
             DispatchQueue.main.async {
-                _ = uiView.becomeFirstResponder()
+                if uiView.window != nil {
+                    _ = uiView.becomeFirstResponder()
+                }
             }
         } else if !isFirstResponder && uiView.isFirstResponder {
             DispatchQueue.main.async {

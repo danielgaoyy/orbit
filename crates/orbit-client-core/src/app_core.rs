@@ -3255,6 +3255,9 @@ impl OrbitAppCore {
     pub fn terminal_screen(&self, host_id: &str) -> Option<TerminalScreenView> {
         let guard = self.hosts.read().ok()?;
         let state = guard.get(host_id)?;
+        if state.terminals.is_empty() && state.active_terminal_id.is_none() {
+            return None;
+        }
         let slot = state.active_terminal_slot;
         Some(
             state
@@ -3263,6 +3266,24 @@ impl OrbitAppCore {
                 .map(TerminalGridEmulator::snapshot)
                 .unwrap_or_else(|| TerminalGridEmulator::new(100, 30).snapshot()),
         )
+    }
+
+    pub fn terminal_scrollback(&self, host_id: &str) -> Vec<String> {
+        let Ok(guard) = self.hosts.read() else {
+            return Vec::new();
+        };
+        let Some(state) = guard.get(host_id) else {
+            return Vec::new();
+        };
+        if state.terminals.is_empty() && state.active_terminal_id.is_none() {
+            return Vec::new();
+        }
+        let slot = state.active_terminal_slot;
+        state
+            .terminal_emulators
+            .get(&slot)
+            .map(|emu| emu.scrollback_lines().to_vec())
+            .unwrap_or_default()
     }
 
     pub fn terminal_screen_slot(&self, host_id: &str, slot: u8) -> Option<TerminalScreenView> {
@@ -4949,6 +4970,17 @@ impl OrbitAppCore {
             if let Some(rm) = route_mode {
                 h.profile.route_mode = rm;
             }
+            if reconnect {
+                // Tear down active transport immediately when reconfiguring route mode / endpoints
+                // so a DirectOnly switch never lingers on a previously dialed Relay session.
+                h.session = None;
+                h.connecting_in_flight = false;
+                h.profile.state = if matches!(h.profile.route_mode, HostRouteMode::DirectOnly) {
+                    HostConnectionState::ConnectingDirect
+                } else {
+                    HostConnectionState::Disconnected
+                };
+            }
             if let Some(sa) = ssh_alias {
                 let t = sa.trim();
                 h.profile.ssh_alias = if t.is_empty() {
@@ -5198,7 +5230,10 @@ impl OrbitAppCore {
                 Vec::new()
             };
 
-        let connect_res = if !is_local_host && has_online_bridge {
+        let connect_res = if !is_local_host
+            && profile.route_mode != HostRouteMode::DirectOnly
+            && has_online_bridge
+        {
             let smart_fut = connect_smart_with_fallback_relays(
                 &profile,
                 &fallback_relays,
@@ -5262,7 +5297,10 @@ impl OrbitAppCore {
             .await
             {
                 Ok(handle) => Ok(handle),
-                Err(smart_err) if !smart_err.is_auth_error() => {
+                Err(smart_err)
+                    if !smart_err.is_auth_error()
+                        && profile.route_mode != HostRouteMode::DirectOnly =>
+                {
                     if let Some(bridged) = self
                         .try_connect_host_via_peer_bridges(host_id, &profile)
                         .await
@@ -12721,6 +12759,9 @@ impl OrbitAppCore {
         let relay_has_ft = relay_url.contains("?ft=") || relay_url.contains("&ft=");
         if let Ok(mut guard) = self.hosts.write() {
             for (hid, h) in guard.iter_mut() {
+                if matches!(h.profile.route_mode, HostRouteMode::DirectOnly) {
+                    continue;
+                }
                 let needs_update = match h.profile.relay_url.as_deref() {
                     None => true,
                     Some(cur) => {
@@ -14586,6 +14627,14 @@ impl OrbitAppCore {
                 h.slot_attach_dispatched_gen.remove(&slot);
                 h.slot_confirmed_gen.remove(&slot);
                 h.pending_slot_frames.remove(&slot);
+                if let Some(emu) = h.terminal_emulators.get_mut(&slot) {
+                    emu.clear();
+                }
+            }
+            if h.terminals.is_empty()
+                && let Some(emu) = h.terminal_emulators.get_mut(&h.active_terminal_slot)
+            {
+                emu.clear();
             }
             if h.active_terminal_id.as_deref() == Some(terminal_id) {
                 h.active_terminal_id = h.terminals.first().map(|t| t.terminal_id.clone());
@@ -24205,7 +24254,9 @@ fn should_strip_remote_loopback(
                 HostRouteMode::SshTunnel | HostRouteMode::RelayOnly
             )
             || relay_url.is_some_and(|r| !r.trim().is_empty())
-            || direct_endpoints.iter().any(|ep| !is_loopback_endpoint(ep)))
+            || direct_endpoints.iter().any(|ep| {
+                !is_loopback_endpoint(ep) && !crate::cloud_sync::is_tun_benchmark_endpoint(ep)
+            }))
 }
 
 fn read_local_host_identity_pair_in(orbit_dir: &Path) -> Option<(String, String)> {
@@ -36681,5 +36732,66 @@ mod tests {
         assert!(!enabled.instant_unlock_enabled);
         assert!(state.key_content.lock().expect("lock").is_none());
         assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tun_benchmark_endpoint_and_direct_only_fleet_relay_rules() {
+        assert!(crate::cloud_sync::is_tun_benchmark_endpoint(
+            "http://198.18.0.1:6868"
+        ));
+        assert!(crate::cloud_sync::is_tun_benchmark_endpoint(
+            "198.19.12.4:6868"
+        ));
+        assert!(!crate::cloud_sync::is_tun_benchmark_endpoint(
+            "http://192.168.1.20:6868"
+        ));
+
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp1 = orbit_crypto::HostIdentityKeypair::generate().expect("kp1");
+        let kp2 = orbit_crypto::HostIdentityKeypair::generate().expect("kp2");
+        let h1 = kp1.host_id().expect("h1");
+        let h2 = kp2.host_id().expect("h2");
+
+        let offer1 = PairingOffer {
+            host_id: h1.clone(),
+            hostname: "direct-only-host".into(),
+            daemon_pubkey_b64: kp1.public_key_b64,
+            direct_endpoints: vec!["http://127.0.0.1:18868".into()],
+            relay_url: None,
+            pairing_secret: "s1".into(),
+        };
+        let offer2 = PairingOffer {
+            host_id: h2.clone(),
+            hostname: "auto-host".into(),
+            daemon_pubkey_b64: kp2.public_key_b64,
+            direct_endpoints: vec!["http://127.0.0.1:18869".into()],
+            relay_url: None,
+            pairing_secret: "s2".into(),
+        };
+        core.pair_host(&offer1.to_qr_uri().expect("u1"))
+            .expect("p1");
+        core.pair_host(&offer2.to_qr_uri().expect("u2"))
+            .expect("p2");
+
+        {
+            let mut hosts = core.hosts.write().expect("write");
+            hosts.get_mut(&h1).expect("h1").profile.route_mode = HostRouteMode::DirectOnly;
+            hosts.get_mut(&h2).expect("h2").profile.route_mode = HostRouteMode::Auto;
+        }
+
+        let relay_url = "wss://relay.example.com?ft=fleet_secret_1";
+        core.propagate_fleet_relay_to_online_hosts(relay_url);
+
+        let hosts = core.hosts.read().expect("read");
+        assert_eq!(
+            hosts.get(&h1).expect("h1").profile.relay_url,
+            None,
+            "DirectOnly host must never auto-inherit fleet relay"
+        );
+        assert_eq!(
+            hosts.get(&h2).expect("h2").profile.relay_url.as_deref(),
+            Some(relay_url),
+            "Auto host must receive authenticated fleet relay"
+        );
     }
 }

@@ -174,8 +174,14 @@ struct ModelPickerPopoverView: View {
         )
     }
 
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let isCompactHeight = verticalSizeClass == .compact
+        let maxListHeight: CGFloat = isCompactHeight ? 148 : 244
+        let listHeight = min(CGFloat(max(1, browsedRows.count)) * 46 + 8, maxListHeight)
+
+        return VStack(alignment: .leading, spacing: isCompactHeight ? 7 : 10) {
             if showAgentSwitcher {
                 Picker("Agent", selection: providerSelectionBinding) {
                     ForEach(detectedProviders, id: \.self) { provider in
@@ -191,14 +197,30 @@ struct ModelPickerPopoverView: View {
             providerHeaderRow
                 .padding(.horizontal, 12)
 
-            ViewThatFits(in: .vertical) {
+            ScrollView(.vertical, showsIndicators: true) {
                 modelRowsStack
-                ScrollView(.vertical, showsIndicators: true) {
-                    modelRowsStack
-                }
-                .frame(height: 268)
             }
-            .frame(maxHeight: 268)
+            .frame(height: listHeight)
+
+            OrbitHairline()
+                .padding(.horizontal, 12)
+
+            Toggle(isOn: Binding(
+                get: { store.fastModeEnabled },
+                set: { store.setFastMode($0) }
+            )) {
+                HStack(spacing: 6) {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(store.fastModeEnabled ? palette.warning : palette.fgMuted)
+                    Text(OrbitL10n.tr("Fast Mode"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(palette.fgPrimary)
+                }
+            }
+            .toggleStyle(.switch)
+            .tint(palette.warning)
+            .padding(.horizontal, 16)
 
             if let row = activeRowForThinking, !row.thinkingOptions.isEmpty {
                 OrbitHairline()
@@ -209,6 +231,7 @@ struct ModelPickerPopoverView: View {
         }
         .padding(.vertical, 12)
         .frame(width: 304)
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             browsedProvider = store.selectedProvider
             store.refreshProviderModels(force: false)

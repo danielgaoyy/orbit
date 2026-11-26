@@ -72,7 +72,7 @@ extension OrbitIosStore {
                 self.hapticSuccess()
                 self.showToast("Goal started")
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -88,7 +88,7 @@ extension OrbitIosStore {
                 self.upsertGoalRecord(updated)
                 self.hapticLight()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -133,7 +133,7 @@ extension OrbitIosStore {
                 self.hapticSuccess()
                 self.showToast("Monitor active")
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -149,7 +149,7 @@ extension OrbitIosStore {
                 self.upsertMonitorRecord(updated)
                 self.hapticLight()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -194,7 +194,7 @@ extension OrbitIosStore {
                 self.hapticSuccess()
                 self.showToast("Trigger armed")
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -210,7 +210,7 @@ extension OrbitIosStore {
                 self.upsertTimerRecord(updated)
                 self.hapticMedium()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -226,7 +226,7 @@ extension OrbitIosStore {
                 self.upsertTimerRecord(updated)
                 self.hapticLight()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -269,7 +269,7 @@ extension OrbitIosStore {
                 self.hapticSuccess()
                 self.showToast("Workflow started")
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -285,7 +285,7 @@ extension OrbitIosStore {
                 self.upsertWorkflowRecord(updated)
                 self.hapticLight()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -316,7 +316,7 @@ extension OrbitIosStore {
                 self.hapticSuccess()
                 self.showToast("Rule saved")
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -332,7 +332,7 @@ extension OrbitIosStore {
                 self.permissionRules.removeAll(where: { $0.id == ruleId })
                 self.hapticMedium()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -348,7 +348,7 @@ extension OrbitIosStore {
                 self.guardianConfigSnapshot = snap
                 self.hapticLight()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }

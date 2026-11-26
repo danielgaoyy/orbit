@@ -193,6 +193,7 @@ struct GlobalSearchSheet: View {
         Button {
             store.hapticLight()
             dismiss()
+            store.stageState.isStageHydrating = true
             store.selectAgent(hostId: hit.hostId, agentId: hit.agentId)
         } label: {
             VStack(alignment: .leading, spacing: 6) {
@@ -212,7 +213,7 @@ struct GlobalSearchSheet: View {
                         .background(palette.subtleFill, in: Capsule())
                 }
 
-                Text(hit.snippet)
+                highlightedSnippetText(hit.snippet)
                     .font(OrbitTypography.meta(.regular))
                     .foregroundStyle(palette.fgSecondary)
                     .lineLimit(3)
@@ -246,6 +247,20 @@ struct GlobalSearchSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func highlightedSnippetText(_ raw: String) -> Text {
+        let segments = OrbitSearchHighlightLogic.segments(from: raw)
+        if segments.isEmpty {
+            return Text(raw)
+        }
+        return segments.reduce(Text("")) { acc, seg in
+            var piece = Text(seg.text)
+            if seg.highlighted {
+                piece = piece.bold().foregroundColor(palette.primary)
+            }
+            return acc + piece
+        }
     }
 
     private func triggerSearch(_ text: String, immediate: Bool = false) {

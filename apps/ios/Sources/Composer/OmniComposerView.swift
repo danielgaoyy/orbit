@@ -9,6 +9,7 @@ struct OmniComposerView: View {
     @ObservedObject var store: OrbitIosStore
 
     @Environment(\.orbitPalette) private var palette
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var isComposerFocused: Bool = false
     @State private var cursorOffset: Int = 0
     @State private var isSoftwareKeyboardVisible: Bool = false
@@ -17,6 +18,8 @@ struct OmniComposerView: View {
     @State private var isCameraPickerPresented: Bool = false
     @State private var isFileImporterPresented: Bool = false
     @State private var isPermissionPickerPresented: Bool = false
+    @State private var isExtraDirsSheetPresented: Bool = false
+    @State private var extraDirDraft: String = ""
     @State private var cachedSlashCommands: [FfiSlashCommand] = []
     @State private var cachedMentionCandidates: [FfiMentionCandidate] = []
     @StateObject private var voiceController = OrbitVoiceDictationController()
@@ -177,12 +180,68 @@ struct OmniComposerView: View {
                     }
             }
         }
-        .fileImporter(
-            isPresented: $isFileImporterPresented,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: true
-        ) { result in
-            handleImportedFiles(result)
+        .background {
+            Color.clear
+                .fileImporter(
+                    isPresented: $isFileImporterPresented,
+                    allowedContentTypes: [.item],
+                    allowsMultipleSelection: true
+                ) { result in
+                    handleImportedFiles(result)
+                }
+        }
+        .sheet(isPresented: $isExtraDirsSheetPresented) {
+            NavigationStack {
+                List {
+                    Section("Add Extra Context Folder") {
+                        HStack {
+                            TextField("/path/to/extra-repo", text: $extraDirDraft)
+                                .font(OrbitTypography.code(.regular))
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            Button("Add") {
+                                let clean = extraDirDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !clean.isEmpty {
+                                    store.addExtraDirectory(clean)
+                                    extraDirDraft = ""
+                                }
+                            }
+                            .disabled(extraDirDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+
+                    Section("Active Extra Directories (\(store.activeExtraDirs.count))") {
+                        if store.activeExtraDirs.isEmpty {
+                            Text("No extra directories added for this session.")
+                                .foregroundStyle(palette.fgMuted)
+                        } else {
+                            ForEach(store.activeExtraDirs, id: \.self) { dir in
+                                HStack {
+                                    Text(dir)
+                                        .font(OrbitTypography.code(.regular))
+                                        .lineLimit(2)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        store.removeExtraDirectory(dir)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .foregroundStyle(palette.danger)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("Extra Directories")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button(OrbitL10n.tr("Done")) { isExtraDirsSheetPresented = false }
+                    }
+                }
+            }
+            .environment(\.orbitPalette, palette)
         }
         .padding(.horizontal, OrbitSpacing.lg)
         .padding(.top, OrbitSpacing.sm)
@@ -276,7 +335,13 @@ struct OmniComposerView: View {
 
         switch cmd.id {
         case "plan":
-            store.applyQuickWorkflow(.plan)
+            let remaining = collapsed.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            store.applySessionMode(.plan)
+            store.slashDirective = .plan
+            if !remaining.isEmpty {
+                store.composerText = remaining
+                cursorOffset = remaining.count
+            }
         case "review":
             store.applyQuickWorkflow(.review)
         case "compact":
@@ -284,7 +349,7 @@ struct OmniComposerView: View {
                 store.applyQuickWorkflow(.compact)
             } else {
                 store.hapticWarning()
-                store.showToast("Start an active session first to compact context")
+                store.showToast("Start an active session first to compact context", isWarning: true)
             }
         case "orbit", "orbit-handoff", "orbit-committee", "orbit-advisor":
             if let dir = OrbitSlashDirective(rawValue: cmd.id) {
@@ -296,6 +361,8 @@ struct OmniComposerView: View {
             store.applySessionMode(.auto)
         case "edits":
             store.applySessionMode(.acceptEdits)
+        case "fast":
+            store.setFastMode(!store.fastModeEnabled)
         case "full":
             store.applySessionMode(.fullAccess)
         case "diff":
@@ -342,7 +409,9 @@ struct OmniComposerView: View {
         switch candidate.kind {
         case "file":
             let path = candidate.filePath.isEmpty ? candidate.key : candidate.filePath
-            let token = candidate.tokenLabel.isEmpty ? "@\(candidate.title)" : candidate.tokenLabel
+            let token = path.contains("/")
+                ? "@\(path)"
+                : (candidate.tokenLabel.isEmpty ? "@\(candidate.title)" : candidate.tokenLabel)
             store.registerInlineMention(token: token, item: .file(path: path))
             insertInlineToken(token)
         case "git_diff":
@@ -380,6 +449,29 @@ struct OmniComposerView: View {
     private var queuedPromptsTray: some View {
         let queuedList = store.activeQueuedPrompts
         return VStack(alignment: .leading, spacing: 0) {
+            if queuedList.count > 1 {
+                HStack {
+                    Text("Queued (\(queuedList.count))")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.fgMuted)
+                    Spacer()
+                    Button {
+                        store.flushAllQueuedPrompts()
+                    } label: {
+                        Text(OrbitL10n.tr("Flush All"))
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.danger)
+                            .padding(.horizontal, OrbitSpacing.sm)
+                            .frame(minHeight: 30)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Flush All Queued Prompts")
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 6)
+                OrbitHairline()
+            }
             ForEach(Array(queuedList.enumerated()), id: \.element.id) { idx, item in
                 if idx > 0 {
                     OrbitHairline()
@@ -503,9 +595,42 @@ struct OmniComposerView: View {
                 attachmentsTray
             }
 
-            // Auto-expanding 1..6 line native TextView with inline directive prefix (1:1 Desktop)
+            if let directive = store.slashDirective {
+                HStack(spacing: OrbitSpacing.xs) {
+                    Button {
+                        store.slashDirective = nil
+                        store.hapticLight()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: directive.icon)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(palette.primary)
+                            Text("/\(directive.rawValue)")
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(palette.subtleFill, in: Capsule())
+                        .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear /\(directive.rawValue) directive")
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.top, hasTrayItems ? OrbitSpacing.xs : OrbitSpacing.md)
+                .padding(.bottom, 2)
+            }
+
+            // Auto-expanding 1..6 line native TextView
             ZStack(alignment: .topLeading) {
-                if store.slashDirective == nil && store.composerText.isEmpty {
+                if store.composerText.isEmpty {
                     Text(placeholderText)
                         .font(OrbitTypography.body(.regular))
                         .foregroundStyle(palette.fgMuted.opacity(0.58))
@@ -519,9 +644,10 @@ struct OmniComposerView: View {
                     isFocused: $isComposerFocused,
                     cursorOffset: $cursorOffset,
                     focusNonce: store.composerFocusNonce,
-                    firstLineHeadIndent: ComposerTextView.inlineDirectiveIndent(for: store.slashDirective),
+                    firstLineHeadIndent: 0,
                     textColor: UIColor(palette.fgPrimary),
                     tintColor: UIColor(palette.primary),
+                    customMaxHeight: verticalSizeClass == .compact ? 64 : nil,
                     onBackspaceAtStart: {
                         guard store.slashDirective != nil else { return false }
                         store.slashDirective = nil
@@ -542,30 +668,9 @@ struct OmniComposerView: View {
                         store.showToast("Attached large paste as snippet")
                     }
                 )
-
-                if let directive = store.slashDirective {
-                    Button {
-                        store.slashDirective = nil
-                        store.hapticLight()
-                    } label: {
-                        HStack(spacing: 5.5) {
-                            Image(systemName: directive.icon)
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(palette.fgMuted)
-                            Text(directive.rawValue)
-                                .font(.system(size: 15, weight: .regular))
-                                .foregroundStyle(palette.fgPrimary)
-                        }
-                        .frame(height: ceil(ComposerTextView.bodyFont.lineHeight))
-                        .padding(.top, 2)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Clear /\(directive.rawValue) directive")
-                }
             }
             .padding(.horizontal, OrbitSpacing.lg)
-            .padding(.top, hasTrayItems ? OrbitSpacing.xs : OrbitSpacing.md)
+            .padding(.top, (hasTrayItems || store.slashDirective != nil) ? OrbitSpacing.xs : OrbitSpacing.md)
             .padding(.bottom, 2)
 
             // Bottom Control Bar — balanced optical spacing (~12pt paired gaps, concentric 10pt Send inset)
@@ -606,6 +711,20 @@ struct OmniComposerView: View {
                         } label: {
                             Label("Files", systemImage: "folder")
                         }
+
+                        Divider()
+
+                        Button {
+                            store.hapticLight()
+                            isExtraDirsSheetPresented = true
+                        } label: {
+                            Label(
+                                store.activeExtraDirs.isEmpty
+                                    ? "Extra Directories"
+                                    : "Extra Directories (\(store.activeExtraDirs.count))",
+                                systemImage: "folder.badge.plus"
+                            )
+                        }
                     } label: {
                         plusButtonLabel
                     }
@@ -617,7 +736,7 @@ struct OmniComposerView: View {
                 ComposerModelTriggerButton(
                     provider: store.selectedProvider,
                     modelDisplayName: store.composerModelDisplayName,
-                    effortDisplayLabel: store.composerEffortDisplayLabel,
+                    effortDisplayLabel: isRunningWithDraft ? nil : store.composerEffortDisplayLabel,
                     isPresented: $store.isModelPickerPresented,
                     onTap: {
                         isComposerFocused = false
@@ -629,6 +748,30 @@ struct OmniComposerView: View {
                             .environment(\.orbitPalette, palette)
                     }
                 )
+
+                if store.fastModeEnabled {
+                    Button {
+                        store.hapticLight()
+                        store.setFastMode(false)
+                    } label: {
+                        HStack(spacing: 2) {
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 9.5, weight: .bold))
+                            if !isRunningWithDraft {
+                                Text("Fast")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .lineLimit(1)
+                            }
+                        }
+                        .foregroundStyle(palette.warning)
+                        .padding(.horizontal, isRunningWithDraft ? 6 : 7)
+                        .frame(height: 22)
+                        .background(palette.warning.opacity(0.14), in: Capsule())
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Fast Mode Active")
+                }
 
                 Spacer(minLength: OrbitSpacing.xs)
 
@@ -676,6 +819,16 @@ struct OmniComposerView: View {
                             }
 
                             OrbitPopoverOptionRow(
+                                title: "Plan Mode",
+                                subtitle: "Draft and review a plan before making edits",
+                                systemImage: "list.bullet.clipboard",
+                                isSelected: normalizedPermissionMode == .plan
+                            ) {
+                                store.applySessionMode(.plan)
+                                isPermissionPickerPresented = false
+                            }
+
+                            OrbitPopoverOptionRow(
                                 title: "Full Access",
                                 subtitle: "Edit files and run commands without prompts",
                                 systemImage: "shield.slash",
@@ -691,8 +844,27 @@ struct OmniComposerView: View {
                     .frame(width: 296)
                 }
 
-                // Borderless Stop action when user is typing a queued prompt during active run
+                // Borderless Steer/Queue toggle + Stop action when typing during active run
                 if isRunningWithDraft {
+                    Button {
+                        store.hapticLight()
+                        store.composerBusySubmitMode = (store.composerBusySubmitMode == .queue) ? .steer : .queue
+                    } label: {
+                        Text(store.composerBusySubmitMode == .steer ? "Steer" : "Queue")
+                            .font(OrbitTypography.meta(.semibold))
+                            .lineLimit(1)
+                            .foregroundStyle(store.composerBusySubmitMode == .steer ? palette.warning : palette.fgSecondary)
+                            .padding(.horizontal, 8)
+                            .frame(height: 26)
+                            .background(
+                                store.composerBusySubmitMode == .steer ? palette.warning.opacity(0.14) : palette.subtleFill,
+                                in: Capsule()
+                            )
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Toggle Queue or Steer Mode")
+
                     Button {
                         store.interruptActiveAgent()
                     } label: {
@@ -701,7 +873,9 @@ struct OmniComposerView: View {
                                 .font(OrbitTypography.iconSmall)
                             Text("Stop")
                                 .font(OrbitTypography.meta(.semibold))
+                                .lineLimit(1)
                         }
+                        .fixedSize(horizontal: true, vertical: false)
                         .foregroundStyle(palette.danger)
                         .padding(.horizontal, OrbitSpacing.xs + 2)
                         .frame(minHeight: Self.controlBarHeight)
@@ -750,13 +924,17 @@ struct OmniComposerView: View {
                     .accessibilityLabel(OrbitL10n.tr("Stop Generation"))
                 } else if isRunningWithDraft {
                     Button {
-                        store.enqueueComposerPrompt()
+                        if store.composerBusySubmitMode == .steer {
+                            store.submitComposer()
+                        } else {
+                            store.enqueueComposerPrompt()
+                        }
                     } label: {
                         ZStack {
                             Circle()
-                                .fill(palette.primary)
+                                .fill(store.composerBusySubmitMode == .steer ? palette.warning : palette.primary)
                                 .frame(width: 32, height: 32)
-                            Image(systemName: "arrow.up.to.line")
+                            Image(systemName: store.composerBusySubmitMode == .steer ? "arrow.up.right" : "arrow.up.to.line")
                                 .font(OrbitTypography.iconSmall)
                                 .foregroundStyle(palette.onPrimary)
                         }
@@ -764,7 +942,7 @@ struct OmniComposerView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel(OrbitL10n.tr("Queue Next Prompt"))
+                    .accessibilityLabel(store.composerBusySubmitMode == .steer ? OrbitL10n.tr("Steer Now") : OrbitL10n.tr("Queue Next Prompt"))
                 } else if store.canSubmitComposer {
                     Button {
                         store.submitComposer()
@@ -795,7 +973,7 @@ struct OmniComposerView: View {
                                     store.composerText = updated
                                 },
                                 onPermissionDenied: { msg in
-                                    store.showToast(msg)
+                                    store.showToast(msg, isWarning: true)
                                 }
                             )
                         }

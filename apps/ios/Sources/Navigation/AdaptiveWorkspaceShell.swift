@@ -31,6 +31,9 @@ struct AdaptiveWorkspaceShell: View {
 
                 toastAndErrorOverlay
             }
+            .overlay(alignment: .bottom) {
+                bottomArchiveUndoOverlay
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onAppear {
                 store.updateContainerWidth(width)
@@ -147,6 +150,7 @@ struct AdaptiveWorkspaceShell: View {
             WorkspaceStagePane(
                 store: store,
                 showSidebarButton: true,
+                isSidebarVisible: !store.isPadSidebarCollapsed,
                 canShowInlineInspector: canShowInlineInspector,
                 onToggleSidebar: {
                     store.hapticLight()
@@ -194,6 +198,7 @@ struct AdaptiveWorkspaceShell: View {
             WorkspaceStagePane(
                 store: store,
                 showSidebarButton: true,
+                isSidebarVisible: false,
                 canShowInlineInspector: false,
                 onToggleSidebar: {
                     store.hapticLight()
@@ -324,6 +329,8 @@ struct AdaptiveWorkspaceShell: View {
                 isGitRepo: isGitRepo,
                 moveAgentId: moveAgentId
             )
+        case let .worktreeHandoff(workspaceId):
+            WorktreeHandoffSheet(store: store, workspaceId: workspaceId)
         case .globalSearch:
             GlobalSearchSheet(store: store)
         case .personalRouter:
@@ -333,98 +340,117 @@ struct AdaptiveWorkspaceShell: View {
         }
     }
 
-    // MARK: - Subtle Toast & Error Banner
+    // MARK: - Subtle Toast & Error Banner (Top) + Archive Undo (Bottom Non-Blocking)
+
+    @ViewBuilder
+    private var bottomArchiveUndoOverlay: some View {
+        if let undo = store.pendingArchiveUndo {
+            HStack(spacing: OrbitSpacing.sm) {
+                Image(systemName: "archivebox")
+                    .font(OrbitTypography.iconSmall)
+                    .foregroundStyle(palette.fgSecondary)
+                Text("Archived \"\(undo.title)\"")
+                    .font(OrbitTypography.subhead(.medium))
+                    .foregroundStyle(palette.fgPrimary)
+                    .lineLimit(1)
+                Button("Undo") {
+                    store.undoPendingArchive()
+                }
+                .font(OrbitTypography.subhead(.semibold))
+                .foregroundStyle(palette.primary)
+                .frame(minWidth: OrbitSpacing.hitTarget, minHeight: 36)
+                .contentShape(Rectangle())
+                Button {
+                    store.dismissArchiveUndo()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(OrbitTypography.iconMicro)
+                        .foregroundStyle(palette.fgMuted)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, OrbitSpacing.md)
+            .padding(.vertical, OrbitSpacing.xs)
+            .orbitGlassSurface(
+                in: Capsule(),
+                fallbackFill: palette.elevated,
+                fallbackBorder: palette.hairline,
+                fallbackShadowOpacity: 0.14
+            )
+            .padding(.bottom, 76)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
 
     @ViewBuilder
     private var toastAndErrorOverlay: some View {
-        VStack(spacing: OrbitSpacing.sm) {
-            if let undo = store.pendingArchiveUndo {
-                HStack(spacing: OrbitSpacing.sm) {
-                    Image(systemName: "archivebox")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(palette.fgSecondary)
-                    Text("Archived \"\(undo.title)\"")
-                        .font(OrbitTypography.subhead(.medium))
-                        .foregroundStyle(palette.fgPrimary)
-                        .lineLimit(1)
-                    Button("Undo") {
-                        store.undoPendingArchive()
+        if !store.isDrawerOpen {
+            VStack(spacing: OrbitSpacing.sm) {
+                if let message = store.toastMessage {
+                    HStack(spacing: OrbitSpacing.sm) {
+                        Image(systemName: store.toastIsWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                            .font(OrbitTypography.iconSmall)
+                            .foregroundStyle(store.toastIsWarning ? palette.warning : palette.direct)
+                        Text(message)
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.fgPrimary)
                     }
-                    .font(OrbitTypography.subhead(.semibold))
-                    .foregroundStyle(palette.primary)
-                    Button {
-                        store.dismissArchiveUndo()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(OrbitTypography.iconMicro)
-                            .foregroundStyle(palette.fgMuted)
-                    }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .padding(.vertical, OrbitSpacing.sm)
+                    .orbitGlassSurface(
+                        in: Capsule(),
+                        fallbackFill: palette.elevated,
+                        fallbackBorder: palette.hairline,
+                        fallbackShadowOpacity: 0.12
+                    )
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                .padding(.horizontal, OrbitSpacing.md)
-                .padding(.vertical, OrbitSpacing.sm)
-                .orbitGlassSurface(
-                    in: Capsule(),
-                    fallbackFill: palette.elevated,
-                    fallbackBorder: palette.hairline,
-                    fallbackShadowOpacity: 0.14
-                )
-                .transition(.move(edge: .top).combined(with: .opacity))
-            } else if let message = store.toastMessage {
-                HStack(spacing: OrbitSpacing.sm) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(palette.direct)
-                    Text(message)
-                        .font(OrbitTypography.subhead(.medium))
-                        .foregroundStyle(palette.fgPrimary)
-                }
-                .padding(.horizontal, OrbitSpacing.md)
-                .padding(.vertical, OrbitSpacing.sm)
-                .orbitGlassSurface(
-                    in: Capsule(),
-                    fallbackFill: palette.elevated,
-                    fallbackBorder: palette.hairline,
-                    fallbackShadowOpacity: 0.12
-                )
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
 
-            if let err = store.lastError {
-                HStack(spacing: OrbitSpacing.sm) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(palette.danger)
-                    Text(err)
-                        .font(OrbitTypography.meta(.medium))
-                        .foregroundStyle(palette.fgPrimary)
-                        .lineLimit(2)
-                    Button {
-                        store.clearError()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(OrbitTypography.iconMicro)
-                            .foregroundStyle(palette.fgMuted)
-                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
-                            .contentShape(Rectangle())
+                if let err = store.lastError {
+                    HStack(spacing: OrbitSpacing.sm) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(OrbitTypography.iconSmall)
+                            .foregroundStyle(palette.danger)
+                        Text(err)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.fgPrimary)
+                            .lineLimit(2)
+                        if store.core == nil {
+                            Button(OrbitL10n.tr("Reset")) {
+                                store.resetLocalVaultAndReinitialize()
+                            }
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.primary)
+                        }
+                        Button {
+                            store.clearError()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(OrbitTypography.iconMicro)
+                                .foregroundStyle(palette.fgMuted)
+                                .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss Error")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss Error")
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .padding(.vertical, OrbitSpacing.sm)
+                    .orbitGlassSurface(
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+                        tint: palette.danger.opacity(0.12),
+                        fallbackFill: palette.elevated,
+                        fallbackBorder: palette.danger.opacity(0.35),
+                        fallbackShadowOpacity: 0.10
+                    )
+                    .padding(.horizontal, OrbitSpacing.lg)
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                .padding(.horizontal, OrbitSpacing.md)
-                .padding(.vertical, OrbitSpacing.sm)
-                .orbitGlassSurface(
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous),
-                    tint: palette.danger.opacity(0.12),
-                    fallbackFill: palette.elevated,
-                    fallbackBorder: palette.danger.opacity(0.35),
-                    fallbackShadowOpacity: 0.10
-                )
-                .padding(.horizontal, OrbitSpacing.lg)
-                .transition(.move(edge: .top).combined(with: .opacity))
             }
+            .padding(.top, 64)
         }
-        .padding(.top, 64)
     }
 }
 
@@ -589,10 +615,18 @@ private func workspaceHeaderMoreMenuItems(
     Section {
         if store.activeAgent != nil {
             Button {
+                store.hapticLight()
+                store.isStageFindBarVisible.toggle()
+            } label: {
+                Text(OrbitL10n.tr("Find in Chat"))
+                Image(systemName: "magnifyingglass")
+            }
+
+            Button {
                 store.openSessionOverview()
             } label: {
                 let bgCount = store.activeRunningBackgroundTaskCount
-                Text("Session Overview")
+                Text(OrbitL10n.tr("Session Overview"))
                 if bgCount > 0 {
                     Text("\(bgCount) running")
                 }
@@ -733,6 +767,7 @@ private func workspaceHeaderMoreMenuItems(
 private struct WorkspaceStagePane: View {
     @ObservedObject var store: OrbitIosStore
     let showSidebarButton: Bool
+    var isSidebarVisible: Bool = false
     let canShowInlineInspector: Bool
     let onToggleSidebar: () -> Void
 
@@ -789,12 +824,14 @@ private struct WorkspaceStagePane: View {
         #if compiler(>=6.4)
         if #available(iOS 27.0, *) {
             if store.hosts.isEmpty {
-                ToolbarItem(placement: .topBarPinnedTrailing) {
-                    Button {
-                        store.hapticLight()
-                        store.activeSheet = .settings
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
+                if !isSidebarVisible {
+                    ToolbarItem(placement: .topBarPinnedTrailing) {
+                        Button {
+                            store.hapticLight()
+                            store.activeSheet = .settings
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
                     }
                 }
             } else {
@@ -829,12 +866,14 @@ private struct WorkspaceStagePane: View {
     @ToolbarContentBuilder
     private func trailingToolbarContentIOS26(ctx: WorkspaceHeaderContext) -> some ToolbarContent {
         if store.hosts.isEmpty {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    store.hapticLight()
-                    store.activeSheet = .settings
-                } label: {
-                    Label("Settings", systemImage: "gearshape")
+            if !isSidebarVisible {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        store.hapticLight()
+                        store.activeSheet = .settings
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
                 }
             }
         } else if let agent = store.activeAgent {
@@ -1106,33 +1145,55 @@ private struct PadMultiTabInspectorView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 4) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 4) {
-                        ForEach(availableTabs) { tab in
-                            let selected = store.padInspectorTab == tab
-                            Button {
-                                store.hapticLight()
-                                store.padInspectorTab = tab
-                                if tab == .diff {
-                                    store.refreshGitReview()
-                                } else if tab == .files && store.workspaceFilesList.isEmpty {
-                                    store.refreshWorkspaceFiles()
-                                } else if tab == .board, let wsId = store.activeWorkspace?.workspaceId {
-                                    store.fetchWorkspaceBoardAndEvents(wsId)
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(availableTabs) { tab in
+                                let selected = store.padInspectorTab == tab
+                                Button {
+                                    store.hapticLight()
+                                    store.padInspectorTab = tab
+                                    if tab == .diff {
+                                        store.refreshGitReview()
+                                    } else if tab == .files && store.workspaceFilesList.isEmpty {
+                                        store.refreshWorkspaceFiles()
+                                    } else if tab == .board, let wsId = store.activeWorkspace?.workspaceId {
+                                        store.fetchWorkspaceBoardAndEvents(wsId)
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: tab.systemImage)
+                                            .font(.system(size: 11, weight: .medium))
+                                        Text(OrbitL10n.tr(tab.label))
+                                            .font(OrbitTypography.meta(selected ? .semibold : .medium))
+                                            .lineLimit(1)
+                                            .fixedSize(horizontal: true, vertical: false)
+                                    }
+                                    .foregroundStyle(selected ? palette.primary : palette.fgMuted)
+                                    .padding(.horizontal, 10)
+                                    .frame(minHeight: OrbitSpacing.hitTarget)
+                                    .background(
+                                        selected ? palette.primary.opacity(0.14) : Color.clear,
+                                        in: Capsule()
+                                    )
+                                    .overlay(
+                                        Capsule().strokeBorder(selected ? palette.primary.opacity(0.35) : Color.clear, lineWidth: 0.75)
+                                    )
+                                    .contentShape(Rectangle())
                                 }
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: tab.systemImage)
-                                        .font(.system(size: 11, weight: .medium))
-                                    Text(tab.label)
-                                        .font(OrbitTypography.meta(selected ? .semibold : .medium))
-                                }
-                                .foregroundStyle(selected ? palette.fgPrimary : palette.fgMuted)
-                                .padding(.horizontal, 9)
-                                .frame(height: 28)
-                                .background(selected ? palette.activeRowFill : Color.clear, in: Capsule())
+                                .buttonStyle(.plain)
+                                .id(tab)
                             }
-                            .buttonStyle(.plain)
+                        }
+                    }
+                    .onAppear {
+                        DispatchQueue.main.async {
+                            proxy.scrollTo(store.padInspectorTab, anchor: .center)
+                        }
+                    }
+                    .onChange(of: store.padInspectorTab) { nextTab in
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo(nextTab, anchor: .center)
                         }
                     }
                 }
@@ -1144,15 +1205,16 @@ private struct PadMultiTabInspectorView: View {
                     }
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 11.5, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(palette.fgMuted)
-                        .frame(width: 28, height: 28)
+                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close Inspector")
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background(palette.drawer)
 
             OrbitHairline()
@@ -1243,6 +1305,12 @@ private struct OrbitRenameAlertModifier: ViewModifier {
             Button("Save", action: onCommit)
             Button("Cancel", role: .cancel) {
                 store.renameTarget = nil
+            }
+        } message: {
+            if case .agent = store.renameTarget {
+                Text("Title appears in the sidebar; optional @handle labels peer tabs.")
+            } else {
+                Text("Enter a new display name.")
             }
         }
     }

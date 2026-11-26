@@ -39,7 +39,7 @@ extension OrbitIosStore {
                 self.refreshGitReview()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -60,7 +60,7 @@ extension OrbitIosStore {
                 self.refreshGitReview()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -79,7 +79,7 @@ extension OrbitIosStore {
             return generated.message
         } catch {
             gitWriteBusy = false
-            gitWriteError = error.localizedDescription
+            gitWriteError = OrbitErrorFormatter.humanize(error)
             return nil
         }
     }
@@ -105,7 +105,7 @@ extension OrbitIosStore {
                 onSuccess?()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -134,7 +134,7 @@ extension OrbitIosStore {
                 self.refreshGitWriteMetadata()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -161,7 +161,7 @@ extension OrbitIosStore {
                 self.refreshGitWriteMetadata()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -182,7 +182,7 @@ extension OrbitIosStore {
                 self.refreshGitWriteMetadata()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -221,7 +221,7 @@ extension OrbitIosStore {
                 onCreated?(res)
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -255,7 +255,7 @@ extension OrbitIosStore {
                 self.refreshGitWriteMetadata()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -291,7 +291,7 @@ extension OrbitIosStore {
                 self.refreshGitWriteMetadata()
             } catch {
                 self?.gitWriteBusy = false
-                self?.gitWriteError = error.localizedDescription
+                self?.gitWriteError = OrbitErrorFormatter.humanize(error)
             }
         }
     }

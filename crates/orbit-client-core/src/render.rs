@@ -1851,6 +1851,7 @@ pub struct TerminalScreenView {
 
 pub struct TerminalGridEmulator {
     parser: vt100::Parser,
+    scrollback_lines: Vec<String>,
 }
 
 impl TerminalGridEmulator {
@@ -1859,11 +1860,13 @@ impl TerminalGridEmulator {
         let c = std::num::NonZeroU16::new(cols.max(20)).unwrap_or(std::num::NonZeroU16::MIN);
         Self {
             parser: vt100::Parser::new(r, c, 2000),
+            scrollback_lines: Vec::new(),
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+        self.refresh_scrollback_cache();
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -1871,12 +1874,44 @@ impl TerminalGridEmulator {
         let c = std::num::NonZeroU16::new(cols.max(20)).unwrap_or(std::num::NonZeroU16::MIN);
         if self.parser.screen().size() != (r, c) {
             self.parser.screen_mut().set_size(r, c);
+            self.refresh_scrollback_cache();
         }
     }
 
     pub fn clear(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, 2000);
+        self.scrollback_lines.clear();
+    }
+
+    pub fn scrollback_lines(&self) -> &[String] {
+        &self.scrollback_lines
+    }
+
+    fn refresh_scrollback_cache(&mut self) {
+        let screen = self.parser.screen_mut();
+        let (rows_nz, cols_nz) = screen.size();
+        let rows = usize::from(rows_nz.get());
+        let cols = cols_nz.get();
+        screen.set_scrollback(usize::MAX);
+        let depth = screen.scrollback();
+        if depth == 0 {
+            screen.set_scrollback(0);
+            self.scrollback_lines.clear();
+            return;
+        }
+        let mut lines = Vec::with_capacity(depth);
+        let mut remaining = depth;
+        while remaining > 0 {
+            screen.set_scrollback(remaining);
+            let take = remaining.min(rows);
+            for line in screen.rows(0, cols).take(take) {
+                lines.push(line.trim_end_matches(' ').to_string());
+            }
+            remaining -= take;
+        }
+        screen.set_scrollback(0);
+        self.scrollback_lines = lines;
     }
 
     /// Render a clean, self-contained ANSI reset + full screen state resync sequence from the
@@ -2500,5 +2535,35 @@ diff --git a/src/lib.rs b/src/lib.rs
         let legacy_json = r#"{"kind":"list_item","ordered":false,"index":0,"checked":null,"spans":[{"text":"old","bold":false,"italic":false,"strikethrough":false,"inline_code":false,"link_url":null}]}"#;
         let parsed: RichBlockView = serde_json::from_str(legacy_json).expect("legacy json");
         assert!(matches!(parsed, RichBlockView::ListItem { depth: 0, .. }));
+    }
+
+    #[test]
+    fn terminal_emulator_tracks_scrolled_off_scrollback_without_duplication() {
+        let mut emu = TerminalGridEmulator::new(80, 24);
+        let mut payload = String::new();
+        for n in 1..=120 {
+            payload.push_str(&format!("{n}\r\n"));
+        }
+        emu.process(payload.as_bytes());
+        let scrollback = emu.scrollback_lines();
+        assert!(
+            scrollback.len() >= 90,
+            "expected >= 90 scrollback lines for 120 lines on 24-row viewport, got {}",
+            scrollback.len()
+        );
+        assert_eq!(scrollback.first().map(String::as_str), Some("1"));
+        assert!(scrollback.iter().any(|l| l == "50"));
+        assert!(scrollback.iter().any(|l| l == "90"));
+
+        let snap = emu.snapshot();
+        let visible_lines: Vec<String> = snap
+            .rows_data
+            .iter()
+            .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        assert!(visible_lines.iter().any(|l| l.trim() == "120"));
+
+        emu.clear();
+        assert!(emu.scrollback_lines().is_empty());
     }
 }

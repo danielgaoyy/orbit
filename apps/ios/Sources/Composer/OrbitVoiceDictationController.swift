@@ -55,6 +55,14 @@ public final class OrbitVoiceDictationController: ObservableObject {
         baseDraftBeforeRecording = currentDraft
         self.onTranscriptChanged = onTranscriptChanged
 
+        let recognizer = SFSpeechRecognizer(locale: OrbitL10n.effectiveLocale) ?? SFSpeechRecognizer()
+        guard let recognizer, recognizer.isAvailable else {
+            let msg = OrbitL10n.tr("Speech recognition is unavailable on this device.")
+            self.errorMessage = msg
+            onPermissionDenied(msg)
+            return
+        }
+
         SFSpeechRecognizer.requestAuthorization { [weak self] authStatus in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -133,7 +141,7 @@ public final class OrbitVoiceDictationController: ObservableObject {
             let engine = AVAudioEngine()
             let inputNode = engine.inputNode
             let recordingFormat = inputNode.outputFormat(forBus: 0)
-            guard recordingFormat.sampleRate > 0 else {
+            guard recordingFormat.sampleRate > 0 && recordingFormat.channelCount > 0 else {
                 let msg = OrbitL10n.tr("Voice dictation is unavailable on this device.")
                 errorMessage = msg
                 onError(msg)
@@ -188,8 +196,14 @@ public final class OrbitVoiceDictationController: ObservableObject {
                         if result.isFinal {
                             self.stopRecording(discard: false)
                         }
-                    } else if error != nil {
+                    } else if let error {
+                        let hadTranscript = !self.partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         self.stopRecording(discard: false)
+                        if !hadTranscript {
+                            let msg = OrbitErrorFormatter.humanize(error)
+                            self.errorMessage = msg
+                            onError(msg)
+                        }
                     }
                 }
             }

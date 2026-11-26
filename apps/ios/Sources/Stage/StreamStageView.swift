@@ -2,6 +2,7 @@ import SwiftUI
 
 struct StreamStageView: View {
     @ObservedObject var store: OrbitIosStore
+    @ObservedObject private var stageState: OrbitStageStreamState
 
     @Environment(\.orbitPalette) private var palette
     @State private var isBottomAnchorMounted: Bool = true
@@ -15,11 +16,18 @@ struct StreamStageView: View {
     @State private var isHostPickerPresented: Bool = false
     @State private var isEnvironmentPickerPresented: Bool = false
     @State private var projectSearchQuery: String = ""
+    @State private var activeFindMatchIdx: Int = 0
+    @State private var pendingScrollTargetTurnKey: String? = nil
+
+    init(store: OrbitIosStore) {
+        self.store = store
+        self._stageState = ObservedObject(wrappedValue: store.stageState)
+    }
 
     private let bottomAnchorId = "bottom_anchor"
 
     private var turns: [FfiStageTurn] {
-        store.agentStage?.turns ?? []
+        stageState.agentStage?.turns ?? []
     }
 
     private var isLatestTurnActive: Bool {
@@ -30,14 +38,29 @@ struct StreamStageView: View {
     }
 
     private var hasLiveBackgroundTasks: Bool {
-        !(store.agentStage?.insights.backgroundTasks.isEmpty ?? true)
+        !(stageState.agentStage?.insights.backgroundTasks.isEmpty ?? true)
     }
 
     private var pendingDecisionCount: Int {
-        (store.agentStage?.pendingPermissions.count ?? 0)
-            + (store.agentStage?.pendingQuestions.count ?? 0)
+        (stageState.agentStage?.pendingPermissions.count ?? 0)
+            + (stageState.agentStage?.pendingQuestions.count ?? 0)
             + store.demoPendingPermissions.count
             + store.demoPendingQuestions.count
+    }
+
+    private var findMatchingTurnKeys: [String] {
+        let q = store.stageFindQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return [] }
+        return turns.compactMap { turn in
+            var haystack = ""
+            if case let .userPrompt(_, _, text, _, _, _)? = turn.userPrompt {
+                haystack.append(text)
+            }
+            if case let .assistantMessage(_, _, text, _, _, _)? = (turn.terminalReply ?? turn.lastAssistantReply) {
+                haystack.append("\n" + text)
+            }
+            return haystack.lowercased().contains(q) ? turn.key : nil
+        }
     }
 
     private var showScrollToBottomPill: Bool {
@@ -59,6 +82,10 @@ struct StreamStageView: View {
                 ConnectionStatusBannerView(store: store)
                 SubagentLineageStripView(store: store)
                 WorkspacePeerStripView(store: store)
+            }
+
+            if store.isStageFindBarVisible {
+                findInChatBar
             }
 
             Group {
@@ -89,17 +116,89 @@ struct StreamStageView: View {
                 }
             }
         }
+        .onChange(of: store.jumpToTurnKey) { turnKey in
+            guard let turnKey else { return }
+            store.jumpToTurnKey = nil
+            pendingScrollTargetTurnKey = turnKey
+        }
+    }
+
+    private var findInChatBar: some View {
+        let matches = findMatchingTurnKeys
+        return HStack(spacing: OrbitSpacing.xs) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(OrbitTypography.iconMicro)
+                    .foregroundStyle(palette.fgMuted)
+                TextField(OrbitL10n.tr("Find in conversation…"), text: $store.stageFindQuery)
+                    .font(OrbitTypography.subhead(.regular))
+                    .foregroundStyle(palette.fgPrimary)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                if !store.stageFindQuery.isEmpty {
+                    Text(matches.isEmpty ? "0" : "\(min(activeFindMatchIdx + 1, matches.count))/\(matches.count)")
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgMuted)
+                        .fixedSize()
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 36)
+            .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+            Button {
+                guard !matches.isEmpty else { return }
+                activeFindMatchIdx = (activeFindMatchIdx - 1 + matches.count) % matches.count
+                pendingScrollTargetTurnKey = matches[activeFindMatchIdx]
+            } label: {
+                Image(systemName: "chevron.up")
+                    .font(OrbitTypography.iconMicro)
+                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(matches.isEmpty)
+
+            Button {
+                guard !matches.isEmpty else { return }
+                activeFindMatchIdx = (activeFindMatchIdx + 1) % matches.count
+                pendingScrollTargetTurnKey = matches[activeFindMatchIdx]
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(OrbitTypography.iconMicro)
+                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(matches.isEmpty)
+
+            Button {
+                store.isStageFindBarVisible = false
+                store.stageFindQuery = ""
+            } label: {
+                Image(systemName: "xmark")
+                    .font(OrbitTypography.iconMicro)
+                    .foregroundStyle(palette.fgMuted)
+                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, OrbitSpacing.lg)
+        .padding(.vertical, 6)
+        .background(palette.elevated)
+        .overlay(alignment: .bottom) { OrbitHairline() }
     }
 
     private var activeEmptyOrHydratingState: some View {
         VStack(spacing: OrbitSpacing.md) {
             Spacer(minLength: 24)
-            if store.isStageHydrating {
+            if stageState.isStageHydrating {
                 OrbitSpinnerRingView(color: palette.primary, size: 22)
                 Text("Loading conversation…")
                     .font(OrbitTypography.subhead(.medium))
                     .foregroundStyle(palette.fgSecondary)
-            } else if let err = store.activeStageLoadError, !err.isEmpty {
+            } else if let err = stageState.activeStageLoadError, !err.isEmpty {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 24, weight: .medium))
                     .foregroundStyle(palette.warning)
@@ -176,7 +275,7 @@ struct StreamStageView: View {
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 22) {
-                        if store.stageHasOlderTurns {
+                        if stageState.stageHasOlderTurns {
                             loadOlderTurnsBar
                         }
 
@@ -200,6 +299,7 @@ struct StreamStageView: View {
                                 actions: turnActions
                             )
                             .equatable()
+                            .id(turn.key)
                         }
 
                         Color.clear
@@ -218,11 +318,12 @@ struct StreamStageView: View {
                     }
                     .padding(.horizontal, OrbitSpacing.lg)
                     .padding(.top, OrbitSpacing.md)
-                    .padding(.bottom, OrbitSpacing.lg)
+                    .padding(.bottom, OrbitSpacing.xl)
+                    .frame(minHeight: outerGeo.size.height, alignment: .bottom)
                 }
+                .frame(width: outerGeo.size.width, height: outerGeo.size.height)
                 .orbitSoftScrollEdgeEffect()
                 .scrollDismissesKeyboard(.interactively)
-                .modifier(OrbitDefaultBottomScrollAnchorModifier())
                 .refreshable {
                     await store.pullToRefreshStage()
                 }
@@ -248,8 +349,8 @@ struct StreamStageView: View {
                     let previousHeight = stageViewportHeight
                     stageViewportHeight = newHeight
                     guard !store.keepStageScrolledToTop, !turns.isEmpty else { return }
-                    let shrank = previousHeight > 0 && newHeight < previousHeight - 2
-                    if previousHeight == 0 || (shrank && (wasPinnedToBottom || isBottomAnchorMounted)) {
+                    let changedSignificantly = previousHeight == 0 || abs(newHeight - previousHeight) > 2
+                    if changedSignificantly && (wasPinnedToBottom || isBottomAnchorMounted) {
                         reanchorToBottomAfterLayout(proxy: proxy)
                     }
                 }
@@ -257,6 +358,14 @@ struct StreamStageView: View {
                     guard newCount > 0, !store.keepStageScrolledToTop, !turns.isEmpty else { return }
                     if wasPinnedToBottom || isBottomAnchorMounted {
                         reanchorToBottomAfterLayout(proxy: proxy)
+                    }
+                }
+                .onChange(of: pendingScrollTargetTurnKey) { targetKey in
+                    guard let key = targetKey else { return }
+                    pendingScrollTargetTurnKey = nil
+                    wasPinnedToBottom = false
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(key, anchor: .center)
                     }
                 }
                 .onChange(of: turns.first?.key) { _ in
@@ -285,7 +394,7 @@ struct StreamStageView: View {
                         }
                     }
                 }
-                .onChange(of: store.agentStage?.latestSeq) { _ in
+                .onChange(of: stageState.agentStage?.latestSeq) { _ in
                     guard pendingPrependAnchorKey == nil,
                           wasPinnedToBottom,
                           !showScrollToBottomPill,
@@ -363,23 +472,12 @@ struct StreamStageView: View {
     private func reanchorToBottomAfterLayout(proxy: ScrollViewProxy) {
         isReanchoringForViewportShrink = true
         wasPinnedToBottom = true
-        withAnimation(.easeOut(duration: 0.18)) {
-            proxy.scrollTo(bottomAnchorId, anchor: .bottom)
-        }
-        DispatchQueue.main.async {
-            guard !store.keepStageScrolledToTop else {
-                isReanchoringForViewportShrink = false
-                return
+        proxy.scrollTo(bottomAnchorId, anchor: .bottom)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            if !store.keepStageScrolledToTop {
+                proxy.scrollTo(bottomAnchorId, anchor: .bottom)
             }
-            proxy.scrollTo(bottomAnchorId, anchor: .bottom)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                if !store.keepStageScrolledToTop {
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        proxy.scrollTo(bottomAnchorId, anchor: .bottom)
-                    }
-                }
-                isReanchoringForViewportShrink = false
-            }
+            isReanchoringForViewportShrink = false
         }
     }
 
@@ -397,11 +495,11 @@ struct StreamStageView: View {
                     .background(palette.primary.opacity(0.1))
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                Text("Pair Your First Host")
+                Text(OrbitL10n.tr("Pair Your First Host"))
                     .font(OrbitTypography.title)
                     .foregroundStyle(palette.fgPrimary)
 
-                Text("Run `orbit pair` on your Mac or Linux workstation to stream agents over LAN or E2EE Relay.")
+                Text(OrbitL10n.tr("Run `orbit pair` on your Mac or Linux workstation to stream agents over LAN or E2EE Relay."))
                     .orbitSubheadStyle()
                     .foregroundStyle(palette.fgSecondary)
                     .multilineTextAlignment(.center)
@@ -416,7 +514,7 @@ struct StreamStageView: View {
                         HStack(spacing: OrbitSpacing.sm) {
                             Image(systemName: "bolt.horizontal.circle.fill")
                                 .font(OrbitTypography.icon)
-                            Text("Connect Local Simulator Host")
+                            Text(OrbitL10n.tr("Connect Local Simulator Host"))
                                 .font(OrbitTypography.subhead(.semibold))
                         }
                         .foregroundStyle(palette.onPrimary)
@@ -552,14 +650,8 @@ struct StreamStageView: View {
                         .minimumScaleFactor(0.84)
 
                     // Compact Contextual Readiness Pills: [Project ▾] [Workspace ▾] [Host ▾] [Local / Worktree ▾]
-                    ViewThatFits(in: .horizontal) {
-                        launchpadReadinessPillsRow
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            launchpadReadinessPillsRow
-                                .padding(.horizontal, 4)
-                        }
-                    }
-                    .padding(.top, 14)
+                    launchpadReadinessPillsRow
+                        .padding(.top, 14)
 
                     // Quiet single-line Git branch or host connection caption
                     if let host = store.activeHost, !isHostOnline(host) {
@@ -610,7 +702,7 @@ struct StreamStageView: View {
     }
 
     private var launchpadReadinessPillsRow: some View {
-        HStack(spacing: OrbitSpacing.sm) {
+        OrbitFlowLayout(spacing: OrbitSpacing.sm, rowSpacing: OrbitSpacing.xs + 2, alignment: .center) {
             Button {
                 store.hapticLight()
                 projectSearchQuery = ""
@@ -854,7 +946,9 @@ struct StreamStageView: View {
     }
 
     private var projectPickerPopover: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let count = max(1, filteredLaunchpadProjects.count)
+        let listHeight = min(CGFloat(count) * 44 + 8, 220)
+        return VStack(alignment: .leading, spacing: 6) {
             OrbitPopoverSectionHeader(title: "Projects")
                 .padding(.horizontal, 10)
 
@@ -873,14 +967,10 @@ struct StreamStageView: View {
             .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .padding(.horizontal, 10)
 
-            ViewThatFits(in: .vertical) {
+            ScrollView(.vertical, showsIndicators: true) {
                 projectRowsStack
-                ScrollView(.vertical, showsIndicators: true) {
-                    projectRowsStack
-                }
-                .frame(height: 220)
             }
-            .frame(maxHeight: 220)
+            .frame(height: listHeight)
 
             OrbitHairline()
                 .padding(.horizontal, 20)
@@ -897,6 +987,7 @@ struct StreamStageView: View {
         }
         .padding(.vertical, 10)
         .frame(width: 268)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var projectRowsStack: some View {
@@ -1053,15 +1144,5 @@ struct StreamStageView: View {
         .background(palette.subtleFill)
         .clipShape(Capsule())
         .contentShape(Capsule())
-    }
-}
-
-private struct OrbitDefaultBottomScrollAnchorModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(iOS 17.0, *) {
-            content.defaultScrollAnchor(.bottom)
-        } else {
-            content
-        }
     }
 }

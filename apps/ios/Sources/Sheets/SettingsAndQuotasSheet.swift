@@ -46,17 +46,20 @@ struct SettingsAndQuotasSheet: View {
                     if store.activeHost != nil {
                         quotasSection
                     }
+                    if store.core == nil {
+                        vaultRecoverySection
+                    }
                     aboutSection
                 }
                 .padding(.horizontal, OrbitSpacing.lg)
                 .padding(.vertical, OrbitSpacing.lg)
             }
             .background(groupedBackground.ignoresSafeArea())
-            .navigationTitle("Settings")
+            .navigationTitle(OrbitL10n.tr("Settings"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
+                    Button(OrbitL10n.tr("Done")) {
                         dismiss()
                     }
                     .font(OrbitTypography.subhead(.semibold))
@@ -77,11 +80,14 @@ struct SettingsAndQuotasSheet: View {
             }
         }
         .onAppear {
-            store.refreshCloudSyncStatus()
-            if store.activeHost != nil {
-                store.refreshQuotas()
-                store.refreshPushDevices()
-                store.refreshRouterAndMesh()
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                store.refreshCloudSyncStatus()
+                if store.activeHost != nil {
+                    store.refreshQuotas()
+                    store.refreshPushDevices()
+                    store.refreshRouterAndMesh()
+                }
             }
         }
         .onChange(of: store.cloudSyncStatus?.state) { nextState in
@@ -93,11 +99,41 @@ struct SettingsAndQuotasSheet: View {
         }
     }
 
+    private var vaultRecoverySection: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text(OrbitL10n.tr("Local Store Recovery"))
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                if let err = store.lastError, !err.isEmpty {
+                    Text(err)
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.danger)
+                }
+                Button(role: .destructive) {
+                    store.resetLocalVaultAndReinitialize()
+                } label: {
+                    Text(OrbitL10n.tr("Reset Local Store"))
+                        .font(OrbitTypography.subhead(.semibold))
+                        .foregroundStyle(palette.onPrimary)
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .background(palette.danger, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(OrbitSpacing.md)
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
     // MARK: - 1. Appearance (Strictly System / Light / Dark)
 
     private var appearanceSection: some View {
         VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
-            Text("Appearance")
+            Text(OrbitL10n.tr("Appearance"))
                 .font(OrbitTypography.meta(.medium))
                 .foregroundStyle(palette.fgMuted)
                 .padding(.horizontal, OrbitSpacing.xs)
@@ -114,7 +150,7 @@ struct SettingsAndQuotasSheet: View {
                         HStack(spacing: 5) {
                             Image(systemName: mode.systemImage)
                                 .font(.system(size: 12.5, weight: .medium))
-                            Text(mode.label)
+                            Text(OrbitL10n.tr(mode.label))
                                 .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
                         }
                         .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
@@ -147,21 +183,22 @@ struct SettingsAndQuotasSheet: View {
     private var generalPreferencesSection: some View {
         let defaultPerm = OrbitIosStore.sessionModeFromRaw(store.defaultPermissionModeRaw)
         return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
-            Text("General")
+            Text(OrbitL10n.tr("General"))
                 .font(OrbitTypography.meta(.medium))
                 .foregroundStyle(palette.fgMuted)
                 .padding(.horizontal, OrbitSpacing.xs)
 
             VStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
-                    Text("Default Access Permissions")
+                    Text(OrbitL10n.tr("Default Access Permissions"))
                         .font(OrbitTypography.meta(.medium))
                         .foregroundStyle(palette.fgSecondary)
 
-                    HStack(spacing: 3) {
-                        permissionPrefChip(.default, title: "Always Ask", selected: defaultPerm == .default)
-                        permissionPrefChip(.acceptEdits, title: "Accept Edits", selected: defaultPerm == .acceptEdits)
-                        permissionPrefChip(.fullAccess, title: "Full Access", selected: defaultPerm == .fullAccess)
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 4), GridItem(.flexible(), spacing: 4)], spacing: 4) {
+                        permissionPrefChip(.default, title: OrbitL10n.tr("Always Ask"), selected: defaultPerm == .default)
+                        permissionPrefChip(.acceptEdits, title: OrbitL10n.tr("Accept Edits"), selected: defaultPerm == .acceptEdits)
+                        permissionPrefChip(.plan, title: OrbitL10n.tr("Plan"), selected: defaultPerm == .plan)
+                        permissionPrefChip(.fullAccess, title: OrbitL10n.tr("Full Access"), selected: defaultPerm == .fullAccess)
                     }
                     .padding(3)
                     .background(palette.subtleFill)
@@ -175,10 +212,39 @@ struct SettingsAndQuotasSheet: View {
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Default Execution Mode")
+                        Text(OrbitL10n.tr("Language"))
                             .font(OrbitTypography.subhead(.regular))
                             .foregroundStyle(palette.fgPrimary)
-                        Text(store.draftUseWorktree ? "Isolated Git Worktree" : "Direct Local Folder")
+                        Text(languageDisplayLabel(store.preferredLanguageCode))
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    Spacer()
+                    Picker(OrbitL10n.tr("Language"), selection: Binding(
+                        get: { store.preferredLanguageCode },
+                        set: { store.setPreferredLanguage($0) }
+                    )) {
+                        Text(OrbitL10n.tr("System")).tag("")
+                        Text("English").tag("en")
+                        Text("简体中文").tag("zh-Hans")
+                        Text("日本語").tag("ja")
+                    }
+                    .pickerStyle(.menu)
+                    .tint(palette.fgPrimary)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 8)
+                .frame(minHeight: OrbitSpacing.hitTarget)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(OrbitL10n.tr("Default Execution Mode"))
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text(store.draftUseWorktree ? OrbitL10n.tr("Isolated Git Worktree") : OrbitL10n.tr("Direct Local Folder"))
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                     }
@@ -187,8 +253,8 @@ struct SettingsAndQuotasSheet: View {
                         get: { store.draftUseWorktree },
                         set: { store.setDraftUseWorktree($0) }
                     )) {
-                        Text("Local").tag(false)
-                        Text("Worktree").tag(true)
+                        Text(OrbitL10n.tr("Local")).tag(false)
+                        Text(OrbitL10n.tr("Worktree")).tag(true)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 150)
@@ -204,10 +270,10 @@ struct SettingsAndQuotasSheet: View {
                     set: { store.setCoalesceExploration($0) }
                 )) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Collapse Thinking & Tool Steps")
+                        Text(OrbitL10n.tr("Collapse Thinking & Tool Steps"))
                             .font(OrbitTypography.subhead(.regular))
                             .foregroundStyle(palette.fgPrimary)
-                        Text("Keep completed exploration folded behind compact summaries")
+                        Text(OrbitL10n.tr("Keep completed exploration folded behind compact summaries"))
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                     }
@@ -222,6 +288,15 @@ struct SettingsAndQuotasSheet: View {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .strokeBorder(palette.hairline, lineWidth: 0.5)
             )
+        }
+    }
+
+    private func languageDisplayLabel(_ code: String) -> String {
+        switch code {
+        case "en": return "English"
+        case "zh-Hans": return "简体中文"
+        case "ja": return "日本語"
+        default: return OrbitL10n.tr("Follow iOS System Language")
         }
     }
 
@@ -266,7 +341,7 @@ struct SettingsAndQuotasSheet: View {
                         Text(OrbitL10n.tr("Live Activity"))
                             .font(OrbitTypography.subhead(.regular))
                             .foregroundStyle(palette.fgPrimary)
-                        Text("Dynamic Island & Lock Screen agent status + approval badge")
+                        Text(OrbitL10n.tr("Dynamic Island & Lock Screen agent status + approval badge"))
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                     }
@@ -284,14 +359,14 @@ struct SettingsAndQuotasSheet: View {
                             .foregroundStyle(palette.fgPrimary)
                         Text(
                             store.apnsDeviceTokenHex != nil
-                                ? "APNs registered · \(devices.count) device(s) on host"
-                                : "Zero-knowledge APNs alerts for approvals, errors & completions"
+                                ? OrbitL10n.fmt("APNs registered · %d device(s) on host", devices.count)
+                                : OrbitL10n.tr("Zero-knowledge APNs alerts for approvals, errors & completions")
                         )
                         .font(OrbitTypography.meta(.regular))
                         .foregroundStyle(palette.fgMuted)
                     }
                     Spacer()
-                    Button(store.apnsDeviceTokenHex != nil ? OrbitL10n.tr("Send Test Push") : "Enable") {
+                    Button(store.apnsDeviceTokenHex != nil ? OrbitL10n.tr("Send Test Push") : OrbitL10n.tr("Enable")) {
                         store.hapticLight()
                         if store.apnsDeviceTokenHex != nil {
                             store.sendTestPushNotification()
@@ -1074,30 +1149,59 @@ struct SettingsAndQuotasSheet: View {
 
     private func quotaWindowBar(_ window: FfiQuotaWindow) -> some View {
         let clampedPct = min(100.0, max(0.0, Double(window.usedPercent)))
+        let isRemainingStyle = window.label.localizedCaseInsensitiveContains("remaining")
+        // If backend label specifies "Remaining" with 0% (or >90% used on usage windows), reflect scarcity clearly.
+        let normalizedUsedPct = isRemainingStyle ? (100.0 - clampedPct) : clampedPct
+        let displayLabel = window.label
+            .replacingOccurrences(of: " Limit Remaining", with: "")
+            .replacingOccurrences(of: " Remaining", with: "")
         let barColor: Color = {
-            if clampedPct > 90 { return palette.danger }
-            if clampedPct >= 70 { return palette.warning }
+            if normalizedUsedPct >= 90 { return palette.danger }
+            if normalizedUsedPct >= 70 { return palette.warning }
             return palette.direct
         }()
 
         return VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: OrbitSpacing.xs) {
-                Text(window.label)
-                    .font(OrbitTypography.meta(.medium))
-                    .foregroundStyle(palette.fgSecondary)
-                    .lineLimit(1)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: OrbitSpacing.xs) {
+                    Text(displayLabel)
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgSecondary)
+                        .lineLimit(1)
 
-                Spacer(minLength: OrbitSpacing.xs)
+                    Spacer(minLength: OrbitSpacing.xs)
 
-                if let reset = OrbitFormatters.resetCountdown(rfc3339: window.resetsAtRfc3339) {
-                    Text(reset)
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.fgMuted)
+                    if let reset = OrbitFormatters.resetCountdown(rfc3339: window.resetsAtRfc3339) {
+                        Text(reset)
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                            .fixedSize()
+                    }
+
+                    Text(isRemainingStyle ? "\(Int(clampedPct.rounded()))% left" : "\(Int(clampedPct.rounded()))% used")
+                        .font(OrbitTypography.code(.medium))
+                        .foregroundStyle(barColor)
+                        .fixedSize()
                 }
 
-                Text("\(Int(clampedPct.rounded()))%")
-                    .font(OrbitTypography.code(.medium))
-                    .foregroundStyle(barColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: OrbitSpacing.xs) {
+                        Text(displayLabel)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.fgSecondary)
+                            .lineLimit(2)
+                        Spacer(minLength: OrbitSpacing.xs)
+                        Text(isRemainingStyle ? "\(Int(clampedPct.rounded()))% left" : "\(Int(clampedPct.rounded()))% used")
+                            .font(OrbitTypography.code(.medium))
+                            .foregroundStyle(barColor)
+                            .fixedSize()
+                    }
+                    if let reset = OrbitFormatters.resetCountdown(rfc3339: window.resetsAtRfc3339) {
+                        Text("Resets \(reset)")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
             }
 
             GeometryReader { geo in
@@ -1514,7 +1618,7 @@ private struct HostDetailSettingsView: View {
 
                 groupedInputRow(
                     label: "Direct Endpoint",
-                    placeholder: host.directEndpoints.first ?? "ws://192.168.1.x:6868",
+                    placeholder: OrbitEndpointLogic.sanitizeDirectEndpoints(host.directEndpoints).first ?? "ws://192.168.1.x:6868",
                     text: $customDirectEndpoint,
                     isMono: true
                 )

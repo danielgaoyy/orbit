@@ -29,13 +29,35 @@ struct SessionOverviewSheet: View {
 
 struct SessionOverviewPanel: View {
     @ObservedObject var store: OrbitIosStore
+    @ObservedObject private var stageState: OrbitStageStreamState
     var onNavigateAction: (() -> Void)? = nil
 
     @Environment(\.orbitPalette) private var palette
     @State private var expandedTaskIds: Set<String> = []
 
+    init(store: OrbitIosStore, onNavigateAction: (() -> Void)? = nil) {
+        self.store = store
+        self._stageState = ObservedObject(wrappedValue: store.stageState)
+        self.onNavigateAction = onNavigateAction
+    }
+
     private var insights: FfiSessionInsights? {
-        store.agentStage?.insights
+        stageState.agentStage?.insights
+    }
+
+    private var turnOutlineItems: [(turnKey: String, index: Int, preview: String)] {
+        let turns = stageState.agentStage?.turns ?? []
+        return turns.enumerated().compactMap { idx, turn in
+            if case let .userPrompt(_, _, text, _, _, _)? = turn.userPrompt {
+                let clean = text
+                    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !clean.isEmpty {
+                    return (turn.key, idx + 1, clean)
+                }
+            }
+            return nil
+        }
     }
 
     private var backgroundTasks: [FfiSessionBackgroundTask] {
@@ -58,6 +80,10 @@ struct SessionOverviewPanel: View {
                 }
 
                 quickActionsSection
+
+                if !turnOutlineItems.isEmpty {
+                    turnOutlineSection
+                }
 
                 if !backgroundTasks.isEmpty {
                     backgroundTasksSection
@@ -209,6 +235,55 @@ struct SessionOverviewPanel: View {
         }
     }
 
+    private var turnOutlineSection: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text(OrbitL10n.tr("Turn Outline"))
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, 4)
+
+            VStack(spacing: 0) {
+                ForEach(Array(turnOutlineItems.enumerated()), id: \.element.turnKey) { idx, item in
+                    Button {
+                        store.hapticLight()
+                        store.keepStageScrolledToTop = false
+                        store.jumpToTurnKey = item.turnKey
+                        onNavigateAction?()
+                    } label: {
+                        HStack(spacing: OrbitSpacing.sm) {
+                            Text("#\(item.index)")
+                                .font(OrbitTypography.code(.semibold))
+                                .foregroundStyle(palette.primary)
+                                .frame(minWidth: 26, alignment: .leading)
+
+                            Text(item.preview)
+                                .font(OrbitTypography.subhead(.regular))
+                                .foregroundStyle(palette.fgPrimary)
+                                .lineLimit(1)
+
+                            Spacer(minLength: OrbitSpacing.xs)
+
+                            Image(systemName: "arrow.up.forward")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                        .padding(.horizontal, OrbitSpacing.md)
+                        .frame(minHeight: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if idx < turnOutlineItems.count - 1 {
+                        OrbitHairline().padding(.leading, OrbitSpacing.md)
+                    }
+                }
+            }
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+        }
+    }
+
     private func metaPill(_ text: String, icon: String? = nil) -> some View {
         HStack(spacing: 3) {
             if let icon {
@@ -283,6 +358,17 @@ struct SessionOverviewPanel: View {
                 }
 
                 if store.activeAgent != nil {
+                    OrbitHairline().padding(.leading, 44)
+
+                    actionRow(
+                        title: OrbitL10n.tr("Find in Chat"),
+                        icon: "magnifyingglass",
+                        badge: nil
+                    ) {
+                        onNavigateAction?()
+                        store.isStageFindBarVisible = true
+                    }
+
                     OrbitHairline().padding(.leading, 44)
 
                     actionRow(

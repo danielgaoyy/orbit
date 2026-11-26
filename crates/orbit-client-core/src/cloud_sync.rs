@@ -648,7 +648,8 @@ pub fn filter_shareable_endpoints(endpoints: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     for raw in endpoints {
         let trimmed = raw.trim();
-        if trimmed.is_empty() || is_loopback_endpoint(trimmed) {
+        if trimmed.is_empty() || is_loopback_endpoint(trimmed) || is_tun_benchmark_endpoint(trimmed)
+        {
             continue;
         }
         if seen.insert(trimmed.to_string()) {
@@ -658,7 +659,7 @@ pub fn filter_shareable_endpoints(endpoints: &[String]) -> Vec<String> {
     out
 }
 
-pub fn is_loopback_endpoint(endpoint: &str) -> bool {
+fn extract_endpoint_host(endpoint: &str) -> String {
     let lower = endpoint.trim().to_ascii_lowercase();
     let rest = lower
         .strip_prefix("ws://")
@@ -667,16 +668,27 @@ pub fn is_loopback_endpoint(endpoint: &str) -> bool {
         .or_else(|| lower.strip_prefix("https://"))
         .unwrap_or(&lower);
     let authority = rest.split('/').next().unwrap_or("");
-    let host = if authority.starts_with('[') {
+    if authority.starts_with('[') {
         authority
             .split(']')
             .next()
             .unwrap_or("")
             .trim_start_matches('[')
+            .to_string()
     } else {
-        authority.split(':').next().unwrap_or("")
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0") || host.starts_with("127.")
+        authority.split(':').next().unwrap_or("").to_string()
+    }
+}
+
+pub fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let host = extract_endpoint_host(endpoint);
+    matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
+        || host.starts_with("127.")
+}
+
+pub fn is_tun_benchmark_endpoint(endpoint: &str) -> bool {
+    let host = extract_endpoint_host(endpoint);
+    host.starts_with("198.18.") || host.starts_with("198.19.")
 }
 
 pub fn synced_host_from_local(rec: &LocalHostSyncRecord) -> SyncedHostEntry {

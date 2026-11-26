@@ -679,6 +679,14 @@ pub(crate) fn coalesce_or_push_timeline(
                     )
                 })
             {
+                let preserved_ts = if prev.timestamp <= incoming.timestamp {
+                    prev.timestamp
+                } else {
+                    incoming.timestamp
+                };
+                incoming.payload =
+                    orbit_protocol::merge_tool_call_payload(prev.payload.clone(), incoming.payload);
+                incoming.timestamp = preserved_ts;
                 *prev = incoming;
                 return turn_start_idx + rel_idx;
             }

@@ -2397,17 +2397,10 @@ impl AgentOrchestrator {
         if spec.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
             agent_labels.insert("orbit.title_locked".into(), "1".into());
         }
-        let is_subagent = spec.parent_agent_id.is_some() || effective_background;
-        let has_browser_binary = if crate::tools::prompt_mentions_browser(&human_seed) {
-            crate::browser::discover_chrome_binary().is_some()
-        } else {
-            false
-        };
-        let detected_packs =
-            crate::tools::detect_startup_mcp_packs(&human_seed, is_subagent, has_browser_binary);
+        let startup_packs = crate::tools::default_startup_mcp_packs();
         agent_labels.insert(
             crate::tools::LABEL_MCP_PACKS.into(),
-            crate::tools::format_mcp_packs_label(&detected_packs),
+            crate::tools::format_mcp_packs_label(&startup_packs),
         );
         let allocated_handle = allocate_unique_handle(
             spec.handle.as_deref(),

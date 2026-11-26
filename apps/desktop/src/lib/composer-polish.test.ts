@@ -268,10 +268,13 @@ describe("composer directive submission", () => {
     });
   }
 
-  it("preserves plan and only recognizes whole raw commands", () => {
+  it("preserves plan and only recognizes whole unescaped raw commands", () => {
     assert.deepEqual(resolveComposerSubmission("plan", "/btw example"), { kind: "prompt", directive: "plan" });
     assert.deepEqual(resolveComposerSubmission(null, "/goalkeeper"), { kind: "prompt", directive: null });
     assert.deepEqual(resolveComposerSubmission("btw", "/goal example"), { kind: "btw", text: "/goal example" });
+    assert.deepEqual(resolveComposerSubmission(null, "\\/goal example"), { kind: "prompt", directive: null });
+    assert.deepEqual(resolveComposerSubmission(null, "\\/btw example"), { kind: "prompt", directive: null });
+    assert.deepEqual(resolveComposerSubmission(null, "explain /goal command"), { kind: "prompt", directive: null });
   });
 
   it("normalizes slash directive labels and shares frameless InlineDirectiveToken across surfaces", () => {
@@ -308,16 +311,17 @@ describe("composer directive submission", () => {
 });
 
 describe("composer caret triggers", () => {
-  it("matches the slash and mention grammar at every caret boundary", () => {
+  it("matches leading-only slash and anywhere-whitespace mention grammar at every caret boundary", () => {
     for (const text of [
-      "/plan", "prefix /plan suffix", "see /src/main.rs then type here",
+      "/plan", "  /goal", "\n/review", "prefix /plan suffix", "see /src/main.rs then type here",
+      "\\/goal escaped", "如何实现 /goal 命令", "如何实现 \\/goal 命令",
       "@file", "read @src/main.rs next", "mail@host a@b/c",
       "/x@y @x/y @a@b //", "x\t/@\n@file  /", "你好　/计划 接续　@文件",
       "前缀@无效 🪐 /计划", "",
     ]) {
       for (let pos = 0; pos <= text.length; pos++) {
         const prefix = text.slice(0, pos);
-        const expected = /(?:^|\s)\/([^\s/]*)$/.test(prefix) ? "slash"
+        const expected = /^\s*\/([^\s/]*)$/.test(prefix) ? "slash"
           : /(?:^|\s)@([^\s@]*)$/.test(prefix) ? "mention" : null;
         assert.equal(detectActiveTriggerKind(text, pos), expected, JSON.stringify(prefix));
       }

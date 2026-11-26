@@ -230,7 +230,7 @@ async fn composite_mcp_lifecycle_and_budgeted_context() -> Result<()> {
         Some("memory-agent"),
         &McpToolPolicy::default(),
     );
-    assert_eq!(defs.len(), 12);
+    assert_eq!(defs.len(), 13);
     let mem: Vec<_> = defs.iter().filter(|d| d.name.contains("memory")).collect();
     assert_eq!(mem.len(), 1);
     assert_eq!(mem[0].name, "orbit_memory");

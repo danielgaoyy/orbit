@@ -2434,6 +2434,43 @@ mod tests {
     }
 
     #[test]
+    fn escaped_leading_slash_commands_bypass_dispatch_verbatim() {
+        // Matches Claude Code & Codex behavior: leading `\/...` skips slash command dispatch and
+        // preserves the user's text verbatim so underlying provider CLIs (`claude`, `agy`, `codex`,
+        // `pi`) also do not re-interpret `/compact`, `/plan`, or `/goal` as native slash commands.
+        for raw in [
+            "\\/plan explain how plan mode works",
+            "\\/btw what is btw?",
+            "\\/goal compare clients",
+            "\\/fork not a fork",
+            "\\/fast not fast mode",
+            "\\/compact",
+            "\\/compact not compact",
+            "explain /goal and /plan in prose",
+        ] {
+            let composed = compose_prompt(
+                &ComposePromptRequest {
+                    provider: ProviderKind::Antigravity,
+                    raw_text: raw.into(),
+                    explicit_directive: None,
+                    host_id: None,
+                    cwd: None,
+                    contexts: Vec::new(),
+                    pastes: Vec::new(),
+                    quotes: Vec::new(),
+                },
+                None,
+                None,
+            );
+            assert_eq!(composed.effective_directive, None, "raw={raw}");
+            assert!(!composed.is_btw && !composed.is_fork && !composed.is_compact);
+            assert_eq!(composed.fast_mode_action, None);
+            assert_eq!(composed.display_prompt, raw);
+            assert_eq!(composed.wire_prompt, raw);
+        }
+    }
+
+    #[test]
     fn fork_slash_command_parses_same_dir_worktree_branch_and_prompt() {
         let catalog = slash_commands(ClientPlatform::Desktop);
         assert!(

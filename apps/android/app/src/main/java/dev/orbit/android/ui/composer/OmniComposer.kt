@@ -134,7 +134,7 @@ private sealed class AutocompleteTrigger {
     data class Mention(val range: IntRange, val query: String) : AutocompleteTrigger()
 }
 
-private val SLASH_TRIGGER_REGEX = Regex("""(?:^|\s)(/[^\s/]*)$""")
+private val SLASH_TRIGGER_REGEX = Regex("""^\s*(/[^\s/]*)$""")
 private val MENTION_TRIGGER_REGEX = Regex("""(?:^|\s)(@[^\s]*)$""")
 
 private fun detectAutocompleteTrigger(

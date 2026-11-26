@@ -3549,7 +3549,7 @@ public final class OrbitIosStore: ObservableObject {
         quotes: [QuotedDiffSnippet]
     ) {
         let needsGitDiff = explicitDirective == .review
-            || rawInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("/review")
+            || OrbitComposerLogic.matchesLeadingSlashCommand(rawInput, command: "/review")
             || contexts.contains {
                 if case .gitDiff = $0 { return true }
                 return false

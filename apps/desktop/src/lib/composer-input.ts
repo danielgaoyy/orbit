@@ -1,4 +1,10 @@
-/** Only inspect the word to the left of the caret. The other trigger character is legal in a query. */
+/**
+ * Inspect the token to the left of the caret.
+ * - `@` mentions activate at start-of-input or after any whitespace (mid-sentence `@file` / `@peer`).
+ * - `/` slash commands activate ONLY at the start of input (allowing leading whitespace),
+ *   matching Claude Code / Antigravity so mid-sentence `/goal` or Unix paths never open or
+ *   hijack the composer.
+ */
 export function detectActiveTriggerKind(text: string, cursorPos: number): "slash" | "mention" | null {
   const end = Math.min(cursorPos, text.length);
   let hasSlash = false;
@@ -7,7 +13,9 @@ export function detectActiveTriggerKind(text: string, cursorPos: number): "slash
     const char = text[i];
     if (/\s/.test(char)) break;
     if (i === 0 || /\s/.test(text[i - 1])) {
-      if (char === "/" && !hasSlash) return "slash";
+      if (char === "/" && !hasSlash) {
+        return !/\S/.test(text.slice(0, i)) ? "slash" : null;
+      }
       if (char === "@" && !hasAt) return "mention";
       break;
     }

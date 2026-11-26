@@ -133,26 +133,35 @@ export struct OmniComposer {
     let slashTrigger: AutocompleteTriggerState | null = null;
     if (this.store.activeSlashDirective.length === 0) {
       const lastSlash = text.lastIndexOf('/');
-      if (lastSlash >= 0 && (lastSlash === 0 || this.isWhitespaceChar(text.charAt(lastSlash - 1)))) {
-        const q = text.substring(lastSlash + 1);
-        let hasInvalid = false;
-        for (let i = 0; i < q.length; i++) {
-          const ch = q.charAt(i);
-          if (this.isWhitespaceChar(ch) || ch === '/') {
-            hasInvalid = true;
+      if (lastSlash >= 0) {
+        let onlyLeadingWhitespace = true;
+        for (let i = 0; i < lastSlash; i++) {
+          if (!this.isWhitespaceChar(text.charAt(i))) {
+            onlyLeadingWhitespace = false;
             break;
           }
         }
-        if (!hasInvalid) {
-          const tok = `/${q}`;
-          if (this.dismissedTriggerToken !== tok) {
-            slashTrigger = {
-              kind: 'slash',
-              startIndex: lastSlash,
-              endIndex: text.length,
-              query: q.toLowerCase(),
-              rawToken: tok
-            };
+        if (onlyLeadingWhitespace) {
+          const q = text.substring(lastSlash + 1);
+          let hasInvalid = false;
+          for (let i = 0; i < q.length; i++) {
+            const ch = q.charAt(i);
+            if (this.isWhitespaceChar(ch) || ch === '/') {
+              hasInvalid = true;
+              break;
+            }
+          }
+          if (!hasInvalid) {
+            const tok = `/${q}`;
+            if (this.dismissedTriggerToken !== tok) {
+              slashTrigger = {
+                kind: 'slash',
+                startIndex: lastSlash,
+                endIndex: text.length,
+                query: q.toLowerCase(),
+                rawToken: tok
+              };
+            }
           }
         }
       }

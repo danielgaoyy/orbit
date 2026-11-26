@@ -25,6 +25,7 @@
   - `crates/orbit-daemon/src/manager.rs` 全部异步路径通过 `with_store` / `try_store`（`tokio::task::spawn_blocking`）将同步 SQLite 读写移出 Tokio worker 线程。
   - `crates/orbit-daemon/src/workspace_watcher.rs` 基于 `notify` 提供 250ms 防抖、忽略构建/对象目录并限流的文件与 `.git/HEAD`/`index` 监听，自动广播 `WireMessage::WorkspaceFilesChanged` 并失效符号/规则缓存。
   - `crates/orbit-daemon/src/mcp_servers.rs` 与 `artifacts.rs` 支持 SEP-1865 `ui://` 资源 `resources/read` 自动拉取与严格绑定归属 MCP Server 的 `tools/call`（`WireMessage::ReadMcpResource` / `CallArtifactMcpTool`）。
+  - **按需延迟工具发现（`orbit_tool_search`）与严格 MCP Schema 门禁**（`crates/orbit-daemon/src/tools.rs`、`mcp.rs`、`guardian.rs`）：会话启动始终锁定精简 `Core` Pack（含 `orbit_tool_search`，零首轮提示词关键词猜测、零 `tools/list` 中途变更以保护 Prompt Cache），7 个扩展能力 Pack（`orbit_browser`、`orbit_schedule`、`orbit_workflow`、`orbit_goal`、`orbit_terminal`、`orbit_artifact`、`orbit_lsp`）对齐 Claude Code `ToolSearch` / Codex `tool_search` 语义通过 `orbit_tool_search(action="search", query=...)` 按需检索 Schema 并经 `orbit_tool_search(action="call", tool=..., arguments=...)` 透传执行（严格复用目标工具的 `McpToolPolicy`、`PreToolUse`/`PostToolUse` Hook 与权限校验，Guardian 仅放行只读 `search`）。全部内置 MCP 工具受 `all_mcp_tool_schemas_satisfy_strict_provider_validation` 递归单测门禁约束（兼容 Gemini / OpenAI 严格规范：数组必填 `items`、对象必填非空 `properties`、禁止无 `type` 空 Schema）。
 - **防轮次错位与跨轮去重不变式**：
   1. 在并发 `steer`（改向）、`interrupt`（打断）或排队消息自动冲刷时，每一条 assistant 响应与 finalize 事件必须严格绑定并校验当前活跃 turn 上下文，严禁下一轮错收到上一轮残留输出（off-by-one lag）。
   2. 延迟到达的跨轮 finalize 消息必须在持久化与 WebSocket 广播路径（`crates/orbit-daemon/src/manager.rs` / `lib.rs`）正确归位或去重。

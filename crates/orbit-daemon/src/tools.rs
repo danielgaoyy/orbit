@@ -1,10 +1,12 @@
 //! Transport-neutral Orbit Orchestration Tool Catalog.
 //!
 //! Exposed to agents via the built-in MCP Server (`POST /mcp/agents`) and `orbit mcp` stdio bridge.
-//! Exposes a compact Core Pack (12 tools) plus startup-locked optional Capability Packs (up to 19
-//! total composite tools in `tools/list`) to minimize LLM context overhead and preserve prompt cache
-//! prefixes. Enabled plugin operations add one shared catalog entry. Legacy tool names remain
-//! available through `execute_tool`.
+//! Exposes a compact Core Pack (13 tools, including `orbit_tool_search`) plus 7 deferred Capability
+//! Packs (20 total composite tools) discovered and invoked on demand via `orbit_tool_search`
+//! (aligned with Claude Code `ToolSearch` / Codex `tool_search`) so `tools/list` never mutates
+//! mid-conversation and normal chats never guess capability packs from prompt keywords. Enabled
+//! plugin operations add one shared catalog entry. Legacy tool names remain available through
+//! `execute_tool`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -80,118 +82,13 @@ impl ToolExecResult {
     }
 }
 
-/// Fast deterministic check whether an initial prompt requests browser/web interaction.
-pub fn prompt_mentions_browser(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    [
-        "browser",
-        "screenshot",
-        "webpage",
-        "e2e",
-        "playwright",
-        "cdp",
-        "dom ",
-        "浏览器",
-        "截图",
-        "网页",
-        "打开页面",
-    ]
-    .iter()
-    .any(|kw| lower.contains(kw) || prompt.contains(kw))
-}
-
-/// Determine which MCP capability packs should be locked for a newly launched agent session.
+/// Default startup MCP capability packs locked for a newly launched agent session.
 ///
-/// The returned pack list is persisted on the agent at launch and kept immutable for the lifetime
-/// of the session so `tools/list` never mutates mid-conversation (protecting LLM prompt caches).
-pub fn detect_startup_mcp_packs(
-    initial_prompt: &str,
-    is_subagent: bool,
-    has_browser_binary: bool,
-) -> Vec<McpToolPack> {
-    let mut packs = vec![McpToolPack::Core];
-    let lower = initial_prompt.to_ascii_lowercase();
-    let has_any = |kws: &[&str]| {
-        kws.iter()
-            .any(|kw| lower.contains(kw) || initial_prompt.contains(kw))
-    };
-
-    if has_browser_binary && prompt_mentions_browser(initial_prompt) {
-        packs.push(McpToolPack::Browser);
-    }
-    if has_any(&[
-        "cron",
-        "schedule",
-        "heartbeat",
-        "recurring",
-        "定时",
-        "每天",
-        "每小时",
-        "周期",
-    ]) {
-        packs.push(McpToolPack::Schedules);
-    }
-    if !is_subagent
-        && has_any(&[
-            "batch",
-            "csv",
-            "fanout",
-            "dag",
-            "workflow",
-            "best-of-n",
-            "best_of_n",
-            "arena",
-            "工作流",
-            "流水线",
-            "批量",
-        ])
-    {
-        packs.push(McpToolPack::Workflows);
-    }
-    if has_any(&[
-        "/goal",
-        "autonomous goal",
-        "start_goal",
-        "monitor",
-        "log_file_tail",
-        "http_health",
-        "健康检查",
-        "监控",
-    ]) {
-        packs.push(McpToolPack::Goals);
-    }
-    if has_any(&[
-        "pty",
-        "detached terminal",
-        "interactive terminal",
-        "离屏终端",
-        "虚拟终端",
-    ]) {
-        packs.push(McpToolPack::Terminals);
-    }
-    if has_any(&[
-        "artifact",
-        "mermaid",
-        "svg",
-        "mcp_app",
-        "mcp app",
-        "可视化产物",
-        "交互图表",
-    ]) {
-        packs.push(McpToolPack::Artifacts);
-    }
-    if has_any(&[
-        "lsp",
-        "goto definition",
-        "go to definition",
-        "workspace symbol",
-        "diagnostics",
-        "语言服务",
-        "符号跳转",
-    ]) {
-        packs.push(McpToolPack::Lsp);
-    }
-    packs
+/// Sessions always start with the minimal `Core` pack (including `orbit_tool_search` for on-demand
+/// deferred tool discovery & invocation, matching Claude Code `ToolSearch` / Codex `tool_search`),
+/// avoiding brittle keyword heuristics on user prompts while keeping `tools/list` cache-stable.
+pub fn default_startup_mcp_packs() -> Vec<McpToolPack> {
+    vec![McpToolPack::Core]
 }
 
 pub fn format_mcp_packs_label(packs: &[McpToolPack]) -> String {
@@ -257,7 +154,7 @@ pub fn resolve_effective_packs(
             vec![McpToolPack::Core]
         }
     } else {
-        // External MCP clients (no caller_agent_id) see the full 18-tool catalog unless disabled.
+        // External MCP clients (no caller_agent_id) see the full 20-tool catalog unless disabled.
         McpToolPack::ALL.to_vec()
     };
 
@@ -292,16 +189,8 @@ pub fn list_tool_definitions(policy: &McpToolPolicy) -> Vec<ToolDefinition> {
         .collect()
 }
 
-pub fn list_tool_definitions_for_caller(
-    runtime: &DaemonRuntime,
-    caller_agent_id: Option<&str>,
-    policy: &McpToolPolicy,
-) -> Vec<ToolDefinition> {
-    if !policy.enabled {
-        return Vec::new();
-    }
-    let packs = resolve_effective_packs(runtime, caller_agent_id, policy);
-    let plugin = runtime.plugins.has_ops().then(|| PackToolDefinition {
+fn plugin_tool_definition() -> PackToolDefinition {
+    PackToolDefinition {
         pack: McpToolPack::Core,
         def: ToolDefinition {
             name: "orbit_plugin",
@@ -312,13 +201,28 @@ pub fn list_tool_definitions_for_caller(
                     "action": { "type": "string", "enum": ["list", "call"] },
                     "plugin": { "type": "string" },
                     "op": { "type": "string" },
-                    "input": {}
+                    "input": {
+                        "type": "string",
+                        "description": "Optional JSON-encoded input payload."
+                    }
                 },
                 "required": ["action"],
                 "additionalProperties": false
             }),
         },
-    });
+    }
+}
+
+pub fn list_tool_definitions_for_caller(
+    runtime: &DaemonRuntime,
+    caller_agent_id: Option<&str>,
+    policy: &McpToolPolicy,
+) -> Vec<ToolDefinition> {
+    if !policy.enabled {
+        return Vec::new();
+    }
+    let packs = resolve_effective_packs(runtime, caller_agent_id, policy);
+    let plugin = runtime.plugins.has_ops().then(plugin_tool_definition);
     pack_tool_definitions()
         .into_iter()
         .chain(plugin)
@@ -567,6 +471,68 @@ pub async fn execute_tool_with_context(
         ));
     }
 
+    // `orbit_tool_search(action="call")` acts as an on-demand proxy for deferred capability packs
+    // (aligned with Claude Code `ToolSearch` / Codex `tool_search`). Unwrap here before hook and
+    // policy enforcement so the target tool goes through the exact same `McpToolPolicy`,
+    // `PreToolUse` (including `Block` and `updated_input`), `PostToolUse`, and ACL checks.
+    if name == "orbit_tool_search"
+        && args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|a| a.trim().eq_ignore_ascii_case("call"))
+    {
+        let Some(target_tool) = args
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return ToolExecResult::err(
+                "missing required parameter `tool` for `orbit_tool_search(action=\"call\")`",
+            );
+        };
+        if target_tool == "orbit_tool_search" {
+            return ToolExecResult::err("recursive `orbit_tool_search` invocation is not allowed");
+        }
+        let target_args = match args.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(Value::Object(map)) => Value::Object(map.clone()),
+            Some(Value::String(raw)) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    json!({})
+                } else {
+                    match serde_json::from_str::<Value>(trimmed) {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        Ok(_) => {
+                            return ToolExecResult::err(
+                                "`arguments` JSON must decode to a JSON object",
+                            );
+                        }
+                        Err(e) => {
+                            return ToolExecResult::err(format!(
+                                "invalid JSON in `arguments`: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                return ToolExecResult::err(
+                    "`arguments` must be a JSON-encoded object string or JSON object",
+                );
+            }
+        };
+        return Box::pin(execute_tool_with_context(
+            runtime,
+            caller_agent_id,
+            target_tool,
+            target_args,
+            hook_origin,
+        ))
+        .await;
+    }
+
     let resolved = match resolve_composite_dispatch(name, &args) {
         Ok("") => name.to_string(),
         Ok(mapped) => mapped.to_string(),
@@ -772,6 +738,32 @@ async fn execute_tool_inner(
     };
 
     match name {
+        "orbit_tool_search" => {
+            let action = opt_str(args, "action")
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_else(|| "search".into());
+            anyhow::ensure!(
+                action == "search",
+                "unsupported `orbit_tool_search` action `{action}` (expected `search` or `call`)"
+            );
+            let policy = resolve_caller_policy(rt, caller_agent_id);
+            let is_subagent = caller
+                .as_ref()
+                .is_some_and(|c| c.parent_agent_id.is_some() || c.background);
+            let query = opt_str(args, "query").unwrap_or_default();
+            let max_results = args
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .map(|v| v.clamp(1, 20) as usize)
+                .unwrap_or(5);
+            Ok(search_deferred_tools(
+                &policy,
+                is_subagent,
+                &query,
+                max_results,
+                None,
+            ))
+        }
         "orbit_memory" => {
             let caller = caller
                 .ok_or_else(|| anyhow::anyhow!("orbit_memory requires a workspace-bound caller"))?;
@@ -808,9 +800,20 @@ async fn execute_tool_inner(
                             .await
                             .map_err(anyhow::Error::msg)?
                     };
-                    rt.plugins
-                        .invoke(&id, &op, root, args.get("input").unwrap_or(&Value::Null))
-                        .await
+                    let parsed_input = match args.get("input") {
+                        Some(Value::String(raw)) => {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                Value::Null
+                            } else {
+                                serde_json::from_str::<Value>(trimmed)
+                                    .unwrap_or_else(|_| Value::String(raw.clone()))
+                            }
+                        }
+                        Some(other) => other.clone(),
+                        None => Value::Null,
+                    };
+                    rt.plugins.invoke(&id, &op, root, &parsed_input).await
                 }
                 _ => anyhow::bail!("expected plugin action list or call"),
             }
@@ -3329,7 +3332,12 @@ async fn execute_tool_inner(
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(str::trim))
+                        .filter_map(|v| {
+                            v.as_str()
+                                .or_else(|| v.get("label").and_then(Value::as_str))
+                                .or_else(|| v.get("id").and_then(Value::as_str))
+                                .map(str::trim)
+                        })
                         .filter(|s| !s.is_empty())
                         .map(ToOwned::to_owned)
                         .collect()
@@ -3404,8 +3412,21 @@ async fn execute_tool_inner(
                 opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
             let note = opt_str(args, "note");
             let mut patches = Vec::new();
-            if let Some(arr) = args.get("criteria").and_then(Value::as_array) {
+            let batch_updates = args
+                .get("criteria_updates")
+                .and_then(Value::as_array)
+                .or_else(|| args.get("criteria").and_then(Value::as_array));
+            if let Some(arr) = batch_updates {
                 for item in arr {
+                    if let Some(raw_label) = item.as_str().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        let passed = args.get("passed").and_then(Value::as_bool).unwrap_or(true);
+                        patches.push(GoalCriterionPatch {
+                            id_or_label: raw_label.to_string(),
+                            passed,
+                        });
+                        continue;
+                    }
                     let key = item
                         .get("id")
                         .and_then(Value::as_str)
@@ -4936,9 +4957,198 @@ fn summarize_timeline_event(ev: &orbit_protocol::TimelineEvent) -> Value {
     }
 }
 
+/// Search deferred capability-pack tools on demand (aligned with Claude Code `ToolSearch` and
+/// Codex `tool_search`).
+///
+/// Query grammar:
+/// - `select:orbit_goal,orbit_browser` — exact selection by tool name or pack slug
+/// - `+browser screenshot` — `+term` required terms, ranked by remaining keywords
+/// - `dag workflow` — keyword search across tool name, pack, description, and action enums
+/// - empty / omitted — lists all available deferred tools for this caller (up to `max_results`)
+fn search_deferred_tools(
+    policy: &McpToolPolicy,
+    is_subagent: bool,
+    raw_query: &str,
+    max_results: usize,
+    has_browser_binary_override: Option<bool>,
+) -> Value {
+    let trimmed = raw_query.trim();
+    let lower_query = trimmed.to_ascii_lowercase();
+
+    let mut available: Vec<PackToolDefinition> = pack_tool_definitions()
+        .into_iter()
+        .filter(|entry| {
+            entry.pack != McpToolPack::Core
+                && !policy.disabled_packs.contains(&entry.pack)
+                && policy
+                    .enabled_packs
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(&entry.pack))
+                && !policy.disabled_tools.iter().any(|d| d == entry.def.name)
+                && !(is_subagent && entry.pack == McpToolPack::Workflows)
+        })
+        .collect();
+
+    // Only check Chrome binary presence if Browser pack survived policy gating.
+    if available.iter().any(|e| e.pack == McpToolPack::Browser) {
+        let has_browser = has_browser_binary_override
+            .unwrap_or_else(|| crate::browser::discover_chrome_binary().is_some());
+        if !has_browser {
+            available.retain(|e| e.pack != McpToolPack::Browser);
+        }
+    }
+
+    let total_available = available.len();
+    let to_entry_json = |entry: &PackToolDefinition| {
+        json!({
+            "name": entry.def.name,
+            "pack": entry.pack.slug(),
+            "description": entry.def.description,
+            "inputSchema": entry.def.input_schema,
+        })
+    };
+
+    if trimmed.is_empty() {
+        let limit = max_results.max(total_available.min(10));
+        let tools: Vec<Value> = available.iter().take(limit).map(to_entry_json).collect();
+        return json!({
+            "tools": tools,
+            "total_available": total_available,
+        });
+    }
+
+    if let Some(selected_raw) = trimmed
+        .strip_prefix("select:")
+        .or_else(|| trimmed.strip_prefix("SELECT:"))
+        .or_else(|| {
+            lower_query
+                .starts_with("select:")
+                .then(|| &trimmed["select:".len()..])
+        })
+    {
+        let mut matched = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for tok in selected_raw
+            .split([',', ' ', '\t', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let tok_lower = tok.to_ascii_lowercase();
+            let resolved_pack = tool_pack_for_canonical_name(&tok_lower);
+            if let Some(entry) = available.iter().find(|e| {
+                e.def.name.eq_ignore_ascii_case(&tok_lower)
+                    || e.pack.slug().eq_ignore_ascii_case(&tok_lower)
+                    || (resolved_pack != McpToolPack::Core && e.pack == resolved_pack)
+            }) && seen.insert(entry.def.name)
+            {
+                matched.push(to_entry_json(entry));
+            }
+        }
+        matched.truncate(max_results);
+        return json!({
+            "tools": matched,
+            "total_available": total_available,
+        });
+    }
+
+    let mut required_terms = Vec::new();
+    let mut optional_terms = Vec::new();
+    for tok in lower_query.split_whitespace() {
+        if let Some(req) = tok.strip_prefix('+') {
+            if !req.is_empty() {
+                required_terms.push(req);
+            }
+        } else if !tok.is_empty() {
+            optional_terms.push(tok);
+        }
+    }
+
+    let mut scored: Vec<(usize, u32, &PackToolDefinition)> = Vec::new();
+    for (idx, entry) in available.iter().enumerate() {
+        let name_lower = entry.def.name.to_ascii_lowercase();
+        let pack_lower = entry.pack.slug().to_ascii_lowercase();
+        let desc_lower = entry.def.description.to_ascii_lowercase();
+        let actions_lower: Vec<String> = entry
+            .def
+            .input_schema
+            .pointer("/properties/action/enum")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let matches_term = |term: &str| {
+            name_lower.contains(term)
+                || pack_lower.contains(term)
+                || desc_lower.contains(term)
+                || actions_lower.iter().any(|a| a.contains(term))
+        };
+
+        if !required_terms.iter().all(|t| matches_term(t)) {
+            continue;
+        }
+
+        let mut score: u32 = 0;
+        for term in required_terms.iter().chain(optional_terms.iter()) {
+            if name_lower == *term || pack_lower == *term {
+                score += 12;
+            } else if name_lower.contains(term) || pack_lower.contains(term) {
+                score += 6;
+            }
+            if actions_lower.iter().any(|a| a == term) {
+                score += 8;
+            } else if actions_lower.iter().any(|a| a.contains(term)) {
+                score += 4;
+            }
+            if desc_lower.contains(term) {
+                score += 2;
+            }
+        }
+
+        if score > 0 || !required_terms.is_empty() {
+            scored.push((idx, score, entry));
+        }
+    }
+
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let tools: Vec<Value> = scored
+        .into_iter()
+        .take(max_results)
+        .map(|(_, _, entry)| to_entry_json(entry))
+        .collect();
+
+    json!({
+        "tools": tools,
+        "total_available": total_available,
+    })
+}
+
 fn pack_tool_definitions() -> Vec<PackToolDefinition> {
     vec![
-        // ==================== CORE PACK (12 tools, compact schemas) ====================
+        // ==================== CORE PACK (13 tools, compact schemas) ====================
+        PackToolDefinition {
+            pack: McpToolPack::Core,
+            def: ToolDefinition {
+                name: "orbit_tool_search",
+                description: "Discover and invoke Orbit's deferred capability tools on demand (`orbit_browser`, `orbit_schedule`, `orbit_workflow`, `orbit_goal`, `orbit_terminal`, `orbit_artifact`, `orbit_lsp`). Call with `action=\"search\"` (supports `select:name1,name2`, `+required keyword`, keywords, or empty query) to fetch exact schemas, then `action=\"call\"` with `tool` and JSON-encoded `arguments`.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["search", "call"] },
+                        "query": { "type": "string", "description": "For action=search: `select:orbit_goal,orbit_browser`, `+term keyword`, keywords, or empty to list all available deferred tools." },
+                        "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
+                        "tool": { "type": "string", "description": "Deferred tool name to invoke when action=call." },
+                        "arguments": { "type": "string", "description": "JSON-encoded object of arguments for the deferred tool when action=call." }
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false
+                }),
+            },
+        },
         PackToolDefinition {
             pack: McpToolPack::Core,
             def: ToolDefinition {
@@ -5290,8 +5500,37 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "csv_content": { "type": "string" },
                         "prompt_template": { "type": "string" },
                         "prompt": { "type": "string" },
-                        "steps": { "type": "array", "items": { "type": "object" } },
-                        "candidates": { "type": "array", "items": { "type": "object" } },
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step_id": { "type": "string" },
+                                    "name": { "type": "string" },
+                                    "depends_on": { "type": "array", "items": { "type": "string" } },
+                                    "prompt_template": { "type": "string" },
+                                    "provider": { "type": "string" },
+                                    "model": { "type": "string" },
+                                    "isolated_worktree": { "type": "boolean" },
+                                    "retry_count": { "type": "integer" },
+                                    "timeout_secs": { "type": "integer" }
+                                },
+                                "required": ["step_id", "name", "prompt_template"]
+                            }
+                        },
+                        "candidates": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "provider": { "type": "string" },
+                                    "model": { "type": "string" },
+                                    "effort": { "type": "string" }
+                                },
+                                "required": ["label", "provider"]
+                            }
+                        },
                         "provider": { "type": "string" },
                         "default_provider": { "type": "string" },
                         "model": { "type": "string" },
@@ -5318,7 +5557,18 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "goal_id": { "type": "string" },
                         "monitor_id": { "type": "string" },
                         "objective": { "type": "string" },
-                        "criteria": { "type": "array" },
+                        "criteria": { "type": "array", "items": { "type": "string" } },
+                        "criteria_updates": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "label": { "type": "string" },
+                                    "passed": { "type": "boolean" }
+                                }
+                            }
+                        },
                         "criterion_id": { "type": "string" },
                         "passed": { "type": "boolean" },
                         "verify_command": { "type": "string" },
@@ -5428,8 +5678,8 @@ mod tests {
         let core_defs = list_tool_definitions(&core_policy);
         assert_eq!(
             core_defs.len(),
-            12,
-            "Core pack must expose 12 compact tools"
+            13,
+            "Core pack must expose 13 compact tools (12 base + orbit_tool_search)"
         );
         let core_json = serde_json::to_string(
             &core_defs
@@ -5445,16 +5695,16 @@ mod tests {
         )
         .expect("serialize core defs");
         assert!(
-            core_json.len() <= 9_500,
-            "Core MCP catalog JSON ({} bytes) exceeded 9,500-byte budget",
+            core_json.len() <= 10_500,
+            "Core MCP catalog JSON ({} bytes) exceeded 10,500-byte budget",
             core_json.len()
         );
 
         let full_defs = list_tool_definitions(&McpToolPolicy::default());
         assert_eq!(
             full_defs.len(),
-            19,
-            "Full MCP catalog must expose 19 composite tools (12 Core + 7 optional packs)"
+            20,
+            "Full MCP catalog must expose 20 composite tools (13 Core + 7 deferred packs)"
         );
         let full_json = serde_json::to_string(
             &full_defs
@@ -5470,8 +5720,8 @@ mod tests {
         )
         .expect("serialize full defs");
         assert!(
-            full_json.len() <= 18_500,
-            "Full MCP catalog JSON ({} bytes) exceeded 18,500-byte budget",
+            full_json.len() <= 20_000,
+            "Full MCP catalog JSON ({} bytes) exceeded 20,000-byte budget",
             full_json.len()
         );
 
@@ -5488,30 +5738,218 @@ mod tests {
     }
 
     #[test]
-    fn startup_pack_detection_keeps_normal_chat_minimal_and_gates_subagents() {
-        let plain =
-            detect_startup_mcp_packs("Explain why this Rust function returns early", false, true);
-        assert_eq!(plain, vec![McpToolPack::Core]);
+    fn default_startup_packs_stay_minimal_and_tool_search_discovers_deferred_packs() {
+        assert_eq!(default_startup_mcp_packs(), vec![McpToolPack::Core]);
 
-        let browser_no_bin =
-            detect_startup_mcp_packs("Open browser and take a screenshot", false, false);
-        assert_eq!(browser_no_bin, vec![McpToolPack::Core]);
+        let policy = McpToolPolicy::default();
+        // Empty query returns all deferred tools available to a non-subagent host with browser.
+        let all = search_deferred_tools(&policy, false, "", 10, Some(true));
+        assert_eq!(all["total_available"], 7);
+        assert_eq!(all["tools"].as_array().map(Vec::len), Some(7));
 
-        let browser_with_bin =
-            detect_startup_mcp_packs("Open browser and take a screenshot", false, true);
-        assert_eq!(
-            browser_with_bin,
-            vec![McpToolPack::Core, McpToolPack::Browser]
+        // Subagents cannot discover recursive workflows, and missing browser hides orbit_browser.
+        let sub = search_deferred_tools(&policy, true, "", 10, Some(false));
+        let sub_names: Vec<&str> = sub["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert!(!sub_names.contains(&"orbit_workflow"));
+        assert!(!sub_names.contains(&"orbit_browser"));
+        assert!(sub_names.contains(&"orbit_goal"));
+
+        // Exact `select:` query mirrors Claude Code ToolSearch.
+        let sel = search_deferred_tools(
+            &policy,
+            false,
+            "select:orbit_goal,orbit_workflow",
+            5,
+            Some(true),
         );
+        let sel_names: Vec<&str> = sel["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(sel_names, vec!["orbit_goal", "orbit_workflow"]);
 
-        let subagent_dag =
-            detect_startup_mcp_packs("Run a DAG workflow and cron schedule every 5m", true, false);
-        assert!(subagent_dag.contains(&McpToolPack::Core));
-        assert!(subagent_dag.contains(&McpToolPack::Schedules));
+        // `+term` required filter + keyword ranking.
+        let plus = search_deferred_tools(&policy, false, "+browser screenshot", 5, Some(true));
+        let plus_names: Vec<&str> = plus["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(plus_names, vec!["orbit_browser"]);
+
+        // Policy `disabled_packs` & `disabled_tools` are strictly enforced during search.
+        let restricted = McpToolPolicy {
+            enabled: true,
+            disabled_tools: vec!["orbit_lsp".into()],
+            enabled_packs: None,
+            disabled_packs: vec![McpToolPack::Goals],
+        };
+        let filtered = search_deferred_tools(&restricted, false, "", 10, Some(true));
+        let filtered_names: Vec<&str> = filtered["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert!(!filtered_names.contains(&"orbit_goal"));
+        assert!(!filtered_names.contains(&"orbit_lsp"));
+    }
+
+    #[tokio::test]
+    async fn orbit_tool_search_executes_deferred_tools_and_enforces_policy_and_recursion_guards() {
+        let tmp_home =
+            std::env::temp_dir().join(format!("orbit-tool-search-exec-{}", Uuid::new_v4()));
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        // Self-recursion must be rejected cleanly.
+        let rec = execute_tool(
+            &rt,
+            None,
+            "orbit_tool_search",
+            json!({
+                "action": "call",
+                "tool": "orbit_tool_search",
+                "arguments": "{\"action\":\"search\"}"
+            }),
+        )
+        .await;
+        assert!(rec.is_error);
+        assert!(rec.text.contains("recursive"));
+
+        // Malformed JSON arguments must fail closed.
+        let bad_json = execute_tool(
+            &rt,
+            None,
+            "orbit_tool_search",
+            json!({
+                "action": "call",
+                "tool": "orbit_terminal",
+                "arguments": "{not-json"
+            }),
+        )
+        .await;
+        assert!(bad_json.is_error);
+        assert!(bad_json.text.contains("invalid JSON"));
+
+        // Real deferred tool call (`orbit_terminal` `list`) succeeds with JSON-encoded string args.
+        let list_res = execute_tool(
+            &rt,
+            None,
+            "orbit_tool_search",
+            json!({
+                "action": "call",
+                "tool": "orbit_terminal",
+                "arguments": "{\"action\":\"list\"}"
+            }),
+        )
+        .await;
         assert!(
-            !subagent_dag.contains(&McpToolPack::Workflows),
-            "subagents cannot launch recursive workflows and must not receive Workflows pack"
+            !list_res.is_error,
+            "expected deferred orbit_terminal list to succeed, got: {}",
+            list_res.text
         );
+        assert!(list_res.structured.get("terminals").is_some());
+
+        // `action="search"` returns exact schema for `orbit_goal`.
+        let search_res = execute_tool(
+            &rt,
+            None,
+            "orbit_tool_search",
+            json!({
+                "action": "search",
+                "query": "select:orbit_goal"
+            }),
+        )
+        .await;
+        assert!(!search_res.is_error, "search failed: {}", search_res.text);
+        assert_eq!(search_res.structured["tools"][0]["name"], "orbit_goal");
+        assert_eq!(
+            search_res.structured["tools"][0]["inputSchema"]["properties"]["criteria"]["items"]["type"],
+            "string"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn all_mcp_tool_schemas_satisfy_strict_provider_validation() {
+        fn assert_strict_schema(tool_name: &str, path: &str, schema: &Value) {
+            let obj = schema.as_object().unwrap_or_else(|| {
+                panic!("tool `{tool_name}` schema at `{path}` must be a JSON object")
+            });
+            let ty = obj
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tool `{tool_name}` schema at `{path}` is missing string `type` (rejected by Gemini/OpenAI)"
+                    )
+                });
+            assert!(
+                matches!(
+                    ty,
+                    "object" | "array" | "string" | "integer" | "number" | "boolean"
+                ),
+                "tool `{tool_name}` schema at `{path}` has unsupported type `{ty}`"
+            );
+            if ty == "array" {
+                let items = obj.get("items").unwrap_or_else(|| {
+                    panic!(
+                        "tool `{tool_name}` array schema at `{path}` is missing `items` (Gemini 400 INVALID_ARGUMENT)"
+                    )
+                });
+                assert_strict_schema(tool_name, &format!("{path}.items"), items);
+            }
+            if ty == "object" {
+                let props = obj
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "tool `{tool_name}` object schema at `{path}` is missing `properties` (Gemini 400 OBJECT non-empty properties)"
+                        )
+                    });
+                assert!(
+                    !props.is_empty(),
+                    "tool `{tool_name}` object schema at `{path}` has empty `properties`"
+                );
+                if let Some(required) = obj.get("required").and_then(Value::as_array) {
+                    for req in required {
+                        let key = req.as_str().unwrap_or_else(|| {
+                            panic!("tool `{tool_name}` required entry at `{path}` must be string")
+                        });
+                        assert!(
+                            props.contains_key(key),
+                            "tool `{tool_name}` requires `{key}` at `{path}` which is absent from `properties`"
+                        );
+                    }
+                }
+                for (prop_name, prop_schema) in props {
+                    assert_strict_schema(
+                        tool_name,
+                        &format!("{path}.properties[{prop_name}]"),
+                        prop_schema,
+                    );
+                }
+            }
+        }
+
+        for entry in pack_tool_definitions()
+            .into_iter()
+            .chain(std::iter::once(plugin_tool_definition()))
+        {
+            assert_strict_schema(entry.def.name, "parameters", &entry.def.input_schema);
+        }
     }
 
     #[test]
@@ -5781,7 +6219,7 @@ mod tests {
 
         let caller_tools =
             list_tool_definitions_for_caller(&rt, Some("ag_cas_1"), &McpToolPolicy::default());
-        assert_eq!(caller_tools.len(), 12);
+        assert_eq!(caller_tools.len(), 13);
 
         let ok_res = execute_tool(
             &rt,

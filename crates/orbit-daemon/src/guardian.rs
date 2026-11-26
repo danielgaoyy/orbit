@@ -923,6 +923,28 @@ fn classify_generic_tool(
     let lower_tool = tool_name.trim().to_ascii_lowercase();
     let parsed: Option<serde_json::Value> = serde_json::from_str(arguments_json).ok();
 
+    // Pure read-only deferred tool discovery via `orbit_tool_search(action="search")` is Low risk.
+    // Side-effecting `action="call"` is intentionally excluded here so it undergoes full Guardian
+    // evaluation and permission checks.
+    if matches!(
+        lower_tool.as_str(),
+        "mcp__orbit__orbit_tool_search" | "orbit/orbit_tool_search"
+    ) && parsed
+        .as_ref()
+        .and_then(|v| v.get("action"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|a| a.trim().eq_ignore_ascii_case("search"))
+        && !contains_sensitive_secret_reference(arguments_json)
+    {
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Low,
+            GuardianDecision::AutoAllow,
+            0.98,
+            format!("Orbit read-only deferred tool search `{tool_name}`"),
+            vec!["orbit_mcp_readonly".into()],
+        );
+    }
+
     // Safe read-only & workspace coordination Orbit MCP tools are Low risk and AutoAllow cleanly.
     if matches!(
         lower_tool.as_str(),
@@ -3897,6 +3919,43 @@ mod tests {
         assert_eq!(r4.risk_level, GuardianRiskLevel::High);
         assert_eq!(r4.classifier_tier, "fail_closed");
         assert!(r4.signals.iter().any(|s| s == "classifier_panic"));
+    }
+
+    #[test]
+    fn guardian_allows_readonly_orbit_tool_search_but_never_auto_allows_call_action() {
+        let cfg = GuardianPolicyConfig::default();
+        let search_res = classify_generic_tool(
+            "mcp__orbit__orbit_tool_search",
+            r#"{"action":"search","query":"select:orbit_goal"}"#,
+            "/tmp",
+            &cfg,
+        );
+        match search_res.outcome {
+            Tier1Outcome::Final(assessment) => {
+                assert_eq!(assessment.risk_level, GuardianRiskLevel::Low);
+                assert_eq!(assessment.decision, GuardianDecision::AutoAllow);
+            }
+            Tier1Outcome::NeedsTier2 { reason, .. } => {
+                panic!("expected Final Low AutoAllow for search, got NeedsTier2({reason})")
+            }
+        }
+
+        let call_res = classify_generic_tool(
+            "mcp__orbit__orbit_tool_search",
+            r#"{"action":"call","tool":"orbit_browser","arguments":"{\"action\":\"open\"}"}"#,
+            "/tmp",
+            &cfg,
+        );
+        assert!(
+            !matches!(
+                call_res.outcome,
+                Tier1Outcome::Final(GuardianAssessment {
+                    decision: GuardianDecision::AutoAllow,
+                    ..
+                })
+            ),
+            "orbit_tool_search(action=\"call\") must never bypass Guardian as read-only"
+        );
     }
 
     #[tokio::test]

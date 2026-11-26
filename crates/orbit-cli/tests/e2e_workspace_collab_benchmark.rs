@@ -554,8 +554,8 @@ async fn live_00_normal_chat_unblocked_and_cached() {
     let defs = list_tool_definitions_for_caller(&rt, Some(&t1.agent_id), &McpToolPolicy::default());
     assert_eq!(
         defs.len(),
-        12,
-        "Normal standalone chat MCP catalog must stay strictly at 12 Core tools"
+        13,
+        "Normal standalone chat MCP catalog must stay strictly at 13 Core tools (12 base + orbit_tool_search)"
     );
 
     let ws = rt

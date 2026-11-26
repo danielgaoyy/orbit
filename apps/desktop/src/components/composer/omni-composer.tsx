@@ -718,7 +718,7 @@ export const OmniComposer = memo(function OmniComposer({
   const cursorOffset = cursor.text === draftText ? cursor.offset : 0;
   const triggerKind = useMemo(() => detectActiveTriggerKind(draftText, cursorOffset), [draftText, cursorOffset]);
   const slashTrigger = useMemo(() => {
-    if (triggerKind !== "slash") return null;
+    if (slashDirective || triggerKind !== "slash") return null;
     const slashIndex = draftText.lastIndexOf("/", cursorOffset - 1);
     const query = draftText.slice(slashIndex + 1, cursorOffset);
     const tokenKey = `slash:${slashIndex}:${query}`;
@@ -728,7 +728,7 @@ export const OmniComposer = memo(function OmniComposer({
     const items = filterSlashCommands(commands, query, t);
     if (items.length === 0) return null;
     return { slashIndex, endIndex: cursorOffset, query, tokenKey, items };
-  }, [triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
+  }, [slashDirective, triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
 
   const mentionTrigger = useMemo(() => {
     if (triggerKind !== "mention") return null;
@@ -1454,7 +1454,11 @@ export const OmniComposer = memo(function OmniComposer({
         executeSlashCommand(slashTrigger.items[safeIdx]);
         return;
       }
-      if (e.key === " ") {
+      if (
+        e.key === " " &&
+        !slashDirective &&
+        !/\S/.test(draftText.slice(0, slashTrigger.slashIndex))
+      ) {
         const exactCmd = slashTrigger.items.find(
           (c) =>
             isComposerInlineDirective(c.id) &&

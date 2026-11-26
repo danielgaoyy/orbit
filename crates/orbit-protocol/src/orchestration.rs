@@ -126,6 +126,8 @@ pub struct PendingPermissionSummary {
     /// Personal Router or resolved by an agent.
     #[serde(default)]
     pub human_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_recommendation: Option<crate::RouterRecommendation>,
     pub created_at: DateTime<Utc>,
 }
 

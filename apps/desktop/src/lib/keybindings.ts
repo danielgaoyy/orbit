@@ -27,6 +27,7 @@ import {
 } from "@/lib/timeline-coalesce";
 import { t as translateGlobal } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { selectPersonalAgentRef } from "@/state/selectors/personal-agent-selectors";
 
 export function modSymbol(): string {
   return isMacDesktop() ? "⌘" : "Ctrl+";
@@ -229,11 +230,17 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 3b. Personal Agent Global Overview (`⌘⇧O` / custom)
+      // 3b. Personal Agent Home (`⌘⇧O` / custom)
       if (matchesActionChord(e, "open_global_overview", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
-        if (snap.workspacePanel === "overview" && snap.selectedHostId && snap.selectedAgentId) {
+        const pa = selectPersonalAgentRef(snap);
+        if (
+          !pa &&
+          snap.workspacePanel === "overview" &&
+          snap.selectedHostId &&
+          snap.selectedAgentId
+        ) {
           orbitActions.selectAgent(snap.selectedHostId, snap.selectedAgentId);
         } else {
           orbitActions.openGlobalOverview();
@@ -270,6 +277,14 @@ export function useGlobalErgonomicKeybindings(): void {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.openSidePanelNewTab();
+        return;
+      }
+
+      // 5b-3. Reopen Closed Side Panel Tab (`⌘⇧T` / custom)
+      if (matchesActionChord(e, "reopen_closed_side_tab", custom, isMac)) {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.reopenClosedSidePanelTab();
         return;
       }
 

@@ -1,7 +1,7 @@
 //! One host's in-memory replica. JS owns the socket and encrypted IndexedDB transactions.
 use std::collections::{BTreeMap, HashMap};
 
-use orbit_client_core::{catalog, contract, stage, viewmodel::*};
+use orbit_client_core::{catalog, contract, personal_agent, stage, viewmodel::*};
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{PROTOCOL_VERSION, TimelineEvent, TimelineOutlinePrompt, WireMessage};
 use wasm_bindgen::prelude::*;
@@ -151,6 +151,18 @@ impl WasmHost {
             ProviderModelsSnapshot { catalogs, .. } => h.provider_catalogs = catalogs,
             QuotaReport { snapshots, .. } => h.quotas = snapshots,
             PendingPermissionsSnapshot { permissions, .. } => h.pending_permissions = permissions,
+            ConditionalTimersSnapshot { timers, .. } => h.conditional_timers = timers,
+            ConditionalTimerCreated { timer, .. } | ConditionalTimerUpdated { timer, .. } => {
+                if let Some(slot) = h
+                    .conditional_timers
+                    .iter_mut()
+                    .find(|existing| existing.timer_id == timer.timer_id)
+                {
+                    *slot = timer;
+                } else {
+                    h.conditional_timers.insert(0, timer);
+                }
+            }
             GoalRunsSnapshot { goals, .. } => h.goal_runs = goals,
             GoalRunUpdated { goal, .. } | GoalRunEvent { goal } => {
                 if let Some(slot) = h
@@ -355,5 +367,42 @@ pub fn resolve_model_selection(req: JsValue, live: JsValue) -> Result<JsValue, J
         req.provider,
         req.desired_model.as_deref(),
         req.desired_effort,
+    ))
+}
+
+#[wasm_bindgen]
+pub fn get_personal_agent_briefing(
+    hosts: JsValue,
+    primary_router_host_id: Option<String>,
+    now_ms: Option<f64>,
+) -> Result<JsValue, JsError> {
+    let details: Vec<HostDetailView> = from_js(hosts)?;
+    let empty_read = HashMap::new();
+    let empty_previews = HashMap::new();
+    let inputs: Vec<personal_agent::BriefingHostInput<'_>> = details
+        .iter()
+        .map(|d| personal_agent::BriefingHostInput {
+            host_id: d.host.host_id.as_str(),
+            host_name: d.host.display_name.as_str(),
+            online: matches!(
+                d.host.connection_state,
+                HostConnectionState::OnlineDirect | HostConnectionState::OnlineRelay
+            ),
+            agents: d.agents.as_slice(),
+            pending_permissions: d.pending_permissions.as_slice(),
+            conditional_timers: d.conditional_timers.as_slice(),
+            goal_runs: d.goal_runs.as_slice(),
+            agent_read_at_ms: &empty_read,
+            step_previews: &empty_previews,
+        })
+        .collect();
+    let now = now_ms
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v as i64)
+        .unwrap_or(0);
+    js(&personal_agent::build_personal_agent_briefing(
+        &inputs,
+        primary_router_host_id.as_deref(),
+        now,
     ))
 }

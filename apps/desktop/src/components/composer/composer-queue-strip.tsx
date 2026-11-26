@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   CornerDownRight,
   Folder,
@@ -12,8 +12,10 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { InlineDirectiveToken } from "@/components/composer/composer-directive-token";
+import { DragShield } from "@/components/ui/drag-feedback";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useInlineSortable } from "@/lib/drag/use-inline-sortable";
 import { useI18n } from "@/lib/i18n";
 import type { PromptBadge, QueuedPromptView } from "@/lib/orbit-ipc";
 import {
@@ -165,257 +167,72 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
     return localQueued;
   }, [hostSupportsServerQueue, serverQueued, localQueued]);
 
-  const [queueDrag, setQueueDrag] = useState<{
-    phase: "dragging" | "settling";
-    fromIndex: number;
-    overIndex: number;
-    deltaY: number;
-    rowStep: number;
-  } | null>(null);
-  const queueRowRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const queueDragCleanupRef = useRef<(() => void) | null>(null);
-  const settleFinishRef = useRef<(() => void) | null>(null);
-  const settleTimerRef = useRef<number | null>(null);
-  const queuedSignature = useMemo(() => queued.map((q) => q.id).join("\0"), [queued]);
+  const scrollViewportRef = useRef<HTMLDivElement | null>(null);
+  const queuedIds = useMemo(() => queued.map((q) => q.id), [queued]);
 
-  useEffect(() => {
-    queueDragCleanupRef.current?.();
-  }, [queuedSignature]);
-
-  useEffect(() => {
-    return () => {
-      queueDragCleanupRef.current?.();
-    };
-  }, []);
-
-  const handleQueueRowPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>, fromIndex: number) => {
-      if (e.button !== 0 || queued.length < 2) return;
-      if ((e.target as HTMLElement | null)?.closest("button")) return;
-
-      // Flush any in-flight settle cleanly before starting a new drag.
-      if (settleFinishRef.current) {
-        settleFinishRef.current();
-      }
-
-      const firstRect = queueRowRefs.current[0]?.getBoundingClientRect();
-      const secondRect = queueRowRefs.current[1]?.getBoundingClientRect();
-      const measuredStep =
-        firstRect && secondRect && secondRect.top > firstRect.top
-          ? secondRect.top - firstRect.top
-          : 30;
-      const startY = e.clientY;
-      const count = queued.length;
-      const minDeltaY = -fromIndex * measuredStep;
-      const maxDeltaY = (count - 1 - fromIndex) * measuredStep;
-
-      let active = false;
-      let overIndex = fromIndex;
-      let latestDeltaY = 0;
-
-      const clearSettleTimer = () => {
-        if (settleTimerRef.current !== null) {
-          window.clearTimeout(settleTimerRef.current);
-          settleTimerRef.current = null;
-        }
-        settleFinishRef.current = null;
-      };
-
-      const detachListeners = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        window.removeEventListener("pointercancel", onCancel);
-        window.removeEventListener("keydown", onKeyDown);
-      };
-
-      const cleanup = () => {
-        detachListeners();
-        clearSettleTimer();
-        queueDragCleanupRef.current = null;
-        setQueueDrag(null);
-      };
-
-      const startSettle = (targetOverIndex: number, shouldCommit: boolean) => {
-        detachListeners();
-        const targetDeltaY = (targetOverIndex - fromIndex) * measuredStep;
-        const reducedMotion =
-          typeof window !== "undefined" &&
-          window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-
-        let finished = false;
-        const finalize = () => {
-          if (finished) return;
-          finished = true;
-          clearSettleTimer();
-          queueDragCleanupRef.current = null;
-          if (shouldCommit) {
-            orbitActions.reorderQueuedPrompts(fromIndex, targetOverIndex);
-          }
-          setQueueDrag(null);
-        };
-
-        if (reducedMotion || Math.abs(latestDeltaY - targetDeltaY) < 0.5) {
-          finalize();
-          return;
-        }
-
-        settleFinishRef.current = finalize;
-        queueDragCleanupRef.current = () => {
-          if (finished) return;
-          finished = true;
-          clearSettleTimer();
-          queueDragCleanupRef.current = null;
-          setQueueDrag(null);
-        };
-        setQueueDrag({
-          phase: "settling",
-          fromIndex,
-          overIndex: targetOverIndex,
-          deltaY: targetDeltaY,
-          rowStep: measuredStep,
-        });
-        settleTimerRef.current = window.setTimeout(finalize, 160);
-      };
-
-      const onMove = (ev: PointerEvent) => {
-        const rawDelta = ev.clientY - startY;
-        if (!active) {
-          if (Math.abs(rawDelta) < 4) return;
-          active = true;
-        }
-        const clampedDeltaY = Math.max(minDeltaY, Math.min(maxDeltaY, rawDelta));
-        latestDeltaY = clampedDeltaY;
-        const slotShift = Math.round(clampedDeltaY / measuredStep);
-        overIndex = Math.max(0, Math.min(count - 1, fromIndex + slotShift));
-        setQueueDrag({
-          phase: "dragging",
-          fromIndex,
-          overIndex,
-          deltaY: clampedDeltaY,
-          rowStep: measuredStep,
-        });
-      };
-
-      const onUp = () => {
-        if (!active) {
-          cleanup();
-          return;
-        }
-        startSettle(overIndex, overIndex !== fromIndex);
-      };
-
-      const onCancel = () => {
-        if (!active) {
-          cleanup();
-          return;
-        }
-        startSettle(fromIndex, false);
-      };
-      const onKeyDown = (ev: KeyboardEvent) => {
-        if (ev.key === "Escape") {
-          if (!active) {
-            cleanup();
-          } else {
-            startSettle(fromIndex, false);
-          }
-        }
-      };
-
-      queueDragCleanupRef.current?.();
-      queueDragCleanupRef.current = cleanup;
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
-      window.addEventListener("pointercancel", onCancel);
-      window.addEventListener("keydown", onKeyDown);
+  const queueSortable = useInlineSortable({
+    axis: "y",
+    itemIds: queuedIds,
+    scrollViewportRef,
+    ignoreSelector: "button",
+    onCommit: (fromIdx, toIdx) => {
+      orbitActions.reorderQueuedPrompts(fromIdx, toIdx);
     },
-    [queued.length],
-  );
+  });
 
   if (!selectedHostId || queued.length === 0) return null;
 
   return (
-    <div className="composer-queue-surface orbit-stage-enter overflow-hidden rounded-2xl text-[13px]">
-      <ScrollArea
-        className="w-full"
-        viewportClassName="max-h-[156px] overscroll-contain px-2 py-1.5"
-        contentClassName="flex flex-col gap-0.5"
-      >
-        {queued.map((qItem, idx) => {
-          const canDrag = queued.length > 1;
-          const isDragged = queueDrag !== null && queueDrag.fromIndex === idx;
-          let translateY = 0;
-          if (queueDrag) {
-            if (isDragged) {
-              translateY = queueDrag.deltaY;
-            } else if (
-              queueDrag.fromIndex < queueDrag.overIndex &&
-              idx > queueDrag.fromIndex &&
-              idx <= queueDrag.overIndex
-            ) {
-              translateY = -queueDrag.rowStep;
-            } else if (
-              queueDrag.fromIndex > queueDrag.overIndex &&
-              idx >= queueDrag.overIndex &&
-              idx < queueDrag.fromIndex
-            ) {
-              translateY = queueDrag.rowStep;
-            }
-          }
+    <>
+      <div className="composer-queue-surface orbit-stage-enter overflow-hidden rounded-2xl text-[13px]">
+        <ScrollArea
+          className="w-full"
+          viewportRef={scrollViewportRef}
+          viewportClassName="max-h-[156px] overscroll-contain px-2 py-1.5"
+          contentClassName="flex flex-col gap-0.5"
+        >
+          {queued.map((qItem, idx) => {
+            const canDrag = queued.length > 1;
+            const isDragged = queueSortable.sortState?.fromIndex === idx;
+            const isSettling = isDragged && queueSortable.sortState?.phase === "settling";
 
-          const imageBadges = qItem.badges.filter((b) => b.kind === "image");
-          const otherBadges = qItem.badges.filter((b) => b.kind !== "image");
-          const visibleImages = imageBadges.slice(0, MAX_QUEUED_IMAGE_THUMBS);
-          const extraImageCount = Math.max(0, imageBadges.length - MAX_QUEUED_IMAGE_THUMBS);
-          const visibleOtherBadges = otherBadges.slice(0, 2);
-          const hiddenOtherBadgeCount = Math.max(
-            0,
-            otherBadges.length - visibleOtherBadges.length,
-          );
-          const trimmedDisplayText = qItem.displayText?.trim() ?? "";
-          const hasDisplayText = trimmedDisplayText.length > 0;
-          const imageOnlyLabel =
-            !hasDisplayText && otherBadges.length === 0 && imageBadges.length > 0
-              ? imageBadges.length === 1
-                ? t("composer.imageCountOne")
-                : t("composer.imageCountMany", { count: imageBadges.length })
-              : "";
+            const imageBadges = qItem.badges.filter((b) => b.kind === "image");
+            const otherBadges = qItem.badges.filter((b) => b.kind !== "image");
+            const visibleImages = imageBadges.slice(0, MAX_QUEUED_IMAGE_THUMBS);
+            const extraImageCount = Math.max(0, imageBadges.length - MAX_QUEUED_IMAGE_THUMBS);
+            const visibleOtherBadges = otherBadges.slice(0, 2);
+            const hiddenOtherBadgeCount = Math.max(
+              0,
+              otherBadges.length - visibleOtherBadges.length,
+            );
+            const trimmedDisplayText = qItem.displayText?.trim() ?? "";
+            const hasDisplayText = trimmedDisplayText.length > 0;
+            const imageOnlyLabel =
+              !hasDisplayText && otherBadges.length === 0 && imageBadges.length > 0
+                ? imageBadges.length === 1
+                  ? t("composer.imageCountOne")
+                  : t("composer.imageCountMany", { count: imageBadges.length })
+                : "";
 
-          return (
-            <div
-              key={qItem.id}
-              ref={(el) => {
-                queueRowRefs.current[idx] = el;
-              }}
-              onPointerDown={canDrag ? (e) => handleQueueRowPointerDown(e, idx) : undefined}
-              onTransitionEnd={
-                isDragged && queueDrag.phase === "settling"
-                  ? (e) => {
-                      if (e.target === e.currentTarget && e.propertyName === "transform") {
-                        settleFinishRef.current?.();
-                      }
-                    }
-                  : undefined
-              }
-              style={
-                queueDrag ? { transform: `translate3d(0, ${translateY}px, 0)` } : undefined
-              }
-              className={cn(
-                "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none",
-                isDragged
-                  ? cn(
-                      "bg-surface-overlay relative z-10 shadow-md",
-                      queueDrag.phase === "settling"
-                        ? "transition-[transform,box-shadow] duration-[140ms] ease-[var(--ease-out-expo)]"
-                        : "cursor-grabbing",
-                    )
-                  : cn(
-                      queueDrag
-                        ? "transition-transform duration-150 ease-[var(--ease-out-expo)]"
-                        : "hover:bg-accent/65 transition-colors",
-                      canDrag && !queueDrag && "cursor-grab",
-                    ),
-              )}
-            >
+            return (
+              <div
+                key={qItem.id}
+                ref={(el) => queueSortable.registerItem(qItem.id, el)}
+                onPointerDown={canDrag ? (e) => queueSortable.handlePointerDown(e, idx) : undefined}
+                onDragStart={(e) => e.preventDefault()}
+                style={queueSortable.getNeighborStyle(idx)}
+                className={cn(
+                  "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none [-webkit-user-drag:none]",
+                  isDragged
+                    ? cn("drag-lifted-surface relative z-10", !isSettling && "cursor-grabbing")
+                    : cn(
+                        queueSortable.isActive
+                          ? "transition-transform duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none"
+                          : "hover:bg-accent/65 transition-colors",
+                        canDrag && !queueSortable.isActive && "cursor-grab",
+                      ),
+                )}
+              >
               <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                 {canDrag ? (
                   <span className="relative inline-flex size-3.5 shrink-0 items-center justify-center">
@@ -514,7 +331,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
               <div
                 className={cn(
                   "flex shrink-0 items-center gap-0.5 transition-opacity duration-150",
-                  queueDrag && "pointer-events-none opacity-45",
+                  queueSortable.isActive && "pointer-events-none opacity-45",
                 )}
               >
                 <SimpleTooltip label={t("composer.sendNowTooltip")} side="top">
@@ -547,10 +364,12 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                   </button>
                 </SimpleTooltip>
               </div>
-            </div>
-          );
-        })}
-      </ScrollArea>
-    </div>
+              </div>
+            );
+          })}
+        </ScrollArea>
+      </div>
+      <DragShield active={queueSortable.isDragging} cursor="grabbing" />
+    </>
   );
 });

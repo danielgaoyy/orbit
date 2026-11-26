@@ -69,14 +69,12 @@ export const FileViewerTab = memo(function FileViewerTab({
 }: {
   tab: SidePanelTab;
 }) {
-  const fallbackHostId = useOrbitSelector((s) => s.selectedHostId);
-  const fallbackCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const isDark = resolvedTheme === "dark";
   const { t } = useI18n();
 
-  const hostId = tab.hostId ?? fallbackHostId ?? "";
-  const cwd = tab.cwd ?? fallbackCwd ?? "~";
+  const hostId = tab.hostId ?? "";
+  const cwd = tab.cwd ?? "~";
   const path = tab.filePath ?? "";
   const cKey = fileCacheKey(hostId, cwd, path);
 

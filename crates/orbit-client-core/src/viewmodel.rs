@@ -844,14 +844,24 @@ pub(crate) fn render_timeline_event_view(
             text,
             badges,
         } => {
-            let key = (agent_id.to_string(), ev.seq, text.len());
+            let trimmed = text.trim_start();
+            let cleaned_for_blocks = if trimmed.starts_with("<orbit-")
+                || trimmed.starts_with("<WORKSPACE_RULES")
+                || trimmed.starts_with("<ATTACHED_CONTEXT")
+            {
+                orbit_protocol::clean_agent_message_display_body(text)
+            } else {
+                None
+            };
+            let parse_src = cleaned_for_blocks.as_deref().unwrap_or(text.as_str());
+            let key = (agent_id.to_string(), ev.seq, parse_src.len());
             if markdown_cache.len() > 2048 {
                 markdown_cache.clear();
             }
             let blocks = markdown_cache
                 .entry(key)
                 .or_insert_with(|| {
-                    crate::render::parse_markdown_blocks_with_math(text, false, false)
+                    crate::render::parse_markdown_blocks_with_math(parse_src, false, false)
                 })
                 .clone();
             Some(TimelineItemView::UserPrompt {
@@ -1011,14 +1021,22 @@ pub(crate) fn render_timeline_event_view(
             dispatched_at_ms,
             settled_at_ms,
         } => {
-            let key = (agent_id.to_string(), ev.seq, text.len());
+            let cleaned_for_blocks = if *kind == orbit_protocol::AgentMessageKind::DirectMessage
+                && permission_context.is_none()
+            {
+                orbit_protocol::clean_agent_message_display_body(text)
+            } else {
+                None
+            };
+            let parse_src = cleaned_for_blocks.as_deref().unwrap_or(text.as_str());
+            let key = (agent_id.to_string(), ev.seq, parse_src.len());
             if markdown_cache.len() > 2048 {
                 markdown_cache.clear();
             }
             let blocks = markdown_cache
                 .entry(key)
                 .or_insert_with(|| {
-                    crate::render::parse_markdown_blocks_with_math(text, false, false)
+                    crate::render::parse_markdown_blocks_with_math(parse_src, false, false)
                 })
                 .clone();
             let folded = delivery_updates.get(message_id);

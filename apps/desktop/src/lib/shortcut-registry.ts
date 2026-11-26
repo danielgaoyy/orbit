@@ -19,6 +19,7 @@ export type ShortcutActionId =
   | "toggle_sidebar"
   | "toggle_side_panel"
   | "new_side_tab"
+  | "reopen_closed_side_tab"
   | "toggle_overview_hud"
   | "quick_open_file"
   | "toggle_diff"
@@ -115,6 +116,13 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = [
     groupKey: "settings.groupPanels",
     labelKey: "settings.scNewSideTab",
     defaultChord: "Mod+T",
+  },
+  {
+    id: "reopen_closed_side_tab",
+    scope: "panels",
+    groupKey: "settings.groupPanels",
+    labelKey: "settings.scReopenClosedSideTab",
+    defaultChord: "Mod+Shift+T",
   },
   {
     id: "toggle_overview_hud",

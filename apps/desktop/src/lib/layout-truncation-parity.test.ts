@@ -133,16 +133,71 @@ describe("desktop flexbox truncation & overflow guards", () => {
       /inline-flex min-w-0 max-w-full items-center gap-1\.5 text-\[11\.5px\]/,
     );
 
-    // Overview SubagentCrewList renders ProviderIcon + Model + Effort (no dot between Model & Effort) + Status
+    // Shared AgentListItem renders ProviderIcon + Model + Effort (no dot between Model & Effort) + Status,
+    // and is composed by SubagentCrewList, PersonalAgentBriefingRail, and WorkspaceBoardTab.
+    const agentListItemSrc = readFileSync(
+      join(COMPONENTS_ROOT, "ui/agent-list-item.tsx"),
+      "utf8",
+    );
+    assert.match(agentListItemSrc, /<ProviderIcon[\s\S]*?provider=\{provider\}/);
+    assert.match(agentListItemSrc, /<span className="min-w-0 truncate">\{modelLabel\}<\/span>/);
+    assert.match(agentListItemSrc, /<span className="text-ink-muted shrink-0">\{effortLabel\}<\/span>/);
+    assert.doesNotMatch(agentListItemSrc, /modelLabel\}[\s\S]{0,80}·[\s\S]{0,80}\{effortLabel\}/);
+    assert.doesNotMatch(agentListItemSrc, /\bdetail\?:/);
+
     const crewDockSrc = readFileSync(
       join(COMPONENTS_ROOT, "stage/subagent-crew-dock.tsx"),
       "utf8",
     );
     assert.match(crewDockSrc, /const showModel = Boolean\(sa\.modelLabel\) && depth < 4;/);
-    assert.match(crewDockSrc, /<ProviderIcon[\s\S]*?provider=\{sa\.childProvider\}/);
-    assert.match(crewDockSrc, /<span className="min-w-0 truncate">\{sa\.modelLabel\}<\/span>/);
-    assert.match(crewDockSrc, /<span className="text-ink-muted shrink-0">\{effortText\}<\/span>/);
-    assert.doesNotMatch(crewDockSrc, /sa\.modelLabel\}[\s\S]{0,80}·[\s\S]{0,80}\{effortText\}/);
+    assert.match(crewDockSrc, /<AgentListItem\b/);
+
+    const briefingRailSrc = readFileSync(
+      join(COMPONENTS_ROOT, "personal-agent/personal-agent-briefing-rail.tsx"),
+      "utf8",
+    );
+    assert.match(briefingRailSrc, /<AgentListItem\b/);
+    assert.match(briefingRailSrc, /orbitActions\.openSubagentTab\(/);
+    assert.doesNotMatch(briefingRailSrc, /orbitActions\.openPeerSplitTab\(/);
+    assert.doesNotMatch(briefingRailSrc, /<DiffStat\b/);
+    // Briefing Rail shares the exact StageRail primitives and Overview section/goal/timer components with StageOverviewPanel
+    assert.match(briefingRailSrc, /<StageRailShell\b/);
+    assert.match(briefingRailSrc, /<StageRailHeader\b/);
+    assert.match(briefingRailSrc, /<StageRailScrollBody\b/);
+    assert.match(briefingRailSrc, /<OverviewSection\b/);
+    assert.match(briefingRailSrc, /<StageRailExpandFooter\b/);
+    assert.match(briefingRailSrc, /<OverviewGoalRow\b/);
+    assert.match(briefingRailSrc, /<ArmedTimerRow\b/);
+    assert.doesNotMatch(briefingRailSrc, /\bconst BriefingSection\b/);
+    assert.doesNotMatch(briefingRailSrc, /\bconst MissionGroupCard\b/);
+    assert.doesNotMatch(briefingRailSrc, /\bPersonalAgentTopBarCapsule\b/);
+
+    // TopBar aligns Personal Agent header identically to standard sessions (SubagentCrewMiniDock + standard toggle, no special capsule)
+    const topBarSrc = readFileSync(
+      join(COMPONENTS_ROOT, "layout/top-bar.tsx"),
+      "utf8",
+    );
+    assert.doesNotMatch(topBarSrc, /PersonalAgentTopBarCapsule/);
+    assert.match(topBarSrc, /const needsTopBarActivity = hasActiveSession && !overviewVisible;/);
+    assert.doesNotMatch(topBarSrc, /showTopBarCrewRelay\s*=\s*[\s\S]{0,120}!isPersonalAgentSession/);
+    assert.match(topBarSrc, /isDefaultPersonalAgentTitle\(/);
+    assert.match(topBarSrc, /<SubagentCrewMiniDock\b/);
+    assert.match(topBarSrc, /data-overview-trigger/);
+
+    const stageOverviewSrc = readFileSync(
+      join(COMPONENTS_ROOT, "stage/stage-overview-panel.tsx"),
+      "utf8",
+    );
+    assert.match(stageOverviewSrc, /<StageRailShell\b/);
+    assert.match(stageOverviewSrc, /<StageRailHeader\b/);
+    assert.match(stageOverviewSrc, /<StageRailScrollBody\b/);
+    assert.match(stageOverviewSrc, /<OverviewSection\b/);
+
+    const boardTabSrc = readFileSync(
+      join(COMPONENTS_ROOT, "side-panel/workspace-board-tab.tsx"),
+      "utf8",
+    );
+    assert.match(boardTabSrc, /<AgentListItem\b/);
 
     // Side Panel SubagentTab renders the unified 32px semantic context header (Provider + Agent + Model + Effort + Status, crumbs only for depth >= 2)
     const subagentTabSrc = readFileSync(

@@ -219,6 +219,7 @@ mod tests {
                 source: Some(source.into()),
             }),
             human_only: true,
+            router_recommendation: None,
             created_at: Utc::now(),
         }
     }

@@ -4,7 +4,13 @@ import type {
   TimelineItemView,
   ToolCallDetail,
 } from "../../lib/orbit-ipc.ts";
-import { isTimelineAgentMessageHidden } from "../../lib/turn-delegation-split.ts";
+import {
+  extractDirectAgentMessagePresentation,
+} from "../../lib/agent-message-clean.ts";
+import {
+  isDirectAgentPromptBubble,
+  isTimelineAgentMessageHidden,
+} from "../../lib/turn-delegation-split.ts";
 import { findTurnIndexForSeq } from "./stage-helpers.ts";
 
 export const STAGE_FIND_REMOTE_DEBOUNCE_MS = 180;
@@ -77,6 +83,12 @@ function extractItemSearchSlice(
         ? { seq: item.seq, role: "assistant", text: item.text, visibleInDom }
         : null;
     case "agent_message": {
+      if (isDirectAgentPromptBubble(item)) {
+        const cleaned = extractDirectAgentMessagePresentation(item.text, item).cleanText;
+        return cleaned
+          ? { seq: item.seq, role: "agent", text: cleaned, visibleInDom }
+          : null;
+      }
       const combined = [item.source_title, item.event, item.text]
         .filter((s): s is string => Boolean(s && s.trim()))
         .join(" ");

@@ -15,12 +15,43 @@ before(async () => {
       load(id) {
         if (id.endsWith("/state/orbit-store.ts")) return `
           export const opened = [];
-          export const orbitActions = { openSubagentTab: (record) => opened.push(record) };
+          export const selected = [];
+          export const orbitActions = {
+            openSubagentTab: (record) => opened.push(record),
+            selectAgent: (hostId, agentId) => selected.push({ hostId, agentId }),
+          };
           export const state = {
-            hostDetails: {remote: {
-              host: {host_id: "remote"},
-              agents: ["ag_review", "ag_Reviewer", "ag_Auditor"].map(agent_id => ({agent_id})),
-            }},
+            hostDetails: {
+              local: {
+                host: { host_id: "local" },
+                agents: [
+                  {
+                    agent_id: "ag_router",
+                    title: "Personal Router",
+                    handle: "router",
+                    labels: { "orbit.role": "personal_router" },
+                  },
+                  {
+                    agent_id: "ag_backend",
+                    title: "Backend Worker",
+                    handle: "backend",
+                    labels: {},
+                  },
+                  {
+                    agent_id: "ag_worker_legacy",
+                    title: "Legacy Worker",
+                    parent_agent_id: "ag_router",
+                    parent_host_id: "local",
+                    labels: {},
+                  },
+                ],
+              },
+              remote: {
+                host: {host_id: "remote"},
+                agents: ["ag_review", "ag_Reviewer", "ag_Auditor"].map(agent_id => ({agent_id})),
+              },
+            },
+            archivedThreads: {},
             stages: {},
           };
           export const useOrbitSelector = (selector) => selector(state);
@@ -397,39 +428,28 @@ it("reuses dispatch maps until a resolved entry or timeline key changes", async 
   assert.notEqual(results[4], results[5]);
 });
 
-it("hides direct inter-agent messages and routine finish callbacks while preserving failure alerts", async () => {
+it("renders direct agent dispatches via shared UserPromptBubble with source provenance and hides routine finish/protocol noise", async () => {
   const { TurnStageSection } = await server.ssrLoadModule("/src/components/stage/stage-turn-card.tsx");
-  const report = {
-    item_type: "agent_message", kind: "direct_message", seq: 1, message_id: "report",
-    source_agent_id: "ag_review", source_title: "Reviewer", text: "Review ready", blocks: [],
-  };
-  for (const event of ["finished", "canceled", "errored"]) {
-    const finish = { ...report, seq: 5, message_id: "finish", kind: "finish_notification", event, text: "Final notification" };
-    const turn = {
-      agent_message: report, folded_steps: [], notices: [], compactions: [], turn_diffs: [],
-      live_segments: [{ kind: "agent_message", key: "finish", item: finish }],
-    };
-    const html = renderRow(TurnStageSection, {
-      hostId: "local", agentId: "parent", cwd: "/", hostArtifacts: [], turn, isTurnActive: false,
-    }).html;
-    // Timeline messages never render colorful animal avatars or direct inter-agent rows
-    assert.doesNotMatch(html, /data-slot="subagent-avatar"/);
-    assert.doesNotMatch(html, /Review ready/);
-    if (event === "errored") {
-      assert.match(html, />failed</i);
-      assert.match(html, /border-signal-danger-border bg-signal-danger-bg\/45/);
-      assert.match(html, /Final notification/);
-    } else {
-      assert.equal(html, "");
-    }
-  }
+  const { UserPromptBubble } = await server.ssrLoadModule("/src/components/stage/stage-prompt-controls.tsx");
+  const { selected } = await server.ssrLoadModule("/src/state/orbit-store.ts");
+  const { translate } = await server.ssrLoadModule("/src/lib/i18n/index.ts");
 
-  // Standalone direct_message or routine finish_notification turns render nothing (no ghost footer)
+  // 1. Routine finish notifications and pure fleet/protocol noise stay silent (no ghost footer or bubble)
   for (const opening of [
-    report,
     {
       item_type: "agent_message", kind: "finish_notification", seq: 10, message_id: "fin-10",
       source_agent_id: "ag_review", source_title: "Reviewer", event: "finished", text: "Done", blocks: [],
+    },
+    {
+      item_type: "agent_message", kind: "direct_message", seq: 11, message_id: "noise-11",
+      source_agent_id: "ag_router", source_title: "Personal Router",
+      text: '<orbit-fleet-delta rev="3">\n- worker1 idle\n</orbit-fleet-delta>', blocks: [],
+    },
+    {
+      item_type: "agent_message", kind: "direct_message", seq: 12, message_id: "noise-12",
+      source_agent_id: "ag_router", source_title: "Personal Router",
+      text: '<orbit-system version="1" kind="agent-notification" event="finished">\nAgent finished.\n</orbit-system>',
+      blocks: [],
     },
   ]) {
     const emptyTurn = {
@@ -439,10 +459,111 @@ it("hides direct inter-agent messages and routine finish callbacks while preserv
       completed_at_ms: 1_700_000_000_000,
     };
     const emptyHtml = renderRow(TurnStageSection, {
-      hostId: "local", agentId: "parent", cwd: "/", hostArtifacts: [], turn: emptyTurn, isTurnActive: false,
+      hostId: "local", agentId: "worker", cwd: "/", hostArtifacts: [], turn: emptyTurn, isTurnActive: false,
     }).html;
     assert.equal(emptyHtml, "");
   }
+
+  // 2. Failed finish alerts still render via AgentMessageCard danger banner (not UserPromptBubble)
+  const failedFinish = {
+    item_type: "agent_message", kind: "finish_notification", seq: 5, message_id: "finish-err",
+    source_agent_id: "ag_review", source_title: "Reviewer", event: "errored", text: "Final notification", blocks: [],
+  };
+  const failedHtml = renderRow(TurnStageSection, {
+    hostId: "local", agentId: "parent", cwd: "/", hostArtifacts: [], isTurnActive: false,
+    turn: {
+      folded_steps: [], notices: [], compactions: [], turn_diffs: [],
+      live_segments: [{ kind: "agent_message", key: "finish", item: failedFinish }],
+    },
+  }).html;
+  assert.doesNotMatch(failedHtml, /data-slot="subagent-avatar"|prompt-bubble-surface/);
+  assert.match(failedHtml, />failed</i);
+  assert.match(failedHtml, /border-signal-danger-border bg-signal-danger-bg\/45/);
+  assert.match(failedHtml, /Final notification/);
+
+  // 3. Direct message from Personal Agent (even wrapped in <orbit-system>) renders in global UserPromptBubble
+  //    with localized source label and clickable jump to Personal Agent
+  const personalDispatch = {
+    item_type: "agent_message", kind: "direct_message", seq: 1, message_id: "dm-personal",
+    source_agent_id: "ag_router", source_host_id: "local", source_title: "Personal Router",
+    text: '<orbit-system version="1" kind="agent-message" source-agent-id="ag_router" source-host-id="local" source-agent-title="Personal Router" message-id="dm-personal">\nInvestigate &lt;Trace&gt; icon alignment.\n</orbit-system>',
+    blocks: [],
+  };
+  const personalTurn = {
+    turn_index: 0, anchor_seq: 1, agent_message: personalDispatch,
+    folded_steps: [], notices: [], compactions: [], turn_diffs: [],
+    live_segments: [],
+  };
+  const personalEn = renderRow(TurnStageSection, {
+    hostId: "local", agentId: "ag_worker", cwd: "/", hostArtifacts: [], turn: personalTurn, isTurnActive: false,
+  });
+  assert.match(personalEn.html, /prompt-bubble-surface/);
+  assert.match(personalEn.html, /data-slot="prompt-source"/);
+  assert.match(personalEn.html, /From Personal Agent/);
+  assert.match(personalEn.html, /Investigate &lt;Trace&gt; icon alignment\./);
+  assert.doesNotMatch(personalEn.html, /orbit-system|Undo to this point/);
+
+  // Clicking the source button navigates directly to the source agent session
+  const beforeJump = selected.length;
+  const bubbleRender = renderRow(UserPromptBubble, {
+    hostId: "local", agentId: "ag_worker", cwd: "/",
+    item: personalDispatch,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+    onPreviewImage: () => {},
+  });
+  bubbleRender.clicks[0]();
+  assert.equal(selected.length, beforeJump + 1);
+  assert.deepEqual(selected.at(-1), { hostId: "local", agentId: "ag_router" });
+
+  // Chinese & Japanese locales format localized Personal Agent source labels via i18n
+  assert.equal(
+    translate("zh-CN", "stage.fromSource", { source: translate("zh-CN", "sidebar.personalRouter") }),
+    "来自 个人代理",
+  );
+  assert.equal(
+    translate("en", "stage.fromSource", { source: translate("en", "sidebar.personalRouter") }),
+    "From Personal Agent",
+  );
+  assert.equal(
+    translate("ja", "stage.fromSource", { source: translate("ja", "sidebar.personalRouter") }),
+    "パーソナルエージェント から",
+  );
+
+  // 4. Inline peer message (e.g. message_peer from @backend) renders via UserPromptBubble with @handle
+  const peerMsg = {
+    item_type: "agent_message", kind: "direct_message", seq: 20, message_id: "pm-1",
+    source_agent_id: "ag_backend", source_host_id: "local", source_title: "@backend", event: "peer_message",
+    text: "Updated OpenAPI schema for login.", blocks: [],
+  };
+  const peerTurn = {
+    turn_index: 1, anchor_seq: 18,
+    folded_steps: [], notices: [], compactions: [], turn_diffs: [],
+    live_segments: [{ kind: "agent_message", key: "pm-1", item: peerMsg }],
+  };
+  const peerHtml = renderRow(TurnStageSection, {
+    hostId: "local", agentId: "ag_frontend", cwd: "/", hostArtifacts: [], turn: peerTurn, isTurnActive: false,
+  }).html;
+  assert.match(peerHtml, /prompt-bubble-surface/);
+  assert.match(peerHtml, /From @backend/);
+  assert.match(peerHtml, /Updated OpenAPI schema for login\./);
+
+  // 5. Historical create_agent worker (turn 0 persisted as UserPrompt with parent_agent_id=ag_router)
+  //    automatically attributes turn 0 bubble to Personal Agent
+  const legacyTurn = {
+    turn_index: 0, anchor_seq: 1,
+    user_prompt: {
+      item_type: "user_prompt", seq: 1, message_id: "u-legacy",
+      text: "Audit stage folding", badges: [], blocks: [],
+    },
+    folded_steps: [], notices: [], compactions: [], turn_diffs: [],
+    live_segments: [],
+  };
+  const legacyHtml = renderRow(TurnStageSection, {
+    hostId: "local", agentId: "ag_worker_legacy", cwd: "/", hostArtifacts: [], turn: legacyTurn, isTurnActive: false,
+  }).html;
+  assert.match(legacyHtml, /prompt-bubble-surface/);
+  assert.match(legacyHtml, /From Personal Agent/);
+  assert.match(legacyHtml, /Audit stage folding/);
 });
 
 it("expands heartbeat and timer details on a left rail, with a copy action for the timer", async () => {
@@ -567,7 +688,7 @@ it("renders system notes as markers and a detail-free worktree handoff as a stat
   assert.doesNotMatch(handoff.html, /<button\b/);
 });
 
-it("wraps completed turn work behind Worked for, hides settled icons/suffixes, and omits thinking preview", async () => {
+it("renders thinking and failure icons consistently, wraps pure tool turns behind Worked for without double-nesting, and preserves important segments", async () => {
   const { TurnStageSection } = await server.ssrLoadModule("/src/components/stage/stage-turn-card.tsx");
   const { TurnActivityDisclosure } = await server.ssrLoadModule("/src/components/stage/stage-step-group.tsx");
   const { StepItemRow } = await server.ssrLoadModule("/src/components/stage/stage-tool-renderers.tsx");
@@ -583,7 +704,7 @@ it("wraps completed turn work behind Worked for, hides settled icons/suffixes, a
     liveLabel: "Editing a.ts…",
     liveDetail: "Checking hidden headline",
     settledLabel: "",
-    summaryCounts: { action_steps: 1, additions: 12, deletions: 4, unrecovered_failure_count: 0 },
+    summaryCounts: { action_steps: 1, thought_count: 1, additions: 12, deletions: 4, unrecovered_failure_count: 0 },
     labelIncludesFailure: false,
     defaultCollapsed: true,
     autoOpenForError: false,
@@ -601,7 +722,74 @@ it("wraps completed turn work behind Worked for, hides settled icons/suffixes, a
   assert.match(liveGroup.html, /data-slot="trace-description"[^>]*>5s</);
   assert.doesNotMatch(liveGroup.html, /· 5s|Checking hidden headline|2 steps|\+12|>-4<|Offline|queued/i);
 
-  // 2. Inner thinking row: omits both leading icon and truncated headline preview while collapsed
+  // 1b. Thought-only TurnActivityDisclosure: pulsing Brain while active, static Brain when settled ("Thought for 5s")
+  const activeThought = renderRow(TurnActivityDisclosure, {
+    items: [{ item_type: "assistant_thinking", seq: 1, item_id: "th1", text: "Reasoning..." }],
+    isWorkActive: true,
+    liveLabel: "Thinking…",
+    settledLabel: "Thought about it",
+    thoughtDurationMs: 5_000,
+    summaryCounts: { action_steps: 0, thought_count: 1, unrecovered_failure_count: 0 },
+    labelIncludesFailure: false,
+    defaultCollapsed: true,
+    autoOpenForError: false,
+    liveStartedAtMs: Date.now() - 3000,
+    cwd: "/",
+    agentId: "ag-think-live",
+    thinkingSignature: "",
+    getThinkingDurationMs: () => 5_000,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+  });
+  assert.match(activeThought.html, /lucide-brain/);
+  assert.match(activeThought.html, /animate-pulse/);
+  assert.match(activeThought.html, /Thinking…/);
+
+  const settledThought = renderRow(TurnActivityDisclosure, {
+    items: [{ item_type: "assistant_thinking", seq: 1, item_id: "th1", text: "Reasoning..." }],
+    isWorkActive: false,
+    liveLabel: "Thinking…",
+    settledLabel: "Thought about it",
+    thoughtDurationMs: 5_000,
+    summaryCounts: { action_steps: 0, thought_count: 1, unrecovered_failure_count: 0 },
+    labelIncludesFailure: false,
+    defaultCollapsed: true,
+    autoOpenForError: false,
+    liveStartedAtMs: null,
+    cwd: "/",
+    agentId: "ag-think-done",
+    thinkingSignature: "",
+    getThinkingDurationMs: () => 5_000,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+  });
+  assert.match(settledThought.html, /lucide-brain/);
+  assert.doesNotMatch(settledThought.html, /animate-pulse/);
+  assert.match(settledThought.html, /Thought for 5s/);
+  assert.equal(settledThought.html.match(/data-slot="trace-icon"/g)?.length, 2);
+
+  // 1c. Settled tool disclosure with unrecovered failure surfaces non-color AlertTriangle icon
+  const settledFailed = renderRow(TurnActivityDisclosure, {
+    items: [
+      { item_type: "tool_call", seq: 1, status: "failed", summary_title: "Run test", diff_files: [], detail: { kind: "shell", command: "npm test" } },
+    ],
+    isWorkActive: false,
+    liveLabel: "Running…",
+    settledLabel: "Ran command",
+    summaryCounts: { action_steps: 1, thought_count: 0, failed_count: 1, unrecovered_failure_count: 1 },
+    labelIncludesFailure: false,
+    defaultCollapsed: true,
+    autoOpenForError: false,
+    liveStartedAtMs: null,
+    cwd: "/",
+    agentId: "ag-failed",
+    thinkingSignature: "",
+    getThinkingDurationMs: () => null,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+  });
+  assert.match(settledFailed.html, /lucide-triangle-alert/);
+  assert.match(settledFailed.html, /data-status="error"/);
+
+  // 2. Inner thinking row: keeps restrained Brain icon (static when settled, pulsing when active)
+  //    while still omitting truncated headline preview while collapsed
   const thinkingRow = renderRow(StepItemRow, {
     cwd: "/",
     thoughtDurationMs: 5000,
@@ -609,10 +797,36 @@ it("wraps completed turn work behind Worked for, hides settled icons/suffixes, a
     item: { item_type: "assistant_thinking", seq: 1, item_id: "th1", text: "Secret preview sentence\nDetails" },
   });
   assert.match(thinkingRow.html, /Thought for 5s/);
+  assert.match(thinkingRow.html, /lucide-brain/);
+  assert.doesNotMatch(thinkingRow.html, /animate-pulse/);
   assert.doesNotMatch(thinkingRow.html, /Secret preview sentence|lucide-sparkles/);
-  assert.equal(thinkingRow.html.match(/data-slot="trace-icon"/g)?.length, 1);
+  assert.equal(thinkingRow.html.match(/data-slot="trace-icon"/g)?.length, 2);
 
-  // 3. Completed turn with tool work + final reply: folds pre-final work behind iconless "Worked for 18s"
+  const activeThinkingRow = renderRow(StepItemRow, {
+    cwd: "/",
+    isActivelyThinking: true,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+    item: { item_type: "assistant_thinking", seq: 1, item_id: "th1", text: "Streaming thought" },
+  });
+  assert.match(activeThinkingRow.html, /Thinking…/);
+  assert.match(activeThinkingRow.html, /lucide-brain/);
+  assert.match(activeThinkingRow.html, /animate-pulse/);
+
+  const mkMsg = (seq: number, text: string) => ({
+    kind: "assistant_message",
+    key: `msg-${seq}`,
+    item: {
+      item_type: "assistant_message",
+      seq,
+      item_id: `m${seq}`,
+      text,
+      streaming: false,
+      blocks: [{ kind: "paragraph", spans: [{ text, bold: false, italic: false, strikethrough: false, inline_code: false, link_url: null }] }],
+    },
+  });
+
+  // 3. Completed turn with pure pre-final tool work + final reply: folds behind "Worked for 18s",
+  //    and expanding opens StepTimelineRail directly without a double-nested "Read files" disclosure
   const turn = {
     key: "turn-1",
     turn_index: 0,
@@ -645,26 +859,13 @@ it("wraps completed turn work behind Worked for, hides settled icons/suffixes, a
         has_running_step: false,
         work_duration_ms: 18_000,
       },
-      {
-        kind: "assistant_message",
-        key: "msg-final",
-        item: {
-          item_type: "assistant_message",
-          seq: 13,
-          item_id: "m13",
-          text: "All done.",
-          streaming: false,
-          blocks: [{ kind: "paragraph", spans: [{ text: "All done.", bold: false, italic: false, strikethrough: false, inline_code: false, link_url: null }] }],
-        },
-      },
+      mkMsg(13, "All done."),
     ],
   };
-  const collapsedTurn = renderRow(TurnStageSection, {
+  const baseProps = {
     hostId: "local",
-    agentId: "ag-worked",
     cwd: "/repo",
     hostArtifacts: [],
-    turn,
     isTurnActive: false,
     autoFoldCompleted: true,
     isNetworkOffline: false,
@@ -673,30 +874,109 @@ it("wraps completed turn work behind Worked for, hides settled icons/suffixes, a
     holdViewport: (_a: unknown, apply: () => void) => apply(),
     onRequestRewind: () => {},
     onPreviewImage: () => {},
-  });
+  };
+  const collapsedTurn = renderRow(TurnStageSection, { ...baseProps, agentId: "ag-worked", turn });
   assert.match(collapsedTurn.html, /Worked for 18s/);
   assert.match(collapsedTurn.html, /All done\./);
   assert.doesNotMatch(collapsedTurn.html, /Read files/);
   // Trigger has trailing chevron trace-icon only (no leading prefix icon inside trace-line)
   assert.equal(collapsedTurn.html.match(/data-slot="trace-icon"/g)?.length, 1);
 
-  // Expanding "Worked for 18s" (via autoFoldCompleted=false) reveals iconless "Read files" without per-group "· 18s"
+  // Expanding "Worked for 18s" reveals inner steps directly (single click, no nested "Read files" wrapper)
   const expandedTurn = renderRow(TurnStageSection, {
-    hostId: "local",
+    ...baseProps,
     agentId: "ag-worked-open",
-    cwd: "/repo",
-    hostArtifacts: [],
     turn,
-    isTurnActive: false,
     autoFoldCompleted: false,
-    isNetworkOffline: false,
-    thinkingSignature: "",
-    getThinkingDurationMs: () => null,
-    holdViewport: (_a: unknown, apply: () => void) => apply(),
-    onRequestRewind: () => {},
-    onPreviewImage: () => {},
   });
   assert.match(expandedTurn.html, /Worked for 18s/);
-  assert.match(expandedTurn.html, /Read files/);
-  assert.doesNotMatch(expandedTurn.html, /· 18s/);
+  assert.match(expandedTurn.html, /a\.ts/);
+  assert.match(expandedTurn.html, /b\.ts/);
+  assert.doesNotMatch(expandedTurn.html, /Read files|· 18s/);
+
+  // Fast pure-work turn (< 1s / missing duration) uses natural fallback label instead of bare "Worked"
+  const fastTurn = {
+    ...turn,
+    key: "turn-fast",
+    work_duration_ms: null,
+    turn_duration_ms: null,
+    live_segments: [
+      { ...turn.live_segments[0], work_duration_ms: null },
+      turn.live_segments[1],
+    ],
+  };
+  const fastCollapsed = renderRow(TurnStageSection, { ...baseProps, agentId: "ag-fast", turn: fastTurn });
+  assert.match(fastCollapsed.html, /Read files/);
+  assert.match(fastCollapsed.html, /All done\./);
+
+  // 4. Antigravity multi-segment completed turn: intermediate assistant reply MUST stay visible
+  //    top-level after turn ends (never swallowed behind "Worked for"), while tool groups stay folded
+  const multiReplyTurn = {
+    ...turn,
+    key: "turn-multi-reply",
+    live_segments: [
+      turn.live_segments[0],
+      mkMsg(13, "Detailed root-cause analysis stays visible."),
+      {
+        kind: "step_group",
+        key: "sg-2",
+        first_seq: 14,
+        items: [
+          { item_type: "tool_call", seq: 14, status: "completed", summary_title: "Run tests", diff_files: [], detail: { kind: "shell", command: "npm test" } },
+        ],
+        summary: {
+          counts: { action_steps: 1, command_count: 1, unrecovered_failure_count: 0, failed_count: 0, denied_count: 0, additions: 0, deletions: 0 },
+          label: "Ran command",
+          live_label: "Running command…",
+          live_detail: null,
+          label_includes_failure: false,
+        },
+        has_following_content: true,
+        has_running_step: false,
+        work_duration_ms: 4_000,
+      },
+      mkMsg(15, "Verification passed."),
+    ],
+  };
+  const multiReplyHtml = renderRow(TurnStageSection, {
+    ...baseProps,
+    agentId: "ag-multi-reply",
+    turn: multiReplyTurn,
+  }).html;
+  assert.match(multiReplyHtml, /Detailed root-cause analysis stays visible\./);
+  assert.match(multiReplyHtml, /Verification passed\./);
+  assert.match(multiReplyHtml, /Read files/);
+  assert.match(multiReplyHtml, /Ran command/);
+  assert.doesNotMatch(multiReplyHtml, /Worked for 18s/);
+
+  // 5. Antigravity post-turn wakeup, runtime warning notice, and promoted timer milestone stay visible
+  const wakeupTurn = {
+    ...turn,
+    key: "turn-wakeup",
+    live_segments: [
+      turn.live_segments[0],
+      mkMsg(13, "Primary task completed."),
+      { kind: "wakeup", key: "wk-14", label: "Subagent finished" },
+      mkMsg(15, "Follow-up summary."),
+    ],
+  };
+  const wakeupHtml = renderRow(TurnStageSection, { ...baseProps, agentId: "ag-wakeup", turn: wakeupTurn }).html;
+  assert.match(wakeupHtml, /Primary task completed\./);
+  assert.match(wakeupHtml, /Subagent finished/);
+  assert.match(wakeupHtml, /Follow-up summary\./);
+  assert.doesNotMatch(wakeupHtml, /Worked for 18s/);
+
+  const noticeTurn = {
+    ...turn,
+    key: "turn-notice",
+    live_segments: [
+      turn.live_segments[0],
+      { kind: "notice", key: "n-13", item: { item_type: "notice", seq: 13, level: "warning", message: "API stream retried" } },
+      mkMsg(14, "Recovered cleanly."),
+    ],
+  };
+  const noticeHtml = renderRow(TurnStageSection, { ...baseProps, agentId: "ag-notice", turn: noticeTurn }).html;
+  assert.match(noticeHtml, /API stream retried/);
+  assert.match(noticeHtml, /Recovered cleanly\./);
+  assert.doesNotMatch(noticeHtml, /Worked for 18s/);
 });

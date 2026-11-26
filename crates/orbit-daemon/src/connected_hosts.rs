@@ -662,6 +662,7 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::PreviewTunnelOpened { request_id, .. }
         | WireMessage::McpResourceResponse { request_id, .. }
         | WireMessage::ArtifactMcpToolResponse { request_id, .. }
+        | WireMessage::PersonalAgentActivitySnapshot { request_id, .. }
         | WireMessage::RewindPreviewResult { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }

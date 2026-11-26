@@ -44,6 +44,9 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  resolveSidePanelScopeKey,
+} from "../side-panel-scope";
+import {
   fileCacheKey,
   upsertLruRecord,
 } from "../store-helpers";
@@ -1432,6 +1435,34 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
     ): Promise<LspLocation | null> {
       if (!hostId || !cwd || cwd === "~" || !path || line < 1 || col < 1) return null;
       const seq = ++nextLspGotoSeq;
+      const originState = getState();
+      const originScopeKey =
+        originState.sidePanelScopeKey ??
+        resolveSidePanelScopeKey({
+          selectedHostId: originState.selectedHostId,
+          selectedAgentId: originState.selectedAgentId,
+          isDraftNewSession: originState.isDraftNewSession,
+          hostDetails: originState.hostDetails,
+          archivedThreads: originState.archivedThreads,
+        });
+      const isStaleTarget = (): boolean => {
+        const cur = getState();
+        const curScopeKey =
+          cur.sidePanelScopeKey ??
+          resolveSidePanelScopeKey({
+            selectedHostId: cur.selectedHostId,
+            selectedAgentId: cur.selectedAgentId,
+            isDraftNewSession: cur.isDraftNewSession,
+            hostDetails: cur.hostDetails,
+            archivedThreads: cur.archivedThreads,
+          });
+        return (
+          seq !== nextLspGotoSeq ||
+          !cur.sidePanelOpen ||
+          cur.selectedHostId !== hostId ||
+          (originScopeKey !== null && curScopeKey !== originScopeKey)
+        );
+      };
       try {
         const locations = await orbitIpc.lspGotoDefinition({
           hostId,
@@ -1440,7 +1471,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
           line,
           col,
         });
-        if (seq !== nextLspGotoSeq || !getState().sidePanelOpen || getState().selectedHostId !== hostId) {
+        if (isStaleTarget()) {
           return null;
         }
         const first = locations[0] ?? null;
@@ -1456,7 +1487,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
         });
         return first;
       } catch {
-        if (seq !== nextLspGotoSeq || !getState().sidePanelOpen || getState().selectedHostId !== hostId) {
+        if (isStaleTarget()) {
           return null;
         }
         notifyToast("No definition found");

@@ -72,6 +72,7 @@ use orbit_client_core::desktop_ops::{
 use orbit_client_core::export::{
     ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
 };
+use orbit_client_core::personal_agent::PersonalAgentBriefingView;
 use orbit_client_core::render::{
     HighlightedLineView, RichBlockView, highlight_code_lines_capped, parse_markdown_blocks,
 };
@@ -3478,6 +3479,32 @@ fn set_primary_router_selection(
 }
 
 #[tauri::command]
+async fn get_personal_agent_briefing(
+    state: State<'_, DesktopAppState>,
+    primary_router_host_id: Option<String>,
+) -> Result<PersonalAgentBriefingView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.personal_agent_briefing(primary_router_host_id)
+    })
+    .await
+    .map_err(|e| format!("personal agent briefing task error: {e}"))
+}
+
+#[tauri::command]
+async fn list_personal_agent_activity(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    limit: Option<u32>,
+    since_ms: Option<i64>,
+) -> Result<Vec<orbit_protocol::PersonalAgentActivityEntry>, String> {
+    state
+        .core
+        .list_personal_agent_activity(&host_id, limit.unwrap_or(50), since_ms)
+        .await
+}
+
+#[tauri::command]
 fn focus_main_window(app: AppHandle) -> Result<(), String> {
     tray::focus_main_window_impl(&app)
 }
@@ -5456,6 +5483,8 @@ pub fn run() {
             export_hermes_bridge_config,
             get_primary_router_selection,
             set_primary_router_selection,
+            get_personal_agent_briefing,
+            list_personal_agent_activity,
             focus_main_window,
             update_tray_status,
             probe_local_provider_readiness,

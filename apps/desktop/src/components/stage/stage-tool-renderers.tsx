@@ -2,6 +2,7 @@ import { memo, useMemo, useRef, useState, type PointerEvent, type ReactNode } fr
 import {
   AlertTriangle,
   ArrowUpRight,
+  Brain,
   Check,
   FilePenLine,
   FilePlus2,
@@ -60,6 +61,20 @@ import { StageCopyButton } from "./stage-prompt-controls";
 
 const quickActionClass =
   "text-ink-muted hover:text-ink-primary inline-flex shrink-0 cursor-pointer rounded p-0.5 opacity-0 transition-opacity duration-150 group-hover/tool:opacity-100 group-focus-within/tool:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none";
+
+/** Shared restrained monochrome thinking glyph used by both top-level and inner thought rows. */
+export function ThinkingGlyph({ active = false }: { active?: boolean }) {
+  return (
+    <Brain
+      className={cn(
+        "size-[13px]",
+        active &&
+          "animate-pulse motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]",
+      )}
+      strokeWidth={1.75}
+    />
+  );
+}
 
 function StepOutput({
   text,
@@ -497,6 +512,9 @@ export const StepItemRow = memo(function StepItemRow({
       : formatThoughtSummaryLabel(thoughtDurationMs, 1, locale);
     return renderStep(
       <TraceLine status={isActivelyThinking ? "running" : undefined}>
+        <TraceIcon>
+          <ThinkingGlyph active={isActivelyThinking} />
+        </TraceIcon>
         <TraceTitle>{label}</TraceTitle>
       </TraceLine>,
       trimmed.length > 0 && (() => (

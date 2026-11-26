@@ -1405,7 +1405,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         };
         if (submission.kind === "btw") {
           clearDirectiveDraft();
-          ctx.actions.openSideQuestionTab();
+          ctx.actions.openSideQuestionTab({ source: "auto" });
           if (submission.text) void ctx.actions.submitSideQuestion(submission.text);
           return;
         }
@@ -2002,7 +2002,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           (getState().isDraftNewSession || !getState().selectedAgentId) === submitTarget.isDraftNewSession &&
           (submitTarget.isDraftNewSession || getState().selectedAgentId === submitTarget.agentId);
         if (stillOnOrigin) {
-          ctx.actions.openSideQuestionTab();
+          ctx.actions.openSideQuestionTab({ source: "auto" });
         }
         if (composed.btw_question) {
           void ctx.actions.submitSideQuestion(composed.btw_question, {

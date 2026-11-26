@@ -62,7 +62,7 @@ orbit login --mesh
 Instead of manually juggling separate threads across machines:
 
 1. Open **Settings → App → Personal Agent** in Orbit Desktop.
-2. Elect any always-on host in your fleet (such as a home Mac Studio or cloud Devbox) as your global **Personal Router** (`chief-of-staff`).
+2. Elect any always-on host in your fleet (such as a home Mac Studio or cloud Devbox) as your global **Personal Agent** (`chief-of-staff`).
 3. Choose your preferred coordinator provider (`Claude Code`, `Codex`, `Antigravity`, or any ACP agent) and optionally connect **Slack Socket Mode**, **Discord Gateway v10**, or **Feishu / Lark** with zero public webhooks.
 
 Your Personal Agent maintains a live incremental view of every online machine, dispatches work across hosts into isolated Git worktrees, and pings you only when an irreversible **Tier-3 human decision** (such as a production push, deploy, or secret rotation) is required.

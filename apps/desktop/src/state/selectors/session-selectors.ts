@@ -71,7 +71,7 @@ const EMPTY_INSIGHT_SUBAGENTS: readonly SessionSubagentEntryView[] = Object.free
  */
 export function selectSessionSubagents(
   state: Pick<OrbitUiState, "hostDetails" | "fleet" | "archivedSubagents"> &
-    Partial<Pick<OrbitUiState, "stages">>,
+    Partial<Pick<OrbitUiState, "stages" | "archivedThreads">>,
   hostId: string | null,
   agentId: string | null,
   insightsSubagentsOverride?: readonly SessionSubagentEntryView[],
@@ -103,7 +103,13 @@ export function selectSessionSubagents(
     character: characterByKey.get(sa.key)!,
   }));
 
-  const visible = filterVisibleSubagents(all, state.archivedSubagents, hostId, agentId);
+  const visible = filterVisibleSubagents(
+    all,
+    state.archivedSubagents,
+    hostId,
+    agentId,
+    state.archivedThreads,
+  );
 
   let activeCount = 0;
   let awaitingCount = 0;

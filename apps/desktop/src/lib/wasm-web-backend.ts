@@ -42,6 +42,11 @@ export interface BrowserBindings {
   WasmHost: new (profile: Profile, cached: unknown) => HostModel;
   parse_pairing_uri(text: string): Profile;
   project_fleet_sidebar(data: unknown, req: unknown): unknown;
+  get_personal_agent_briefing(
+    hosts: HostDetailView[],
+    primaryRouterHostId?: string | null,
+    nowMs?: number | null,
+  ): unknown;
   compose_prompt(req: unknown): unknown;
   provider_catalogs(live: unknown): unknown;
   resolve_model_selection(req: unknown, live: unknown): unknown;
@@ -477,6 +482,12 @@ export class WasmWebBackend implements OrbitTransportBackend {
             hosts: hosts.map((h) => h.model.snapshot()),
           },
           req,
+        );
+      case "get_personal_agent_briefing":
+        return this.wasm.get_personal_agent_briefing(
+          hosts.map((h) => h.model.snapshot()),
+          a.primaryRouterHostId == null ? null : String(a.primaryRouterHostId),
+          Date.now(),
         );
       case "pair_host":
         return this.pair(String(a.pairingUri));
@@ -988,6 +999,13 @@ export class WasmWebBackend implements OrbitTransportBackend {
           action: a.action,
         });
         return reply.goal;
+      }
+      case "list_personal_agent_activity": {
+        const reply = await this.rpc(h, "list_personal_agent_activity", {
+          limit: Number(a.limit ?? 50),
+          since_ms: a.sinceMs ?? null,
+        });
+        return reply.entries ?? [];
       }
     }
     throw new Error("This action is unavailable in Orbit Web (" + cmd + ")");

@@ -219,6 +219,7 @@ pub struct CreateAgentSpec {
     pub workspace_id: Option<String>,
     pub parent_agent_id: Option<String>,
     pub parent_host_id: Option<String>,
+    pub initial_prompt_source: Option<crate::messaging::AgentPromptSource>,
     pub profile_id: Option<String>,
     pub background: bool,
     pub auto_archive: bool,
@@ -1043,7 +1044,13 @@ impl AgentOrchestrator {
                                 });
                                 if matches!(
                                     latest_non_status.map(|ev| &ev.payload),
-                                    Some(TimelinePayload::UserPrompt { .. })
+                                    Some(
+                                        TimelinePayload::UserPrompt { .. }
+                                            | TimelinePayload::AgentMessage {
+                                                kind: orbit_protocol::AgentMessageKind::DirectMessage,
+                                                ..
+                                            }
+                                    )
                                 ) {
                                     let notice = TimelinePayload::Notice {
                                         level: "warning".into(),
@@ -2533,8 +2540,9 @@ impl AgentOrchestrator {
         }
 
         let initial_rule_badges = spec.initial_badges.clone();
-        // Persist the initial user prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
-        // and the user sees their clean message + badges at 0ms without blocking the socket!
+        // Persist the initial prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
+        // and clients see the clean message + badges (or sourced agent dispatch bubble) at 0ms
+        // without blocking the socket!
         let (initial_turn, final_agent_opt) = if !initial_prompt.trim().is_empty() {
             let tid = format!("turn_{}", Uuid::new_v4().simple());
             let visible_text = spec
@@ -2543,19 +2551,36 @@ impl AgentOrchestrator {
             let aid_p = agent_id.clone();
             let tid_p = tid.clone();
             let badges_p = spec.initial_badges;
-            let mark_read = summary.parent_agent_id.is_none();
+            let initial_prompt_source = spec.initial_prompt_source;
+            let mark_read = summary.parent_agent_id.is_none() && initial_prompt_source.is_none();
+            let dispatched_ms = Utc::now().timestamp_millis();
             let (ev, final_ag) = self
                 .try_store(move |s| -> anyhow::Result<_> {
-                    let ev = s.append_timeline_event(
-                        &aid_p,
-                        1,
-                        Some(&tid_p),
+                    let payload = if let Some(src) = initial_prompt_source {
+                        TimelinePayload::AgentMessage {
+                            message_id: format!("am_{}", Uuid::new_v4().simple()),
+                            kind: src.kind,
+                            source_agent_id: src.source_agent_id,
+                            source_host_id: src.source_host_id,
+                            source_title: src.source_title,
+                            event: src.event.or_else(|| Some("initial_prompt".into())),
+                            text: visible_text,
+                            permission_context: src.permission_context,
+                            delivery_status: Some(AgentMessageDeliveryStatus::Dispatched),
+                            delivery_turn_id: Some(tid_p.clone()),
+                            blocking_turn_id: None,
+                            queued_at_ms: Some(dispatched_ms),
+                            dispatched_at_ms: Some(dispatched_ms),
+                            settled_at_ms: None,
+                        }
+                    } else {
                         TimelinePayload::UserPrompt {
                             message_id: format!("u_{}", Uuid::new_v4().simple()),
                             text: visible_text,
                             badges: badges_p,
-                        },
-                    )?;
+                        }
+                    };
+                    let ev = s.append_timeline_event(&aid_p, 1, Some(&tid_p), payload)?;
                     let prompt_seq = ev.seq;
                     // Authoritative multi-device sync: human's own prompt is already read by the creator.
                     if mark_read {
@@ -5639,11 +5664,28 @@ impl AgentOrchestrator {
                 .store
                 .record_permission_rule_match(&matched.rule.id, matched_at);
             let decided_at_ms = u64::try_from(matched_at.timestamp_millis()).unwrap_or(0);
+            let pre_req_id = format!("pre_{}", &Uuid::new_v4().simple().to_string()[..12]);
+            let _ = self.store.append_audit_event_with_host(
+                orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                "deny",
+                "permission_rule",
+                Some(self.host_id.as_str()),
+                Some(agent_id),
+                "applied",
+                &serde_json::json!({
+                    "request_id": pre_req_id,
+                    "agent_title": ag.title,
+                    "summary": target_summary,
+                    "risk_level": "high",
+                    "classifier_tier": "deterministic",
+                    "reason": matched.reason,
+                }),
+            );
             self.guardian
                 .record_audit_entry(orbit_protocol::GuardianAuditEntry {
                     id: format!("pr_{}", &Uuid::new_v4().simple().to_string()[..12]),
                     agent_id: agent_id.to_string(),
-                    request_id: format!("pre_{}", &Uuid::new_v4().simple().to_string()[..12]),
+                    request_id: pre_req_id,
                     tool_name: primary_tool,
                     target_summary: target_summary.clone(),
                     assessment: orbit_protocol::GuardianAssessment {
@@ -7410,6 +7452,45 @@ impl AgentOrchestrator {
             .await
             .get(&(agent_id.to_string(), request_id.to_string()))
             .cloned()
+    }
+
+    /// Attach a non-binding Personal Agent recommendation (`allow` | `deny` + reason) to a pending
+    /// permission entry in memory and broadcast the updated snapshot to all connected clients.
+    pub async fn recommend_permission(
+        &self,
+        agent_id: &str,
+        request_id: &str,
+        decision: String,
+        reason: String,
+    ) -> anyhow::Result<orbit_protocol::RouterRecommendation> {
+        let normalized_decision = decision.trim().to_ascii_lowercase();
+        if !matches!(normalized_decision.as_str(), "allow" | "deny") {
+            anyhow::bail!("recommendation decision must be `allow` or `deny`");
+        }
+        let trimmed_reason = reason.trim();
+        if trimmed_reason.is_empty() {
+            anyhow::bail!("recommendation reason must not be empty");
+        }
+        let recommendation = orbit_protocol::RouterRecommendation {
+            decision: normalized_decision,
+            reason: trimmed_reason.to_string(),
+            created_at: Utc::now(),
+        };
+        let key = (agent_id.to_string(), request_id.to_string());
+        let snapshot = {
+            let mut guard = self.pending_permissions.write().await;
+            let Some(entry) = guard.get_mut(&key) else {
+                anyhow::bail!("no pending permission `{request_id}` for agent `{agent_id}`");
+            };
+            entry.router_recommendation = Some(recommendation.clone());
+            let mut out: Vec<PendingPermissionSummary> = guard.values().cloned().collect();
+            out.sort_by_key(|p| p.created_at);
+            out
+        };
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::PendingPermissionsChanged(snapshot));
+        Ok(recommendation)
     }
 
     pub async fn has_pending_permissions(&self, agent_id: &str) -> bool {
@@ -9193,6 +9274,22 @@ impl AgentOrchestrator {
                                         crate::guardian::summarize_tool_request(&detail, &title);
                                     let decided_at_ms =
                                         u64::try_from(matched_at.timestamp_millis()).unwrap_or(0);
+                                    let _ = self.store.append_audit_event_with_host(
+                                        orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                                        if is_allow { "allow" } else { "deny" },
+                                        "permission_rule",
+                                        Some(self.host_id.as_str()),
+                                        Some(agent_id),
+                                        "applied",
+                                        &serde_json::json!({
+                                            "request_id": request_id,
+                                            "agent_title": ag.title,
+                                            "summary": target_summary,
+                                            "risk_level": if is_allow { "low" } else { "high" },
+                                            "classifier_tier": "deterministic",
+                                            "reason": matched.reason,
+                                        }),
+                                    );
                                     self.guardian
                                         .record_audit_entry(orbit_protocol::GuardianAuditEntry {
                                             id: format!(
@@ -9350,8 +9447,26 @@ impl AgentOrchestrator {
                                         ),
                                     };
                                     let aid_g = agent_id.to_string();
+                                    let host_id_g = self.host_id.clone();
+                                    let audit_details_g = serde_json::json!({
+                                        "request_id": request_id,
+                                        "agent_title": ag.title,
+                                        "summary": target_summary,
+                                        "risk_level": assessment.risk_level.as_str(),
+                                        "classifier_tier": assessment.classifier_tier,
+                                        "reason": assessment.reason,
+                                    });
                                     if let Ok((saved_ev_opt, updated_opt)) = self
                                         .with_store(move |s| {
+                                            let _ = s.append_audit_event_with_host(
+                                                orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                                                "allow",
+                                                "guardian_tier1",
+                                                Some(host_id_g.as_str()),
+                                                Some(aid_g.as_str()),
+                                                "applied",
+                                                &audit_details_g,
+                                            );
                                             let updated = if clear_attn {
                                                 Self::clear_permission_attention_in_store(s, &aid_g)
                                             } else {
@@ -9424,8 +9539,26 @@ impl AgentOrchestrator {
                                         ),
                                     };
                                     let aid_g = agent_id.to_string();
+                                    let host_id_g = self.host_id.clone();
+                                    let audit_details_g = serde_json::json!({
+                                        "request_id": request_id,
+                                        "agent_title": ag.title,
+                                        "summary": target_summary,
+                                        "risk_level": assessment.risk_level.as_str(),
+                                        "classifier_tier": assessment.classifier_tier,
+                                        "reason": assessment.reason,
+                                    });
                                     if let Ok((saved_ev_opt, updated_opt)) = self
                                         .with_store(move |s| {
+                                            let _ = s.append_audit_event_with_host(
+                                                orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                                                "deny",
+                                                "guardian_tier1",
+                                                Some(host_id_g.as_str()),
+                                                Some(aid_g.as_str()),
+                                                "applied",
+                                                &audit_details_g,
+                                            );
                                             let updated = if clear_attn {
                                                 Self::clear_permission_attention_in_store(s, &aid_g)
                                             } else {
@@ -9505,6 +9638,7 @@ impl AgentOrchestrator {
                             guardian_assessment: guardian_assessment.clone(),
                             plan_approval: plan_approval.clone(),
                             human_only,
+                            router_recommendation: None,
                             created_at: Utc::now(),
                         },
                     );
@@ -9553,19 +9687,39 @@ impl AgentOrchestrator {
                             && router_id != agent_id
                             && let Some(delivery) = self.message_delivery().await
                         {
-                            let body = format!(
-                                "Worker `{}` ({}) requests Tier-2 ({}) permission `{}`: {}.\n\
-                                 Evaluate whether this aligns with the user's stated intent. \
-                                 If aligned and mode allows, call `orbit_control(action=\"respond_permission\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\")`; \
-                                 otherwise deny or summarize for the human.",
-                                ag.title,
-                                agent_id,
-                                risk_level.as_str(),
-                                request_id,
-                                title,
-                                agent_id,
-                                request_id
-                            );
+                            let body = if cfg.pre_review_mode
+                                == orbit_protocol::RouterPreReviewMode::AssistOnly
+                            {
+                                format!(
+                                    "Worker `{}` ({}) requests Tier-2 ({}) permission `{}`: {}.\n\
+                                     Pre-review mode is `assist_only`: do NOT resolve directly. \
+                                     Call `orbit_control(action=\"recommend_permission\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\"|\"deny\", reason=\"...\")` \
+                                     to attach your recommendation for the human.",
+                                    ag.title,
+                                    agent_id,
+                                    risk_level.as_str(),
+                                    request_id,
+                                    title,
+                                    agent_id,
+                                    request_id
+                                )
+                            } else {
+                                format!(
+                                    "Worker `{}` ({}) requests Tier-2 ({}) permission `{}`: {}.\n\
+                                     Evaluate whether this aligns with the user's stated intent. \
+                                     If aligned and mode allows, call `orbit_control(action=\"respond_permission\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\", reason=\"...\")`; \
+                                     otherwise deny or call `orbit_control(action=\"recommend_permission\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\"|\"deny\", reason=\"...\")` for human review.",
+                                    ag.title,
+                                    agent_id,
+                                    risk_level.as_str(),
+                                    request_id,
+                                    title,
+                                    agent_id,
+                                    request_id,
+                                    agent_id,
+                                    request_id
+                                )
+                            };
                             let _ = delivery
                                 .enqueue(crate::messaging::QueuedAgentMessage {
                                     recipient_id: router_id,
@@ -11601,6 +11755,7 @@ mod fast_mode_orchestrator_tests {
             workspace_id: None,
             parent_agent_id: None,
             parent_host_id: None,
+            initial_prompt_source: None,
             profile_id: profile_id.map(ToOwned::to_owned),
             background: false,
             auto_archive: false,
@@ -13014,6 +13169,7 @@ mod fast_mode_orchestrator_tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
                 created_at: now,
             },
         );
@@ -13097,6 +13253,7 @@ mod fast_mode_orchestrator_tests {
                     guardian_assessment: None,
                     plan_approval: None,
                     human_only: false,
+                    router_recommendation: None,
                     created_at: now,
                 },
             );
@@ -15289,6 +15446,7 @@ diff --git a/config/prod.env b/config/prod.env\n\
                     guardian_assessment: assessment,
                     plan_approval: plan,
                     human_only: false,
+                    router_recommendation: None,
                     created_at: now,
                 }
             };
@@ -15616,6 +15774,7 @@ diff --git a/config/prod.env b/config/prod.env\n\
                     guardian_assessment: assessment,
                     plan_approval: None,
                     human_only: false,
+                    router_recommendation: None,
                     created_at: now,
                 }
             };
@@ -17114,5 +17273,79 @@ diff --git a/config/prod.env b/config/prod.env\n\
         );
 
         let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn create_agent_with_initial_prompt_source_persists_sourced_direct_agent_message() {
+        let (dir, store, orch) = test_orchestrator("initial_prompt_source").await;
+
+        let sourced_spec = CreateAgentSpec {
+            cwd: dir.to_string_lossy().to_string(),
+            extra_dirs: Vec::new(),
+            title: Some("Worker Task".into()),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: None,
+            mode: SessionMode::AcceptEdits,
+            initial_prompt: "Audit folding logic".into(),
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree: false,
+            workspace_id: None,
+            parent_agent_id: Some("ag_personal_router".into()),
+            parent_host_id: Some("host_main".into()),
+            initial_prompt_source: Some(crate::messaging::AgentPromptSource {
+                kind: orbit_protocol::AgentMessageKind::DirectMessage,
+                source_agent_id: Some("ag_personal_router".into()),
+                source_host_id: Some("host_main".into()),
+                source_title: Some("Personal Agent".into()),
+                event: Some("initial_prompt".into()),
+                permission_context: None,
+            }),
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            base_ref: None,
+            worktree_mode: WorktreeCreateMode::BranchOff,
+            branch: None,
+            pr_number: None,
+            handle: None,
+            auto_cluster: Some(false),
+            acp_agent_id: None,
+        };
+        let ag = orch
+            .create_and_start_agent(sourced_spec)
+            .await
+            .expect("create sourced agent");
+        let (events, _) = store
+            .fetch_timeline_since(&ag.agent_id, 0, 20)
+            .expect("timeline");
+        assert!(
+            events.iter().any(|ev| matches!(
+                &ev.payload,
+                TimelinePayload::AgentMessage {
+                    kind: orbit_protocol::AgentMessageKind::DirectMessage,
+                    source_agent_id: Some(sid),
+                    source_host_id: Some(shid),
+                    source_title: Some(title),
+                    event: Some(evt),
+                    text,
+                    ..
+                } if sid == "ag_personal_router"
+                    && shid == "host_main"
+                    && title == "Personal Agent"
+                    && evt == "initial_prompt"
+                    && text == "Audit folding logic"
+            )),
+            "expected sourced DirectMessage event, got: {events:?}"
+        );
+        let outline = store
+            .fetch_timeline_outline_prompts(&ag.agent_id)
+            .expect("outline");
+        assert_eq!(outline.len(), 1);
+        assert_eq!(outline[0].preview, "Audit folding logic");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

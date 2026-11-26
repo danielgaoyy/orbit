@@ -206,6 +206,7 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
           updated_at_ms: Date.now(),
         });
         setPrimarySelection(nextPrimary);
+        orbitActions.setPrimaryRouterHostId(nextPrimary?.host_id ?? effectiveHostId);
       }
       void scanFleetHosts({ silent: true });
     } catch (err) {
@@ -255,6 +256,7 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
           updated_at_ms: Date.now(),
         });
         setPrimarySelection(nextPrimary);
+        orbitActions.setPrimaryRouterHostId(nextPrimary?.host_id ?? effectiveHostId);
         orbitActions.selectAgent(effectiveHostId, snap.router_agent.agent_id);
         orbitActions.closeSettings();
       }
@@ -311,6 +313,7 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
         updated_at_ms: Date.now(),
       });
       setPrimarySelection(nextPrimary);
+      orbitActions.setPrimaryRouterHostId(nextPrimary?.host_id ?? target.host_id);
       setStatus(snap);
       setDraft(snap.config);
       if (snap.router_agent?.agent_id) {

@@ -28,6 +28,7 @@ import type {
   PersistedPrefs,
   ReviewScope,
   SettingsSectionTarget,
+  SidePanelOpenSource,
   SimpleSyncGate,
   StagePullGate,
   TerminalSplitDirection,
@@ -125,22 +126,27 @@ export interface OrbitCrossSliceActions {
   markOpenFilesStaleForWorkspace(hostId: string, cwd: string): void;
   focusSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void;
   closeSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void;
+  reopenClosedSidePanelTab(): void;
   reorderSidePanelTabs(sourceTabId: string, targetTabId: string, position: "before" | "after"): void;
   splitSidePanelTab(tabId?: string | null): void;
   closeSidePanelSplit(): void;
   setSidePanelSplitRatio(ratio: number): void;
   setSidePanelSecondaryTab(tabId: string): void;
   openGlobalOverview(): void;
-  pinOverviewLane(hostId: string, agentId: string): void;
-  unpinOverviewLane(hostId: string, agentId: string): void;
-  clearOverviewLanes(): void;
+  setPrimaryRouterHostId(hostId: string | null): void;
+  refreshPrimaryRouterSelection(): Promise<string | null>;
   setCustomKeybinding(actionId: ShortcutActionId, chord: string | null): void;
   setCustomKeybindings(next: Record<string, string>): void;
   resetCustomKeybinding(actionId: ShortcutActionId): void;
   resetAllCustomKeybindings(): void;
-  openReviewTab(opts?: { path?: string | null; scope?: ReviewScope }): void;
+  openReviewTab(opts?: {
+    path?: string | null;
+    scope?: ReviewScope;
+    source?: SidePanelOpenSource;
+    activate?: boolean;
+  }): void;
   toggleReviewTab(openOverride?: boolean): void;
-  openFilesExplorerTab(): void;
+  openFilesExplorerTab(opts?: { source?: SidePanelOpenSource; activate?: boolean }): void;
   openExportDialog(hostId: string, agentId: string): void;
   openCopyCodeBlocksModal(hostId: string, agentId: string): Promise<void>;
   openFileInSidePanel(
@@ -153,6 +159,8 @@ export interface OrbitCrossSliceActions {
       fallbackPath?: string;
       initialMode?: "view" | "edit";
       skipUnsavedGuard?: boolean;
+      source?: SidePanelOpenSource;
+      activate?: boolean;
     },
   ): void;
   prefetchWorkspaceFile(
@@ -227,17 +235,29 @@ export interface OrbitCrossSliceActions {
     sessionId: string,
     action: BrowserActionRequest,
   ): Promise<BrowserActionResponseView | null>;
-  openTerminalTab(opts?: { spawnIfEmpty?: boolean }): void;
+  openTerminalTab(opts?: {
+    spawnIfEmpty?: boolean;
+    source?: SidePanelOpenSource;
+    activate?: boolean;
+  }): void;
   toggleTerminalTab(openOverride?: boolean): void;
   splitActiveTerminalPane(direction: TerminalSplitDirection): void;
   setTerminalSplitRatios(splitId: string, ratios: number[]): void;
+  reorderTerminalTabs(hostId: string, fromHostIndex: number, toHostIndex: number): void;
   runCommandInTerminal(
     command: string,
     opts?: { execute?: boolean; hostId?: string; cwd?: string },
   ): void;
   onTerminalTabAttached(hostId: string, tabKey: string, terminalId: string): void;
-  openBrowserTab(initialUrl?: string): void;
-  openSideQuestionTab(opts?: { entryId?: string }): void;
+  openBrowserTab(
+    initialUrl?: string,
+    opts?: { source?: SidePanelOpenSource; activate?: boolean },
+  ): void;
+  openSideQuestionTab(opts?: {
+    entryId?: string;
+    source?: SidePanelOpenSource;
+    activate?: boolean;
+  }): void;
   submitSideQuestion(
     rawQuestion?: string,
     targetOverride?: {
@@ -274,15 +294,23 @@ export interface OrbitCrossSliceActions {
     path: string,
     extraDirs?: string[],
   ): Promise<GitReposInspectionView | null>;
-  openPeerSplitTab(hostId: string, peerAgentId: string, title?: string): void;
+  openPeerSplitTab(
+    hostId: string,
+    peerAgentId: string,
+    title?: string,
+    opts?: { source?: SidePanelOpenSource; activate?: boolean },
+  ): void;
   openSubagentTab(opts: {
     callId: string;
     role: string;
     promptPreview?: string;
     childAgentId?: string | null;
     childHostId?: string | null;
+    parentHostId?: string | null;
     providerSubagentId?: string | null;
     parentAgentId?: string | null;
+    source?: SidePanelOpenSource;
+    activate?: boolean;
   }): void;
   fetchWorkspaceBoardAndEvents(hostId: string, workspaceId: string): Promise<void>;
   showToast(msg: string, action?: ToastAction | null): void;

@@ -363,6 +363,7 @@ fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'stat
                 Ok("list_pending_permissions")
             }
             "respond_permission" | "respond_to_permission" => Ok("respond_to_permission"),
+            "recommend_permission" | "recommend_to_permission" => Ok("recommend_permission"),
             "list_projects" | "projects" => Ok("list_projects"),
             "inspect_project_context" | "project_context" => Ok("inspect_project_context"),
             other => anyhow::bail!("unsupported `orbit_control` action `{other}`"),
@@ -914,6 +915,19 @@ async fn execute_tool_inner(
                 }
             }
 
+            let caller_source_title = caller.as_ref().map(|c| {
+                if c.is_personal_router() {
+                    c.title.clone()
+                } else {
+                    c.handle
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .map(|h| format!("@{h}"))
+                        .unwrap_or_else(|| c.title.clone())
+                }
+            });
+
             let created_agent = if let Some(ref remote_host_id) = target_host {
                 let cwd = opt_str(args, "cwd").unwrap_or_default();
                 if workspace_id.is_none() && cwd.is_empty() {
@@ -947,6 +961,7 @@ async fn execute_tool_inner(
                             workspace_id,
                             parent_agent_id: caller_agent_id.map(ToOwned::to_owned),
                             parent_host_id: caller_agent_id.map(|_| rt.host_info.host_id.clone()),
+                            parent_title: caller_source_title.clone(),
                             profile_id,
                             background,
                             auto_archive,
@@ -984,6 +999,14 @@ async fn execute_tool_inner(
                 let cwd = opt_str(args, "cwd")
                     .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
                     .unwrap_or_else(|| "~".to_string());
+                let initial_prompt_source = caller_agent_id.map(|cid| AgentPromptSource {
+                    kind: AgentMessageKind::DirectMessage,
+                    source_agent_id: Some(cid.to_string()),
+                    source_host_id: Some(rt.host_info.host_id.clone()),
+                    source_title: caller_source_title.clone(),
+                    event: Some("initial_prompt".into()),
+                    permission_context: None,
+                });
                 let res = Box::pin(
                     rt.orchestrator.create_and_start_agent(CreateAgentSpec {
                         cwd,
@@ -1004,6 +1027,7 @@ async fn execute_tool_inner(
                         workspace_id,
                         parent_agent_id: caller_agent_id.map(ToOwned::to_owned),
                         parent_host_id: None,
+                        initial_prompt_source,
                         profile_id,
                         background,
                         auto_archive,
@@ -1076,6 +1100,19 @@ async fn execute_tool_inner(
             let message_id = opt_str(args, "message_id")
                 .unwrap_or_else(|| format!("am_{}", Uuid::new_v4().simple()));
 
+            let caller_source_title = caller.as_ref().map(|c| {
+                if c.is_personal_router() {
+                    c.title.clone()
+                } else {
+                    c.handle
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .map(|h| format!("@{h}"))
+                        .unwrap_or_else(|| c.title.clone())
+                }
+            });
+
             if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
                 let resp = rt
@@ -1092,6 +1129,8 @@ async fn execute_tool_inner(
                             active_turn_behavior: behavior,
                             message_id: Some(message_id.clone()),
                             caller_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                            caller_host_id: caller_agent_id.map(|_| rt.host_info.host_id.clone()),
+                            caller_title: caller_source_title.clone(),
                             notify_on_finish: Some(false),
                         },
                         Duration::from_secs(30),
@@ -1136,7 +1175,7 @@ async fn execute_tool_inner(
                         kind: AgentMessageKind::DirectMessage,
                         source_agent_id: caller_agent_id.map(ToOwned::to_owned),
                         source_host_id: Some(rt.host_info.host_id.clone()),
-                        source_title: caller.as_ref().map(|c| c.title.clone()),
+                        source_title: caller_source_title,
                         event: None,
                         permission_context: None,
                     },
@@ -2303,43 +2342,44 @@ async fn execute_tool_inner(
                 .or_else(|| opt_str(args, "permission_request_id"))
                 .ok_or_else(|| anyhow::anyhow!("missing required string argument `request_id`"))?;
             let decision = str_arg(args, "decision")?;
+            let decision_reason = opt_str(args, "reason");
             if !matches!(decision.as_str(), "allow" | "deny") {
                 anyhow::bail!(
                     "agent permission resolution only permits `allow` or `deny` (persistent `allow_always` grants require explicit human approval)"
                 );
             }
+            let is_pa_caller = match caller_agent_id {
+                Some(cid) => {
+                    rt.personal_router
+                        .is_authorized_global_router(cid, target_host.is_some())
+                        .await
+                }
+                None => false,
+            };
+            let mut resolved_pending_info: Option<orbit_protocol::PendingPermissionSummary> = None;
             // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling & worker ownership when called by PersonalRouter
             if let Some(cid) = caller_agent_id
-                && rt
-                    .personal_router
-                    .is_authorized_global_router(cid, target_host.is_some())
-                    .await
+                && is_pa_caller
             {
                 if target_host.is_none() {
-                    let target_agent = rt.store.get_agent(&agent_id)?;
-                    if target_agent
-                        .as_ref()
-                        .and_then(|a| a.parent_agent_id.as_deref())
-                        != Some(cid)
-                    {
+                    if !is_worker_spawned_by_caller(&rt.store, &agent_id, cid)? {
                         anyhow::bail!(
                             "Personal Router can only resolve permissions for workers it spawned (`parent_agent_id == router_id`); escalate unrelated session `{agent_id}` to the human"
                         );
                     }
-                }
-                let pending_assessment = if target_host.is_none() {
-                    rt.orchestrator
+                    resolved_pending_info = rt
+                        .orchestrator
                         .list_pending_permissions(Some(&agent_id))
                         .await
                         .into_iter()
-                        .find(|p| p.request_id == request_id)
-                        .and_then(|p| p.guardian_assessment)
-                } else {
-                    None
-                };
+                        .find(|p| p.request_id == request_id);
+                }
+                let pending_assessment = resolved_pending_info
+                    .as_ref()
+                    .and_then(|p| p.guardian_assessment.as_ref());
                 if let Err(reason) = rt
                     .personal_router
-                    .validate_router_permission_decision(&decision, pending_assessment.as_ref())
+                    .validate_router_permission_decision(&decision, pending_assessment)
                     .await
                 {
                     anyhow::bail!("{reason}");
@@ -2362,17 +2402,21 @@ async fn execute_tool_inner(
                     .await?;
                 match list_resp {
                     WireMessage::PendingPermissionsSnapshot { permissions, .. } => {
-                        if permissions.iter().any(|p| {
-                            p.request_id == request_id
-                                && (p.plan_approval.is_some()
-                                    || p.human_only
-                                    || p.guardian_assessment.as_ref().is_some_and(
-                                        crate::guardian::assessment_requires_human_only,
-                                    ))
-                        }) {
-                            anyhow::bail!(
-                                "permission `{request_id}` requires explicit human review and cannot be resolved by an agent"
-                            );
+                        if let Some(matched_perm) =
+                            permissions.into_iter().find(|p| p.request_id == request_id)
+                        {
+                            if matched_perm.plan_approval.is_some()
+                                || matched_perm.human_only
+                                || matched_perm
+                                    .guardian_assessment
+                                    .as_ref()
+                                    .is_some_and(crate::guardian::assessment_requires_human_only)
+                            {
+                                anyhow::bail!(
+                                    "permission `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                                );
+                            }
+                            resolved_pending_info = Some(matched_perm);
                         }
                     }
                     WireMessage::RpcError { message, .. } => {
@@ -2400,8 +2444,191 @@ async fn execute_tool_inner(
                     anyhow::bail!("{message}");
                 }
             } else {
+                if resolved_pending_info.is_none() {
+                    resolved_pending_info = rt
+                        .orchestrator
+                        .get_pending_permission(&agent_id, &request_id)
+                        .await;
+                }
                 rt.orchestrator
                     .resolve_permission_by_agent(&agent_id, request_id.clone(), decision.clone())
+                    .await?;
+            }
+            if is_pa_caller {
+                let target_host_id = target_host
+                    .clone()
+                    .unwrap_or_else(|| rt.host_info.host_id.clone());
+                let agent_title = resolved_pending_info
+                    .as_ref()
+                    .map(|p| p.agent_title.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        if target_host.is_none() {
+                            rt.store
+                                .get_agent(&agent_id)
+                                .ok()
+                                .flatten()
+                                .map(|a| a.title)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| agent_id.clone());
+                let summary = resolved_pending_info
+                    .as_ref()
+                    .map(|p| crate::guardian::summarize_tool_request(&p.detail, &p.title).1)
+                    .unwrap_or_else(|| request_id.clone());
+                let risk_level = resolved_pending_info
+                    .as_ref()
+                    .and_then(|p| p.guardian_assessment.as_ref())
+                    .map(|a| a.risk_level.as_str().to_string());
+                let classifier_tier = resolved_pending_info
+                    .as_ref()
+                    .and_then(|p| p.guardian_assessment.as_ref())
+                    .map(|a| a.classifier_tier.clone())
+                    .unwrap_or_else(|| "personal_agent".to_string());
+                let reason = decision_reason.unwrap_or_else(|| {
+                    format!("Personal Agent decided `{decision}` during pre-review")
+                });
+                let store = Arc::clone(&rt.store);
+                let action_log = decision.clone();
+                let agent_id_log = agent_id.clone();
+                let details = json!({
+                    "request_id": request_id,
+                    "agent_title": agent_title,
+                    "summary": summary,
+                    "risk_level": risk_level,
+                    "classifier_tier": classifier_tier,
+                    "reason": reason,
+                });
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.append_audit_event_with_host(
+                        orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                        &action_log,
+                        "personal_agent",
+                        Some(target_host_id.as_str()),
+                        Some(agent_id_log.as_str()),
+                        "applied",
+                        &details,
+                    )
+                })
+                .await;
+            }
+            Ok(json!({
+                "ok": true,
+                "agent_id": agent_id,
+                "request_id": request_id,
+                "decision": decision,
+            }))
+        }
+
+        "recommend_permission" => {
+            let agent_id = str_arg(args, "agent_id")?;
+            let request_id = opt_str(args, "request_id")
+                .or_else(|| opt_str(args, "permission_request_id"))
+                .ok_or_else(|| anyhow::anyhow!("missing required string argument `request_id`"))?;
+            let decision = str_arg(args, "decision")?.trim().to_ascii_lowercase();
+            if !matches!(decision.as_str(), "allow" | "deny") {
+                anyhow::bail!("recommend_permission only permits `allow` or `deny`");
+            }
+            let reason = str_arg(args, "reason")?;
+            if reason.trim().is_empty() {
+                anyhow::bail!("missing required non-empty string argument `reason`");
+            }
+
+            // Enforce worker ownership: caller can only attach recommendations for workers it spawned.
+            if let Some(cid) = caller_agent_id {
+                if let Some(ref remote_host_id) = target_host {
+                    if !rt
+                        .personal_router
+                        .is_authorized_global_router(cid, true)
+                        .await
+                    {
+                        anyhow::bail!(
+                            "caller `{cid}` is not authorized to recommend permissions on remote host `{remote_host_id}`"
+                        );
+                    }
+                    let list_req_id = Uuid::new_v4();
+                    let list_resp = rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            list_req_id,
+                            WireMessage::ListAgents {
+                                request_id: list_req_id,
+                                workspace_id: None,
+                                include_archived: false,
+                                include_background: true,
+                                parent_agent_id: None,
+                            },
+                            Duration::from_secs(15),
+                        )
+                        .await?;
+                    match list_resp {
+                        WireMessage::AgentsSnapshot { agents, .. } => {
+                            if !is_remote_worker_spawned_by_caller(
+                                &agents,
+                                &agent_id,
+                                cid,
+                                &rt.host_info.host_id,
+                            ) {
+                                anyhow::bail!(
+                                    "Personal Router can only recommend permissions for workers it spawned; unrelated remote session `{agent_id}` is not owned by `{cid}`"
+                                );
+                            }
+                        }
+                        WireMessage::RpcError { message, .. } => {
+                            anyhow::bail!("{message}");
+                        }
+                        _ => {
+                            anyhow::bail!(
+                                "failed to verify remote worker ownership for `{agent_id}` on host `{remote_host_id}`"
+                            );
+                        }
+                    }
+                } else {
+                    // Recommendations surface in every client as "Personal Agent recommends", so only
+                    // the authorized Personal Agent may attach them (not arbitrary parent workers).
+                    if !rt
+                        .personal_router
+                        .is_authorized_global_router(cid, false)
+                        .await
+                    {
+                        anyhow::bail!(
+                            "only the Personal Agent may recommend permission decisions; caller `{cid}` is not the authorized Personal Agent"
+                        );
+                    }
+                    if !is_worker_spawned_by_caller(&rt.store, &agent_id, cid)? {
+                        anyhow::bail!(
+                            "Personal Router can only recommend permissions for workers it spawned (`parent_agent_id == router_id`); unrelated session `{agent_id}` is not owned by `{cid}`"
+                        );
+                    }
+                }
+            }
+
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::RecommendPermission {
+                            request_id: req_id,
+                            agent_id: agent_id.clone(),
+                            permission_request_id: request_id.clone(),
+                            decision: decision.clone(),
+                            reason: reason.trim().to_string(),
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                if let WireMessage::RpcError { message, .. } = resp {
+                    anyhow::bail!("{message}");
+                }
+            } else {
+                rt.orchestrator
+                    .recommend_permission(&agent_id, &request_id, decision.clone(), reason.clone())
                     .await?;
             }
             Ok(json!({
@@ -2409,6 +2636,7 @@ async fn execute_tool_inner(
                 "agent_id": agent_id,
                 "request_id": request_id,
                 "decision": decision,
+                "reason": reason.trim(),
             }))
         }
 
@@ -2547,6 +2775,16 @@ async fn execute_tool_inner(
                 .as_ref()
                 .and_then(|c| c.handle.clone())
                 .unwrap_or_else(|| "peer".into());
+            let sender_source_title = caller
+                .as_ref()
+                .map(|c| {
+                    if c.is_personal_router() {
+                        c.title.clone()
+                    } else {
+                        format!("@{sender_handle}")
+                    }
+                })
+                .unwrap_or_else(|| format!("@{sender_handle}"));
             let mut delivered = Vec::new();
             for peer in targets {
                 if notify_on_finish && let Some(cid) = caller_agent_id {
@@ -2563,7 +2801,7 @@ async fn execute_tool_inner(
                         kind: AgentMessageKind::DirectMessage,
                         source_agent_id: caller_agent_id.map(ToOwned::to_owned),
                         source_host_id: Some(rt.host_info.host_id.clone()),
-                        source_title: Some(format!("@{sender_handle}")),
+                        source_title: Some(sender_source_title.clone()),
                         event: Some("peer_message".into()),
                         permission_context: None,
                     },
@@ -2755,6 +2993,25 @@ async fn execute_tool_inner(
                 .or_else(|| ws.source_cwd.clone())
                 .unwrap_or_else(|| ws.cwd.clone());
 
+            let initial_prompt_source = caller_agent_id.map(|cid| AgentPromptSource {
+                kind: AgentMessageKind::DirectMessage,
+                source_agent_id: Some(cid.to_string()),
+                source_host_id: Some(rt.host_info.host_id.clone()),
+                source_title: caller.as_ref().map(|c| {
+                    if c.is_personal_router() {
+                        c.title.clone()
+                    } else {
+                        c.handle
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|h| !h.is_empty())
+                            .map(|h| format!("@{h}"))
+                            .unwrap_or_else(|| c.title.clone())
+                    }
+                }),
+                event: Some("initial_prompt".into()),
+                permission_context: None,
+            });
             let peer = rt
                 .orchestrator
                 .create_and_start_agent(CreateAgentSpec {
@@ -2774,6 +3031,7 @@ async fn execute_tool_inner(
                     // Sibling peers stay top-level inside the Mission Workspace (not collapsed as hidden subagents)
                     parent_agent_id: None,
                     parent_host_id: None,
+                    initial_prompt_source,
                     profile_id,
                     background: false,
                     auto_archive: false,
@@ -5467,16 +5725,17 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "orbit_control",
-                description: "Inspect host profiles, providers, models, connected remote hosts, cross-host projects & project context (`AGENTS.md`/`README.md`/git), or list/respond to pending child permission approvals.",
+                description: "Inspect profiles, providers, models, hosts, projects & context, or list/respond/recommend on child permissions.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["list_profiles", "list_providers", "list_models", "list_hosts", "list_projects", "inspect_project_context", "list_pending_permissions", "respond_permission"] },
+                        "action": { "type": "string", "enum": ["list_profiles", "list_providers", "list_models", "list_hosts", "list_projects", "inspect_project_context", "list_pending_permissions", "respond_permission", "recommend_permission"] },
                         "provider": { "type": "string" },
-                        "cwd": { "type": "string", "description": "Project directory path for `inspect_project_context`." },
+                        "cwd": { "type": "string", "description": "Project path for `inspect_project_context`." },
                         "agent_id": { "type": "string" },
                         "request_id": { "type": "string" },
                         "decision": { "type": "string", "enum": ["allow", "deny"] },
+                        "reason": { "type": "string" },
                         "host_id": { "type": "string", "description": "Target host ID (or `all` for `list_projects`)." }
                     },
                     "required": ["action"]
@@ -5745,6 +6004,75 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             },
         },
     ]
+}
+
+fn is_worker_spawned_by_caller(
+    store: &orbit_store::OrbitStore,
+    target_agent_id: &str,
+    caller_agent_id: &str,
+) -> anyhow::Result<bool> {
+    if target_agent_id == caller_agent_id {
+        return Ok(false);
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut current = target_agent_id.to_string();
+    for _ in 0..32 {
+        if !visited.insert(current.clone()) {
+            return Ok(false);
+        }
+        let Some(agent) = store.get_agent(&current)? else {
+            return Ok(false);
+        };
+        let Some(parent_id) = agent.parent_agent_id else {
+            return Ok(false);
+        };
+        if parent_id == caller_agent_id {
+            return Ok(true);
+        }
+        if agent.parent_host_id.is_some() {
+            return Ok(false);
+        }
+        current = parent_id;
+    }
+    Ok(false)
+}
+
+fn is_remote_worker_spawned_by_caller(
+    remote_agents: &[orbit_protocol::AgentSummary],
+    target_agent_id: &str,
+    caller_agent_id: &str,
+    caller_host_id: &str,
+) -> bool {
+    let by_id: std::collections::HashMap<&str, &orbit_protocol::AgentSummary> = remote_agents
+        .iter()
+        .map(|a| (a.agent_id.as_str(), a))
+        .collect();
+    let mut visited = std::collections::HashSet::new();
+    let mut current = target_agent_id;
+    for _ in 0..32 {
+        if !visited.insert(current) {
+            return false;
+        }
+        let Some(agent) = by_id.get(current) else {
+            return false;
+        };
+        let Some(parent_id) = agent.parent_agent_id.as_deref() else {
+            return false;
+        };
+        if parent_id == caller_agent_id
+            && agent
+                .parent_host_id
+                .as_deref()
+                .is_none_or(|ph| ph == caller_host_id)
+        {
+            return true;
+        }
+        if agent.parent_host_id.is_some() {
+            return false;
+        }
+        current = parent_id;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -6908,6 +7236,303 @@ mod tests {
         let post_contents =
             std::fs::read_to_string(&post_log).expect("normal call fires PostToolUse");
         assert_eq!(post_contents.lines().count(), 1);
+
+        rt.browser.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[tokio::test]
+    async fn recommend_permission_enforces_worker_ownership_and_broadcasts_recommendation() {
+        let tmp_home =
+            std::env::temp_dir().join(format!("orbit-recommend-perm-{}", Uuid::new_v4()));
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        let now = chrono::Utc::now();
+        rt.store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_1".into(),
+                title: "Test Workspace".into(),
+                cwd: tmp_home.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("insert workspace");
+        let make_summary = |id: &str, parent: Option<&str>, is_router: bool| {
+            let mut labels = std::collections::HashMap::new();
+            if is_router {
+                labels.insert(
+                    orbit_protocol::LABEL_AGENT_ROLE.into(),
+                    orbit_protocol::AGENT_ROLE_PERSONAL_ROUTER.into(),
+                );
+            }
+            orbit_protocol::AgentSummary {
+                agent_id: id.into(),
+                workspace_id: "ws_1".into(),
+                cwd: tmp_home.to_string_lossy().to_string(),
+                title: id.into(),
+                provider: ProviderKind::Codex,
+                model: None,
+                effort: None,
+                fast_mode: false,
+                mode: orbit_protocol::SessionMode::Auto,
+                status: orbit_protocol::AgentStatus::Idle,
+                parent_agent_id: parent.map(ToOwned::to_owned),
+                parent_host_id: None,
+                latest_seq: 1,
+                timeline_epoch: 1,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels,
+                attention: orbit_protocol::AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 0,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
+                acp_agent_id: None,
+            }
+        };
+
+        rt.store
+            .upsert_agent(&make_summary("ag_router", None, true), None)
+            .expect("insert router");
+        rt.store
+            .upsert_agent(&make_summary("ag_child", Some("ag_router"), false), None)
+            .expect("insert child");
+        rt.store
+            .upsert_agent(&make_summary("ag_stranger", None, false), None)
+            .expect("insert stranger");
+
+        let mk_perm = |aid: &str, rid: &str| orbit_protocol::PendingPermissionSummary {
+            agent_id: aid.into(),
+            agent_title: aid.into(),
+            workspace_id: "ws_1".into(),
+            request_id: rid.into(),
+            title: "Run migration".into(),
+            detail: orbit_protocol::ToolCallDetail::Shell {
+                command: "psql -c 'DROP TABLE temp'".into(),
+                cwd: None,
+                exit_code: None,
+                output_preview: None,
+            },
+            allowed_decisions: vec!["allow".into(), "deny".into()],
+            guardian_assessment: Some(orbit_protocol::GuardianAssessment {
+                risk_level: orbit_protocol::GuardianRiskLevel::High,
+                decision: orbit_protocol::GuardianDecision::RequireHuman,
+                confidence: 0.99,
+                classifier_tier: "deterministic_tier1".into(),
+                reason: "Destructive command".into(),
+                signals: vec![],
+                latency_ms: 1,
+            }),
+            plan_approval: None,
+            human_only: true,
+            router_recommendation: None,
+            created_at: now,
+        };
+        rt.orchestrator
+            .insert_pending_permission_for_test(mk_perm("ag_child", "req_child"))
+            .await;
+        rt.orchestrator
+            .insert_pending_permission_for_test(mk_perm("ag_stranger", "req_stranger"))
+            .await;
+
+        // Only the enabled, authorized Personal Agent may attach recommendations.
+        rt.personal_router
+            .configure(
+                orbit_protocol::PersonalRouterConfig {
+                    enabled: true,
+                    router_agent_id: Some("ag_router".into()),
+                    ..Default::default()
+                },
+                None,
+                false,
+            )
+            .await
+            .expect("enable personal router");
+
+        // 1. Unauthorized: router cannot recommend on unrelated session it did not spawn.
+        let unauth = execute_tool(
+            &rt,
+            Some("ag_router"),
+            "orbit_control",
+            json!({
+                "action": "recommend_permission",
+                "agent_id": "ag_stranger",
+                "request_id": "req_stranger",
+                "decision": "deny",
+                "reason": "Unrelated session"
+            }),
+        )
+        .await;
+        assert!(
+            unauth.is_error,
+            "expected unauthorized error: {}",
+            unauth.text
+        );
+        assert!(
+            rt.orchestrator
+                .get_pending_permission("ag_stranger", "req_stranger")
+                .await
+                .and_then(|p| p.router_recommendation)
+                .is_none()
+        );
+
+        // 2. Unauthorized: stranger cannot recommend on router's child.
+        let cross_unauth = execute_tool(
+            &rt,
+            Some("ag_stranger"),
+            "orbit_control",
+            json!({
+                "action": "recommend_permission",
+                "agent_id": "ag_child",
+                "request_id": "req_child",
+                "decision": "allow",
+                "reason": "Not my child"
+            }),
+        )
+        .await;
+        assert!(cross_unauth.is_error);
+
+        // 3. Authorized: router attaches recommendation to its own Tier-3 human_only worker
+        //    and broadcasts PendingPermissionsChanged.
+        let mut rx = rt.orchestrator.broadcast_tx.subscribe();
+        let ok = execute_tool(
+            &rt,
+            Some("ag_router"),
+            "orbit_control",
+            json!({
+                "action": "recommend_permission",
+                "agent_id": "ag_child",
+                "request_id": "req_child",
+                "decision": "deny",
+                "reason": "Destructive SQL on production table"
+            }),
+        )
+        .await;
+        assert!(
+            !ok.is_error,
+            "expected recommendation success, got: {}",
+            ok.text
+        );
+
+        let updated = rt
+            .orchestrator
+            .get_pending_permission("ag_child", "req_child")
+            .await
+            .expect("pending permission still present");
+        let rec = updated
+            .router_recommendation
+            .expect("recommendation attached");
+        assert_eq!(rec.decision, "deny");
+        assert_eq!(rec.reason, "Destructive SQL on production table");
+
+        let mut saw_broadcast = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::manager::DaemonBroadcast::PendingPermissionsChanged(list) = ev
+                && list.iter().any(|p| {
+                    p.request_id == "req_child"
+                        && p.router_recommendation
+                            .as_ref()
+                            .is_some_and(|r| r.decision == "deny")
+                })
+            {
+                saw_broadcast = true;
+            }
+        }
+        assert!(
+            saw_broadcast,
+            "expected PendingPermissionsChanged broadcast"
+        );
+
+        // 4. Decision audit log write & ListPersonalAgentActivity projection (descending order + limit + since_ms).
+        rt.store
+            .append_audit_event_with_host(
+                orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                "allow",
+                "guardian_tier1",
+                Some(rt.host_info.host_id.as_str()),
+                Some("ag_child"),
+                "applied",
+                &json!({
+                    "request_id": "req_g1",
+                    "agent_title": "Child Worker",
+                    "summary": "cargo test",
+                    "risk_level": "low",
+                    "classifier_tier": "deterministic_tier1",
+                    "reason": "Safe workspace test command"
+                }),
+            )
+            .expect("append guardian audit");
+        rt.store
+            .append_audit_event_with_host(
+                orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION,
+                "deny",
+                "personal_agent",
+                Some("remote_host_2"),
+                Some("ag_remote_child"),
+                "applied",
+                &json!({
+                    "request_id": "req_pa1",
+                    "agent_title": "Remote Worker",
+                    "summary": "rm -rf /tmp/out",
+                    "risk_level": "medium",
+                    "classifier_tier": "personal_agent",
+                    "reason": "Outside requested scope"
+                }),
+            )
+            .expect("append pa audit");
+        // Unrelated category must NOT appear in personal_agent_decision activity list.
+        rt.store
+            .append_audit_event("hook", "execute", "daemon", None, "block", &json!({}))
+            .expect("append unrelated audit");
+
+        let rows = rt
+            .store
+            .list_audit_events_since(
+                50,
+                Some(orbit_protocol::AUDIT_CATEGORY_PERSONAL_AGENT_DECISION),
+                None,
+            )
+            .expect("list activity rows");
+        let entries: Vec<orbit_protocol::PersonalAgentActivityEntry> = rows
+            .into_iter()
+            .map(crate::audit_entry_to_personal_agent_activity)
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].seq > entries[1].seq, "must be newest-first");
+        assert_eq!(entries[0].actor, "personal_agent");
+        assert_eq!(entries[0].decision, "deny");
+        assert_eq!(entries[0].host_id.as_deref(), Some("remote_host_2"));
+        assert_eq!(entries[0].agent_title, "Remote Worker");
+        assert_eq!(entries[0].request_id.as_deref(), Some("req_pa1"));
+        assert_eq!(entries[1].actor, "guardian_tier1");
+        assert_eq!(entries[1].decision, "allow");
+        assert_eq!(entries[1].risk_level.as_deref(), Some("low"));
 
         rt.browser.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&tmp_home);

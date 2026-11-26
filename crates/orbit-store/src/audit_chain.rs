@@ -87,9 +87,25 @@ impl OrbitStore {
         outcome: &str,
         details: &Value,
     ) -> Result<u64, StoreError> {
+        self.append_audit_event_with_host(category, action, actor, None, agent_id, outcome, details)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_audit_event_with_host(
+        &self,
+        category: &str,
+        action: &str,
+        actor: &str,
+        host_id: Option<&str>,
+        agent_id: Option<&str>,
+        outcome: &str,
+        details: &Value,
+    ) -> Result<u64, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let seq = self.audit_insert(&tx, category, action, actor, agent_id, outcome, details)?;
+        let seq = self.audit_insert_with_host(
+            &tx, category, action, actor, host_id, agent_id, outcome, details,
+        )?;
         tx.commit()?;
         Ok(seq)
     }
@@ -101,6 +117,23 @@ impl OrbitStore {
         category: &str,
         action: &str,
         actor: &str,
+        agent_id: Option<&str>,
+        outcome: &str,
+        details: &Value,
+    ) -> Result<u64, StoreError> {
+        self.audit_insert_with_host(
+            tx, category, action, actor, None, agent_id, outcome, details,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit_insert_with_host(
+        &self,
+        tx: &Connection,
+        category: &str,
+        action: &str,
+        actor: &str,
+        host_id: Option<&str>,
         agent_id: Option<&str>,
         outcome: &str,
         details: &Value,
@@ -123,6 +156,11 @@ impl OrbitStore {
             .checked_add(1)
             .ok_or_else(|| StoreError::InvalidArgument("audit sequence exhausted".into()))?;
         let id = self.audit_identity.get();
+        let resolved_host_id = host_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| id.map(|(h, _)| h.clone()));
         let mut details = details.clone();
         details.sort_all_objects();
         let mut e = AuditEntry {
@@ -131,7 +169,7 @@ impl OrbitStore {
             category: category.into(),
             action: action.into(),
             actor: actor.into(),
-            host_id: id.map(|(h, _)| h.clone()),
+            host_id: resolved_host_id,
             agent_id: agent_id.map(str::to_owned),
             outcome: outcome.into(),
             details_json: serde_json::to_string(&details)?,
@@ -197,6 +235,26 @@ impl OrbitStore {
         Ok(stmt
             .query_map(
                 params![before_seq, category, limit.min(1000)],
+                AuditEntry::from_row,
+            )?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_audit_events_since(
+        &self,
+        limit: u32,
+        category: Option<&str>,
+        since_ms: Option<i64>,
+    ) -> Result<Vec<AuditEntry>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM security_audit_chain \
+             WHERE (?1 IS NULL OR category=?1) AND (?2 IS NULL OR timestamp_ms >= ?2) \
+             ORDER BY seq DESC LIMIT ?3",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![category, since_ms, limit.min(1000)],
                 AuditEntry::from_row,
             )?
             .collect::<Result<_, _>>()?)
@@ -274,6 +332,38 @@ mod tests {
                 .execute(mutation, [])?;
             assert_eq!(store.verify_audit_chain(key.as_ref())?.broken_seq, Some(2));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn audit_events_with_host_and_since_ms_preserve_chain_integrity() -> Result<(), StoreError> {
+        let store = OrbitStore::open_in_memory()?;
+        store.set_audit_identity("host_local".into(), SigningKey::from_bytes(&[9; 32]))?;
+        store.append_audit_event_with_host(
+            "personal_agent_decision",
+            "allow",
+            "personal_agent",
+            Some("host_remote"),
+            Some("ag_1"),
+            "applied",
+            &json!({"request_id": "r1", "reason": "ok"}),
+        )?;
+        let entries =
+            store.list_audit_events_since(50, Some("personal_agent_decision"), Some(0))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host_id.as_deref(), Some("host_remote"));
+        let key = store.audit_verifying_key();
+        let verified = store.verify_audit_chain(key.as_ref())?;
+        assert_eq!(verified.broken_seq, None);
+        assert_eq!(verified.verified_entries, 1);
+        assert_eq!(verified.signed_checkpoints, 1);
+
+        let future = store.list_audit_events_since(
+            50,
+            Some("personal_agent_decision"),
+            Some(entries[0].timestamp_ms + 60_000),
+        )?;
+        assert!(future.is_empty());
         Ok(())
     }
 }

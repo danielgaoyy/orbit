@@ -2,6 +2,7 @@
 //! multi-host Fleet Router auto-discovery, 3-tier Guardian pre-review policy, and
 //! bidirectional Hermes MCP / Webhook bridging.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentStatus, AgentSummary, ProviderKind, ReasoningEffort};
@@ -10,6 +11,8 @@ use crate::{AgentStatus, AgentSummary, ProviderKind, ReasoningEffort};
 pub const LABEL_AGENT_ROLE: &str = "orbit.role";
 /// Label value stored under [`LABEL_AGENT_ROLE`] for the host's canonical Personal Router session.
 pub const AGENT_ROLE_PERSONAL_ROUTER: &str = "personal_router";
+/// Audit-chain category recorded for Personal Agent, Guardian Tier-1, and permission-rule decisions.
+pub const AUDIT_CATEGORY_PERSONAL_AGENT_DECISION: &str = "personal_agent_decision";
 
 fn router_default_true() -> bool {
     true
@@ -223,6 +226,37 @@ pub struct HermesBridgeBundle {
     pub skill_md_template: String,
 }
 
+/// Personal Agent's non-binding recommendation attached to a pending permission request
+/// (used in `assist_only` mode or for Tier-3 human-only checkpoints).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterRecommendation {
+    /// Recommended decision: `"allow"` or `"deny"`.
+    pub decision: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Logged automatic permission decision performed by the Personal Agent, Guardian Tier-1,
+/// or a persistent permission rule, projected from the host's signed security audit chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalAgentActivityEntry {
+    pub seq: u64,
+    pub timestamp_ms: i64,
+    pub actor: String,
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub agent_title: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
 /// Client-persisted global selection of WHICH host in the Multi-Host Fleet owns the user's
 /// canonical Primary Personal Router (e.g. an always-on remote Mac mini or cloud Devbox).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,5 +363,64 @@ mod tests {
         assert_eq!(AgentRole::from_slug("router"), AgentRole::PersonalRouter);
         assert_eq!(AgentRole::from_slug("worker"), AgentRole::Worker);
         assert_eq!(AgentRole::from_slug("unknown"), AgentRole::Worker);
+    }
+
+    #[test]
+    fn pending_permission_summary_backward_compat_without_router_recommendation() {
+        let legacy_json = serde_json::json!({
+            "agent_id": "ag_1",
+            "agent_title": "Worker 1",
+            "workspace_id": "ws_1",
+            "request_id": "perm_1",
+            "title": "Run tests",
+            "detail": {
+                "kind": "shell",
+                "command": "cargo test",
+                "cwd": null,
+                "exit_code": null,
+                "output_preview": null
+            },
+            "allowed_decisions": ["allow", "deny"],
+            "created_at": "2026-11-26T00:00:00Z"
+        });
+        let parsed: crate::PendingPermissionSummary =
+            serde_json::from_value(legacy_json).expect("legacy PendingPermissionSummary parses");
+        assert!(parsed.router_recommendation.is_none());
+        assert!(!parsed.human_only);
+
+        let wire_list: crate::WireMessage = serde_json::from_value(serde_json::json!({
+            "op": "list_personal_agent_activity",
+            "request_id": uuid::Uuid::new_v4(),
+            "limit": 50
+        }))
+        .expect("ListPersonalAgentActivity parses without since_ms");
+        assert!(matches!(
+            wire_list,
+            crate::WireMessage::ListPersonalAgentActivity {
+                limit: 50,
+                since_ms: None,
+                ..
+            }
+        ));
+
+        let req_id = uuid::Uuid::new_v4();
+        let rec_wire = crate::WireMessage::RecommendPermission {
+            request_id: req_id,
+            agent_id: "ag_1".into(),
+            permission_request_id: "perm_1".into(),
+            decision: "deny".into(),
+            reason: "Too broad".into(),
+        };
+        let encoded = serde_json::to_string(&rec_wire).expect("serialize RecommendPermission");
+        let decoded: crate::WireMessage =
+            serde_json::from_str(&encoded).expect("deserialize RecommendPermission");
+        assert!(matches!(
+            decoded,
+            crate::WireMessage::RecommendPermission {
+                request_id: rid,
+                ref decision,
+                ..
+            } if rid == req_id && decision == "deny"
+        ));
     }
 }

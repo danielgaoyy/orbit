@@ -645,4 +645,128 @@ describe("session-selectors", () => {
       ["art-1", "art-shared"],
     );
   });
+
+  it("collects cross-project and cross-host Personal Agent subagents for TopBar crew relay with accurate active vs settled status", () => {
+    const localHost = makeHostCard({ host_id: "host_mac", display_name: "Mac Studio" });
+    const remoteHost = makeHostCard({
+      host_id: "host_linux",
+      display_name: "linux-build-01",
+      is_local: false,
+      connection_state: "online_relay",
+    });
+
+    const pa = makeAgent({
+      agent_id: "ag_pa",
+      workspace_id: "ws_home",
+      title: "Personal Router",
+      labels: { "orbit.role": "personal_router" },
+    });
+    const localRunning = makeAgent({
+      agent_id: "ag_child_local_run",
+      workspace_id: "ws_other_project",
+      title: "Refactor TopBar",
+      parent_agent_id: "ag_pa",
+      parent_host_id: "host_mac",
+      is_running: true,
+      status_label: "Working",
+      updated_at_rfc3339: "2026-11-26T14:10:00Z",
+    });
+    const remoteRunning = makeAgent({
+      agent_id: "ag_child_remote_run",
+      workspace_id: "ws_linux_wt",
+      title: "Cargo E2E Runner",
+      parent_agent_id: "ag_pa",
+      parent_host_id: "host_mac",
+      is_running: true,
+      status_label: "Working",
+      updated_at_rfc3339: "2026-11-26T14:12:00Z",
+    });
+    const localDone = makeAgent({
+      agent_id: "ag_child_done",
+      workspace_id: "ws_other_project",
+      title: "Security Audit",
+      parent_agent_id: "ag_pa",
+      parent_host_id: "host_mac",
+      is_running: false,
+      status_label: "Idle",
+      updated_at_rfc3339: "2026-11-26T14:05:00Z",
+    });
+    const localWakeupWaiting = Object.assign(
+      makeAgent({
+        agent_id: "ag_child_wait",
+        workspace_id: "ws_other_project",
+        title: "CI Watcher",
+        parent_agent_id: "ag_pa",
+        parent_host_id: "host_mac",
+        is_running: false,
+        has_background_tasks: false,
+        status_label: "Waiting for CI",
+        updated_at_rfc3339: "2026-11-26T14:04:00Z",
+      }),
+      { status: { state: "autonomous_wakeup", source: "waiting:CI" } },
+    );
+    const localArchivedDone = makeAgent({
+      agent_id: "ag_child_archived",
+      workspace_id: "ws_other_project",
+      title: "Archived Task",
+      parent_agent_id: "ag_pa",
+      parent_host_id: "host_mac",
+      is_running: false,
+      status_label: "Idle",
+    });
+
+    const hostDetails: Record<string, HostDetailView> = {
+      host_mac: makeHostDetail(localHost, [
+        pa,
+        localRunning,
+        localDone,
+        localWakeupWaiting,
+        localArchivedDone,
+      ]),
+      host_linux: makeHostDetail(remoteHost, [remoteRunning]),
+    };
+
+    assert.equal(hasLocalSubagentRecords(hostDetails.host_mac, "host_mac", "ag_pa"), true);
+    assert.equal(hasCrossHostChildAgents(hostDetails, "host_mac", "ag_pa"), true);
+
+    const summary = selectSessionSubagents(
+      {
+        hostDetails,
+        fleet: {
+          revision: 1,
+          total_pending_approvals: 0,
+          hosts: [localHost, remoteHost],
+          projects: [],
+        },
+        archivedSubagents: {},
+        archivedThreads: {
+          "host_mac::ag_child_archived": {
+            key: "host_mac::ag_child_archived",
+            hostId: "host_mac",
+            agentId: "ag_child_archived",
+            archivedAtMs: 1,
+          },
+        },
+      },
+      "host_mac",
+      "ag_pa",
+    );
+
+    // Running children sort ahead of completed/waiting children; locally archived settled child is hidden
+    assert.deepEqual(
+      summary.visible.map((s) => ({
+        id: s.childAgentId,
+        status: s.status,
+        remoteHost: s.remoteHostName,
+      })),
+      [
+        { id: "ag_child_remote_run", status: "running", remoteHost: "linux-build-01" },
+        { id: "ag_child_local_run", status: "running", remoteHost: null },
+        { id: "ag_child_done", status: "completed", remoteHost: null },
+        { id: "ag_child_wait", status: "completed", remoteHost: null },
+      ],
+    );
+    assert.equal(summary.activeCount, 2);
+    assert.equal(summary.settledCount, 2);
+  });
 });

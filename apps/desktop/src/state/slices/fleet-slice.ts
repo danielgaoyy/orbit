@@ -8,8 +8,10 @@ import {
   t,
 } from "@/lib/i18n";
 import {
+  PINNED_MANUAL_ORDER_SCOPE,
   collectVisibleSidebarThreads,
 } from "@/components/sidebar/sidebar-model";
+import { mergeSubsetOrder } from "@/lib/drag/drag-constants";
 import {
   defaultMimeForMedia,
 } from "@/lib/media-utils";
@@ -54,6 +56,7 @@ import {
   PENDING_DRAFT_CREATE_TTL_MS,
   THREAD_PREF_MIGRATION_KEY,
   basenameFromPath,
+  collectRemotelyArchivedAgentScopes,
   collectRemotelyArchivedDraftScopes,
   hasCompletedOnboarding,
   isAgentErrorState,
@@ -64,6 +67,17 @@ import {
   threadScopeKey,
   withBootstrapTimeout,
 } from "../store-helpers";
+import {
+  EMPTY_SIDE_PANEL_UNSEEN_IDS,
+  dropSidePanelScopes,
+  promoteDraftSidePanelScope,
+  rebindDraftSidePanelCwd,
+  remapOptimisticSidePanelScopes,
+  removeSubagentTabsFromScopes,
+  resolveSidePanelScopeKey,
+  switchSidePanelScope,
+} from "../side-panel-scope";
+import { selectPersonalAgentRef } from "../selectors/personal-agent-selectors";
 
 function deepEqualJson(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -381,16 +395,25 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
       // 2. Non-blocking secondary metadata bootstrap (never blocks or aborts fleet hydration)
       void (async () => {
-        const [editors, sshList, version, fallbackCatalogs, slashCommands, cloudSyncStatus, sqliteDraftJson] =
-          await Promise.all([
-            orbitIpc.listExternalEditors().catch(() => []),
-            orbitIpc.listSshHosts().catch(() => []),
-            orbitIpc.getAppVersion().catch(() => null),
-            orbitIpc.getFallbackProviderCatalogs().catch(() => []),
-            orbitIpc.getSlashCommands("desktop").catch(() => []),
-            orbitIpc.getCloudSyncStatus().catch(() => null),
-            orbitIpc.getComposerDraft(DRAFTS_STORAGE_KEY).catch(() => null),
-          ]);
+        const [
+          editors,
+          sshList,
+          version,
+          fallbackCatalogs,
+          slashCommands,
+          cloudSyncStatus,
+          sqliteDraftJson,
+          primaryRouterSel,
+        ] = await Promise.all([
+          orbitIpc.listExternalEditors().catch(() => []),
+          orbitIpc.listSshHosts().catch(() => []),
+          orbitIpc.getAppVersion().catch(() => null),
+          orbitIpc.getFallbackProviderCatalogs().catch(() => []),
+          orbitIpc.getSlashCommands("desktop").catch(() => []),
+          orbitIpc.getCloudSyncStatus().catch(() => null),
+          orbitIpc.getComposerDraft(DRAFTS_STORAGE_KEY).catch(() => null),
+          orbitIpc.getPrimaryRouterSelection().catch(() => null),
+        ]);
         if (sqliteDraftJson) {
           const parsedSqliteDrafts = parseAndValidatePersistedDrafts(sqliteDraftJson, {
             excludeScopes: getState().archivedThreads,
@@ -421,6 +444,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           appVersion: version,
           slashCommands,
           cloudSyncStatus,
+          primaryRouterHostId: primaryRouterSel?.host_id ?? s.primaryRouterHostId,
         }));
         if (cloudSyncStatus?.state === "ready") {
           void ctx.actions.hydrateSyncedPreferencesFromCore();
@@ -522,8 +546,15 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       const snap = await orbitIpc.getFleetOverview();
       setState((s) => {
         const nextHostId = s.selectedHostId ?? snap.hosts[0]?.host_id ?? null;
+        const nextScopeKey = resolveSidePanelScopeKey({
+          selectedHostId: nextHostId,
+          selectedAgentId: s.selectedAgentId,
+          isDraftNewSession: s.isDraftNewSession,
+          hostDetails: s.hostDetails,
+        });
+        const scoped = switchSidePanelScope(s, nextScopeKey);
         return {
-          ...s,
+          ...scoped,
           fleet: snap,
           selectedHostId: nextHostId,
         };
@@ -648,7 +679,11 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             activeDetail.agents.some((a) => a.agent_id === nextAgentId);
           if (!stillExists) {
             const firstVisible = activeDetail.agents.find(
-              (a) => !s.archivedThreads[threadScopeKey(activeHostId, a.agent_id)],
+              (a) =>
+                !a.parent_agent_id &&
+                !a.background &&
+                !a.archived_at_rfc3339 &&
+                !s.archivedThreads[threadScopeKey(activeHostId, a.agent_id)],
             );
             nextAgentId = firstVisible?.agent_id ?? null;
             nextDraft = nextAgentId === null;
@@ -678,9 +713,25 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           Object.entries(resolvedDetails),
           activeScopeKey,
         );
+        const remotelyArchivedAgents = collectRemotelyArchivedAgentScopes(
+          Object.entries(resolvedDetails),
+          activeScopeKey,
+        );
+        let scoped =
+          remotelyArchivedAgents.keys.size > 0
+            ? dropSidePanelScopes(s, remotelyArchivedAgents.keys, remotelyArchivedAgents.agents)
+            : s;
+        const nextScopeKey = resolveSidePanelScopeKey({
+          selectedHostId: activeHostId,
+          selectedAgentId: nextAgentId,
+          isDraftNewSession: nextDraft,
+          hostDetails: resolvedDetails,
+          archivedThreads: s.archivedThreads,
+        });
+        scoped = switchSidePanelScope(scoped, nextScopeKey);
 
         return {
-          ...s,
+          ...scoped,
           fleet: snap,
           fleetHydrated: true,
           bootstrapError: null,
@@ -981,7 +1032,11 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
                 ? nextAgentId
                 : null;
             const firstVisible = detail.agents.find(
-              (a) => !s.archivedThreads[threadScopeKey(hostId, a.agent_id)],
+              (a) =>
+                !a.parent_agent_id &&
+                !a.background &&
+                !a.archived_at_rfc3339 &&
+                !s.archivedThreads[threadScopeKey(hostId, a.agent_id)],
             );
             nextAgentId = firstVisible?.agent_id ?? null;
             nextDraft = nextAgentId === null;
@@ -1064,6 +1119,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           [[hostId, detail]],
           activeScopeKey,
         );
+        const remotelyArchivedAgents = collectRemotelyArchivedAgentScopes(
+          [[hostId, detail]],
+          activeScopeKey,
+        );
         const remappedStages = remapScopedRecord(s.stages);
         const remappedComposerDrafts = remapScopedRecord(s.composerDrafts);
         const remappedSlashDirectives = remapScopedRecord(s.slashDirectives);
@@ -1071,14 +1130,57 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         const remappedContextItems = remapScopedRecord(s.contextItems);
         const remappedPastedAttachments = remapScopedRecord(s.pastedAttachments);
         const remappedDiffQuotes = remapScopedRecord(s.diffQuotes);
+        const remappedSideQuestionsByScope = remapScopedRecord(s.sideQuestionsByScope);
         const remappedSideQuestionDrafts = remapScopedRecord(s.sideQuestionDrafts);
 
+        const nextHostId = overview
+          ? (s.selectedHostId ?? overview.hosts[0]?.host_id ?? null)
+          : s.selectedHostId;
+        let scoped =
+          Object.keys(replacedMap).length > 0
+            ? remapOptimisticSidePanelScopes(s, hostId, replacedMap)
+            : s;
+        if (
+          remappedSideQuestionsByScope !== s.sideQuestionsByScope ||
+          remappedSideQuestionDrafts !== s.sideQuestionDrafts
+        ) {
+          scoped = {
+            ...scoped,
+            sideQuestionsByScope: remappedSideQuestionsByScope,
+            sideQuestionDrafts: remappedSideQuestionDrafts,
+          };
+        }
+        if (remotelyArchivedAgents.keys.size > 0) {
+          scoped = dropSidePanelScopes(
+            scoped,
+            remotelyArchivedAgents.keys,
+            remotelyArchivedAgents.agents,
+          );
+        }
+        if (newestCreated) {
+          scoped = promoteDraftSidePanelScope(
+            scoped,
+            hostId,
+            newestCreated.agent_id,
+            newestCreated.cwd,
+          );
+        } else {
+          const nextScopeKey = resolveSidePanelScopeKey({
+            selectedHostId: nextHostId,
+            selectedAgentId: nextAgentId,
+            isDraftNewSession: nextDraft,
+            hostDetails: nextDetails,
+            archivedThreads: s.archivedThreads,
+          });
+          scoped = switchSidePanelScope(scoped, nextScopeKey);
+        }
+
         return {
-          ...s,
+          ...scoped,
           ...(overview
             ? {
                 fleet: overview,
-                selectedHostId: s.selectedHostId ?? overview.hosts[0]?.host_id ?? null,
+                selectedHostId: nextHostId,
               }
             : {}),
           hostDetails: nextDetails,
@@ -1112,10 +1214,11 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             remotelyArchivedDraftKeys.size > 0
               ? omitRecordKeys(remappedDiffQuotes, remotelyArchivedDraftKeys)
               : remappedDiffQuotes,
+          sideQuestionsByScope: scoped.sideQuestionsByScope,
           sideQuestionDrafts:
             remotelyArchivedDraftKeys.size > 0
-              ? omitRecordKeys(remappedSideQuestionDrafts, remotelyArchivedDraftKeys)
-              : remappedSideQuestionDrafts,
+              ? omitRecordKeys(scoped.sideQuestionDrafts, remotelyArchivedDraftKeys)
+              : scoped.sideQuestionDrafts,
         };
       });
 
@@ -1161,7 +1264,11 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       const firstAgent = stayInDraft
         ? null
         : (detail?.agents.find(
-            (a) => !getState().archivedThreads[threadScopeKey(hostId, a.agent_id)],
+            (a) =>
+              !a.parent_agent_id &&
+              !a.background &&
+              !a.archived_at_rfc3339 &&
+              !getState().archivedThreads[threadScopeKey(hostId, a.agent_id)],
           ) ?? null);
       const sidebarHostProj = getState().sidebarView?.projects.find(
         (p) => p.host_id === hostId && !p.is_home_workspace,
@@ -1180,14 +1287,23 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         firstDiscovered?.path ??
         detail?.discovered_projects[0]?.path ??
         "~";
-      setState(
-        (s) => ({
-          ...s,
+      const nextAgentId = firstAgent?.agent_id ?? null;
+      const nextIsDraft = stayInDraft || firstAgent === null;
+      setState((s) => {
+        const nextScopeKey = resolveSidePanelScopeKey({
+          selectedHostId: hostId,
+          selectedAgentId: nextAgentId,
+          isDraftNewSession: nextIsDraft,
+          hostDetails: s.hostDetails,
+        });
+        const scoped = switchSidePanelScope(s, nextScopeKey);
+        return {
+          ...scoped,
           activeView: "workspace",
           workspacePanel: "conversation",
           selectedHostId: hostId,
-          selectedAgentId: firstAgent?.agent_id ?? null,
-          isDraftNewSession: stayInDraft || firstAgent === null,
+          selectedAgentId: nextAgentId,
+          isDraftNewSession: nextIsDraft,
           sessionScrollNonce: s.sessionScrollNonce + 1,
           pendingJumpTarget: null,
           selectedWorkspaceCwd: nextCwd,
@@ -1195,8 +1311,8 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           draftWorktreeRepoPath: null,
           draftWorkspaceId: null,
           draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
-        }),
-      );
+        };
+      });
 
       ctx.actions.refreshSidebarView();
       void orbitIpc.refreshQuotas(hostId);
@@ -1239,7 +1355,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           const parentAg = getState().hostDetails[nextHostId]?.agents.find(
             (a) => a.agent_id === nextAgentId,
           );
-          if (!parentAg || parentAg.archived_at_rfc3339) break;
+          if (!parentAg || parentAg.archived_at_rfc3339 || getState().archivedThreads[visitKey]) break;
           rootHostId = nextHostId;
           rootAgentId = nextAgentId;
           cursor = parentAg;
@@ -1261,6 +1377,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             promptPreview: ag.task_summary ?? "",
             childAgentId: ag.agent_id,
             childHostId: hostId,
+            parentHostId: rootHostId,
             parentAgentId: rootAgentId,
           });
           return;
@@ -1286,24 +1403,20 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             nextArchived = { ...nextArchived };
             delete nextArchived[tKey];
           }
-          // Automatically dismiss stale subagent inspector tabs belonging to a different parent thread
-          const remainingSideTabs = s.sidePanelTabs.filter(
-            (t) => t.kind !== "subagent" || t.parentAgentId === agentId,
-          );
-          const tabsChanged = remainingSideTabs.length !== s.sidePanelTabs.length;
-          const nextActiveSideTab = tabsChanged
-            ? remainingSideTabs.some((t) => t.id === s.activeSidePanelTabId)
-              ? s.activeSidePanelTabId
-              : (remainingSideTabs[remainingSideTabs.length - 1]?.id ?? null)
-            : s.activeSidePanelTabId;
-          const shouldCloseSidePanel = tabsChanged && remainingSideTabs.length === 0;
+          const nextScopeKey = resolveSidePanelScopeKey({
+            selectedHostId: hostId,
+            selectedAgentId: agentId,
+            isDraftNewSession: false,
+            hostDetails: s.hostDetails,
+          });
+          const scoped = switchSidePanelScope(s, nextScopeKey);
           const nextNonce = s.sessionScrollNonce + 1;
           const nextJumpTarget =
             typeof jumpToSeq === "number" && jumpToSeq > 0
               ? { hostId, agentId, seq: jumpToSeq, nonce: nextNonce }
               : null;
           return {
-            ...s,
+            ...scoped,
             activeView: "workspace",
             workspacePanel: "conversation",
             selectedHostId: hostId,
@@ -1314,13 +1427,6 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             selectedWorkspaceCwd: nextCwd,
             selectedDiffPath: null,
             archivedThreads: nextArchived,
-            ...(tabsChanged
-              ? {
-                  sidePanelTabs: remainingSideTabs,
-                  activeSidePanelTabId: nextActiveSideTab,
-                  sidePanelOpen: shouldCloseSidePanel ? false : s.sidePanelOpen,
-                }
-              : {}),
           };
         },
         true,
@@ -1380,36 +1486,45 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       const nextProvider = resolveAvailableDraftProvider(detail, getState().draftProvider);
       const draftKey = `draft::${targetHostId ?? "none"}`;
 
-      setState((s) => ({
-        ...s,
-        activeView: "workspace",
-        workspacePanel: "conversation",
-        selectedHostId: targetHostId,
-        selectedAgentId: null,
-        isDraftNewSession: true,
-        pendingJumpTarget: null,
-        selectedWorkspaceCwd: defaultCwd || "~",
-        draftWorktreeRepoPath: null,
-        draftWorkspaceId: workspaceId ?? null,
-        draftProvider: nextProvider,
-        commandPaletteOpen: false,
-        ...(prefillPrompt !== undefined
-          ? {
-              composerDrafts: {
-                ...s.composerDrafts,
-                [draftKey]: prefillPrompt,
-              },
-            }
-          : {}),
-        ...(prefillSlash !== undefined
-          ? {
-              slashDirectives: {
-                ...s.slashDirectives,
-                [draftKey]: prefillSlash,
-              },
-            }
-          : {}),
-      }));
+      setState((s) => {
+        const nextScopeKey = targetHostId ? `draft::${targetHostId}` : null;
+        const nextDraftCwd = defaultCwd || "~";
+        const scoped = rebindDraftSidePanelCwd(
+          { ...switchSidePanelScope(s, nextScopeKey), isDraftNewSession: true },
+          nextDraftCwd,
+        );
+        return {
+          ...scoped,
+          activeView: "workspace",
+          workspacePanel: "conversation",
+          selectedHostId: targetHostId,
+          selectedAgentId: null,
+          isDraftNewSession: true,
+          pendingJumpTarget: null,
+          selectedWorkspaceCwd: nextDraftCwd,
+          selectedDiffPath: null,
+          draftWorktreeRepoPath: null,
+          draftWorkspaceId: workspaceId ?? null,
+          draftProvider: nextProvider,
+          commandPaletteOpen: false,
+          ...(prefillPrompt !== undefined
+            ? {
+                composerDrafts: {
+                  ...s.composerDrafts,
+                  [draftKey]: prefillPrompt,
+                },
+              }
+            : {}),
+          ...(prefillSlash !== undefined
+            ? {
+                slashDirectives: {
+                  ...s.slashDirectives,
+                  [draftKey]: prefillSlash,
+                },
+              }
+            : {}),
+        };
+      });
 
       ctx.actions.refreshSidebarView();
       ctx.actions.focusComposer();
@@ -1429,7 +1544,42 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     },
 
 
+    setPrimaryRouterHostId(hostId: string | null): void {
+      setState((s) => (s.primaryRouterHostId === hostId ? s : { ...s, primaryRouterHostId: hostId }));
+    },
+
+
+    async refreshPrimaryRouterSelection(): Promise<string | null> {
+      const sel = await orbitIpc.getPrimaryRouterSelection().catch(() => null);
+      const nextHostId = sel?.host_id ?? null;
+      setState((s) =>
+        s.primaryRouterHostId === nextHostId ? s : { ...s, primaryRouterHostId: nextHostId },
+      );
+      return nextHostId;
+    },
+
+
     openGlobalOverview(): void {
+      const snap = getState();
+      const personalAgent = selectPersonalAgentRef(snap);
+
+      // Refresh pending permissions across connected hosts for fresh triage accuracy
+      for (const h of snap.fleet.hosts) {
+        if (h.connection_state === "online_direct" || h.connection_state === "online_relay") {
+          void orbitIpc.refreshPendingPermissions(h.host_id).catch(() => undefined);
+        }
+      }
+
+      if (personalAgent) {
+        setState((s) =>
+          s.commandPaletteOpen || s.overviewPopoverOpen
+            ? { ...s, commandPaletteOpen: false, overviewPopoverOpen: false }
+            : s,
+        );
+        ctx.actions.selectAgent(personalAgent.hostId, personalAgent.agentId);
+        return;
+      }
+
       setState((s) => ({
         ...s,
         activeView: "workspace",
@@ -1437,48 +1587,6 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         commandPaletteOpen: false,
         overviewPopoverOpen: false,
       }));
-      // Refresh pending permissions across connected hosts for fresh triage accuracy
-      const hosts = getState().fleet.hosts;
-      for (const h of hosts) {
-        if (h.connection_state === "online_direct" || h.connection_state === "online_relay") {
-          void orbitIpc.refreshPendingPermissions(h.host_id).catch(() => undefined);
-        }
-      }
-    },
-
-
-    pinOverviewLane(hostId: string, agentId: string): void {
-      if (!hostId || !agentId) return;
-      setState((s) => {
-        const exists = s.overviewPinnedLanes.some(
-          (l) => l.hostId === hostId && l.agentId === agentId,
-        );
-        const nextLanes = exists
-          ? s.overviewPinnedLanes
-          : [...s.overviewPinnedLanes, { hostId, agentId }].slice(-4);
-        return {
-          ...s,
-          activeView: "workspace",
-          workspacePanel: "overview",
-          commandPaletteOpen: false,
-          overviewPinnedLanes: nextLanes,
-        };
-      });
-    },
-
-
-    unpinOverviewLane(hostId: string, agentId: string): void {
-      setState((s) => ({
-        ...s,
-        overviewPinnedLanes: s.overviewPinnedLanes.filter(
-          (l) => !(l.hostId === hostId && l.agentId === agentId),
-        ),
-      }));
-    },
-
-
-    clearOverviewLanes(): void {
-      setState((s) => (s.overviewPinnedLanes.length === 0 ? s : { ...s, overviewPinnedLanes: [] }));
     },
 
 
@@ -1499,7 +1607,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
     setSelectedWorkspaceCwd(cwd: string): void {
       setState((s) => ({
-        ...s,
+        ...rebindDraftSidePanelCwd(s, cwd),
         selectedWorkspaceCwd: cwd,
         selectedDiffPath: null,
         draftWorktreeRepoPath: null,
@@ -1515,16 +1623,26 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
     selectProjectWorkspace(hostId: string, cwd: string): void {
       const detail = getState().hostDetails[hostId];
-      setState((s) => ({
-        ...s,
-        selectedHostId: hostId,
-        selectedAgentId: s.isDraftNewSession ? null : s.selectedAgentId,
-        selectedWorkspaceCwd: cwd,
-        selectedDiffPath: null,
-        draftWorktreeRepoPath: null,
-        draftWorkspaceId: null,
-        draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
-      }));
+      setState((s) => {
+        const nextAgentId = s.isDraftNewSession ? null : s.selectedAgentId;
+        const nextScopeKey = resolveSidePanelScopeKey({
+          selectedHostId: hostId,
+          selectedAgentId: nextAgentId,
+          isDraftNewSession: s.isDraftNewSession,
+          hostDetails: s.hostDetails,
+        });
+        const scoped = rebindDraftSidePanelCwd(switchSidePanelScope(s, nextScopeKey), cwd);
+        return {
+          ...scoped,
+          selectedHostId: hostId,
+          selectedAgentId: nextAgentId,
+          selectedWorkspaceCwd: cwd,
+          selectedDiffPath: null,
+          draftWorktreeRepoPath: null,
+          draftWorkspaceId: null,
+          draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
+        };
+      });
       ctx.actions.refreshSidebarView();
       void ctx.actions.ensureWorkspaceFiles(hostId, cwd);
       if (cwd && cwd !== "~") {
@@ -1618,11 +1736,15 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       lastReportedSeenSeq.delete(tKey);
       if (isCurrentlySelected) {
         setState(
-          (s) => ({
-            ...s,
-            isDraftNewSession: true,
-            selectedAgentId: null,
-          }),
+          (s) => {
+            const scoped = switchSidePanelScope(s, `draft::${hostId}`);
+            return {
+              ...scoped,
+              isDraftNewSession: true,
+              selectedAgentId: null,
+              selectedDiffPath: null,
+            };
+          },
           true,
         );
       }
@@ -1975,12 +2097,8 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
               }
             }
             for (const tab of s.sidePanelTabs) {
-              if (tab.kind === "file" && tab.filePath) {
-                const tabHost = tab.hostId ?? s.selectedHostId;
-                const tabCwd = tab.cwd ?? s.selectedWorkspaceCwd;
-                if (tabHost === hostId && tabCwd === cwd) {
-                  openFileTabsToReload.push({ hostId: tabHost, cwd: tabCwd, path: tab.filePath });
-                }
+              if (tab.kind === "file" && tab.filePath && tab.hostId === hostId && tab.cwd === cwd) {
+                openFileTabsToReload.push({ hostId: tab.hostId, cwd: tab.cwd, path: tab.filePath });
               }
             }
           }
@@ -2134,6 +2252,8 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         const nextCandidate = detail?.agents.find(
           (a) =>
             a.agent_id !== agentId &&
+            !a.parent_agent_id &&
+            !a.background &&
             !a.archived_at_rfc3339 &&
             !getState().archivedThreads[threadScopeKey(hostId, a.agent_id)],
         );
@@ -2155,32 +2275,50 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       };
 
       const archivedKeySet = new Set([tKey]);
+      const removedSidePanelAgents: Array<{ hostId: string; agentId: string }> = [
+        { hostId, agentId },
+      ];
+      const removedSidePanelKeys = new Set([tKey]);
+      for (const [hId, hDetail] of Object.entries(preArchive.hostDetails)) {
+        for (const ag of hDetail.agents) {
+          if (ag.parent_agent_id === agentId && (ag.parent_host_id ?? hId) === hostId) {
+            removedSidePanelAgents.push({ hostId: hId, agentId: ag.agent_id });
+            removedSidePanelKeys.add(threadScopeKey(hId, ag.agent_id));
+          }
+        }
+      }
       setState(
-        (s) => ({
-          ...s,
-          archivedThreads: {
-            ...s.archivedThreads,
-            [tKey]: {
-              key: tKey,
-              hostId,
-              agentId,
-              archivedAtMs: Date.now(),
+        (s) => {
+          let scoped = dropSidePanelScopes(s, removedSidePanelKeys, removedSidePanelAgents);
+          if (wasSelected && !fallbackAgentId) {
+            scoped = switchSidePanelScope(scoped, `draft::${hostId}`, { dropCurrent: true });
+          }
+          return {
+            ...scoped,
+            archivedThreads: {
+              ...s.archivedThreads,
+              [tKey]: {
+                key: tKey,
+                hostId,
+                agentId,
+                archivedAtMs: Date.now(),
+              },
             },
-          },
-          composerDrafts: omitRecordKeys(s.composerDrafts, archivedKeySet),
-          slashDirectives: omitRecordKeys(s.slashDirectives, archivedKeySet),
-          inlineMentions: omitRecordKeys(s.inlineMentions, archivedKeySet),
-          contextItems: omitRecordKeys(s.contextItems, archivedKeySet),
-          pastedAttachments: omitRecordKeys(s.pastedAttachments, archivedKeySet),
-          diffQuotes: omitRecordKeys(s.diffQuotes, archivedKeySet),
-          sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, archivedKeySet),
-          ...(wasSelected && !fallbackAgentId
-            ? {
-                selectedAgentId: null,
-                isDraftNewSession: true,
-              }
-            : {}),
-        }),
+            composerDrafts: omitRecordKeys(s.composerDrafts, archivedKeySet),
+            slashDirectives: omitRecordKeys(s.slashDirectives, archivedKeySet),
+            inlineMentions: omitRecordKeys(s.inlineMentions, archivedKeySet),
+            contextItems: omitRecordKeys(s.contextItems, archivedKeySet),
+            pastedAttachments: omitRecordKeys(s.pastedAttachments, archivedKeySet),
+            diffQuotes: omitRecordKeys(s.diffQuotes, archivedKeySet),
+            sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, archivedKeySet),
+            ...(wasSelected && !fallbackAgentId
+              ? {
+                  selectedAgentId: null,
+                  isDraftNewSession: true,
+                }
+              : {}),
+          };
+        },
         true,
       );
       draftPersistence.removeScopes(archivedKeySet, true);
@@ -2259,8 +2397,9 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
               }
             }
           }
+          const scoped = dropSidePanelScopes(s, deletedThreadKeys, items);
           return {
-            ...s,
+            ...scoped,
             archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
             threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
             stages: omitRecordKeys(s.stages, deletedThreadKeys),
@@ -2425,8 +2564,24 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             tKey in s.stageRunningSubagentMeta
               ? omitRecordKeys(s.stageRunningSubagentMeta, new Set([tKey]))
               : s.stageRunningSubagentMeta;
+          const removedSidePanelAgents: Array<{ hostId: string; agentId: string }> = [
+            { hostId, agentId },
+          ];
+          const removedSidePanelKeys = new Set([tKey]);
+          for (const [hId, hDetail] of Object.entries(s.hostDetails)) {
+            for (const ag of hDetail.agents) {
+              if (ag.parent_agent_id === agentId && (ag.parent_host_id ?? hId) === hostId) {
+                removedSidePanelAgents.push({ hostId: hId, agentId: ag.agent_id });
+                removedSidePanelKeys.add(threadScopeKey(hId, ag.agent_id));
+              }
+            }
+          }
+          let scoped = dropSidePanelScopes(s, removedSidePanelKeys, removedSidePanelAgents);
+          if (wasSelected) {
+            scoped = switchSidePanelScope(scoped, `draft::${hostId}`, { dropCurrent: true });
+          }
           return {
-            ...s,
+            ...scoped,
             archivedThreads: nextArchived,
             threadCustomTitles: nextTitles,
             stages: nextStages,
@@ -2495,6 +2650,24 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     },
 
 
+    reorderPinnedThreads(orderedThreadKeys: string[]): void {
+      if (orderedThreadKeys.length === 0) return;
+      setState(
+        (s) => ({
+          ...s,
+          threadManualOrder: {
+            ...s.threadManualOrder,
+            [PINNED_MANUAL_ORDER_SCOPE]: mergeSubsetOrder(
+              s.threadManualOrder[PINNED_MANUAL_ORDER_SCOPE],
+              orderedThreadKeys,
+            ),
+          },
+        }),
+        true,
+      );
+    },
+
+
     toggleSidebar(): void {
       const isCompact = getState().isCompactViewport;
       setState(
@@ -2556,19 +2729,38 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       setState((s) => {
         let nextSidebarOpen = s.sidebarOpen;
         let nextYielded = s.sidebarAutoYieldedForSidePanel;
+        let nextSidePanelOpen = s.sidePanelOpen;
+        let nextCollapsedByResize = s.sidePanelCollapsedByResize;
+        let nextUnseenTabIds = s.sidePanelUnseenTabIds;
+        let nextTerminalFocused = s.terminalFocused;
+
+        if (!s.isCompactViewport && nextCompact) {
+          if (s.sidePanelOpen) {
+            nextSidePanelOpen = false;
+            nextCollapsedByResize = true;
+            nextTerminalFocused = false;
+          }
+        } else if (s.isCompactViewport && !nextCompact) {
+          const shouldRestoreSidePanel = s.sidePanelCollapsedByResize && !s.sidePanelUserDismissed;
+          nextSidePanelOpen = s.sidePanelOpen || shouldRestoreSidePanel;
+          nextCollapsedByResize = false;
+          if (nextSidePanelOpen && !s.sidePanelOpen) {
+            nextUnseenTabIds = EMPTY_SIDE_PANEL_UNSEEN_IDS;
+          }
+        }
 
         if (nextCompact) {
           nextSidebarOpen = false;
           nextYielded = false;
-        } else if (nextTight && s.sidePanelOpen && s.sidebarOpen) {
+        } else if (s.isCompactViewport && !nextCompact) {
+          nextSidebarOpen = nextTight && nextSidePanelOpen ? false : s.sidebarDesktopOpenPref;
+          nextYielded = nextTight && nextSidePanelOpen && s.sidebarDesktopOpenPref;
+        } else if (nextTight && nextSidePanelOpen && s.sidebarOpen) {
           nextSidebarOpen = false;
           nextYielded = true;
         } else if (!nextTight && s.sidebarAutoYieldedForSidePanel) {
           nextSidebarOpen = s.sidebarDesktopOpenPref;
           nextYielded = false;
-        } else if (s.isCompactViewport && !nextCompact) {
-          nextSidebarOpen = nextTight && s.sidePanelOpen ? false : s.sidebarDesktopOpenPref;
-          nextYielded = nextTight && s.sidePanelOpen && s.sidebarDesktopOpenPref;
         }
 
         return {
@@ -2577,6 +2769,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           isTightForDualSidebars: nextTight,
           sidebarOpen: nextSidebarOpen,
           sidebarAutoYieldedForSidePanel: nextYielded,
+          sidePanelOpen: nextSidePanelOpen,
+          sidePanelCollapsedByResize: nextCollapsedByResize,
+          sidePanelUnseenTabIds: nextUnseenTabIds,
+          terminalFocused: nextTerminalFocused,
         };
       });
     },
@@ -2840,11 +3036,37 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             }
           }
 
+          let scoped = dropSidePanelScopes(
+            s,
+            deletedThreadKeys,
+            project.conversations.map((c) => ({ hostId, agentId: c.agent.agent_id })),
+          );
+          if (wasSelectedAgent || wasSelectedProjectCwd) {
+            const nextScopeKey = resolveSidePanelScopeKey({
+              selectedHostId: nextHostId,
+              selectedAgentId: nextAgentId,
+              isDraftNewSession: nextDraft,
+              hostDetails: s.hostDetails,
+              archivedThreads: s.archivedThreads,
+            });
+            scoped = switchSidePanelScope(scoped, nextScopeKey, {
+              dropCurrent: wasSelectedAgent || (nextDraft && !nextCwd),
+            });
+            if (nextDraft && nextCwd) {
+              scoped = rebindDraftSidePanelCwd(
+                { ...scoped, isDraftNewSession: true },
+                nextCwd,
+              );
+            }
+          }
+
           return {
-            ...s,
+            ...scoped,
             selectedHostId: nextHostId,
             selectedAgentId: nextAgentId,
             selectedWorkspaceCwd: nextCwd,
+            selectedDiffPath:
+              wasSelectedAgent || wasSelectedProjectCwd ? null : s.selectedDiffPath,
             isDraftNewSession: nextDraft,
             hiddenProjectKeys: nextHidden,
             collapsedProjectIds: nextCollapsed,
@@ -2909,15 +3131,43 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
     async reorderProjects(orderedKeys: string[]): Promise<void> {
       const prevSort = getState().sidebarProjectSort;
+      const prevSidebarView = getState().sidebarView;
+      if (prevSidebarView && orderedKeys.length > 0) {
+        const rank = new Map<string, number>();
+        orderedKeys.forEach((k, idx) => rank.set(k, idx));
+        const projectKey = (p: (typeof prevSidebarView.projects)[number]) =>
+          p.sort_order_key || p.pinned_project_id || projectPathScopeKey(p.host_id, p.primary_cwd);
+        const optimisticProjects = [...prevSidebarView.projects].sort((a, b) => {
+          const ra = rank.get(projectKey(a)) ?? Number.MAX_SAFE_INTEGER;
+          const rb = rank.get(projectKey(b)) ?? Number.MAX_SAFE_INTEGER;
+          return ra - rb;
+        });
+        setState(
+          (s) => ({
+            ...s,
+            sidebarProjectSort: "manual",
+            sidebarView: s.sidebarView
+              ? { ...s.sidebarView, projects: optimisticProjects }
+              : s.sidebarView,
+          }),
+          true,
+        );
+      }
       try {
         await orbitIpc.reorderProjects(orderedKeys);
         if (prevSort !== "manual") {
-          setState((s) => ({ ...s, sidebarProjectSort: "manual" }), true);
           notifyToast(t("sidebar.switchedToCustomOrder"));
         }
-        await ctx.actions.reloadFleetOnly();
         ctx.actions.refreshSidebarView();
       } catch (err) {
+        setState(
+          (s) => ({
+            ...s,
+            sidebarProjectSort: prevSort,
+            sidebarView: prevSidebarView ?? s.sidebarView,
+          }),
+          false,
+        );
         notifyToast(t("store.failedReorderProjects", { detail: String(err) }));
       }
     },
@@ -2969,27 +3219,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           for (const k of keys) {
             nextArchived[k] = true;
           }
-          const remainingTabs = s.sidePanelTabs.filter((t) => {
-            if (t.kind !== "subagent") return true;
-            const matchesId =
-              (target.id && t.subagentCallId === target.id) ||
-              (target.providerSubagentId && t.providerSubagentId === target.providerSubagentId) ||
-              (target.childAgentId && t.childAgentId === target.childAgentId);
-            return !matchesId;
-          });
-          const removedActive =
-            remainingTabs.length !== s.sidePanelTabs.length &&
-            !remainingTabs.some((t) => t.id === s.activeSidePanelTabId);
-          const shouldClosePanel =
-            remainingTabs.length !== s.sidePanelTabs.length && remainingTabs.length === 0;
+          const scoped = removeSubagentTabsFromScopes(s, hostId, parentAgentId, [target]);
           return {
-            ...s,
+            ...scoped,
             archivedSubagents: nextArchived,
-            sidePanelTabs: remainingTabs,
-            activeSidePanelTabId: removedActive
-              ? (remainingTabs[remainingTabs.length - 1]?.id ?? null)
-              : s.activeSidePanelTabId,
-            sidePanelOpen: shouldClosePanel ? false : s.sidePanelOpen,
           };
         },
         true,
@@ -3037,8 +3270,9 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           for (const k of keys) {
             nextArchived[k] = true;
           }
+          const scoped = removeSubagentTabsFromScopes(s, hostId, parentAgentId, targets);
           return {
-            ...s,
+            ...scoped,
             archivedSubagents: nextArchived,
           };
         },

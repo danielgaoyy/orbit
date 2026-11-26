@@ -68,7 +68,7 @@ All connection pooling, encryption, SQLite WAL persistence, Markdown/GFM AST par
 ## Core Differentiators
 
 ### Personal Agent & Zero-Webhook IM Orchestration
-- Elect any always-on machine as your global **Personal Router** (`AgentRole::PersonalRouter`). It aggregates live `<orbit-fleet-state>` / `<orbit-fleet-delta>` across all online hosts, inspects remote repo context via `orbit_control` without SSH, forks parallel workers into isolated Git worktrees (`BOARD.md` CAS + historical `@handle` aliases), and arms non-blocking conditional wakeup timers.
+- Elect any always-on machine as your global **Personal Agent** (`AgentRole::PersonalRouter`). It aggregates live `<orbit-fleet-state>` / `<orbit-fleet-delta>` across all online hosts, inspects remote repo context via `orbit_control` without SSH, forks parallel workers into isolated Git worktrees (`BOARD.md` CAS + historical `@handle` aliases), and arms non-blocking conditional wakeup timers.
 - Pure-Rust outbound long connections wire **Feishu / Lark WebSocket**, **Slack Socket Mode**, and **Discord Gateway v10** behind NATs with **zero public webhooks**—delivering interactive cards for protocol-hard-blocked Tier-3 human decisions.
 
 ### Single Static Binary & Zero-Downtime Shim Isolation

@@ -18,7 +18,9 @@ import {
 import { useI18n } from "@/lib/i18n";
 import {
   coalescePeerFinishes,
+  isDirectAgentPromptBubble,
   isTimelineAgentMessageHidden,
+  resolveCompletedTurnWorkFold,
   splitStepGroupChronologically,
   summarizeWorkChunk,
 } from "@/lib/turn-delegation-split";
@@ -42,6 +44,7 @@ import {
   parseArtifactRefsFromTurnTools,
 } from "./stage-helpers";
 import {
+  type PromptSourceMeta,
   TurnChangesBar,
   TurnFooter,
   UserPromptBubble,
@@ -51,6 +54,7 @@ import {
   CompactionMilestoneRow,
   DelegationMilestoneRow,
   InlineArtifactCard,
+  StepTimelineRail,
   TurnActivityDisclosure,
   TurnWorkedDisclosure,
   WakeupEventRow,
@@ -357,7 +361,34 @@ export const TurnStageSection = memo(function TurnStageSection({
   const liveStartedAtMs = timing?.startedAtMs ?? turn.started_at_ms ?? null;
   const promptItem =
     turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
+  const needsHistoricalParentSource =
+    turn.turn_index === 0 &&
+    promptItem !== null &&
+    (!promptItem.badges || promptItem.badges.length === 0);
+  const historicalParentAgentId = useOrbitSelector((s) =>
+    needsHistoricalParentSource
+      ? (s.hostDetails?.[hostId]?.agents?.find((a) => a.agent_id === agentId)?.parent_agent_id ?? null)
+      : null,
+  );
+  const historicalParentHostId = useOrbitSelector((s) =>
+    needsHistoricalParentSource
+      ? (s.hostDetails?.[hostId]?.agents?.find((a) => a.agent_id === agentId)?.parent_host_id ?? null)
+      : null,
+  );
+  const historicalParentSource = useMemo<PromptSourceMeta | null>(
+    () =>
+      historicalParentAgentId
+        ? { agentId: historicalParentAgentId, hostId: historicalParentHostId ?? hostId }
+        : null,
+    [historicalParentAgentId, historicalParentHostId, hostId],
+  );
+  const openingDirectBubble =
+    turn.agent_message?.item_type === "agent_message" &&
+    isDirectAgentPromptBubble(turn.agent_message)
+      ? turn.agent_message
+      : null;
   const visibleOpeningMessage =
+    !openingDirectBubble &&
     turn.agent_message?.item_type === "agent_message" &&
     !isTimelineAgentMessageHidden(turn.agent_message)
       ? turn.agent_message
@@ -380,7 +411,7 @@ export const TurnStageSection = memo(function TurnStageSection({
     );
   }
 
-  if (!promptItem && !visibleOpeningMessage && !hasBody && !footer) {
+  if (!promptItem && !openingDirectBubble && !visibleOpeningMessage && !hasBody && !footer) {
     return null;
   }
 
@@ -389,7 +420,7 @@ export const TurnStageSection = memo(function TurnStageSection({
       className={
         (hasBody && !hasBodyContent
           ? "group/turn min-w-0"
-          : promptItem
+          : promptItem || openingDirectBubble
             ? "group/turn min-w-0 space-y-1"
             : "group/turn min-w-0 space-y-3") +
         (!isTurnActive ? " [contain:layout_style]" : "")
@@ -403,7 +434,20 @@ export const TurnStageSection = memo(function TurnStageSection({
           cwd={cwd}
           holdViewport={holdViewport}
           animateEntrance={animatePromptEntrance}
+          source={historicalParentSource}
           onRequestRewind={onRequestRewind}
+          onPreviewImage={onPreviewImage}
+        />
+      )}
+
+      {openingDirectBubble && (
+        <UserPromptBubble
+          item={openingDirectBubble}
+          hostId={hostId}
+          agentId={agentId}
+          cwd={cwd}
+          holdViewport={holdViewport}
+          animateEntrance={animatePromptEntrance}
           onPreviewImage={onPreviewImage}
         />
       )}
@@ -466,6 +510,20 @@ export const TurnStageSection = memo(function TurnStageSection({
 
                 if (seg.kind === "agent_message") {
                   if (seg.item.item_type !== "agent_message") return null;
+                  if (isDirectAgentPromptBubble(seg.item)) {
+                    return (
+                      <div key={seg.key} className="-mx-[10px]">
+                        <UserPromptBubble
+                          item={seg.item}
+                          hostId={hostId}
+                          agentId={agentId}
+                          cwd={cwd}
+                          holdViewport={holdViewport}
+                          onPreviewImage={onPreviewImage}
+                        />
+                      </div>
+                    );
+                  }
                   return (
                     <AgentMessageCard
                       key={seg.key}
@@ -625,58 +683,56 @@ export const TurnStageSection = memo(function TurnStageSection({
               };
 
               const lastSeg = segments[segments.length - 1] ?? null;
-              const hasFinalAssistant =
-                !isTurnActive &&
-                lastSeg !== null &&
-                lastSeg.kind === "assistant_message" &&
-                lastSeg.item.item_type === "assistant_message" &&
-                !lastSeg.item.streaming;
-              const preFinalSegments = hasFinalAssistant ? segments.slice(0, -1) : [];
-              const preFinalHasToolWork = preFinalSegments.some(
-                (seg) => seg.kind === "step_group" && seg.summary.counts.action_steps > 0,
-              );
-              const preFinalWorkOrProseCount = preFinalSegments.filter(
-                (seg) => seg.kind === "step_group" || seg.kind === "assistant_message",
-              ).length;
-              const shouldWrapTurnWorked =
-                hasFinalAssistant &&
-                preFinalSegments.length > 0 &&
-                (preFinalHasToolWork || preFinalWorkOrProseCount > 1);
+              const workFold = resolveCompletedTurnWorkFold({
+                segments,
+                isTurnActive,
+                turnHasUnrecoveredError: turn.has_unrecovered_error,
+                locale,
+                stepGroupSplits,
+              });
 
-              if (shouldWrapTurnWorked && lastSeg) {
-                const preFinalSumDurationMs = preFinalSegments.reduce(
-                  (acc, seg) =>
-                    seg.kind === "step_group" && seg.work_duration_ms ? acc + seg.work_duration_ms : acc,
-                  0,
-                );
+              if (workFold.shouldWrap && lastSeg) {
                 const turnWorkedDurationMs =
                   timing?.workDurationMs ??
                   turn.work_duration_ms ??
                   timing?.durationMs ??
                   turn.turn_duration_ms ??
-                  (preFinalSumDurationMs >= 1000 ? preFinalSumDurationMs : null);
-                const preFinalUnrecoveredFailures = turn.has_unrecovered_error
-                  ? preFinalSegments.reduce(
-                      (acc, seg) =>
-                        seg.kind === "step_group"
-                          ? acc + seg.summary.counts.unrecovered_failure_count
-                          : acc,
-                      0,
-                    )
-                  : 0;
+                  (workFold.sumWorkDurationMs >= 1000 ? workFold.sumWorkDurationMs : null);
                 return (
                   <>
                     <TurnWorkedDisclosure
                       durationMs={turnWorkedDurationMs}
-                      unrecoveredFailureCount={preFinalUnrecoveredFailures}
+                      fallbackLabel={workFold.fallbackLabel}
+                      unrecoveredFailureCount={workFold.unrecoveredFailureCount}
                       defaultCollapsed={autoFoldCompleted}
-                      autoOpenForError={turn.has_unrecovered_error && preFinalUnrecoveredFailures > 0}
+                      autoOpenForError={
+                        turn.has_unrecovered_error && workFold.unrecoveredFailureCount > 0
+                      }
                       agentId={agentId}
                       turnIndex={turn.turn_index}
                       turnAnchorSeq={turn.anchor_seq}
                       holdViewport={holdViewport}
                     >
-                      {() => preFinalSegments.map((seg, idx) => renderSegment(seg, idx))}
+                      {() => (
+                        <StepTimelineRail
+                          items={workFold.items}
+                          hostId={hostId}
+                          cwd={cwd}
+                          holdViewport={holdViewport}
+                          isLiveActive={false}
+                          autoExpandErrors={
+                            turn.has_unrecovered_error && workFold.unrecoveredFailureCount > 0
+                          }
+                          agentId={agentId}
+                          turnIndex={turn.turn_index}
+                          turnAnchorSeq={turn.anchor_seq}
+                          workOrdinal={-1}
+                          thinkingSignature={_thinkingSignature}
+                          getThinkingDurationMs={getThinkingDurationMs}
+                          sessionSubagents={sessionSubagents}
+                          onOpenSubagent={onOpenSubagent}
+                        />
+                      )}
                     </TurnWorkedDisclosure>
                     {renderSegment(lastSeg, segments.length - 1)}
                   </>

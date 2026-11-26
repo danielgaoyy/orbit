@@ -62,7 +62,7 @@ orbit login --mesh
 无需在多台机器的十几个会话之间疲于切换：
 
 1. 在 Orbit Desktop 中打开 **设置 → 应用 → Personal Agent**。
-2. 在线舰队中指定任意一台常驻机器（如家用 Mac Studio 或云端 Devbox）担任全局唯一的 **Personal Router（全局协调节点）**。
+2. 在线舰队中指定任意一台常驻机器（如家用 Mac Studio 或云端 Devbox）担任全局唯一的 **Personal Agent（全局协调节点）**。
 3. 选择主协调引擎（`Claude Code`、`Codex`、`Antigravity` 或任意 ACP 代理），并可按需启用**零公网 Webhook** 的 Slack Socket Mode、Discord Gateway v10 或飞书 / Lark 长连接。
 
 从此你只需对着唯一的 Personal Agent 下达目标，它会跨主机并行或接力派发任务、挂起条件定时器，仅在出现推送、部署或密钥轮换等 **Tier-3 不可逆高危决策**时推送卡片请你拍板。

@@ -21,6 +21,7 @@ import type { SubagentCharacterSpec } from "@/lib/subagent-avatar";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
+  isDirectAgentPromptBubble,
   isTimelineAgentMessageHidden,
   peerFinishStatus,
   type CoalescedFinishStatus,
@@ -272,7 +273,7 @@ export const AgentMessageCard = memo(function AgentMessageCard({
     <LazyMarkdownMessageBody text={body} precomputedBlocks={precomputedBlocks} />
   ) : undefined;
 
-  if (isTimelineAgentMessageHidden(item)) {
+  if (isTimelineAgentMessageHidden(item) || isDirectAgentPromptBubble(item)) {
     return null;
   }
 

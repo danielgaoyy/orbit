@@ -7,6 +7,7 @@ import {
   extractFallbackDispatchCall,
   extractStateChangeMilestoneCall,
   isDelegationMilestoneToolCall,
+  isDirectAgentPromptBubble,
   isTimelineAgentMessageHidden,
   splitStepGroupChronologically,
   summarizeWorkChunk,
@@ -329,13 +330,16 @@ function work(seq: number): Extract<TurnLiveSegmentView, { kind: "step_group" }>
   };
 }
 
-it("suppresses hidden finish and direct messages while rejoining split step groups", () => {
+it("suppresses hidden finish notifications and pure protocol noise while rejoining split step groups", () => {
   const report = message(1, "direct_message");
   const first = { ...work(2), has_following_content: true };
   const last = work(4);
   for (const hidden of [
     message(3, "finish_notification", { event: "finished", source_host_id: "local" }),
-    message(3, "direct_message", { source_title: "Parent" }),
+    message(3, "direct_message", {
+      source_title: "Personal Router",
+      text: '<orbit-fleet-delta rev="2">\n- worker1\n</orbit-fleet-delta>',
+    }),
   ]) {
     const { segments } = coalescePeerFinishes(report, [first, segment(hidden), last], "local");
     assert.equal(segments.length, 1);
@@ -349,11 +353,11 @@ it("suppresses hidden finish and direct messages while rejoining split step grou
   }
 });
 
-it("suppresses direct messages and routine/queued finish notifications while retaining failed, permission, and heartbeat items", () => {
-  const report = message(1, "direct_message", { source_title: "Reviewer" });
+it("renders readable direct messages as sourced user bubbles while hiding routine finish notifications and protocol noise", () => {
+  const report = message(1, "direct_message", { source_title: "Reviewer", text: "Please inspect stage.rs" });
   const permission = { child_agent_id: "ag_reporter", permission_request_id: "req", title: "Read file", allowed_decisions: [] };
 
-  // Failed and permission finish notifications stay visible (resolved permissions hide at render time)
+  // Failed finish notifications and permission checkpoints stay visible via AgentMessageCard (not user bubbles)
   for (const fields of [
     { event: "errored" }, { event: "error" }, { event: "failed" },
     { text: "Agent ag_reporter (Reviewer) failed.\n\n<agent-response>Details</agent-response>" },
@@ -363,21 +367,43 @@ it("suppresses direct messages and routine/queued finish notifications while ret
   ]) {
     const finishItem = message(2, "finish_notification", { source_title: "Reviewer", ...fields });
     assert.equal(isTimelineAgentMessageHidden(finishItem), false);
+    assert.equal(isDirectAgentPromptBubble(finishItem), false);
     const finish = segment(finishItem);
     const result = coalescePeerFinishes(report, [finish], "local");
     assert.deepEqual(result.segments, [finish]);
   }
 
-  // Routine/queued finish notifications and direct inter-agent messages are suppressed
+  // Real direct messages (including <orbit-system> wrapped) render via shared UserPromptBubble
+  for (const directItem of [
+    report,
+    message(5, "direct_message", { source_title: "Personal Router", text: "Fix the folding logic" }),
+    message(6, "direct_message", {
+      source_title: "@backend",
+      text: '<orbit-system version="1" kind="agent-message" source-agent-id="ag_be">\nSchema updated\n</orbit-system>',
+    }),
+  ]) {
+    assert.equal(isDirectAgentPromptBubble(directItem), true);
+    assert.equal(isTimelineAgentMessageHidden(directItem), false);
+    const seg = segment(directItem);
+    const result = coalescePeerFinishes(null, [work(2), seg, work(4)], "local");
+    assert.equal(result.segments.length, 3);
+  }
+
+  // Routine/queued finish notifications and pure protocol noise remain suppressed
   for (const hiddenItem of [
     message(3, "finish_notification", { source_title: "Reviewer", event: "finished", source_agent_id: null }),
     message(3, "finish_notification", { source_title: "Reviewer", event: "finished", source_agent_id: "other" }),
     message(3, "finish_notification", { source_title: "Reviewer", event: "canceled", source_host_id: "remote" }),
     message(3, "finish_notification", { source_title: "Reviewer", event: "finished" }),
     message(3, "finish_notification", { source_title: "Reviewer", event: "finished", delivery_status: "queued" }),
-    report,
-    message(5, "direct_message", { source_title: "Parent", text: "Proceeding with your decisions" }),
+    message(3, "direct_message", { source_title: "Router", text: '<orbit-fleet-state rev="1">\n- a\n</orbit-fleet-state>' }),
+    message(3, "direct_message", { source_title: "Router", text: '<orbit-fleet-delta rev="2">\n- a\n</orbit-fleet-delta>' }),
+    message(3, "direct_message", {
+      source_title: "Router",
+      text: '<orbit-system version="1" kind="agent-notification" event="finished">\nDone\n</orbit-system>',
+    }),
   ]) {
+    assert.equal(isDirectAgentPromptBubble(hiddenItem), false);
     assert.equal(isTimelineAgentMessageHidden(hiddenItem), true);
     const result = coalescePeerFinishes(null, [work(2), segment(hiddenItem), work(4)], "local");
     assert.equal(result.segments.length, 1);
@@ -387,10 +413,175 @@ it("suppresses direct messages and routine/queued finish notifications while ret
     }
   }
 
-  // Heartbeats and permission-context direct messages remain visible
+  // Heartbeats and permission-context direct messages remain visible as system cards (not user bubbles)
   assert.equal(isTimelineAgentMessageHidden(message(4, "heartbeat")), false);
+  assert.equal(isDirectAgentPromptBubble(message(4, "heartbeat")), false);
   assert.equal(isTimelineAgentMessageHidden(message(6, "direct_message", { permission_context: permission })), false);
+  assert.equal(isDirectAgentPromptBubble(message(6, "direct_message", { permission_context: permission })), false);
   const heartbeatSeg = segment(message(4, "heartbeat"));
   const finish = segment(message(2, "finish_notification"));
   assert.deepEqual(coalescePeerFinishes(null, [finish, heartbeatSeg], "local").segments, [heartbeatSeg]);
+});
+
+it("rejoins adjacent step groups even when an intervening wakeup or plan notice was stripped earlier", () => {
+  const first = { ...work(2), has_following_content: true };
+  const second = work(5);
+  const { segments } = coalescePeerFinishes(null, [first, second], "local");
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0]?.kind, "step_group");
+  if (segments[0]?.kind === "step_group") {
+    assert.deepEqual(segments[0].items.map((it) => it.seq), [2, 5]);
+    assert.equal(segments[0].summary.counts.command_count, 2);
+  }
+});
+
+it("resolveCompletedTurnWorkFold wraps only pure pre-final tool work and never swallows important segments", async () => {
+  const { resolveCompletedTurnWorkFold } = await import("./turn-delegation-split.ts");
+
+  const assistant = (seq: number, text: string, streaming = false): TurnLiveSegmentView => ({
+    kind: "assistant_message",
+    key: `msg-${seq}`,
+    item: {
+      item_type: "assistant_message",
+      seq,
+      item_id: `m${seq}`,
+      text,
+      streaming,
+      blocks: [],
+    },
+  });
+
+  const thoughtOnlyGroup = (seq: number): TurnLiveSegmentView => {
+    const items: TimelineItemView[] = [
+      { item_type: "assistant_thinking", seq, item_id: `th-${seq}`, text: "Reasoning..." },
+    ];
+    return {
+      kind: "step_group",
+      key: `th-group-${seq}`,
+      first_seq: seq,
+      items,
+      summary: summarizeWorkChunk(items, 5_000),
+      thought_duration_ms: 5_000,
+      has_following_content: true,
+      has_running_step: false,
+    };
+  };
+
+  // 1. Pure pre-final tool work + final reply => wraps cleanly with natural fallback label
+  const pure = resolveCompletedTurnWorkFold({
+    segments: [{ ...work(1), work_duration_ms: 4_000, has_following_content: true }, assistant(2, "Done.")],
+    isTurnActive: false,
+    turnHasUnrecoveredError: false,
+    locale: "zh-CN",
+  });
+  assert.equal(pure.shouldWrap, true);
+  assert.equal(pure.items.length, 1);
+  assert.equal(pure.sumWorkDurationMs, 4_000);
+  assert.ok(pure.fallbackLabel.length > 0);
+
+  // 2. Active turn or streaming final reply => never wraps
+  assert.equal(
+    resolveCompletedTurnWorkFold({
+      segments: [work(1), assistant(2, "Done.")],
+      isTurnActive: true,
+      turnHasUnrecoveredError: false,
+    }).shouldWrap,
+    false,
+  );
+  assert.equal(
+    resolveCompletedTurnWorkFold({
+      segments: [work(1), assistant(2, "Partial...", true)],
+      isTurnActive: false,
+      turnHasUnrecoveredError: false,
+    }).shouldWrap,
+    false,
+  );
+
+  // 3. Pure thinking-only pre-final work => stays as dedicated [Brain] Thought disclosure
+  assert.equal(
+    resolveCompletedTurnWorkFold({
+      segments: [thoughtOnlyGroup(1), assistant(2, "Answer.")],
+      isTurnActive: false,
+      turnHasUnrecoveredError: false,
+    }).shouldWrap,
+    false,
+  );
+
+  // 4. Multi-message turn (Antigravity mid-turn analysis + final closing) => never swallows earlier reply
+  assert.equal(
+    resolveCompletedTurnWorkFold({
+      segments: [work(1), assistant(2, "Detailed findings"), work(3), assistant(4, "Verified.")],
+      isTurnActive: false,
+      turnHasUnrecoveredError: false,
+    }).shouldWrap,
+    false,
+  );
+  assert.equal(
+    resolveCompletedTurnWorkFold({
+      segments: [assistant(1, "Part 1"), thoughtOnlyGroup(2), assistant(3, "Part 2")],
+      isTurnActive: false,
+      turnHasUnrecoveredError: false,
+    }).shouldWrap,
+    false,
+  );
+
+  // 5. Notice, compaction, wakeup, visible agent_message, or promoted timer milestone => never swallowed
+  const noticeSeg: TurnLiveSegmentView = {
+    kind: "notice",
+    key: "notice-2",
+    item: { item_type: "notice", seq: 2, level: "warning", message: "API retry" },
+  };
+  const compactionSeg: TurnLiveSegmentView = {
+    kind: "compaction",
+    key: "compact-2",
+    label: "Context compacted",
+  };
+  const wakeupSeg: TurnLiveSegmentView = {
+    kind: "wakeup",
+    key: "wakeup-2",
+    label: "Background task finished",
+  };
+  const failedAlertSeg = segment(message(2, "finish_notification", { event: "failed" }));
+  const timerItems: TimelineItemView[] = [
+    makeShellTool(1, "pwd"),
+    {
+      item_type: "tool_call",
+      seq: 2,
+      call_id: "sched-2",
+      summary_title: "Schedule timer",
+      status: "completed",
+      detail: {
+        kind: "generic",
+        tool_name: "schedule",
+        arguments_json: JSON.stringify({ DurationSeconds: 60, Prompt: "Check build" }),
+      },
+      diff_files: [],
+    },
+  ];
+  const timerGroup: TurnLiveSegmentView = {
+    kind: "step_group",
+    key: "timer-group",
+    first_seq: 1,
+    items: timerItems,
+    summary: summarizeWorkChunk(timerItems),
+    has_following_content: true,
+    has_running_step: false,
+  };
+
+  for (const segs of [
+    [work(1), noticeSeg, assistant(3, "Final")],
+    [work(1), compactionSeg, assistant(3, "Final")],
+    [work(1), wakeupSeg, assistant(3, "Final")],
+    [work(1), failedAlertSeg, assistant(3, "Final")],
+    [timerGroup, assistant(3, "Timer armed.")],
+  ]) {
+    assert.equal(
+      resolveCompletedTurnWorkFold({
+        segments: segs,
+        isTurnActive: false,
+        turnHasUnrecoveredError: false,
+      }).shouldWrap,
+      false,
+    );
+  }
 });

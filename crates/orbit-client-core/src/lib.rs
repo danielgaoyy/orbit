@@ -21,6 +21,7 @@ pub mod export;
 #[cfg(feature = "native")]
 pub mod logging;
 pub mod math;
+pub mod personal_agent;
 pub mod render;
 pub mod sidebar;
 pub mod stage;

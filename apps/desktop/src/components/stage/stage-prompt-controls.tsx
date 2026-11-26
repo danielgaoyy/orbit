@@ -867,6 +867,12 @@ export const UserPromptBubble = memo(function UserPromptBubble({
     return true;
   }, [sanitizedLegacy, item.blocks]);
 
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const previewMaxPx = useMemo(
+    () => Math.round(USER_PROMPT_PREVIEW_MAX_PX * (conversationFontSize / 15)),
+    [conversationFontSize],
+  );
+
   useLayoutEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
@@ -875,12 +881,12 @@ export const UserPromptBubble = memo(function UserPromptBubble({
       return;
     }
     const measure = () => {
-      const nextOverflow = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
+      const nextOverflow = el.scrollHeight > previewMaxPx + 10;
       setOverflowing((prev) => (prev === nextOverflow ? prev : nextOverflow));
     };
     measure();
     return observeSharedBubbleResize(el, measure);
-  }, [cleanText, badges.length]);
+  }, [cleanText, badges.length, previewMaxPx]);
 
   useEffect(() => {
     if (!expanded) return;
@@ -1032,7 +1038,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             ref={bodyRef}
             style={
               !expanded && overflowing
-                ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
+                ? { maxHeight: `${previewMaxPx}px`, overflow: "hidden" }
                 : undefined
             }
             className="relative space-y-1.5"
@@ -1134,7 +1140,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             )}
 
             {slashDirectiveLabel ? (
-              <p className="selectable-text text-foreground text-[15px] leading-[1.65] whitespace-pre-wrap">
+              <p className="selectable-text text-foreground font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading) whitespace-pre-wrap">
                 <InlineDirectiveToken
                   directive={slashDirectiveLabel}
                   size="bubble"
@@ -1146,7 +1152,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             ) : (
               cleanText.length > 0 &&
               (!canRenderPrecomputedBlocks ? (
-                <p className="selectable-text text-foreground text-[15px] leading-[1.65] whitespace-pre-wrap">
+                <p className="selectable-text text-foreground font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading) whitespace-pre-wrap">
                   {cleanText}
                 </p>
               ) : (

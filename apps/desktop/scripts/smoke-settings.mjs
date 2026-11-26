@@ -106,6 +106,55 @@ export async function exerciseLocalSettings(cdp) {
     `Composer model/effort trigger must not render a dot separator, got ${JSON.stringify(initialComposerState.modelText)}`,
   );
 
+  // Q4-①: Default typography computed styles in Stage (15px / 24.75px Markdown paragraph, 13px code block)
+  const defaultTypography = await waitFor("default Stage paragraph and code block typography", () => {
+    const stage = document.querySelector("[data-orbit-stage]");
+    if (!stage) return null;
+    const para = [...stage.querySelectorAll("p")].find((el) =>
+      el.textContent?.includes("Paginated response 119"),
+    );
+    const codeViewport = [...stage.querySelectorAll('[data-slot="scroll-area-viewport"]')].find(
+      (el) =>
+        !el.querySelector('[data-slot="scroll-area-viewport"]') &&
+        el.textContent?.includes("const orbitZoom = 100;"),
+    );
+    if (!para || !codeViewport) return null;
+    const paraStyle = getComputedStyle(para);
+    const codeStyle = getComputedStyle(codeViewport);
+    return {
+      paraFontSize: paraStyle.fontSize,
+      paraLineHeight: paraStyle.lineHeight,
+      codeFontSize: codeStyle.fontSize,
+      inlineCssText: document.documentElement.style.cssText,
+      hasTypographySnapshot: localStorage.getItem("orbit.desktop.typography.css.v1") !== null,
+    };
+  });
+  assert.equal(
+    defaultTypography.paraFontSize,
+    "15px",
+    `Expected default Markdown paragraph font-size 15px, got ${defaultTypography.paraFontSize}`,
+  );
+  assert.equal(
+    defaultTypography.paraLineHeight,
+    "24.75px",
+    `Expected default Markdown paragraph line-height 24.75px, got ${defaultTypography.paraLineHeight}`,
+  );
+  assert.equal(
+    defaultTypography.codeFontSize,
+    "13px",
+    `Expected default Markdown code block font-size 13px, got ${defaultTypography.codeFontSize}`,
+  );
+  assert.equal(
+    defaultTypography.inlineCssText.includes("--orbit-"),
+    false,
+    `Default state must not set inline --orbit-* vars on :root, got ${JSON.stringify(defaultTypography.inlineCssText)}`,
+  );
+  assert.equal(
+    defaultTypography.hasTypographySnapshot,
+    false,
+    "Default state must not leave typography snapshot key in localStorage",
+  );
+
   const draft = "A draft to keep while configuring Orbit";
   await click("textarea");
   await cdp.send("Input.insertText", { text: draft });
@@ -348,11 +397,55 @@ export async function exerciseLocalSettings(cdp) {
   assert.equal(
     await evaluate(() => Boolean(
       document.querySelector('[data-setting-id="settings.groupTheme"] [role="radiogroup"]') &&
+      document.querySelector('[data-setting-id="settings.windowZoom"]') &&
+      document.querySelector('[data-setting-id="settings.conversationTextSize"]') &&
+      document.querySelector('[data-setting-id="settings.codeTextSize"]') &&
+      document.querySelector('[data-setting-id="settings.uiFont"]') &&
+      document.querySelector('[data-setting-id="settings.contentFont"]') &&
+      document.querySelector('[data-setting-id="settings.codeFont"]') &&
       document.querySelector('[data-setting-id="settings.collapseExploration"]'),
     )),
     true,
-    "Appearance should render Theme as a Segmented radiogroup and contain Collapse thinking and tool calls",
+    "Appearance should render Theme, Text & Zoom, Fonts, and Display controls",
   );
+  // Q4-③ & Q4-⑤: No Reset buttons at 100%, Actual size hidden at 100%, mock get_ui_zoom=100 & step_ui_zoom called
+  await assertNoResetButtons("Appearance (100% zoom)");
+  const initialZoomCheck = await waitFor("Appearance zoom stepper at 100%", () => {
+    const val = document.querySelector('[data-slot="zoom-stepper-value"]')?.textContent?.trim();
+    const gotGetZoom = (window.smokeZoomCalls || []).some((c) => c.cmd === "get_ui_zoom");
+    const hasActualSize = Boolean(
+      window.smokeFindControl('[data-setting-id="settings.windowZoom"] button', "Actual size"),
+    );
+    return val === "100%" && gotGetZoom ? { val, gotGetZoom, hasActualSize } : null;
+  });
+  assert.equal(
+    initialZoomCheck.hasActualSize,
+    false,
+    "Actual size button must be hidden when zoom is 100%",
+  );
+  await click('[data-setting-id="settings.windowZoom"] button[aria-label="Zoom in"]');
+  await waitFor("Appearance zoom stepped to 110% with Actual size visible", () => {
+    const val = document.querySelector('[data-slot="zoom-stepper-value"]')?.textContent?.trim();
+    const stepped = (window.smokeZoomCalls || []).some(
+      (c) => c.cmd === "step_ui_zoom" && c.args?.delta === 1 && c.args?.source === "settings",
+    );
+    const hasActualSize = Boolean(
+      window.smokeFindControl('[data-setting-id="settings.windowZoom"] button', "Actual size"),
+    );
+    return val === "110%" && stepped && hasActualSize;
+  });
+  await assertNoResetButtons("Appearance (110% zoom)");
+  await click('[data-setting-id="settings.windowZoom"] button', "Actual size");
+  await waitFor("Appearance zoom restored to 100% and Actual size hidden", () => {
+    const val = document.querySelector('[data-slot="zoom-stepper-value"]')?.textContent?.trim();
+    const resetCalled = (window.smokeZoomCalls || []).some(
+      (c) => c.cmd === "set_ui_zoom" && c.args?.zoomPercent === 100,
+    );
+    const hasActualSize = Boolean(
+      window.smokeFindControl('[data-setting-id="settings.windowZoom"] button', "Actual size"),
+    );
+    return val === "100%" && resetCalled && !hasActualSize;
+  });
   await key("f", "KeyF", 4);
   const search = 'input[aria-label="Search settings"]';
   await waitFor("keyboard focus in Settings search", (selector) => document.activeElement?.matches(selector), search);
@@ -448,6 +541,65 @@ export async function exerciseLocalSettings(cdp) {
   await waitFor("Composer returns to disabled Send when Voice is turned off", () =>
     !document.querySelector('[data-slot="settings-view"]') &&
     document.querySelector("[data-composer-action]")?.getAttribute("data-composer-action") === "send_disabled");
+
+  // Q4-②: Change Conversation text size to 18px and Code text size to 16px, verify live preview strip & Stage computed styles
+  await open();
+  await go("appearance");
+  const readSizeTrigger = '[data-setting-id="settings.conversationTextSize"] [data-slot="select-trigger"]';
+  await click(readSizeTrigger);
+  await click('[data-slot="select-content"][data-open] [data-slot="select-item"]', "18 px");
+  await waitFor("Conversation text size updated to 18 px", (sel) =>
+    document.querySelector(sel)?.innerText.includes("18 px") &&
+    !document.querySelector('[data-slot="select-content"][data-open]'), readSizeTrigger);
+
+  const codeSizeTrigger = '[data-setting-id="settings.codeTextSize"] [data-slot="select-trigger"]';
+  await click(codeSizeTrigger);
+  await click('[data-slot="select-content"][data-open] [data-slot="select-item"]', "16 px");
+  await waitFor("Code text size updated to 16 px", (sel) =>
+    document.querySelector(sel)?.innerText.includes("16 px") &&
+    !document.querySelector('[data-slot="select-content"][data-open]'), codeSizeTrigger);
+
+  const previewStyles = await evaluate(() => {
+    const uiEl = document.querySelector('[data-typography-preview="ui"]');
+    const convEl = document.querySelector('[data-typography-preview="conversation"]');
+    const codeEl = document.querySelector('[data-typography-preview="code"]');
+    return {
+      uiFontSize: uiEl ? getComputedStyle(uiEl).fontSize : null,
+      convFontSize: convEl ? getComputedStyle(convEl).fontSize : null,
+      codeFontSize: codeEl ? getComputedStyle(codeEl).fontSize : null,
+    };
+  });
+  assert.deepEqual(
+    previewStyles,
+    { uiFontSize: "13px", convFontSize: "18px", codeFontSize: "16px" },
+    `Expected Appearance typography preview to reflect 13px UI / 18px conversation / 16px code, got ${JSON.stringify(previewStyles)}`,
+  );
+
+  await key("Escape", "Escape");
+  await waitFor("Settings closed after typography change", () =>
+    !document.querySelector('[data-slot="settings-view"]'));
+
+  const updatedStageTypography = await waitFor("updated Stage computed typography (18px / 16px)", () => {
+    const stage = document.querySelector("[data-orbit-stage]");
+    const scroller = window.smokeStage || stage?.querySelector('[data-slot="scroll-area-viewport"]');
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    if (!stage) return null;
+    const para = [...stage.querySelectorAll("p")].find((el) =>
+      el.textContent?.includes("Paginated response 119"),
+    );
+    const codeViewport = [...stage.querySelectorAll('[data-slot="scroll-area-viewport"]')].find(
+      (el) =>
+        !el.querySelector('[data-slot="scroll-area-viewport"]') &&
+        el.textContent?.includes("const orbitZoom = 100;"),
+    );
+    if (!para || !codeViewport) return null;
+    const paraFontSize = getComputedStyle(para).fontSize;
+    const codeFontSize = getComputedStyle(codeViewport).fontSize;
+    return paraFontSize === "18px" && codeFontSize === "16px"
+      ? { paraFontSize, codeFontSize }
+      : null;
+  });
+  assert.deepEqual(updatedStageTypography, { paraFontSize: "18px", codeFontSize: "16px" });
 }
 
 export async function exerciseMultiHostSettings(cdp) {

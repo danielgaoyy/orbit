@@ -20,7 +20,18 @@ describe("ShortcutRegistry", () => {
     assert.equal(normalizeChord("a"), null); // bare key rejected
     assert.equal(normalizeChord("Meta"), null); // modifier-only rejected
 
-    for (const reserved of ["Mod+Q", "Mod+W", "Mod+C", "Mod+V", "Mod+X", "Mod+A", "Mod+Z"]) {
+    for (const reserved of [
+      "Mod+Q",
+      "Mod+W",
+      "Mod+C",
+      "Mod+V",
+      "Mod+X",
+      "Mod+A",
+      "Mod+Z",
+      "Mod+=",
+      "Mod+-",
+      "Mod+0",
+    ]) {
       assert.equal(isOsReservedChord(reserved), true, `expected reserved: ${reserved}`);
     }
     assert.equal(isOsReservedChord("Mod+K"), false);

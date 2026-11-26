@@ -23,6 +23,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
+import { applyTypography, resolveTypography } from "@/lib/typography";
 import {
   MAX_CACHED_STAGE_VIEWS,
   collectPinnedStageKeys,
@@ -177,6 +178,7 @@ const initialPrefs = loadPrefs();
 const initialTheme: ThemeMode = initialPrefs.theme ?? preferenceDefaults.theme;
 const initialResolvedTheme: ResolvedTheme = resolveTheme(initialTheme);
 applyDocumentTheme(initialResolvedTheme);
+applyTypography(resolveTypography(initialPrefs));
 if (typeof document !== "undefined") {
   if (isMacDesktop()) {
     document.documentElement.classList.add("orbit-mac");

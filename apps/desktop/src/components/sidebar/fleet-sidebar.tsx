@@ -565,7 +565,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       className="bg-surface-base flex h-full w-full flex-col select-none"
     >
       {/* 1. Native Window Titlebar Drag Strip (`40px`; `[◫]` lives left in shell, symmetric `[🔍]` lives right) */}
-      <div className="flex h-[40px] shrink-0 items-center pr-2">
+      <div className="flex h-(--orbit-titlebar-h) shrink-0 items-center pr-2">
         <div data-tauri-drag-region className="h-full flex-1" />
         <IconButton
           size="md"

@@ -147,6 +147,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === "+" || ev.key === "=") {
         ev.preventDefault();
         zoomIn();

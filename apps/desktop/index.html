@@ -15,6 +15,31 @@
               window.matchMedia("(prefers-color-scheme: dark)").matches);
           if (isDark) document.documentElement.classList.add("dark");
         } catch (_) {}
+        try {
+          var snap = JSON.parse(localStorage.getItem("orbit.desktop.typography.css.v1") || "null");
+          if (snap && typeof snap === "object") {
+            for (var k in snap) {
+              if (
+                Object.prototype.hasOwnProperty.call(snap, k) &&
+                /^--orbit-[a-z0-9-]+$/.test(k) &&
+                k !== "--orbit-zoom" &&
+                typeof snap[k] === "string" &&
+                snap[k].length <= 400
+              ) {
+                document.documentElement.style.setProperty(k, snap[k]);
+              }
+            }
+          }
+        } catch (_) {}
+        try {
+          var zRaw = localStorage.getItem("orbit.desktop.zoom.v1");
+          if (zRaw) {
+            var z = Number(zRaw);
+            if (Number.isInteger(z) && z >= 80 && z <= 150 && z % 10 === 0 && z !== 100) {
+              document.documentElement.style.setProperty("--orbit-zoom", String(z / 100));
+            }
+          }
+        } catch (_) {}
       })();
     </script>
   </head>

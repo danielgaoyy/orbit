@@ -99,7 +99,8 @@ import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import { formatFileSizeCompact } from "@/lib/session-insights";
-import { orbitActions } from "@/state/orbit-store";
+import { resolveTypography } from "@/lib/typography";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 export interface WorkspaceCodeEditorProps {
@@ -222,6 +223,15 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
   const mod = modSymbol();
   const imeAi = useImeCompositionGuard();
   const imeRename = useImeCompositionGuard();
+  const codeFontSize = useOrbitSelector((s) => s.codeFontSize);
+  const codeFontId = useOrbitSelector((s) => s.codeFontId);
+  const codeFontCustom = useOrbitSelector((s) => s.codeFontCustom);
+  const codeMetrics = useMemo(
+    () => resolveTypography({ codeFontSize, codeFontId, codeFontCustom }).codeMetrics,
+    [codeFontSize, codeFontId, codeFontCustom],
+  );
+  const codeMetricsRef = useRef(codeMetrics);
+  codeMetricsRef.current = codeMetrics;
 
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const editorHostRef = useRef<HTMLDivElement | null>(null);
@@ -823,7 +833,9 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
     const startState = EditorState.create({
       doc: initialDoc,
       extensions: [
-        themeCompartmentRef.current.of(createOrbitCodeMirrorTheme(propsRef.current.isDark)),
+        themeCompartmentRef.current.of(
+          createOrbitCodeMirrorTheme(propsRef.current.isDark, codeMetricsRef.current),
+        ),
         languageCompartmentRef.current.of(
           createCodeMirrorLanguageExtension(propsRef.current.language, propsRef.current.filePath),
         ),
@@ -907,9 +919,11 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
     const view = viewRef.current;
     if (!view) return;
     view.dispatch({
-      effects: themeCompartmentRef.current.reconfigure(createOrbitCodeMirrorTheme(isDark)),
+      effects: themeCompartmentRef.current.reconfigure(
+        createOrbitCodeMirrorTheme(isDark, codeMetrics),
+      ),
     });
-  }, [isDark]);
+  }, [isDark, codeMetrics]);
 
   // Reconfigure language compartment reactively
   useEffect(() => {

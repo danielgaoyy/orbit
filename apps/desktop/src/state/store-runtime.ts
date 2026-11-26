@@ -2,6 +2,7 @@ import type { ComposerInlineDirective } from "@/lib/slash-commands";
 import type { DraftPersistenceController } from "@/lib/draft-persistence";
 import type { NotificationSoundTone } from "@/lib/notification-sound";
 import type { ShortcutActionId } from "@/lib/shortcut-registry";
+import type { FontSlot } from "@/lib/typography";
 import type {
   BrowserActionRequest,
   BrowserActionResponseView,
@@ -17,6 +18,7 @@ import type {
   ReleaseUpdateInfo,
   SessionMode,
   SlashDirective,
+  UiZoomState,
 } from "@/lib/orbit-ipc";
 import type {
   ActiveTurnSendBehavior,
@@ -288,6 +290,10 @@ export interface OrbitCrossSliceActions {
   closeSettings(): void;
   closeOnboardingGuide(markCompleted?: boolean): void;
   setTheme(theme: ThemeMode): void;
+  setConversationFontSize(size: number): void;
+  setCodeFontSize(size: number): void;
+  setFontChoice(slot: FontSlot, id: string, custom?: string | null): void;
+  applyUiZoomState(state: Pick<UiZoomState, "zoom_percent">): void;
   setActiveTurnSendBehavior(behavior: ActiveTurnSendBehavior): void;
   inspectGitRepos(
     hostId: string,

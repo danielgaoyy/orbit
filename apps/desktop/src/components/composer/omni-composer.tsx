@@ -111,6 +111,7 @@ import {
   useComposerDraft,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { resolveTypography } from "@/lib/typography";
 import { cn } from "@/lib/utils";
 
 // Module-level frozen empty arrays for React 19 `useSyncExternalStore` snapshot stability
@@ -582,6 +583,23 @@ export const OmniComposer = memo(function OmniComposer({
   const mentionReqSeqRef = useRef<number>(0);
   const symbolReqSeqRef = useRef<number>(0);
 
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const uiFontId = useOrbitSelector((s) => s.uiFontId);
+  const contentFontId = useOrbitSelector((s) => s.contentFontId);
+  const uiFontCustom = useOrbitSelector((s) => s.uiFontCustom);
+  const contentFontCustom = useOrbitSelector((s) => s.contentFontCustom);
+  const { typographyKey, readScale } = useMemo(
+    () =>
+      resolveTypography({
+        conversationFontSize,
+        uiFontId,
+        contentFontId,
+        uiFontCustom,
+        contentFontCustom,
+      }),
+    [conversationFontSize, uiFontId, contentFontId, uiFontCustom, contentFontCustom],
+  );
+
   useLayoutEffect(() => {
     const overlay = tokenOverlayRef.current;
     if (!overlay) return;
@@ -601,7 +619,7 @@ export const OmniComposer = memo(function OmniComposer({
       if (rafId !== null) window.cancelAnimationFrame(rafId);
       observer.disconnect();
     };
-  }, [slashDirective, selectedHostId]);
+  }, [slashDirective, selectedHostId, typographyKey]);
 
   const activeMode: SessionMode = normalizePermissionMode(
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
@@ -617,8 +635,8 @@ export const OmniComposer = memo(function OmniComposer({
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
-  const minTextareaHeight = 40;
-  const maxTextareaHeight = 200;
+  const minTextareaHeight = Math.max(40, Math.round(22 * readScale) + 18);
+  const maxTextareaHeight = Math.round(200 * readScale);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -683,7 +701,17 @@ export const OmniComposer = memo(function OmniComposer({
     ) {
       scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
     }
-  }, [draftText, scopeKey, composerWidthPx, indent, slashDirective, selectedHostId]);
+  }, [
+    draftText,
+    scopeKey,
+    composerWidthPx,
+    indent,
+    slashDirective,
+    selectedHostId,
+    typographyKey,
+    minTextareaHeight,
+    maxTextareaHeight,
+  ]);
 
   useEffect(() => {
     return orbitActions.onComposerFocusRequest((opts) => {
@@ -2224,10 +2252,10 @@ export const OmniComposer = memo(function OmniComposer({
               onRemoveInlineMention={handleRemoveInlineMention}
             />
 
-            {/* Shared Native Scroll Container (`max-h-[200px]`): inline directive token + inline mention pill backdrop + full-height textarea scroll as one compositor layer */}
+            {/* Shared Native Scroll Container (`max-h-(--orbit-composer-max-h)`): inline directive token + inline mention pill backdrop + full-height textarea scroll as one compositor layer */}
             <div
               ref={scrollContainerRef}
-              className="orbit-native-scroll relative max-h-[200px] overflow-x-hidden overflow-y-auto rounded-t-[20px]"
+              className="orbit-native-scroll relative max-h-(--orbit-composer-max-h) overflow-x-hidden overflow-y-auto rounded-t-[20px]"
             >
               {slashDirective && (
                 <div
@@ -2242,7 +2270,7 @@ export const OmniComposer = memo(function OmniComposer({
                 <div
                   aria-hidden="true"
                   style={{ left: BASE_PAD_LEFT + indent }}
-                  className="text-ink-faint pointer-events-none absolute top-[12px] right-[14px] truncate text-[15px] leading-[22px] select-none"
+                  className="text-ink-faint pointer-events-none absolute top-[12px] right-[14px] truncate font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) select-none"
                 >
                   {dynamicPlaceholder}
                 </div>
@@ -2253,7 +2281,7 @@ export const OmniComposer = memo(function OmniComposer({
                 <div
                   aria-hidden="true"
                   style={inputInset}
-                  className="pointer-events-none absolute top-0 right-0 left-0 z-0 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words text-transparent select-none"
+                  className="pointer-events-none absolute top-0 right-0 left-0 z-0 block w-full px-[14px] pt-[12px] pb-[6px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) whitespace-pre-wrap break-words text-transparent select-none"
                 >
                   {inlineBackdropSegments.map((seg, idx) =>
                     seg.isMention ? (
@@ -2275,7 +2303,7 @@ export const OmniComposer = memo(function OmniComposer({
                 ref={mirrorTextareaRef}
                 style={inputInset}
                 aria-hidden="true"
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words transition-none"
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) whitespace-pre-wrap break-words transition-none"
               />
 
               <textarea
@@ -2304,7 +2332,7 @@ export const OmniComposer = memo(function OmniComposer({
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-ink-primary relative z-[1] block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] transition-none outline-none"
+                className="text-ink-primary relative z-[1] block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) transition-none outline-none"
               />
             </div>
 

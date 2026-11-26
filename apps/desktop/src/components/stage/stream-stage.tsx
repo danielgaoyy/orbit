@@ -64,6 +64,7 @@ import { openSubagent } from "./subagent-crew-dock";
 import { useDelegationDispatches } from "./use-delegation-dispatches";
 import { computePrependRestoredScrollTop } from "@/lib/stage-pagination";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
+import { resolveTypography } from "@/lib/typography";
 import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
@@ -91,6 +92,7 @@ import {
   type ViewportAnchorHoldFn,
   WARM_RESTING_CAP,
   WARM_SCROLLING_CAP,
+  buildTurnHeightCachePrefix,
   computeStageScrollState,
   createHostAgentSelector,
   createStableHostArtifactsSelector,
@@ -334,13 +336,54 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     [],
   );
 
-  const heightCachePrefix = `${selectedHostId}::${selectedAgentId}::${widthBucket}::`;
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const codeFontSize = useOrbitSelector((s) => s.codeFontSize);
+  const uiFontId = useOrbitSelector((s) => s.uiFontId);
+  const contentFontId = useOrbitSelector((s) => s.contentFontId);
+  const codeFontId = useOrbitSelector((s) => s.codeFontId);
+  const uiFontCustom = useOrbitSelector((s) => s.uiFontCustom);
+  const contentFontCustom = useOrbitSelector((s) => s.contentFontCustom);
+  const codeFontCustom = useOrbitSelector((s) => s.codeFontCustom);
+  const { typographyKey, readScale, codeLinePx } = useMemo(
+    () =>
+      resolveTypography({
+        conversationFontSize,
+        codeFontSize,
+        uiFontId,
+        contentFontId,
+        codeFontId,
+        uiFontCustom,
+        contentFontCustom,
+        codeFontCustom,
+      }),
+    [
+      conversationFontSize,
+      codeFontSize,
+      uiFontId,
+      contentFontId,
+      codeFontId,
+      uiFontCustom,
+      contentFontCustom,
+      codeFontCustom,
+    ],
+  );
+  const turnSizeMetrics = useMemo(() => ({ readScale, codeLinePx }), [readScale, codeLinePx]);
+
+  const heightCachePrefix = buildTurnHeightCachePrefix(
+    selectedHostId,
+    selectedAgentId,
+    widthBucket,
+    typographyKey,
+  );
   const getItemKey = useCallback((index: number) => rows[index].key, [rows]);
-  const estimateSize = useCallback((index: number) => {
-    const row = rows[index];
-    const contentHeight = getCachedTurnHeight(heightCachePrefix + row.key);
-    return getTurnItemHeight(turnsRef.current[index], row, contentHeight);
-  }, [rows, heightCachePrefix]);
+  const estimateSize = useCallback(
+    (index: number) => {
+      const row = rows[index];
+      const contentHeight = getCachedTurnHeight(heightCachePrefix + row.key);
+      return getTurnItemHeight(turnsRef.current[index], row, contentHeight, turnSizeMetrics);
+    },
+    [rows, heightCachePrefix, turnSizeMetrics],
+  );
 
   const rangeExtractor = useCallback(
     (range: Range): number[] => {
@@ -574,6 +617,44 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   useLayoutEffect(() => {
     if (turnJump) virtualizer.scrollToIndex(turnJump.index, turnJump);
   }, [turnJump, virtualizer]);
+
+  const prevTypographyKeyRef = useRef(typographyKey);
+  useLayoutEffect(() => {
+    if (prevTypographyKeyRef.current === typographyKey) return;
+    prevTypographyKeyRef.current = typographyKey;
+    const el = scrollRef.current;
+    const wasStuck = stickToBottomRef.current;
+    let anchor: { index: number; offsetInItem: number } | null = null;
+    if (el && !wasStuck) {
+      const scrollTop = el.scrollTop;
+      const vItems = virtualizer.getVirtualItems();
+      const firstVisible = vItems.find((item) => item.end > scrollTop) ?? vItems[0];
+      if (firstVisible) {
+        anchor = {
+          index: firstVisible.index,
+          offsetInItem: scrollTop - firstVisible.start,
+        };
+      }
+    }
+    virtualizer.measure();
+    const rafId = window.requestAnimationFrame(() => {
+      const currentEl = scrollRef.current;
+      if (!currentEl) return;
+      if (wasStuck) {
+        currentEl.scrollTop = Math.max(0, currentEl.scrollHeight - currentEl.clientHeight);
+        return;
+      }
+      if (anchor) {
+        virtualizer.scrollToIndex(anchor.index, { align: "start" });
+        if (Math.abs(anchor.offsetInItem) > 0.5) {
+          const nextTop = currentEl.scrollTop + anchor.offsetInItem;
+          const maxTop = Math.max(0, currentEl.scrollHeight - currentEl.clientHeight);
+          currentEl.scrollTop = Math.max(0, Math.min(maxTop, nextTop));
+        }
+      }
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [typographyKey, virtualizer, scrollRef, stickToBottomRef]);
 
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
     if (holdActiveRef.current || restoringPrependRef.current) {

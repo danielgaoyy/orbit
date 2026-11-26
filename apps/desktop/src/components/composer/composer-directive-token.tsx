@@ -63,7 +63,7 @@ export const ComposerDirectiveToken = memo(function ComposerDirectiveToken({ dir
       <button
         type="button"
         onClick={onClick}
-        className="hover:bg-accent/80 pointer-events-auto inline-flex cursor-pointer items-center rounded-[6px] px-[6px] py-[1px] text-[15px] leading-[22px] transition-colors duration-100"
+        className="hover:bg-accent/80 pointer-events-auto inline-flex cursor-pointer items-center rounded-[6px] px-[6px] py-[1px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) transition-colors duration-100"
       >
         <InlineDirectiveToken directive={directive} size="composer" />
       </button>

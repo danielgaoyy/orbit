@@ -151,14 +151,14 @@ export const SideQuestionTab = memo(function SideQuestionTab({ tab }: { tab: Sid
                   ) : (
                     <>
                       {entry.answer && (
-                        <div className="min-w-0 text-[15px] leading-[1.65]">
+                        <div className="min-w-0 font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading)">
                           {entry.blocks.length > 0 ? (
                             <MarkdownBlocksView
                               blocks={entry.blocks}
                               streaming={entry.status === "streaming"}
                             />
                           ) : (
-                            <div className="selectable-text text-foreground/92 leading-[1.65] whitespace-pre-wrap">
+                            <div className="selectable-text text-foreground/92 leading-(--orbit-read-leading) whitespace-pre-wrap">
                               {entry.answer}
                             </div>
                           )}

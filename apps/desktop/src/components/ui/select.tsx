@@ -11,6 +11,7 @@ export interface SelectOption<T extends string | number> {
   disabled?: boolean;
   mono?: boolean;
   group?: string;
+  style?: React.CSSProperties;
 }
 
 export interface SelectProps<T extends string | number> {
@@ -43,6 +44,7 @@ function renderSelectOptionItem<T extends string | number>(opt: SelectOption<T>)
       <div className="min-w-0 flex-1">
         <BaseSelect.ItemText
           data-slot="select-item-label"
+          style={opt.style}
           className={cn(
             "text-foreground/90 data-[selected]:text-foreground block truncate text-[12.5px] data-[selected]:font-medium",
             opt.mono && "font-mono text-[12px]",
@@ -144,6 +146,11 @@ export function Select<T extends string | number>({
         )}
       >
         <span
+          style={
+            active?.style?.fontFamily
+              ? { fontFamily: active.style.fontFamily }
+              : undefined
+          }
           className={cn(
             "truncate",
             active?.mono && (size === "compact" ? "font-mono text-[11px]" : "font-mono text-[12px]"),

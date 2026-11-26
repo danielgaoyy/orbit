@@ -1,6 +1,6 @@
-//! Rust-first main window geometry persistence for Orbit Desktop.
+//! Main window geometry and zoom persistence for Orbit Desktop.
 //!
-//! Persists logical `(x, y, width, height, maximized)` atomically to
+//! Persists logical geometry, maximized state, and native zoom atomically to
 //! `$ORBIT_HOME/desktop-window-state.json` using debounced non-blocking background
 //! writes on move/resize and an immediate non-blocking flush on window close request.
 //!
@@ -18,7 +18,11 @@ use std::time::{Duration, Instant};
 
 use orbit_client_core::desktop_ops::resolve_orbit_home_dir;
 use serde::{Deserialize, Serialize};
-use tauri::{App, LogicalPosition, LogicalSize, Manager, Monitor, WebviewWindow, WindowEvent};
+use tauri::{
+    App, AppHandle, LogicalPosition, LogicalSize, Manager, Monitor, WebviewWindow, WindowEvent,
+};
+
+use crate::zoom::{self, PersistZoom, ZOOM_DEFAULT_PERCENT};
 
 pub const WINDOW_STATE_FILENAME: &str = "desktop-window-state.json";
 pub const MIN_WINDOW_WIDTH: u32 = 680;
@@ -39,6 +43,12 @@ pub struct WindowState {
     pub height: u32,
     #[serde(default)]
     pub maximized: bool,
+    #[serde(default = "default_zoom_percent")]
+    pub zoom_percent: u16,
+}
+
+fn default_zoom_percent() -> u16 {
+    ZOOM_DEFAULT_PERCENT
 }
 
 /// Logical work-area bounds of an attached display monitor.
@@ -69,26 +79,24 @@ pub fn clamp_min_size(mut state: WindowState) -> WindowState {
     state
 }
 
-/// Preserve the last known unmaximized `(x, y, width, height)` when maximizing so
-/// unmaximizing or restarting does not lose the user's preferred normal frame.
+/// Geometry events retain the tracked zoom, and maximized events retain the normal frame.
 pub fn merge_captured_window_state(
     previous: Option<WindowState>,
     captured: WindowState,
 ) -> WindowState {
-    let clamped = clamp_min_size(captured);
-    if clamped.maximized
-        && let Some(prev) = previous
-    {
-        let prev_clamped = clamp_min_size(prev);
-        return WindowState {
-            x: prev_clamped.x,
-            y: prev_clamped.y,
-            width: prev_clamped.width,
-            height: prev_clamped.height,
+    let Some(previous) = previous else {
+        return clamp_min_size(captured);
+    };
+    if captured.maximized {
+        return clamp_min_size(WindowState {
             maximized: true,
-        };
+            ..previous
+        });
     }
-    clamped
+    clamp_min_size(WindowState {
+        zoom_percent: previous.zoom_percent,
+        ..captured
+    })
 }
 
 fn clamp_size_to_monitor(width: u32, height: u32, monitor: MonitorRect) -> (u32, u32) {
@@ -161,7 +169,7 @@ fn center_on_monitor(state: WindowState, monitor: MonitorRect) -> WindowState {
         y,
         width,
         height,
-        maximized: state.maximized,
+        ..state
     }
 }
 
@@ -202,11 +210,9 @@ pub fn resolve_restored_window_state(
         let (width, height) = clamp_size_to_monitor(clamped.width, clamped.height, monitor);
         return ResolvedWindowState {
             state: WindowState {
-                x: clamped.x,
-                y: clamped.y,
                 width,
                 height,
-                maximized: clamped.maximized,
+                ..clamped
             },
             fell_back_to_center: false,
         };
@@ -238,7 +244,10 @@ pub fn load_window_state(path: &Path) -> Option<WindowState> {
     };
 
     match serde_json::from_str::<WindowState>(&raw) {
-        Ok(state) => Some(clamp_min_size(state)),
+        Ok(state) => Some(clamp_min_size(WindowState {
+            zoom_percent: zoom::snap(state.zoom_percent),
+            ..state
+        })),
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -306,13 +315,6 @@ pub fn save_window_state(path: &Path, state: &WindowState) -> Result<(), String>
         file.sync_all()
             .map_err(|e| format!("failed to flush temporary window state: {e}"))?;
         drop(file);
-
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                let _ = fs::remove_file(path);
-            }
-        }
 
         fs::rename(&tmp_path, path).map_err(|e| {
             format!(
@@ -401,10 +403,13 @@ fn capture_window_state(window: &WebviewWindow) -> Option<WindowState> {
         width,
         height,
         maximized,
+        zoom_percent: ZOOM_DEFAULT_PERCENT,
     })
 }
 
 struct TrackerInner {
+    // A zoom change can precede the first usable (non-minimized) geometry capture.
+    zoom_percent: u16,
     latest: Option<WindowState>,
     last_saved: Option<WindowState>,
     dirty: bool,
@@ -415,7 +420,7 @@ struct TrackerInner {
 struct WindowStateTracker {
     path: PathBuf,
     inner: Mutex<TrackerInner>,
-    write_lock: Arc<Mutex<()>>,
+    write_lock: Mutex<()>,
 }
 
 impl WindowStateTracker {
@@ -427,28 +432,42 @@ impl WindowStateTracker {
         Arc::new(Self {
             path,
             inner: Mutex::new(TrackerInner {
+                zoom_percent: initial.map_or(ZOOM_DEFAULT_PERCENT, |s| s.zoom_percent),
                 latest: initial,
                 last_saved,
                 dirty: false,
                 deadline: None,
                 worker_active: false,
             }),
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock: Mutex::new(()),
         })
     }
 
     fn record_geometry(&self, captured: WindowState) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.latest = Some(merge_captured_window_state(guard.latest, captured));
-        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.latest = Some(merge_captured_window_state(
+            guard.latest,
+            WindowState {
+                zoom_percent: guard.zoom_percent,
+                ..captured
+            },
+        ));
     }
 
-    fn schedule_debounced_save(self: &Arc<Self>, captured: WindowState) {
+    fn set_zoom_percent(self: &Arc<Self>, percent: u16) {
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.zoom_percent = percent;
+            if let Some(state) = &mut guard.latest {
+                state.zoom_percent = percent;
+            }
+        }
+        self.schedule_debounced_save();
+    }
+
+    fn schedule_debounced_save(self: &Arc<Self>) {
         let should_spawn_worker = {
-            let Ok(mut guard) = self.inner.lock() else {
-                return;
-            };
-            guard.latest = Some(merge_captured_window_state(guard.latest, captured));
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             guard.dirty = true;
             guard.deadline = Some(Instant::now() + SAVE_DEBOUNCE);
             if guard.worker_active {
@@ -470,9 +489,7 @@ impl WindowStateTracker {
     async fn run_debounce_worker(self: Arc<Self>) {
         loop {
             let sleep_duration = {
-                let Ok(mut guard) = self.inner.lock() else {
-                    return;
-                };
+                let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if !guard.dirty {
                     guard.worker_active = false;
                     return;
@@ -480,111 +497,79 @@ impl WindowStateTracker {
                 let now = Instant::now();
                 match guard.deadline {
                     Some(dl) if dl > now => Some(dl.saturating_duration_since(now)),
-                    _ => None,
-                }
-            };
-
-            if let Some(dur) = sleep_duration {
-                tokio::time::sleep(dur).await;
-                continue;
-            }
-
-            let pending = {
-                let Ok(mut guard) = self.inner.lock() else {
-                    return;
-                };
-                if !guard.dirty {
-                    guard.worker_active = false;
-                    return;
-                }
-                if let Some(dl) = guard.deadline
-                    && dl > Instant::now()
-                {
-                    continue;
-                }
-                guard.dirty = false;
-                guard.deadline = None;
-                match guard.latest {
-                    Some(state) if guard.last_saved != Some(state) => Some(state),
                     _ => {
-                        guard.worker_active = false;
-                        return;
+                        guard.dirty = false;
+                        guard.deadline = None;
+                        None
                     }
                 }
             };
 
-            if let Some(snapshot) = pending {
-                self.persist_snapshot_async(snapshot).await;
+            if let Some(duration) = sleep_duration {
+                tokio::time::sleep(duration).await;
+            } else {
+                self.persist_latest_async().await;
             }
         }
     }
 
     fn flush_non_blocking(self: &Arc<Self>) {
-        let pending = {
-            let Ok(mut guard) = self.inner.lock() else {
-                return;
-            };
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             guard.dirty = false;
             guard.deadline = None;
-            match guard.latest {
-                Some(state) if guard.last_saved != Some(state) => Some(state),
-                _ => None,
-            }
-        };
+        }
+        let tracker = Arc::clone(self);
+        tauri::async_runtime::spawn(async move { tracker.persist_latest_async().await });
+    }
 
-        if let Some(snapshot) = pending {
-            let tracker = Arc::clone(self);
-            tauri::async_runtime::spawn(async move {
-                tracker.persist_snapshot_async(snapshot).await;
-            });
+    async fn persist_latest_async(self: &Arc<Self>) {
+        let tracker = Arc::clone(self);
+        let res = tauri::async_runtime::spawn_blocking(move || tracker.persist_latest()).await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "Failed to persist desktop window state"),
+            Err(err) => tracing::warn!(error = %err, "Desktop window persistence task failed"),
         }
     }
 
-    async fn persist_snapshot_async(&self, fallback_snapshot: WindowState) {
-        let path = self.path.clone();
-        let write_lock = Arc::clone(&self.write_lock);
-        let latest_snapshot = self
-            .inner
-            .lock()
-            .ok()
-            .and_then(|g| g.latest)
-            .unwrap_or(fallback_snapshot);
-
-        let res = tauri::async_runtime::spawn_blocking(move || {
-            let _io_guard = write_lock.lock();
-            save_window_state(&path, &latest_snapshot)
-        })
-        .await;
-
-        match res {
-            Ok(Ok(())) => {
-                if let Ok(mut guard) = self.inner.lock() {
-                    guard.last_saved = Some(latest_snapshot);
-                }
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "Failed to persist desktop window geometry");
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "Desktop window geometry persistence task failed");
-            }
+    fn persist_latest(&self) -> Result<(), String> {
+        // Debounce and close can race. Select the snapshot after taking the I/O lock
+        // so an older geometry write cannot finish after a newer zoom write.
+        let _writer = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.latest.filter(|s| Some(*s) != guard.last_saved)
+        };
+        if let Some(state) = snapshot {
+            save_window_state(&self.path, &state)?;
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_saved = Some(state);
         }
+        Ok(())
     }
 }
 
 /// Restore persisted geometry on the `"main"` window and attach debounced non-blocking
 /// move/resize & close-request persistence listeners.
-pub fn setup_main_window_state(app: &App) {
+pub fn setup_main_window_state(app: &App) -> u16 {
     let Some(window) = app.get_webview_window("main") else {
         tracing::warn!("Main webview window not found; skipping window state setup");
-        return;
+        return ZOOM_DEFAULT_PERCENT;
     };
     let Some(path) = default_window_state_path() else {
         tracing::warn!("Could not resolve ORBIT_HOME; skipping window geometry persistence");
-        return;
+        zoom::set_window_zoom(&window, ZOOM_DEFAULT_PERCENT);
+        return ZOOM_DEFAULT_PERCENT;
     };
 
-    let (initial_state, last_saved) = if let Some(saved) = load_window_state(&path) {
+    let saved = load_window_state(&path);
+    let percent = saved.map_or(ZOOM_DEFAULT_PERCENT, |s| s.zoom_percent);
+    zoom::set_window_zoom(&window, percent);
+
+    let (initial_state, last_saved) = if let Some(saved) = saved {
         let (monitors, primary_idx) = collect_monitors(&window);
         let resolved = resolve_restored_window_state(saved, &monitors, primary_idx);
 
@@ -615,11 +600,13 @@ pub fn setup_main_window_state(app: &App) {
     };
 
     let tracker = WindowStateTracker::new(path, initial_state, last_saved);
+    app.manage(Arc::clone(&tracker));
     let win_for_events = window.clone();
     window.on_window_event(move |event| match event {
         WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
             if let Some(captured) = capture_window_state(&win_for_events) {
-                tracker.schedule_debounced_save(captured);
+                tracker.record_geometry(captured);
+                tracker.schedule_debounced_save();
             }
         }
         WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
@@ -630,6 +617,21 @@ pub fn setup_main_window_state(app: &App) {
         }
         _ => {}
     });
+    percent
+}
+
+pub fn zoom_persistence(app: &App) -> Option<PersistZoom> {
+    let tracker = Arc::clone(app.try_state::<Arc<WindowStateTracker>>()?.inner());
+    Some(Arc::new(move |p| tracker.set_zoom_percent(p)))
+}
+
+/// A Quit can end the event loop while a debounce timer or close flush is pending.
+pub fn flush_on_exit(app: &AppHandle) {
+    if let Some(tracker) = app.try_state::<Arc<WindowStateTracker>>()
+        && let Err(error) = tracker.persist_latest()
+    {
+        tracing::warn!(%error, "Failed to flush desktop window state on exit");
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +659,7 @@ mod tests {
             width: 1420,
             height: 880,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         save_window_state(&path, &original).expect("should write window state atomically");
         let loaded = load_window_state(&path).expect("should load persisted window state");
@@ -668,6 +671,7 @@ mod tests {
             width: 1600,
             height: 940,
             maximized: true,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         save_window_state(&path, &maximized).expect("should atomically replace window state");
         let loaded_max = load_window_state(&path).expect("should load updated maximized state");
@@ -682,6 +686,100 @@ mod tests {
         assert_eq!(entries, vec![WINDOW_STATE_FILENAME.to_string()]);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_legacy_and_noncanonical_zoom() {
+        let dir = unique_test_dir("zoom-load");
+        let path = dir.join(WINDOW_STATE_FILENAME);
+        for (zoom, expected) in [(None, 100), (Some(135), 140), (Some(999), 150)] {
+            let mut json = serde_json::json!({ "x": 10, "y": 20, "width": 1000, "height": 700 });
+            if let Some(p) = zoom {
+                json["zoom_percent"] = p.into();
+            }
+            fs::write(&path, json.to_string()).expect("write window state fixture");
+            assert_eq!(
+                load_window_state(&path)
+                    .expect("load window state")
+                    .zoom_percent,
+                expected
+            );
+        }
+        fs::remove_dir_all(dir).expect("remove window state fixture");
+    }
+
+    #[test]
+    fn geometry_after_zoom_persists_new_frame_and_preserves_zoom() {
+        let dir = unique_test_dir("zoom-geometry");
+        let path = dir.join(WINDOW_STATE_FILENAME);
+        let initial = WindowState {
+            x: 0,
+            y: 55,
+            width: 1280,
+            height: 840,
+            maximized: false,
+            zoom_percent: 100,
+        };
+        let tracker = WindowStateTracker::new(path.clone(), Some(initial), Some(initial));
+        let captured = WindowState {
+            x: 70,
+            height: 900,
+            ..initial
+        };
+        tracker.set_zoom_percent(130);
+        tracker.record_geometry(captured);
+        tracker.schedule_debounced_save();
+
+        let expected = WindowState {
+            zoom_percent: 130,
+            ..captured
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while load_window_state(&path) != Some(expected) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(load_window_state(&path), Some(expected));
+
+        // A maximized close capture also carries the native frame's default zoom.
+        tracker.record_geometry(WindowState {
+            x: 0,
+            width: 1920,
+            maximized: true,
+            ..captured
+        });
+        tracker.persist_latest().expect("flush final frame");
+        assert_eq!(
+            load_window_state(&path),
+            Some(WindowState {
+                maximized: true,
+                ..expected
+            })
+        );
+        fs::remove_dir_all(dir).expect("remove saved window state");
+    }
+
+    #[test]
+    fn zoom_can_precede_the_first_geometry_capture() {
+        let dir = unique_test_dir("first-geometry");
+        let path = dir.join(WINDOW_STATE_FILENAME);
+        let tracker = WindowStateTracker::new(path.clone(), None, None);
+        tracker.set_zoom_percent(120);
+        tracker.record_geometry(WindowState {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 700,
+            maximized: false,
+            zoom_percent: 100,
+        });
+        tracker.persist_latest().expect("persist first frame");
+        assert_eq!(
+            load_window_state(&path)
+                .expect("load first frame")
+                .zoom_percent,
+            120
+        );
+        fs::remove_dir_all(dir).expect("remove saved window state");
     }
 
     #[test]
@@ -716,6 +814,7 @@ mod tests {
                     width: 1000,
                     height: 700,
                     maximized: false,
+                    zoom_percent: ZOOM_DEFAULT_PERCENT,
                 },
             )
             .is_err()
@@ -732,6 +831,7 @@ mod tests {
             width: 320,
             height: 240,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         let clamped = clamp_min_size(tiny);
         assert_eq!(clamped.width, MIN_WINDOW_WIDTH);
@@ -763,6 +863,7 @@ mod tests {
             width: 2400,
             height: 1400,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         let resolved = resolve_restored_window_state(huge, &laptop, 0);
         assert!(!resolved.fell_back_to_center);
@@ -800,6 +901,7 @@ mod tests {
             width: 1300,
             height: 820,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         let dual_monitors = [primary, right_external];
         let kept = resolve_restored_window_state(on_right_ext, &dual_monitors, 0);
@@ -822,6 +924,7 @@ mod tests {
             width: 1200,
             height: 760,
             maximized: true,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         let left_attached = [left_external, primary];
         let kept_left = resolve_restored_window_state(on_left_ext, &left_attached, 1);
@@ -841,6 +944,7 @@ mod tests {
             width: 1000,
             height: 700,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         assert!(resolve_restored_window_state(off_top, &single_monitor, 0).fell_back_to_center);
 
@@ -850,6 +954,7 @@ mod tests {
             width: 1000,
             height: 700,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         assert!(
             resolve_restored_window_state(barely_peeking_right, &single_monitor, 0)
@@ -864,6 +969,7 @@ mod tests {
                 width: 400,
                 height: 300,
                 maximized: false,
+                zoom_percent: ZOOM_DEFAULT_PERCENT,
             },
             &[],
             0,
@@ -881,6 +987,7 @@ mod tests {
             width: 1280,
             height: 800,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         let max_event = WindowState {
             x: 0,
@@ -888,6 +995,7 @@ mod tests {
             width: 1920,
             height: 1055,
             maximized: true,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         let merged = merge_captured_window_state(Some(normal), max_event);
         assert_eq!(
@@ -898,6 +1006,7 @@ mod tests {
                 width: 1280,
                 height: 800,
                 maximized: true,
+                zoom_percent: ZOOM_DEFAULT_PERCENT,
             }
         );
 
@@ -907,6 +1016,7 @@ mod tests {
             width: 1100,
             height: 720,
             maximized: false,
+            zoom_percent: ZOOM_DEFAULT_PERCENT,
         };
         assert_eq!(
             merge_captured_window_state(Some(merged), unmax_event),

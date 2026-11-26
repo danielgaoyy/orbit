@@ -15,7 +15,8 @@ import {
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
-import { isTauriRuntime, orbitIpc } from "@/lib/orbit-ipc";
+import { isMacDesktop, isTauriRuntime, orbitIpc } from "@/lib/orbit-ipc";
+import { matchDesktopZoomAction, resolveTypography } from "@/lib/typography";
 import {
   type Osc133CommandBlock,
   type Osc133Tracker,
@@ -72,15 +73,22 @@ export function XtermPane({
   const mod = modSymbol();
   const isFocusedPane = focused ?? active;
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
-  const terminalFontSize = useOrbitSelector((s) => s.terminalFontSize);
+  const codeFontSize = useOrbitSelector((s) => s.codeFontSize);
+  const codeFontId = useOrbitSelector((s) => s.codeFontId);
+  const codeFontCustom = useOrbitSelector((s) => s.codeFontCustom);
   const terminalCursorStyle = useOrbitSelector((s) => s.terminalCursorStyle);
   const terminalScrollback = useOrbitSelector((s) => s.terminalScrollback);
   const terminalThemeMode = useOrbitSelector((s) => s.terminalThemeMode);
+  const terminalTypography = useMemo(
+    () => resolveTypography({ codeFontSize, codeFontId, codeFontCustom }).terminal,
+    [codeFontSize, codeFontId, codeFontCustom],
+  );
 
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const webglAddonRef = useRef<WebglAddon | null>(null);
   const osc133TrackerRef = useRef<Osc133Tracker | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
   const resizeTimerRef = useRef<number | null>(null);
@@ -318,12 +326,13 @@ export function XtermPane({
     if (!el) return;
 
     const snap = orbitActions.getSnapshot();
+    const initialTermTypography = resolveTypography(snap).terminal;
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: snap.terminalCursorStyle,
-      fontFamily: '"JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, monospace',
-      fontSize: snap.terminalFontSize,
-      lineHeight: 1.28,
+      fontFamily: initialTermTypography.fontFamily,
+      fontSize: initialTermTypography.fontSize,
+      lineHeight: initialTermTypography.lineHeight,
       scrollback: snap.terminalScrollback,
       theme: resolveXtermTheme(snap.resolvedTheme, snap.terminalThemeMode),
     });
@@ -341,8 +350,10 @@ export function XtermPane({
           // ignore disposal errors after context loss
         }
         webglAddon = null;
+        webglAddonRef.current = null;
       });
       term.loadAddon(webglAddon);
+      webglAddonRef.current = webglAddon;
     } catch {
       // Fallback to DOM renderer when WebGL2 is unavailable
     }
@@ -426,9 +437,12 @@ export function XtermPane({
 
     // Scoped terminal-local shortcuts: Cmd+K (clear), Cmd+Shift/Alt+D (split), Cmd+Up/Down (OSC 133),
     // and Cmd/Ctrl+F, Cmd/Ctrl+G, Esc (search)
-    const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+    const isMac = isMacDesktop();
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
+      if (isTauriRuntime() && matchDesktopZoomAction(ev, isMac)) {
+        return false;
+      }
       const key = ev.key.toLowerCase();
       if (ev.metaKey && !ev.shiftKey && !ev.altKey && !ev.ctrlKey && key === "k") {
         ev.preventDefault();
@@ -633,6 +647,7 @@ export function XtermPane({
       } catch {
         // ignore
       }
+      webglAddonRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -644,17 +659,51 @@ export function XtermPane({
     const term = termRef.current;
     if (!term) return;
     term.options.theme = resolveXtermTheme(resolvedTheme, terminalThemeMode);
-    term.options.fontSize = terminalFontSize;
     term.options.cursorStyle = terminalCursorStyle;
     term.options.scrollback = terminalScrollback;
-    if (active && visible) {
-      fitRef.current?.fit();
-      syncRemoteSize(term);
+
+    const fontChanged =
+      term.options.fontFamily !== terminalTypography.fontFamily ||
+      term.options.fontSize !== terminalTypography.fontSize;
+
+    if (!fontChanged) {
+      if (active && visible) {
+        fitRef.current?.fit();
+        syncRemoteSize(term);
+      }
+      return;
     }
+
+    let cancelled = false;
+    const applyFontAndRefit = () => {
+      if (cancelled || termRef.current !== term) return;
+      term.options.fontFamily = terminalTypography.fontFamily;
+      term.options.fontSize = terminalTypography.fontSize;
+      try {
+        webglAddonRef.current?.clearTextureAtlas();
+      } catch {
+        // Ignore if WebGL addon is unavailable or already disposed
+      }
+      if (active && visible) {
+        fitRef.current?.fit();
+        syncRemoteSize(term);
+      }
+    };
+
+    const fontsReady = typeof document !== "undefined" ? document.fonts?.ready : undefined;
+    if (fontsReady) {
+      void fontsReady.then(applyFontAndRefit, applyFontAndRefit);
+    } else {
+      applyFontAndRefit();
+    }
+    return () => {
+      cancelled = true;
+    };
   }, [
     resolvedTheme,
     terminalThemeMode,
-    terminalFontSize,
+    terminalTypography.fontFamily,
+    terminalTypography.fontSize,
     terminalCursorStyle,
     terminalScrollback,
     active,

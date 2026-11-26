@@ -75,6 +75,26 @@ export interface SystemAudioInputDevice {
   transport?: string | null;
 }
 
+export type ZoomSource = "startup" | "menu" | "shortcut" | "settings";
+
+export interface UiZoomState {
+  zoom_percent: number;
+  min_percent: number;
+  max_percent: number;
+  step_percent: number;
+}
+
+export interface UiZoomChangedPayload extends UiZoomState {
+  source: ZoomSource;
+}
+
+const DEFAULT_UI_ZOOM_STATE: UiZoomState = {
+  zoom_percent: 100,
+  min_percent: 80,
+  max_percent: 150,
+  step_percent: 10,
+};
+
 export interface AcpAgentSpec {
   id: string;
   name: string;
@@ -7840,6 +7860,42 @@ export const orbitIpc = {
   ): Promise<() => void> => {
     if (!isTauriRuntime()) return () => {};
     return listen<NativeNotificationResolvedPayload>("orbit://notification-action-resolved", (ev) => {
+      if (ev.payload) handler(ev.payload);
+    });
+  },
+
+  getUiZoom: async (): Promise<UiZoomState> => {
+    if (!isTauriRuntime()) {
+      return { ...DEFAULT_UI_ZOOM_STATE };
+    }
+    return invoke<UiZoomState>("get_ui_zoom");
+  },
+
+  stepUiZoom: async (
+    delta: -1 | 1,
+    source: "shortcut" | "settings",
+  ): Promise<UiZoomState> => {
+    if (!isTauriRuntime()) {
+      return { ...DEFAULT_UI_ZOOM_STATE };
+    }
+    return invoke<UiZoomState>("step_ui_zoom", { delta, source });
+  },
+
+  setUiZoom: async (
+    zoomPercent: number,
+    source: "shortcut" | "settings",
+  ): Promise<UiZoomState> => {
+    if (!isTauriRuntime()) {
+      return { ...DEFAULT_UI_ZOOM_STATE };
+    }
+    return invoke<UiZoomState>("set_ui_zoom", { zoomPercent, source });
+  },
+
+  onUiZoomChanged: async (
+    handler: (payload: UiZoomChangedPayload) => void,
+  ): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen<UiZoomChangedPayload>("orbit://zoom-changed", (ev) => {
       if (ev.payload) handler(ev.payload);
     });
   },

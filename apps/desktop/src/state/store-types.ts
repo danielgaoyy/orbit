@@ -771,6 +771,15 @@ export interface OrbitUiState {
   terminalScrollback: number;
   terminalThemeMode: TerminalThemeMode;
   customKeybindings: Record<string, string>;
+  conversationFontSize: number;
+  codeFontSize: number;
+  uiFontId: string;
+  contentFontId: string;
+  codeFontId: string;
+  uiFontCustom: string | null;
+  contentFontCustom: string | null;
+  codeFontCustom: string | null;
+  uiZoomPercent: number;
 }
 
 export interface PersistedPrefs {
@@ -795,6 +804,14 @@ export interface PersistedPrefs {
   terminalCursorStyle?: TerminalCursorStyle;
   terminalScrollback?: number;
   terminalThemeMode?: TerminalThemeMode;
+  conversationFontSize?: number;
+  codeFontSize?: number;
+  uiFontId?: string;
+  contentFontId?: string;
+  codeFontId?: string;
+  uiFontCustom?: string | null;
+  contentFontCustom?: string | null;
+  codeFontCustom?: string | null;
   sidebarOpen?: boolean;
   sidebarWidth?: number;
   hiddenProjectKeys?: Record<string, boolean>;

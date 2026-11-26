@@ -229,6 +229,9 @@ export const OS_RESERVED_CHORDS: ReadonlySet<string> = new Set([
   "Mod+X",
   "Mod+A",
   "Mod+Z",
+  "Mod+=",
+  "Mod+-",
+  "Mod+0",
 ]);
 
 const MODIFIER_ONLY_KEYS = new Set(["Meta", "Control", "Alt", "Shift", "OS", "AltGraph"]);

@@ -228,6 +228,7 @@ export class OrbitHarmonyCore {
   subscribe(callback: (err: Error | null, payloadJson: string) => void): void;
   subscribeCoalesced(minIntervalMs: number, callback: (err: Error | null, payloadJson: string) => void): void;
   debugReplayStageDeltasJson(hostId: string, agentId: string, framesJson: string): void;
+  markAgentRead(hostId: string, agentId: string): void;
   personalAgentBriefingJson(primaryRouterHostId?: string | null): string;
   agentStageTurnsSliceJson(hostId: string, agentId: string, startTurnIndex: number, count: number): string;
   listPersonalAgentActivityJson(hostId: string, limit: number, sinceMs?: number | null): Promise<string>;

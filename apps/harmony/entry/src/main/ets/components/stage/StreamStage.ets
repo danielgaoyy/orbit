@@ -28,7 +28,27 @@ import {
   resolveHostStatusColor,
   resolveSelectedHost
 } from '../common/OrbitCommonControls';
+import {
+  OrbitAgentListItem,
+  mapAgentCardToListStatus,
+  mapCrewSubagentStatus,
+  resolveAgentEffortDisplay,
+  resolveAgentFallbackLabel,
+  resolveCompactAgentModelLabel,
+  resolveCrewSubagentDepth,
+  resolveCrewSubagentHostId
+} from '../common/OrbitAgentListItem';
+import {
+  OrbitAvatarSeedKeyed,
+  OrbitSubagentAvatarAsset,
+  assignSubagentCharacters
+} from '../common/OrbitSubagentAvatar';
 import { StageTurnView } from './StageTurnView';
+
+interface StageCrewAvatarSeed extends OrbitAvatarSeedKeyed {
+  readonly key: string;
+  readonly seed: string;
+}
 
 @ComponentV2
 export struct StreamStage {
@@ -81,7 +101,11 @@ export struct StreamStage {
     if (this.store.activeCwd.trim().length > 0 && this.store.activeCwd !== '~') {
       return basenameOfPath(this.store.activeCwd);
     }
-    return '~';
+    const host = this.activeHostCard;
+    if (host !== null && host.display_name.trim().length > 0) {
+      return host.display_name.trim();
+    }
+    return 'Orbit';
   }
 
   private lastListItemIndex(): number {
@@ -126,6 +150,16 @@ export struct StreamStage {
     this.firstVisibleIndex = 0;
     this.lastVisibleIndex = Math.max(0, this.store.stageTurns.length - 1);
     this.atBottomEdge = true;
+  }
+
+  @Monitor('store.decisionFocusRevision')
+  onDecisionFocusRequested(_mon: IMonitor): void {
+    this.atBottomEdge = true;
+    const totalItems = this.store.stageTurns.length;
+    if (totalItems > 0) {
+      this.lastVisibleIndex = totalItems - 1;
+      this.listScroller.scrollEdge(Edge.Bottom);
+    }
   }
 
   private isHostOnline(host: HostCardDto): boolean {
@@ -265,6 +299,71 @@ export struct StreamStage {
     .alignItems(VerticalAlign.Center)
   }
 
+  private findCrewLiveAgent(hostId: string, agentId: string | null | undefined): AgentCardDto | null {
+    if (agentId === null || agentId === undefined || agentId.length === 0) {
+      return null;
+    }
+    const cleanHost = hostId.trim().length > 0 ? hostId.trim() : this.store.selectedHostId;
+    const detail = cleanHost.length > 0
+      ? this.store.fleetStore.getCachedHostDetail(cleanHost)
+      : this.store.currentHostDetail;
+    if (detail === null) {
+      return null;
+    }
+    for (let i = 0; i < detail.agents.length; i += 1) {
+      if (detail.agents[i].agent_id === agentId) {
+        return detail.agents[i];
+      }
+    }
+    return null;
+  }
+
+  private resolveCrewSubagentAgentSource(sub: SessionSubagentEntryDto): AgentCardDto | null {
+    const targetHostId = resolveCrewSubagentHostId(sub, this.store.selectedHostId);
+    const liveChild = this.findCrewLiveAgent(targetHostId, sub.child_agent_id);
+    if (liveChild !== null) {
+      return liveChild;
+    }
+    // Managed child lives on another/uncached host: NEVER masquerade with the parent's model.
+    if (sub.child_agent_id !== null && sub.child_agent_id.trim().length > 0) {
+      return null;
+    }
+    // Provider-native subagent runs inside the parent's session/provider.
+    return this.store.currentAgent;
+  }
+
+  private computeSubagentDepth(sub: SessionSubagentEntryDto): number {
+    return resolveCrewSubagentDepth(
+      sub,
+      this.store.selectedAgentId,
+      this.store.selectedHostId,
+      (hid: string, aid: string): AgentCardDto | null => this.findCrewLiveAgent(hid, aid)
+    );
+  }
+
+  @Computed
+  get crewAvatarMap(): Map<string, OrbitSubagentAvatarAsset> {
+    const seeds: StageCrewAvatarSeed[] = [];
+    const seen = new Set<string>();
+    const subs = this.store.stageSubagents;
+    for (let i = 0; i < subs.length; i += 1) {
+      const k = `sub:${subs[i].id}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        seeds.push({ key: k, seed: subs[i].child_agent_id ?? subs[i].id });
+      }
+    }
+    const peers = this.workspacePeers;
+    for (let i = 0; i < peers.length; i += 1) {
+      const k = `peer:${peers[i].agent_id}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        seeds.push({ key: k, seed: peers[i].agent_id });
+      }
+    }
+    return assignSubagentCharacters(seeds, (item: StageCrewAvatarSeed): string => item.seed);
+  }
+
   @Builder
   private renderLineageAndUsageStrip() {
     Scroll() {
@@ -294,61 +393,77 @@ export struct StreamStage {
         ForEach(
           this.store.stageSubagents,
           (sub: SessionSubagentEntryDto) => {
-            Button({ type: ButtonType.Capsule, stateEffect: true }) {
-              Row({ space: 5 }) {
-                Row()
-                  .width(6)
-                  .height(6)
-                  .borderRadius(3)
-                  .backgroundColor(this.subagentStatusColor(sub.status))
-                Text(sub.role.trim().length > 0 ? sub.role.trim() : 'Subagent')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .constraintSize({ maxWidth: 140 })
-              }
-              .alignItems(VerticalAlign.Center)
+            Column() {
+              OrbitAgentListItem({
+                variant: 'card',
+                title: sub.role.trim().length > 0 ? sub.role.trim() : sub.id,
+                status: mapCrewSubagentStatus(
+                  sub,
+                  this.findCrewLiveAgent(
+                    resolveCrewSubagentHostId(sub, this.store.selectedHostId),
+                    sub.child_agent_id
+                  )
+                ),
+                characterId: this.crewAvatarMap.get(`sub:${sub.id}`)?.id ?? '',
+                avatarSeedKey: sub.child_agent_id ?? sub.id,
+                avatarSizeVp: 20,
+                provider: this.resolveCrewSubagentAgentSource(sub)?.provider ?? '',
+                modelLabel: resolveCompactAgentModelLabel(
+                  this.resolveCrewSubagentAgentSource(sub),
+                  this.store.providerCatalogsForHost(
+                    resolveCrewSubagentHostId(sub, this.store.selectedHostId)
+                  )
+                ),
+                effortLabel: resolveAgentEffortDisplay(
+                  this.resolveCrewSubagentAgentSource(sub)
+                ),
+                agentLabel: resolveAgentFallbackLabel(
+                  this.resolveCrewSubagentAgentSource(sub)
+                ),
+                secondaryMeta: (sub.host_name !== undefined && sub.host_name !== null && sub.host_name.trim().length > 0 &&
+                  resolveCrewSubagentHostId(sub, this.store.selectedHostId) !== this.store.selectedHostId)
+                  ? sub.host_name.trim()
+                  : '',
+                depth: this.computeSubagentDepth(sub),
+                onItemClick: () => {
+                  this.store.inspectSubagent(sub);
+                }
+              })
             }
-            .height(28)
-            .padding({ left: 9, right: 10 })
-            .backgroundColor(this.store.palette.subtleSurface)
-            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
-            .onClick(() => {
-              this.store.inspectSubagent(sub);
-            })
+            .constraintSize({ minWidth: 168, maxWidth: 236 })
           },
-          (sub: SessionSubagentEntryDto) => `sub_${sub.id}_${sub.status}`
+          (sub: SessionSubagentEntryDto) => `sub_${sub.id}_${sub.status}_${sub.depth ?? 0}_${sub.host_id ?? ''}`
         )
 
         ForEach(
           this.workspacePeers,
           (peer: AgentCardDto) => {
-            Button({ type: ButtonType.Capsule, stateEffect: true }) {
-              Row({ space: 5 }) {
-                SymbolGlyph($r('sys.symbol.person_2'))
-                  .fontSize(11)
-                  .fontColor([this.store.palette.fgMuted])
-                Text(
-                  peer.handle !== undefined && peer.handle !== null && peer.handle.length > 0
-                    ? `@${peer.handle}`
-                    : (peer.title.trim().length > 0 ? peer.title.trim() : peer.provider_label)
-                )
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .constraintSize({ maxWidth: 120 })
-              }
-              .alignItems(VerticalAlign.Center)
+            Column() {
+              OrbitAgentListItem({
+                variant: 'card',
+                title: peer.handle !== undefined && peer.handle !== null && peer.handle.length > 0
+                  ? `@${peer.handle}`
+                  : (peer.title.trim().length > 0 ? peer.title.trim() : peer.provider_label),
+                status: mapAgentCardToListStatus(peer),
+                characterId: this.crewAvatarMap.get(`peer:${peer.agent_id}`)?.id ?? '',
+                avatarSeedKey: peer.agent_id,
+                avatarSizeVp: 20,
+                provider: peer.provider,
+                modelLabel: resolveCompactAgentModelLabel(
+                  peer,
+                  this.store.providerCatalogsForHost(this.store.selectedHostId)
+                ),
+                effortLabel: resolveAgentEffortDisplay(peer),
+                agentLabel: resolveAgentFallbackLabel(peer),
+                depth: 0,
+                onItemClick: () => {
+                  this.store.selectAgent(peer.agent_id);
+                }
+              })
             }
-            .height(28)
-            .padding({ left: 9, right: 10 })
-            .backgroundColor(this.store.palette.subtleSurface)
-            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
-            .onClick(() => {
-              this.store.selectAgent(peer.agent_id);
-            })
+            .constraintSize({ minWidth: 168, maxWidth: 236 })
           },
-          (peer: AgentCardDto) => `peer_${peer.agent_id}`
+          (peer: AgentCardDto) => `peer_${peer.agent_id}_${peer.status.state}`
         )
 
         if (this.formatUsagePill().length > 0) {

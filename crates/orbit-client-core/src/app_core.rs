@@ -1062,7 +1062,8 @@ struct HostMemoryState {
     terminal_raw_history: HashMap<String, Vec<u8>>,
     pending_slot_raw_history: HashMap<u8, Vec<u8>>,
     git_statuses: HashMap<String, GitStatusSnapshot>,
-    git_diffs: HashMap<String, String>,
+    git_diffs: HashMap<(String, Option<String>), String>,
+    authoritative_home_dir: Option<String>,
     last_git_diff_staged: HashMap<String, bool>,
     git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
     workspace_files: HashMap<String, Vec<String>>,
@@ -1251,6 +1252,7 @@ impl HostMemoryState {
             pending_slot_raw_history: HashMap::new(),
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
+            authoritative_home_dir: None,
             last_git_diff_staged: HashMap::new(),
             git_repos_by_cwd: HashMap::new(),
             workspace_files: HashMap::new(),
@@ -3251,16 +3253,22 @@ impl OrbitAppCore {
                 };
             };
 
-            let path_suffix = format!("::{}", path.unwrap_or("__all__"));
-            let exact_key = format!("{cwd}{path_suffix}");
+            let exact_key = (cwd.to_string(), path.map(ToOwned::to_owned));
+            let auth_home = host_state.authoritative_home_dir.as_deref();
             let raw_diff = host_state
                 .git_diffs
                 .get(&exact_key)
                 .or_else(|| {
-                    host_state.git_diffs.iter().find_map(|(k, v)| {
-                        let stored_cwd = k.strip_suffix(&path_suffix)?;
-                        cwd_paths_equivalent(stored_cwd, cwd).then_some(v)
-                    })
+                    host_state
+                        .git_diffs
+                        .iter()
+                        .find_map(|((stored_cwd, stored_path), v)| {
+                            (stored_path.as_deref() == path
+                                && crate::viewmodel::git_cache_paths_equivalent(
+                                    stored_cwd, cwd, auth_home,
+                                ))
+                            .then_some(v)
+                        })
                 })
                 .cloned()
                 .unwrap_or_default();
@@ -3268,10 +3276,9 @@ impl OrbitAppCore {
                 .git_statuses
                 .get(cwd)
                 .or_else(|| {
-                    host_state
-                        .git_statuses
-                        .iter()
-                        .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
+                    host_state.git_statuses.iter().find_map(|(k, v)| {
+                        crate::viewmodel::git_cache_paths_equivalent(k, cwd, auth_home).then_some(v)
+                    })
                 })
                 .cloned();
             (raw_diff, status)
@@ -4615,8 +4622,7 @@ impl OrbitAppCore {
     ) -> Result<ClientProjectView, ClientCoreError> {
         let clean_dirs: Vec<String> = directories
             .into_iter()
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty())
+            .filter(|d| !d.trim().is_empty())
             .collect();
         let primary = clean_dirs
             .first()
@@ -4625,7 +4631,14 @@ impl OrbitAppCore {
         let id = project_id
             .filter(|s| !s.trim().is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("{host_id}::{}", primary.trim_end_matches('/')));
+            .unwrap_or_else(|| {
+                let norm_primary = if primary == "/" {
+                    "/"
+                } else {
+                    primary.trim_end_matches('/')
+                };
+                format!("{host_id}::{norm_primary}")
+            });
         let clean_name = if name.trim().is_empty() {
             folder_basename(&primary)
         } else {
@@ -7246,8 +7259,7 @@ impl OrbitAppCore {
                     unified_diff,
                     ..
                 } => {
-                    let key = format!("{cwd}::{}", path.as_deref().unwrap_or("__all__"));
-                    state.git_diffs.insert(key, unified_diff);
+                    state.git_diffs.insert((cwd.clone(), path), unified_diff);
                     notify_git_cwd = Some(cwd);
                 }
                 WireMessage::GitMutationResult {
@@ -7269,17 +7281,22 @@ impl OrbitAppCore {
                         );
                         let remaining_paths: HashSet<&str> =
                             status_snap.files.iter().map(|f| f.path.as_str()).collect();
-                        state.git_diffs.retain(|key, _| {
-                            let Some((stored_cwd, suffix)) = key.rsplit_once("::") else {
-                                return true;
-                            };
-                            if !cwd_paths_equivalent(stored_cwd, &cwd) {
+                        let auth_home = state.authoritative_home_dir.clone();
+                        state.git_diffs.retain(|(stored_cwd, stored_path), _| {
+                            if !crate::viewmodel::git_cache_paths_equivalent(
+                                stored_cwd,
+                                &cwd,
+                                auth_home.as_deref(),
+                            ) {
                                 return true;
                             }
                             if remaining_paths.is_empty() {
                                 return false;
                             }
-                            suffix == "__all__" || remaining_paths.contains(suffix)
+                            match stored_path.as_deref() {
+                                None => true,
+                                Some(file_path) => remaining_paths.contains(file_path),
+                            }
                         });
                         state.git_statuses.insert(cwd.clone(), status_snap);
                         notify_git_cwd = Some(cwd);
@@ -37283,5 +37300,236 @@ mod tests {
             Some(relay_url),
             "Auto host must receive authenticated fleet relay"
         );
+    }
+
+    #[test]
+    fn git_review_never_fuzzy_matches_tilde_cache_against_unrelated_absolute_path() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let host_id = kp.host_id().expect("host_id");
+        let offer = PairingOffer {
+            host_id: host_id.clone(),
+            hostname: "git-target-host".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: vec!["http://127.0.0.1:18870".into()],
+            relay_url: None,
+            pairing_secret: "secret".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let pa_diff = "diff --git a/pa-only.txt b/pa-only.txt\n--- a/pa-only.txt\n+++ b/pa-only.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let worker_diff = "diff --git a/worker-only.txt b/worker-only.txt\n--- a/worker-only.txt\n+++ b/worker-only.txt\n@@ -1 +1 @@\n-a\n+b\n";
+
+        // Cache PA diff/status under daemon shorthand `~/project`
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "~/project".into(),
+                path: None,
+                unified_diff: pa_diff.into(),
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "~/project".into(),
+                    is_git_repo: true,
+                    branch: Some("pa-branch".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                },
+            },
+        );
+
+        // Without authoritative home, querying `/home/worker/project` MUST miss (empty, never `pa-only.txt`)
+        let cold_worker = core.git_review(&host_id, "/home/worker/project", None);
+        assert!(
+            cold_worker.diff_files.is_empty(),
+            "~/project cache must never leak into /home/worker/project"
+        );
+        assert!(cold_worker.status.is_none());
+
+        // With authoritative home `/home/pa`, `/home/pa/project` matches `~/project`, while `/home/worker/project` STILL misses
+        {
+            let mut hosts = core.hosts.write().expect("write");
+            hosts
+                .get_mut(&host_id)
+                .expect("host")
+                .authoritative_home_dir = Some("/home/pa".into());
+        }
+        let auth_pa = core.git_review(&host_id, "/home/pa/project", None);
+        assert_eq!(auth_pa.diff_files.len(), 1);
+        assert_eq!(auth_pa.diff_files[0].path, "pa-only.txt");
+        let auth_worker_miss = core.git_review(&host_id, "/home/worker/project", None);
+        assert!(auth_worker_miss.diff_files.is_empty());
+        assert!(auth_worker_miss.status.is_none());
+
+        // Once `/home/worker/project` arrives, it resolves cleanly without mixing with `~/project`
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/home/worker/project".into(),
+                path: None,
+                unified_diff: worker_diff.into(),
+            },
+        );
+        let hydrated_worker = core.git_review(&host_id, "/home/worker/project", None);
+        assert_eq!(hydrated_worker.diff_files.len(), 1);
+        assert_eq!(hydrated_worker.diff_files[0].path, "worker-only.txt");
+
+        // POSIX literal backslash directory `/tmp/team\project` vs `/tmp/team/project` must stay distinct
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/team\\project".into(),
+                path: None,
+                unified_diff: worker_diff.into(),
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/team/project".into(),
+                path: None,
+                unified_diff: pa_diff.into(),
+            },
+        );
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/team\\project", None)
+                .diff_files[0]
+                .path,
+            "worker-only.txt"
+        );
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/team/project", None)
+                .diff_files[0]
+                .path,
+            "pa-only.txt"
+        );
+
+        // Structured `(cwd, Option<path>)` keys MUST eliminate `::` delimiter collisions both on
+        // reads and on `GitMutationResult` eviction!
+        let colon_diff = "diff --git a/team::index.txt b/team::index.txt\n--- a/team::index.txt\n+++ b/team::index.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let release_diff = "diff --git a/release::notes.txt b/release::notes.txt\n--- a/release::notes.txt\n+++ b/release::notes.txt\n@@ -1 +1 @@\n-v1\n+v2\n";
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo".into(),
+                path: Some("team::index.txt".into()),
+                unified_diff: colon_diff.into(),
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo".into(),
+                path: Some("release::notes.txt".into()),
+                unified_diff: release_diff.into(),
+            },
+        );
+        // Querying `(/repo::team, Some("index.txt"))` MUST miss (never collide with `(/repo, Some("team::index.txt"))`)
+        let colon_collision_probe = core.git_review(&host_id, "/repo::team", Some("index.txt"));
+        assert!(
+            colon_collision_probe.diff_files.is_empty(),
+            "structured git_diffs keys must never collide across `::` boundaries"
+        );
+        assert!(colon_collision_probe.raw_diff.is_empty());
+        assert_eq!(
+            core.git_review(&host_id, "/repo", Some("team::index.txt"))
+                .diff_files[0]
+                .path,
+            "team::index.txt"
+        );
+
+        // Empty-files `GitMutationResult` for `/repo` MUST evict `release::notes.txt` cleanly
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo".into(),
+                result: orbit_protocol::GitMutationOutcome::FilesStaged {
+                    paths: vec![],
+                    all: true,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                }),
+            },
+        );
+        assert!(
+            core.git_review(&host_id, "/repo", Some("release::notes.txt"))
+                .raw_diff
+                .is_empty(),
+            "empty GitMutationResult must evict cached files whose names contain `::`"
+        );
+        assert!(
+            core.git_review(&host_id, "/repo", Some("team::index.txt"))
+                .raw_diff
+                .is_empty()
+        );
+
+        // Legal POSIX directory names differing only by trailing whitespace (`/tmp/project` vs
+        // `/tmp/project `) MUST remain strictly distinct in both lookup and eviction.
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/project".into(),
+                path: None,
+                unified_diff: worker_diff.into(),
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/project ".into(),
+                path: None,
+                unified_diff: pa_diff.into(),
+            },
+        );
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/project", None).diff_files[0].path,
+            "worker-only.txt"
+        );
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/project ", None).diff_files[0].path,
+            "pa-only.txt"
+        );
+        assert!(!crate::viewmodel::git_cache_paths_equivalent(
+            "/tmp/project",
+            "/tmp/project ",
+            None
+        ));
+        assert!(crate::viewmodel::git_cache_paths_equivalent(
+            "\\\\server\\share\\p",
+            "//server/share/p",
+            None
+        ));
+        assert!(!crate::viewmodel::git_cache_paths_equivalent(
+            "C:\\", "C:", None
+        ));
+        assert!(crate::viewmodel::git_cache_paths_equivalent(
+            "C:\\", "C:/", None
+        ));
     }
 }

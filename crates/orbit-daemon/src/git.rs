@@ -1102,7 +1102,9 @@ pub(crate) async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<Str
     if !out.status.success() {
         return None;
     }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let raw = String::from_utf8_lossy(&out.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
     if raw.is_empty() {
         return None;
     }

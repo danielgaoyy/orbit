@@ -49,10 +49,10 @@ pub fn list_directory_entries(
 ) -> (String, Option<String>, Vec<DirectoryEntry>) {
     let home = crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("/"));
 
-    let target = match requested_path.map(str::trim) {
-        None | Some("") | Some("~") => home.clone(),
-        Some(rel) if rel.starts_with("~/") || rel.starts_with(r"~\") => home.join(&rel[2..]),
-        Some(abs) => PathBuf::from(abs),
+    let target = match requested_path {
+        None => home.clone(),
+        Some(raw) if raw.trim().is_empty() || raw == "~" => home.clone(),
+        Some(raw) => crate::expand_host_path(raw),
     };
 
     let canonical = if target.is_dir() {

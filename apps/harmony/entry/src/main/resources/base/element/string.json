@@ -1,183 +1,1736 @@
 {
   "string": [
-    { "name": "module_desc", "value": "Orbit Multi-Host AI Coding Agent Control Plane (HarmonyOS NEXT)" },
-    { "name": "EntryAbility_desc", "value": "Orbit Native ArkUI V2 Control Plane" },
-    { "name": "EntryAbility_label", "value": "Orbit" },
-    { "name": "permission_microphone_reason", "value": "Dictate prompts to coding agents using on-device speech recognition." },
-
-    { "name": "nav_overview", "value": "Overview" },
-    { "name": "nav_new_conversation", "value": "New Conversation" },
-    { "name": "nav_settings", "value": "Settings" },
-    { "name": "nav_search_fleet", "value": "Search Fleet" },
-    { "name": "nav_file_explorer", "value": "Files" },
-    { "name": "nav_git_review", "value": "Git Review" },
-    { "name": "nav_terminal", "value": "Terminal" },
-    { "name": "nav_automations", "value": "Automations" },
-    { "name": "nav_workspace_board", "value": "Board & Peers" },
-    { "name": "nav_side_question", "value": "Side Question (/btw)" },
-    { "name": "nav_personal_router", "value": "Personal Router & Mesh" },
-    { "name": "nav_archived_sessions", "value": "Archived Sessions" },
-    { "name": "nav_export_transcript", "value": "Export Transcript" },
-
-    { "name": "overview_title", "value": "Overview" },
-    { "name": "overview_all_quiet", "value": "All quiet across your fleet · Ready when you are" },
-    { "name": "overview_needs_decision", "value": "Needs Your Decision" },
-    { "name": "overview_batch_approve_safe", "value": "Approve Safe Batch" },
-    { "name": "overview_live_fleet", "value": "Live Fleet" },
-    { "name": "overview_active_sessions", "value": "Active Sessions" },
-    { "name": "overview_no_active_sessions", "value": "No active sessions running right now." },
-    { "name": "overview_router_placeholder", "value": "Ask your Personal Agent across any host…" },
-    { "name": "overview_open_router_settings", "value": "Configure Router" },
-    { "name": "overview_no_hosts_title", "value": "Pair Your First Host" },
-    { "name": "overview_no_hosts_body", "value": "Connect to orbit daemon on your workstation, Linux devbox, or Mac mini over LAN, SSH, or E2EE Noise Relay." },
-
-    { "name": "action_cancel", "value": "Cancel" },
-    { "name": "action_confirm", "value": "Confirm" },
-    { "name": "action_save", "value": "Save" },
-    { "name": "action_delete", "value": "Delete" },
-    { "name": "action_rename", "value": "Rename" },
-    { "name": "action_create", "value": "Create" },
-    { "name": "action_refresh", "value": "Refresh" },
-    { "name": "action_reconnect", "value": "Reconnect" },
-    { "name": "action_copy", "value": "Copy" },
-    { "name": "action_quote", "value": "Quote" },
-    { "name": "action_open", "value": "Open" },
-    { "name": "action_close", "value": "Close" },
-    { "name": "action_send", "value": "Send" },
-    { "name": "action_stop", "value": "Stop" },
-    { "name": "action_edit", "value": "Edit" },
-    { "name": "action_done", "value": "Done" },
-    { "name": "action_pause", "value": "Pause" },
-    { "name": "action_resume", "value": "Resume" },
-    { "name": "action_run_now", "value": "Run" },
-    { "name": "action_allow_once", "value": "Allow Once" },
-    { "name": "action_allow_session", "value": "Allow for Session" },
-    { "name": "action_decline", "value": "Decline" },
-
-    { "name": "composer_placeholder", "value": "Ask anything, @ to mention, / for actions" },
-    { "name": "composer_voice_listening", "value": "Listening…" },
-    { "name": "composer_voice_tap_done", "value": "Tap check to insert transcript" },
-    { "name": "composer_voice_start", "value": "Start voice dictation" },
-    { "name": "composer_voice_stop", "value": "Finish voice dictation" },
-    { "name": "composer_voice_cancel", "value": "Cancel voice dictation" },
-    { "name": "composer_plan_progress", "value": "Plan Progress" },
-
-    { "name": "stage_load_older", "value": "Load earlier history" },
-    { "name": "stage_loading_older", "value": "Loading earlier turns…" },
-    { "name": "stage_offline_banner", "value": "Host is offline · Changes will sync when reconnected" },
-    { "name": "stage_reconnecting_banner", "value": "Reconnecting to host…" },
-    { "name": "stage_lineage_parent", "value": "Parent" },
-    { "name": "stage_lineage_subagents", "value": "Subagents" },
-    { "name": "stage_lineage_peers", "value": "Peers" },
-    { "name": "stage_delivery_queued", "value": "Queued" },
-    { "name": "stage_delivery_dispatched", "value": "Dispatched" },
-    { "name": "stage_delivery_settled", "value": "Settled" },
-    { "name": "stage_delivery_dropped", "value": "Dropped" },
-    { "name": "stage_interrupt_and_continue", "value": "Interrupt & Continue" },
-    { "name": "stage_interrupt_and_deliver", "value": "Interrupt & Deliver" },
-
-    { "name": "plan_review_title", "value": "Plan Ready for Review" },
-    { "name": "plan_approve_build", "value": "Approve & Build" },
-    { "name": "plan_request_changes", "value": "Request Changes" },
-    { "name": "plan_dismiss", "value": "Dismiss" },
-    { "name": "plan_edit_markdown", "value": "Edit Plan" },
-    { "name": "plan_preview_markdown", "value": "Preview" },
-    { "name": "plan_feedback_placeholder", "value": "Optional feedback or adjustments…" },
-
-    { "name": "terminal_title", "value": "PTY Terminal" },
-    { "name": "terminal_mode_raw", "value": "Raw" },
-    { "name": "terminal_mode_line", "value": "Line" },
-    { "name": "terminal_raw_placeholder", "value": "Type raw keystrokes…" },
-    { "name": "terminal_line_placeholder", "value": "Send command line…" },
-    { "name": "terminal_spawn_shell", "value": "Spawn Shell Session" },
-
-    { "name": "files_title", "value": "File Explorer" },
-    { "name": "files_search_placeholder", "value": "Filter workspace files…" },
-    { "name": "files_new_entry", "value": "New" },
-    { "name": "files_empty", "value": "No files loaded for this workspace." },
-    { "name": "files_truncated_notice", "value": "Showing prefix preview (file truncated)" },
-    { "name": "files_edit_mode", "value": "Edit" },
-    { "name": "files_save_file", "value": "Save File" },
-    { "name": "files_new_path_placeholder", "value": "relative/path/to/file.ts" },
-    { "name": "files_create_as_dir", "value": "Create directory" },
-
-    { "name": "git_stage_all", "value": "Stage All" },
-    { "name": "git_unstage_all", "value": "Unstage All" },
-    { "name": "git_stage", "value": "Stage" },
-    { "name": "git_unstage", "value": "Unstage" },
-    { "name": "git_commit", "value": "Commit" },
-    { "name": "git_commit_placeholder", "value": "Commit message…" },
-    { "name": "git_generate_message", "value": "AI Message" },
-    { "name": "git_amend", "value": "Amend last commit" },
-    { "name": "git_pr_section", "value": "Pull Request" },
-    { "name": "git_create_pr", "value": "Create PR" },
-    { "name": "git_pr_title_placeholder", "value": "Pull request title" },
-    { "name": "git_pr_body_placeholder", "value": "Summary of changes…" },
-    { "name": "git_pr_draft", "value": "Draft PR" },
-    { "name": "git_stash_save", "value": "Stash" },
-    { "name": "git_stash_pop", "value": "Pop Stash" },
-    { "name": "git_rebase_continue", "value": "Continue Rebase" },
-    { "name": "git_rebase_abort", "value": "Abort Rebase" },
-    { "name": "git_conflicts_detected", "value": "Merge Conflicts Detected" },
-
-    { "name": "search_title", "value": "Global Search" },
-    { "name": "search_placeholder", "value": "Search messages across all hosts…" },
-    { "name": "search_remote_action", "value": "Search Remote Daemons" },
-    { "name": "search_empty_hint", "value": "Type keywords to search full-history FTS5 transcripts across your fleet." },
-    { "name": "search_no_results", "value": "No matching conversations found." },
-
-    { "name": "automations_schedules", "value": "Schedules" },
-    { "name": "automations_timers", "value": "Timers" },
-    { "name": "automations_goals", "value": "Goals" },
-    { "name": "automations_monitors", "value": "Monitors" },
-    { "name": "automations_workflows", "value": "Workflows" },
-    { "name": "automations_new_timer", "value": "New Timer" },
-    { "name": "automations_new_goal", "value": "New Goal" },
-    { "name": "automations_new_monitor", "value": "New Monitor" },
-    { "name": "automations_new_workflow", "value": "New Workflow" },
-    { "name": "automations_verify_now", "value": "Verify Now" },
-
-    { "name": "router_mesh_title", "value": "Personal Router & Mesh" },
-    { "name": "router_section_hosts", "value": "Router Candidates" },
-    { "name": "router_section_config", "value": "Router Policy" },
-    { "name": "router_section_mesh", "value": "Fleet Mesh Peers" },
-    { "name": "router_enable_toggle", "value": "Enable Personal Router" },
-    { "name": "router_share_hermes", "value": "Share Host Hermes Memory" },
-    { "name": "router_apply", "value": "Save Router Policy" },
-
-    { "name": "sync_title", "value": "Cloud Sync" },
-    { "name": "sync_device_link_qr", "value": "Device Link QR" },
-    { "name": "sync_scan_device_link", "value": "Scan Device Link QR" },
-    { "name": "sync_export_qr", "value": "Show Device Link QR" },
-    { "name": "sync_zero_passphrase", "value": "Zero-Passphrase Instant Unlock" },
-    { "name": "sync_manual_passphrase", "value": "Require Manual Passphrase" },
-    { "name": "sync_github_device_flow", "value": "Sign in with GitHub" },
-    { "name": "sync_huks_security", "value": "Key Protection" },
-    { "name": "sync_huks_hardware", "value": "HUKS Hardware AES-256" },
-    { "name": "sync_huks_fallback", "value": "App Sandbox Key" },
-
-    { "name": "push_title", "value": "Push Kit & Notifications" },
-    { "name": "push_test_button", "value": "Send Test Push" },
-    { "name": "push_sync_hosts", "value": "Sync Push Registration to Hosts" },
-    { "name": "push_pref_permissions", "value": "Approval Requests" },
-    { "name": "push_pref_turns", "value": "Turn Completed" },
-    { "name": "push_pref_errors", "value": "Agent Errors" },
-    { "name": "push_pref_goals", "value": "Goal & Timer Events" },
-    { "name": "push_pref_preview", "value": "Include Message Preview" },
-
-    { "name": "export_title", "value": "Export Transcript" },
-    { "name": "export_format_md", "value": "Markdown" },
-    { "name": "export_format_json", "value": "JSON" },
-    { "name": "export_format_html", "value": "HTML" },
-    { "name": "export_include_thinking", "value": "Include Thinking" },
-    { "name": "export_include_tools", "value": "Include Tool Calls" },
-    { "name": "export_include_timestamps", "value": "Include Timestamps" },
-    { "name": "export_copy_action", "value": "Copy Exported Transcript" },
-
-    { "name": "sidebar_search", "value": "Search" },
-    { "name": "sidebar_needs_attention", "value": "Needs Attention" },
-    { "name": "sidebar_pinned", "value": "Pinned" },
-    { "name": "sidebar_projects", "value": "Projects" },
-    { "name": "settings_upgrade_daemon", "value": "Upgrade Daemon Over Wire" }
+    {
+      "name": "EntryAbility_desc",
+      "value": "Orbit Native ArkUI V2 Control Plane"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Orbit"
+    },
+    {
+      "name": "action_allow_once",
+      "value": "Allow Once"
+    },
+    {
+      "name": "action_allow_session",
+      "value": "Allow for Session"
+    },
+    {
+      "name": "action_cancel",
+      "value": "Cancel"
+    },
+    {
+      "name": "action_close",
+      "value": "Close"
+    },
+    {
+      "name": "action_confirm",
+      "value": "Confirm"
+    },
+    {
+      "name": "action_copy",
+      "value": "Copy"
+    },
+    {
+      "name": "action_create",
+      "value": "Create"
+    },
+    {
+      "name": "action_decline",
+      "value": "Decline"
+    },
+    {
+      "name": "action_delete",
+      "value": "Delete"
+    },
+    {
+      "name": "action_done",
+      "value": "Done"
+    },
+    {
+      "name": "action_edit",
+      "value": "Edit"
+    },
+    {
+      "name": "action_open",
+      "value": "Open"
+    },
+    {
+      "name": "action_pause",
+      "value": "Pause"
+    },
+    {
+      "name": "action_quote",
+      "value": "Quote"
+    },
+    {
+      "name": "action_reconnect",
+      "value": "Reconnect"
+    },
+    {
+      "name": "action_refresh",
+      "value": "Refresh"
+    },
+    {
+      "name": "action_rename",
+      "value": "Rename"
+    },
+    {
+      "name": "action_resume",
+      "value": "Resume"
+    },
+    {
+      "name": "action_run_now",
+      "value": "Run"
+    },
+    {
+      "name": "action_save",
+      "value": "Save"
+    },
+    {
+      "name": "action_send",
+      "value": "Send"
+    },
+    {
+      "name": "action_stop",
+      "value": "Stop"
+    },
+    {
+      "name": "approval_allow",
+      "value": "Allow"
+    },
+    {
+      "name": "approval_alwaysAllow",
+      "value": "Always allow"
+    },
+    {
+      "name": "approval_approveSafeBatch",
+      "value": "Approve safe (%d)"
+    },
+    {
+      "name": "approval_approveSafeBatchDone",
+      "value": "Approved %d permission request(s)"
+    },
+    {
+      "name": "approval_approveSafeBatchNone",
+      "value": "No eligible permissions were approved (%d skipped)"
+    },
+    {
+      "name": "approval_approveSafeBatchPartial",
+      "value": "Approved %d · skipped %d restricted or high-risk"
+    },
+    {
+      "name": "approval_approveSafeBatchSubmitting",
+      "value": "Approving…"
+    },
+    {
+      "name": "approval_approveSafeBatchTooltip",
+      "value": "Approve all eligible pending permissions. High-risk actions, questions, and plans are excluded."
+    },
+    {
+      "name": "approval_criticalRisk",
+      "value": "Critical risk"
+    },
+    {
+      "name": "approval_decline",
+      "value": "Decline"
+    },
+    {
+      "name": "approval_deny",
+      "value": "Deny"
+    },
+    {
+      "name": "approval_highRisk",
+      "value": "High risk"
+    },
+    {
+      "name": "approval_mediumRisk",
+      "value": "Medium risk"
+    },
+    {
+      "name": "approval_permissionFailed",
+      "value": "Permission action failed: %s"
+    },
+    {
+      "name": "approval_viewDiff",
+      "value": "View Diff"
+    },
+    {
+      "name": "automations_goals",
+      "value": "Goals"
+    },
+    {
+      "name": "automations_monitors",
+      "value": "Monitors"
+    },
+    {
+      "name": "automations_new_goal",
+      "value": "New Goal"
+    },
+    {
+      "name": "automations_new_monitor",
+      "value": "New Monitor"
+    },
+    {
+      "name": "automations_new_timer",
+      "value": "New Timer"
+    },
+    {
+      "name": "automations_new_workflow",
+      "value": "New Workflow"
+    },
+    {
+      "name": "automations_schedules",
+      "value": "Schedules"
+    },
+    {
+      "name": "automations_timers",
+      "value": "Timers"
+    },
+    {
+      "name": "automations_verify_now",
+      "value": "Verify Now"
+    },
+    {
+      "name": "automations_workflows",
+      "value": "Workflows"
+    },
+    {
+      "name": "avatar_name_arctic_fox",
+      "value": "Arctic Fox"
+    },
+    {
+      "name": "avatar_name_barn_owl",
+      "value": "Barn Owl"
+    },
+    {
+      "name": "avatar_name_capybara",
+      "value": "Capybara"
+    },
+    {
+      "name": "avatar_name_corgi",
+      "value": "Corgi"
+    },
+    {
+      "name": "avatar_name_cream_alpaca",
+      "value": "Cream Alpaca"
+    },
+    {
+      "name": "avatar_name_emperor_penguin",
+      "value": "Emperor Penguin"
+    },
+    {
+      "name": "avatar_name_european_hedgehog",
+      "value": "Hedgehog"
+    },
+    {
+      "name": "avatar_name_giant_panda",
+      "value": "Giant Panda"
+    },
+    {
+      "name": "avatar_name_gray_chinchilla",
+      "value": "Chinchilla"
+    },
+    {
+      "name": "avatar_name_harbor_seal",
+      "value": "Harbor Seal"
+    },
+    {
+      "name": "avatar_name_holland_lop",
+      "value": "Holland Lop"
+    },
+    {
+      "name": "avatar_name_husky",
+      "value": "Husky"
+    },
+    {
+      "name": "avatar_name_koala",
+      "value": "Koala"
+    },
+    {
+      "name": "avatar_name_mallard_duck",
+      "value": "Mallard Duck"
+    },
+    {
+      "name": "avatar_name_orange_tabby",
+      "value": "Orange Tabby"
+    },
+    {
+      "name": "avatar_name_raccoon",
+      "value": "Raccoon"
+    },
+    {
+      "name": "avatar_name_red_fox",
+      "value": "Red Fox"
+    },
+    {
+      "name": "avatar_name_red_panda",
+      "value": "Red Panda"
+    },
+    {
+      "name": "avatar_name_red_squirrel",
+      "value": "Red Squirrel"
+    },
+    {
+      "name": "avatar_name_russian_blue",
+      "value": "Russian Blue"
+    },
+    {
+      "name": "avatar_name_sea_otter",
+      "value": "Sea Otter"
+    },
+    {
+      "name": "avatar_name_shiba_inu",
+      "value": "Shiba Inu"
+    },
+    {
+      "name": "avatar_name_sika_deer",
+      "value": "Sika Deer"
+    },
+    {
+      "name": "avatar_name_snowy_owl",
+      "value": "Snowy Owl"
+    },
+    {
+      "name": "briefing_actorGuardian",
+      "value": "Guardian"
+    },
+    {
+      "name": "briefing_actorPersonalAgent",
+      "value": "Personal Agent"
+    },
+    {
+      "name": "briefing_actorRule",
+      "value": "Rule"
+    },
+    {
+      "name": "briefing_agentFallback",
+      "value": "Agent"
+    },
+    {
+      "name": "briefing_agentStoppedError",
+      "value": "Agent stopped with an error"
+    },
+    {
+      "name": "briefing_allQuiet",
+      "value": "All clear. Nothing needs your attention right now."
+    },
+    {
+      "name": "briefing_approvalWaiting",
+      "value": "Approval waiting for your decision"
+    },
+    {
+      "name": "briefing_approveAll",
+      "value": "Approve All (%d)"
+    },
+    {
+      "name": "briefing_approveLowRiskBatch",
+      "value": "Approve %d low-risk"
+    },
+    {
+      "name": "briefing_ariaLabel",
+      "value": "Personal Agent briefing"
+    },
+    {
+      "name": "briefing_batchAllSkipped",
+      "value": "Skipped %d request(s); none approved"
+    },
+    {
+      "name": "briefing_batchApprovedCount",
+      "value": "Approved %d safe request(s)"
+    },
+    {
+      "name": "briefing_batchApprovedToast",
+      "value": "Approved %d low-risk request(s)."
+    },
+    {
+      "name": "briefing_batchApprovedWithSkipped",
+      "value": "Approved %d · %d require manual review."
+    },
+    {
+      "name": "briefing_batchFailed",
+      "value": "Batch approval failed"
+    },
+    {
+      "name": "briefing_batchNothingEligible",
+      "value": "No confirmed requests remain eligible"
+    },
+    {
+      "name": "briefing_batchPartialFailure",
+      "value": "Approved %1$d, skipped %2$d; %3$d host(s) failed"
+    },
+    {
+      "name": "briefing_batchSkippedAndFailed",
+      "value": "Skipped %1$d request(s); %2$d host(s) failed"
+    },
+    {
+      "name": "briefing_collapseSection",
+      "value": "Collapse section"
+    },
+    {
+      "name": "briefing_completedTitle",
+      "value": "Completed"
+    },
+    {
+      "name": "briefing_confirmBatchMessage",
+      "value": "All batch-eligible low-risk permissions will be approved. High-risk and human-only actions stay excluded."
+    },
+    {
+      "name": "briefing_confirmBatchTitle",
+      "value": "Approve %d low-risk request(s)?"
+    },
+    {
+      "name": "briefing_decisionAllowed",
+      "value": "Allowed"
+    },
+    {
+      "name": "briefing_decisionDenied",
+      "value": "Denied"
+    },
+    {
+      "name": "briefing_diffTargetUnavailable",
+      "value": "Workspace path unavailable for this request"
+    },
+    {
+      "name": "briefing_errorBadge",
+      "value": "Error"
+    },
+    {
+      "name": "briefing_expandSection",
+      "value": "Expand section"
+    },
+    {
+      "name": "briefing_handledForYouTitle",
+      "value": "Handled for you"
+    },
+    {
+      "name": "briefing_hideBriefing",
+      "value": "Hide briefing"
+    },
+    {
+      "name": "briefing_hostsOnlineSummary",
+      "value": "%d/%d online"
+    },
+    {
+      "name": "briefing_hostsTitle",
+      "value": "Hosts"
+    },
+    {
+      "name": "briefing_inProgressTitle",
+      "value": "In progress"
+    },
+    {
+      "name": "briefing_lowRisk",
+      "value": "Low risk"
+    },
+    {
+      "name": "briefing_needsYouTitle",
+      "value": "Needs you"
+    },
+    {
+      "name": "briefing_openDiffPreview",
+      "value": "Diff"
+    },
+    {
+      "name": "briefing_openSession",
+      "value": "Open session"
+    },
+    {
+      "name": "briefing_openSettings",
+      "value": "Personal Agent settings"
+    },
+    {
+      "name": "briefing_openWorkerHint",
+      "value": "Click to preview in side panel · Cmd/Ctrl+Click to jump"
+    },
+    {
+      "name": "briefing_otherActiveLabel",
+      "value": "Other active"
+    },
+    {
+      "name": "briefing_paHostTooltip",
+      "value": "%s · Personal Agent host"
+    },
+    {
+      "name": "briefing_paRecommendAllow",
+      "value": "Personal Agent recommends: Allow"
+    },
+    {
+      "name": "briefing_paRecommendDeny",
+      "value": "Personal Agent recommends: Deny"
+    },
+    {
+      "name": "briefing_planReviewBadge",
+      "value": "Plan review"
+    },
+    {
+      "name": "briefing_reviewAction",
+      "value": "Review"
+    },
+    {
+      "name": "briefing_sessionNotFound",
+      "value": "Session not found"
+    },
+    {
+      "name": "briefing_settingsSaved",
+      "value": "Personal Agent settings saved"
+    },
+    {
+      "name": "briefing_setupCreateOneClick",
+      "value": "Create & Enable Personal Agent"
+    },
+    {
+      "name": "briefing_setupCustomSettings",
+      "value": "Custom settings"
+    },
+    {
+      "name": "briefing_setupDefaultModel",
+      "value": "Provider default"
+    },
+    {
+      "name": "briefing_setupDescription",
+      "value": "Run one persistent coordinator across your hosts to dispatch workers, pre-review medium-risk approvals, and surface only the decisions that need you."
+    },
+    {
+      "name": "briefing_setupDiscovering",
+      "value": "Checking connected hosts…"
+    },
+    {
+      "name": "briefing_setupEnableDefault",
+      "value": "Enable Personal Agent"
+    },
+    {
+      "name": "briefing_setupEnableOnHost",
+      "value": "Enable on %s"
+    },
+    {
+      "name": "briefing_setupEnabling",
+      "value": "Enabling…"
+    },
+    {
+      "name": "briefing_setupLoadConfigFailed",
+      "value": "Failed to load existing host configuration. Please retry before saving."
+    },
+    {
+      "name": "briefing_setupNoHosts",
+      "value": "No online hosts available yet. Connect a host or configure in Settings."
+    },
+    {
+      "name": "briefing_setupRecommendedHost",
+      "value": "Recommended on %s"
+    },
+    {
+      "name": "briefing_setupSelectHost",
+      "value": "Primary Host"
+    },
+    {
+      "name": "briefing_setupSelectModel",
+      "value": "Model"
+    },
+    {
+      "name": "briefing_setupSelectProvider",
+      "value": "Provider"
+    },
+    {
+      "name": "briefing_setupTagAlwaysOn",
+      "value": "Always-on"
+    },
+    {
+      "name": "briefing_setupTagLocal",
+      "value": "This machine"
+    },
+    {
+      "name": "briefing_setupTitle",
+      "value": "Set up Personal Agent"
+    },
+    {
+      "name": "briefing_showBriefing",
+      "value": "Show briefing"
+    },
+    {
+      "name": "briefing_title",
+      "value": "Briefing"
+    },
+    {
+      "name": "briefing_viewAction",
+      "value": "View"
+    },
+    {
+      "name": "briefing_waitingTitle",
+      "value": "Waiting"
+    },
+    {
+      "name": "briefing_whileAwayBoth",
+      "value": "While you were away: %d completed · %d decisions handled"
+    },
+    {
+      "name": "briefing_whileAwayCompletedOnly",
+      "value": "While you were away: %d completed"
+    },
+    {
+      "name": "briefing_whileAwayHandledOnly",
+      "value": "While you were away: %d decisions handled"
+    },
+    {
+      "name": "common_actionFailed",
+      "value": "Action failed. Please try again."
+    },
+    {
+      "name": "common_archive",
+      "value": "Archive"
+    },
+    {
+      "name": "common_automations",
+      "value": "Automations"
+    },
+    {
+      "name": "common_cancel",
+      "value": "Cancel"
+    },
+    {
+      "name": "common_close",
+      "value": "Close"
+    },
+    {
+      "name": "common_confirm",
+      "value": "Confirm"
+    },
+    {
+      "name": "common_connecting",
+      "value": "Connecting"
+    },
+    {
+      "name": "common_conversation",
+      "value": "Conversation"
+    },
+    {
+      "name": "common_copied",
+      "value": "Copied"
+    },
+    {
+      "name": "common_copy",
+      "value": "Copy"
+    },
+    {
+      "name": "common_default",
+      "value": "Default"
+    },
+    {
+      "name": "common_delete",
+      "value": "Delete"
+    },
+    {
+      "name": "common_direct",
+      "value": "Direct"
+    },
+    {
+      "name": "common_edit",
+      "value": "Edit"
+    },
+    {
+      "name": "common_hide",
+      "value": "Hide"
+    },
+    {
+      "name": "common_loading",
+      "value": "Loading…"
+    },
+    {
+      "name": "common_local",
+      "value": "Local"
+    },
+    {
+      "name": "common_more",
+      "value": "More"
+    },
+    {
+      "name": "common_newConversation",
+      "value": "New Conversation"
+    },
+    {
+      "name": "common_newSession",
+      "value": "New session"
+    },
+    {
+      "name": "common_offline",
+      "value": "Offline"
+    },
+    {
+      "name": "common_online",
+      "value": "Online"
+    },
+    {
+      "name": "common_recommended",
+      "value": "Recommended"
+    },
+    {
+      "name": "common_refresh",
+      "value": "Refresh"
+    },
+    {
+      "name": "common_relay",
+      "value": "Relay"
+    },
+    {
+      "name": "common_remote",
+      "value": "Remote"
+    },
+    {
+      "name": "common_rename",
+      "value": "Rename"
+    },
+    {
+      "name": "common_retry",
+      "value": "Retry"
+    },
+    {
+      "name": "common_save",
+      "value": "Save"
+    },
+    {
+      "name": "common_send",
+      "value": "Send"
+    },
+    {
+      "name": "common_settings",
+      "value": "Settings"
+    },
+    {
+      "name": "common_showLess",
+      "value": "Show less"
+    },
+    {
+      "name": "common_showMore",
+      "value": "Show %d more…"
+    },
+    {
+      "name": "common_start",
+      "value": "Start"
+    },
+    {
+      "name": "composer_placeholder",
+      "value": "Ask anything, @ to mention, / for actions"
+    },
+    {
+      "name": "composer_plan_progress",
+      "value": "Plan Progress"
+    },
+    {
+      "name": "composer_voice_cancel",
+      "value": "Cancel voice dictation"
+    },
+    {
+      "name": "composer_voice_listening",
+      "value": "Listening…"
+    },
+    {
+      "name": "composer_voice_start",
+      "value": "Start voice dictation"
+    },
+    {
+      "name": "composer_voice_stop",
+      "value": "Finish voice dictation"
+    },
+    {
+      "name": "composer_voice_tap_done",
+      "value": "Tap check to insert transcript"
+    },
+    {
+      "name": "conn_connecting",
+      "value": "Connecting"
+    },
+    {
+      "name": "conn_direct",
+      "value": "Direct"
+    },
+    {
+      "name": "conn_offline",
+      "value": "Offline"
+    },
+    {
+      "name": "conn_relay",
+      "value": "Relay"
+    },
+    {
+      "name": "conn_ssh",
+      "value": "SSH"
+    },
+    {
+      "name": "export_copy_action",
+      "value": "Copy Exported Transcript"
+    },
+    {
+      "name": "export_format_html",
+      "value": "HTML"
+    },
+    {
+      "name": "export_format_json",
+      "value": "JSON"
+    },
+    {
+      "name": "export_format_md",
+      "value": "Markdown"
+    },
+    {
+      "name": "export_include_thinking",
+      "value": "Include Thinking"
+    },
+    {
+      "name": "export_include_timestamps",
+      "value": "Include Timestamps"
+    },
+    {
+      "name": "export_include_tools",
+      "value": "Include Tool Calls"
+    },
+    {
+      "name": "export_title",
+      "value": "Export Transcript"
+    },
+    {
+      "name": "files_create_as_dir",
+      "value": "Create directory"
+    },
+    {
+      "name": "files_edit_mode",
+      "value": "Edit"
+    },
+    {
+      "name": "files_empty",
+      "value": "No files loaded for this workspace."
+    },
+    {
+      "name": "files_new_entry",
+      "value": "New"
+    },
+    {
+      "name": "files_new_path_placeholder",
+      "value": "relative/path/to/file.ts"
+    },
+    {
+      "name": "files_save_file",
+      "value": "Save File"
+    },
+    {
+      "name": "files_search_placeholder",
+      "value": "Filter workspace files…"
+    },
+    {
+      "name": "files_title",
+      "value": "File Explorer"
+    },
+    {
+      "name": "files_truncated_notice",
+      "value": "Showing prefix preview (file truncated)"
+    },
+    {
+      "name": "git_amend",
+      "value": "Amend last commit"
+    },
+    {
+      "name": "git_commit",
+      "value": "Commit"
+    },
+    {
+      "name": "git_commit_placeholder",
+      "value": "Commit message…"
+    },
+    {
+      "name": "git_conflicts_detected",
+      "value": "Merge Conflicts Detected"
+    },
+    {
+      "name": "git_create_pr",
+      "value": "Create PR"
+    },
+    {
+      "name": "git_generate_message",
+      "value": "AI Message"
+    },
+    {
+      "name": "git_pr_body_placeholder",
+      "value": "Summary of changes…"
+    },
+    {
+      "name": "git_pr_draft",
+      "value": "Draft PR"
+    },
+    {
+      "name": "git_pr_section",
+      "value": "Pull Request"
+    },
+    {
+      "name": "git_pr_title_placeholder",
+      "value": "Pull request title"
+    },
+    {
+      "name": "git_rebase_abort",
+      "value": "Abort Rebase"
+    },
+    {
+      "name": "git_rebase_continue",
+      "value": "Continue Rebase"
+    },
+    {
+      "name": "git_stage",
+      "value": "Stage"
+    },
+    {
+      "name": "git_stage_all",
+      "value": "Stage All"
+    },
+    {
+      "name": "git_stash_pop",
+      "value": "Pop Stash"
+    },
+    {
+      "name": "git_stash_save",
+      "value": "Stash"
+    },
+    {
+      "name": "git_unstage",
+      "value": "Unstage"
+    },
+    {
+      "name": "git_unstage_all",
+      "value": "Unstage All"
+    },
+    {
+      "name": "module_desc",
+      "value": "Orbit Multi-Host AI Coding Agent Control Plane (HarmonyOS NEXT)"
+    },
+    {
+      "name": "nav_archived_sessions",
+      "value": "Archived Sessions"
+    },
+    {
+      "name": "nav_automations",
+      "value": "Automations"
+    },
+    {
+      "name": "nav_export_transcript",
+      "value": "Export Transcript"
+    },
+    {
+      "name": "nav_file_explorer",
+      "value": "Files"
+    },
+    {
+      "name": "nav_git_review",
+      "value": "Git Review"
+    },
+    {
+      "name": "nav_new_conversation",
+      "value": "New Conversation"
+    },
+    {
+      "name": "nav_overview",
+      "value": "Overview"
+    },
+    {
+      "name": "nav_personal_router",
+      "value": "Personal Agent & Mesh"
+    },
+    {
+      "name": "nav_search_fleet",
+      "value": "Search Fleet"
+    },
+    {
+      "name": "nav_settings",
+      "value": "Settings"
+    },
+    {
+      "name": "nav_side_question",
+      "value": "Side Question (/btw)"
+    },
+    {
+      "name": "nav_terminal",
+      "value": "Terminal"
+    },
+    {
+      "name": "nav_workspace_board",
+      "value": "Board & Peers"
+    },
+    {
+      "name": "notify_agent_error_body",
+      "value": "An agent stopped with an error."
+    },
+    {
+      "name": "notify_agent_error_title",
+      "value": "Agent Error"
+    },
+    {
+      "name": "notify_goal_finished_body",
+      "value": "An autonomous goal reached a terminal state."
+    },
+    {
+      "name": "notify_goal_finished_title",
+      "value": "Goal Finished"
+    },
+    {
+      "name": "notify_permission_body",
+      "value": "An agent is waiting for your approval."
+    },
+    {
+      "name": "notify_permission_title",
+      "value": "Approval Needed"
+    },
+    {
+      "name": "notify_timer_fired_body",
+      "value": "A scheduled timer triggered."
+    },
+    {
+      "name": "notify_timer_fired_title",
+      "value": "Timer Fired"
+    },
+    {
+      "name": "notify_turn_completed_body",
+      "value": "An agent finished its background turn."
+    },
+    {
+      "name": "notify_turn_completed_title",
+      "value": "Turn Completed"
+    },
+    {
+      "name": "overview_active_sessions",
+      "value": "Active Sessions"
+    },
+    {
+      "name": "overview_all_quiet",
+      "value": "All quiet across your fleet · Ready when you are"
+    },
+    {
+      "name": "overview_archiveDone",
+      "value": "Archive done"
+    },
+    {
+      "name": "overview_archiveSubagent",
+      "value": "Archive subagent"
+    },
+    {
+      "name": "overview_batch_approve_safe",
+      "value": "Approve Safe Batch"
+    },
+    {
+      "name": "overview_focusSession",
+      "value": "Focus session"
+    },
+    {
+      "name": "overview_globalOverviewTooltip",
+      "value": "Personal Agent"
+    },
+    {
+      "name": "overview_live_fleet",
+      "value": "Live Fleet"
+    },
+    {
+      "name": "overview_moreSubagents",
+      "value": "%d more subagents"
+    },
+    {
+      "name": "overview_needs_decision",
+      "value": "Needs Your Decision"
+    },
+    {
+      "name": "overview_no_active_sessions",
+      "value": "No active sessions running right now."
+    },
+    {
+      "name": "overview_no_hosts_body",
+      "value": "Connect to orbit daemon on your workstation, Linux devbox, or Mac mini over LAN, SSH, or E2EE Noise Relay."
+    },
+    {
+      "name": "overview_no_hosts_title",
+      "value": "Pair Your First Host"
+    },
+    {
+      "name": "overview_openSubagent",
+      "value": "Open %s"
+    },
+    {
+      "name": "overview_open_router_settings",
+      "value": "Configure Personal Agent"
+    },
+    {
+      "name": "overview_router_placeholder",
+      "value": "Ask your Personal Agent across any host…"
+    },
+    {
+      "name": "overview_stopSubagent",
+      "value": "Stop subagent"
+    },
+    {
+      "name": "overview_subagentApprovalRequired",
+      "value": "Approval required"
+    },
+    {
+      "name": "overview_subagentFailed",
+      "value": "Failed"
+    },
+    {
+      "name": "overview_subagentFinished",
+      "value": "Finished"
+    },
+    {
+      "name": "overview_subagentIdle",
+      "value": "Idle"
+    },
+    {
+      "name": "overview_subagentReview",
+      "value": "Review"
+    },
+    {
+      "name": "overview_subagentStopped",
+      "value": "Stopped"
+    },
+    {
+      "name": "overview_subagentWorking",
+      "value": "Working…"
+    },
+    {
+      "name": "overview_title",
+      "value": "Overview"
+    },
+    {
+      "name": "overview_viewFileDiff",
+      "value": "View diff"
+    },
+    {
+      "name": "permission_microphone_reason",
+      "value": "Dictate prompts to coding agents using on-device speech recognition."
+    },
+    {
+      "name": "plan_approve_build",
+      "value": "Approve & Build"
+    },
+    {
+      "name": "plan_dismiss",
+      "value": "Dismiss"
+    },
+    {
+      "name": "plan_edit_markdown",
+      "value": "Edit Plan"
+    },
+    {
+      "name": "plan_feedback_placeholder",
+      "value": "Optional feedback or adjustments…"
+    },
+    {
+      "name": "plan_preview_markdown",
+      "value": "Preview"
+    },
+    {
+      "name": "plan_request_changes",
+      "value": "Request Changes"
+    },
+    {
+      "name": "plan_review_title",
+      "value": "Plan Ready for Review"
+    },
+    {
+      "name": "push_pref_errors",
+      "value": "Agent Errors"
+    },
+    {
+      "name": "push_pref_goals",
+      "value": "Goal & Timer Events"
+    },
+    {
+      "name": "push_pref_permissions",
+      "value": "Approval Requests"
+    },
+    {
+      "name": "push_pref_preview",
+      "value": "Include Message Preview"
+    },
+    {
+      "name": "push_pref_turns",
+      "value": "Turn Completed"
+    },
+    {
+      "name": "push_sync_hosts",
+      "value": "Sync Push Registration to Hosts"
+    },
+    {
+      "name": "push_test_button",
+      "value": "Send Test Push"
+    },
+    {
+      "name": "push_title",
+      "value": "Push Kit & Notifications"
+    },
+    {
+      "name": "router_apply",
+      "value": "Save Policy"
+    },
+    {
+      "name": "router_enable_toggle",
+      "value": "Enable Personal Agent"
+    },
+    {
+      "name": "router_mesh_title",
+      "value": "Personal Agent & Mesh"
+    },
+    {
+      "name": "router_section_config",
+      "value": "Personal Agent Policy"
+    },
+    {
+      "name": "router_section_hosts",
+      "value": "Candidate Hosts"
+    },
+    {
+      "name": "router_section_mesh",
+      "value": "Connected Host Peers"
+    },
+    {
+      "name": "router_share_hermes",
+      "value": "Share Host External Memory"
+    },
+    {
+      "name": "search_empty_hint",
+      "value": "Type keywords to search full-history FTS5 transcripts across your fleet."
+    },
+    {
+      "name": "search_no_results",
+      "value": "No matching conversations found."
+    },
+    {
+      "name": "search_placeholder",
+      "value": "Search messages across all hosts…"
+    },
+    {
+      "name": "search_remote_action",
+      "value": "Search Remote Daemons"
+    },
+    {
+      "name": "search_title",
+      "value": "Global Search"
+    },
+    {
+      "name": "settings_upgrade_daemon",
+      "value": "Upgrade Daemon Over Wire"
+    },
+    {
+      "name": "sidebar_activeCount",
+      "value": "%d active"
+    },
+    {
+      "name": "sidebar_addProject",
+      "value": "Add project"
+    },
+    {
+      "name": "sidebar_archiveConversation",
+      "value": "Archive conversation"
+    },
+    {
+      "name": "sidebar_archived",
+      "value": "Archived"
+    },
+    {
+      "name": "sidebar_automations",
+      "value": "Automations"
+    },
+    {
+      "name": "sidebar_backgroundTaskRunning",
+      "value": "Background task running"
+    },
+    {
+      "name": "sidebar_browseDirectoryAria",
+      "value": "Browse remote directory"
+    },
+    {
+      "name": "sidebar_clearThreadFilter",
+      "value": "Clear filter"
+    },
+    {
+      "name": "sidebar_closeDrawerAria",
+      "value": "Close navigation drawer"
+    },
+    {
+      "name": "sidebar_collapseAll",
+      "value": "Collapse all"
+    },
+    {
+      "name": "sidebar_collapseSidebarAria",
+      "value": "Collapse fleet sidebar"
+    },
+    {
+      "name": "sidebar_connectHost",
+      "value": "Connect Host"
+    },
+    {
+      "name": "sidebar_connectLocalDaemon",
+      "value": "Connect Local Daemon"
+    },
+    {
+      "name": "sidebar_connectLocalHost",
+      "value": "Connect Local Host"
+    },
+    {
+      "name": "sidebar_connectingToHost",
+      "value": "Connecting to host… · Manage hosts"
+    },
+    {
+      "name": "sidebar_conversationOptions",
+      "value": "Conversation options"
+    },
+    {
+      "name": "sidebar_copiedPath",
+      "value": "Copied path"
+    },
+    {
+      "name": "sidebar_copiedProjectPath",
+      "value": "Copied project path"
+    },
+    {
+      "name": "sidebar_copyPath",
+      "value": "Copy path"
+    },
+    {
+      "name": "sidebar_draft",
+      "value": "Draft"
+    },
+    {
+      "name": "sidebar_error",
+      "value": "Error"
+    },
+    {
+      "name": "sidebar_expandAll",
+      "value": "Expand all"
+    },
+    {
+      "name": "sidebar_expandSidebarAria",
+      "value": "Expand fleet sidebar"
+    },
+    {
+      "name": "sidebar_filesCountMany",
+      "value": "%d files"
+    },
+    {
+      "name": "sidebar_filesCountOne",
+      "value": "1 file"
+    },
+    {
+      "name": "sidebar_filterActiveUnread",
+      "value": "Active & unread"
+    },
+    {
+      "name": "sidebar_filterAll",
+      "value": "All"
+    },
+    {
+      "name": "sidebar_filterThreadsAria",
+      "value": "Filter conversations"
+    },
+    {
+      "name": "sidebar_filterThreadsPlaceholder",
+      "value": "Filter conversations…"
+    },
+    {
+      "name": "sidebar_fullDiff",
+      "value": "Full Diff"
+    },
+    {
+      "name": "sidebar_hideDiffReview",
+      "value": "Hide Diff Review"
+    },
+    {
+      "name": "sidebar_hostLocal",
+      "value": "Local"
+    },
+    {
+      "name": "sidebar_hostOffline",
+      "value": "Host offline · Manage hosts"
+    },
+    {
+      "name": "sidebar_hostRemote",
+      "value": "Remote"
+    },
+    {
+      "name": "sidebar_hostSelectProject",
+      "value": "%s · Select project"
+    },
+    {
+      "name": "sidebar_hostsCount",
+      "value": "%d host(s)"
+    },
+    {
+      "name": "sidebar_hostsOnline",
+      "value": "%d of %d hosts online · Manage hosts"
+    },
+    {
+      "name": "sidebar_manageHosts",
+      "value": "Manage hosts"
+    },
+    {
+      "name": "sidebar_markRead",
+      "value": "Mark read"
+    },
+    {
+      "name": "sidebar_markUnread",
+      "value": "Mark unread"
+    },
+    {
+      "name": "sidebar_moreActionsAria",
+      "value": "More actions"
+    },
+    {
+      "name": "sidebar_needsAttention",
+      "value": "Needs Attention"
+    },
+    {
+      "name": "sidebar_newConversation",
+      "value": "New Conversation"
+    },
+    {
+      "name": "sidebar_newConversationInTarget",
+      "value": "New conversation in %s"
+    },
+    {
+      "name": "sidebar_newSessionHere",
+      "value": "New Session Here"
+    },
+    {
+      "name": "sidebar_noActiveOrUnread",
+      "value": "No active or unread conversations"
+    },
+    {
+      "name": "sidebar_noHostConnected",
+      "value": "No host connected"
+    },
+    {
+      "name": "sidebar_noHostShort",
+      "value": "No Host"
+    },
+    {
+      "name": "sidebar_noHostsBody",
+      "value": "Pair a remote Orbit daemon or connect a local daemon to browse workspaces and sessions."
+    },
+    {
+      "name": "sidebar_noHostsTitle",
+      "value": "No Hosts Paired"
+    },
+    {
+      "name": "sidebar_noMatchingThreads",
+      "value": "No matching conversations"
+    },
+    {
+      "name": "sidebar_noProjectsYet",
+      "value": "No projects yet"
+    },
+    {
+      "name": "sidebar_offlineReconnect",
+      "value": "Offline · Reconnect %s"
+    },
+    {
+      "name": "sidebar_openDrawerAria",
+      "value": "Open navigation drawer"
+    },
+    {
+      "name": "sidebar_openFolder",
+      "value": "Open folder"
+    },
+    {
+      "name": "sidebar_pairHostAria",
+      "value": "Pair host"
+    },
+    {
+      "name": "sidebar_pairNewHost",
+      "value": "Pair New Host"
+    },
+    {
+      "name": "sidebar_pairRemoteHost",
+      "value": "Pair Remote Host (QR / URI)"
+    },
+    {
+      "name": "sidebar_personalAgentNeedsYou",
+      "value": "%d needs you"
+    },
+    {
+      "name": "sidebar_personalRouter",
+      "value": "Personal Agent"
+    },
+    {
+      "name": "sidebar_pin",
+      "value": "Pin"
+    },
+    {
+      "name": "sidebar_pinProject",
+      "value": "Pin Project"
+    },
+    {
+      "name": "sidebar_pinned",
+      "value": "Pinned"
+    },
+    {
+      "name": "sidebar_projects",
+      "value": "Projects"
+    },
+    {
+      "name": "sidebar_running",
+      "value": "Running"
+    },
+    {
+      "name": "sidebar_search",
+      "value": "Search"
+    },
+    {
+      "name": "sidebar_selectProject",
+      "value": "Select project"
+    },
+    {
+      "name": "sidebar_selectWorkspace",
+      "value": "Select Workspace"
+    },
+    {
+      "name": "sidebar_settings",
+      "value": "Settings"
+    },
+    {
+      "name": "sidebar_settingsAndHostsAria",
+      "value": "Settings and hosts"
+    },
+    {
+      "name": "sidebar_show",
+      "value": "Show"
+    },
+    {
+      "name": "sidebar_showAllConversations",
+      "value": "Show all conversations"
+    },
+    {
+      "name": "sidebar_showingActiveUnread",
+      "value": "Showing active & unread"
+    },
+    {
+      "name": "sidebar_sortAndFilter",
+      "value": "Sort & filter"
+    },
+    {
+      "name": "sidebar_sortAndFilterAria",
+      "value": "Sort and filter projects"
+    },
+    {
+      "name": "sidebar_sortBy",
+      "value": "Sort by"
+    },
+    {
+      "name": "sidebar_sortCustom",
+      "value": "Custom"
+    },
+    {
+      "name": "sidebar_sortName",
+      "value": "Name"
+    },
+    {
+      "name": "sidebar_sortRecent",
+      "value": "Recent"
+    },
+    {
+      "name": "sidebar_startConversation",
+      "value": "Start a conversation"
+    },
+    {
+      "name": "sidebar_subagentRunning",
+      "value": "Subagent running"
+    },
+    {
+      "name": "sidebar_switchHostAria",
+      "value": "Switch active host"
+    },
+    {
+      "name": "sidebar_tapToPairHost",
+      "value": "Tap to pair host"
+    },
+    {
+      "name": "sidebar_timerArmed",
+      "value": "Timer armed"
+    },
+    {
+      "name": "sidebar_unpin",
+      "value": "Unpin"
+    },
+    {
+      "name": "sidebar_unpinProject",
+      "value": "Unpin Project"
+    },
+    {
+      "name": "sidebar_waitingForApproval",
+      "value": "Waiting for approval"
+    },
+    {
+      "name": "stage_delivery_dispatched",
+      "value": "Dispatched"
+    },
+    {
+      "name": "stage_delivery_dropped",
+      "value": "Dropped"
+    },
+    {
+      "name": "stage_delivery_queued",
+      "value": "Queued"
+    },
+    {
+      "name": "stage_delivery_settled",
+      "value": "Settled"
+    },
+    {
+      "name": "stage_interrupt_and_continue",
+      "value": "Interrupt & Continue"
+    },
+    {
+      "name": "stage_interrupt_and_deliver",
+      "value": "Interrupt & Deliver"
+    },
+    {
+      "name": "stage_lineage_parent",
+      "value": "Parent"
+    },
+    {
+      "name": "stage_lineage_peers",
+      "value": "Peers"
+    },
+    {
+      "name": "stage_lineage_subagents",
+      "value": "Subagents"
+    },
+    {
+      "name": "stage_load_older",
+      "value": "Load earlier history"
+    },
+    {
+      "name": "stage_loading_older",
+      "value": "Loading earlier turns…"
+    },
+    {
+      "name": "stage_offline_banner",
+      "value": "Host is offline · Changes will sync when reconnected"
+    },
+    {
+      "name": "stage_reconnecting_banner",
+      "value": "Reconnecting to host…"
+    },
+    {
+      "name": "sync_device_link_qr",
+      "value": "Device Link QR"
+    },
+    {
+      "name": "sync_export_qr",
+      "value": "Show Device Link QR"
+    },
+    {
+      "name": "sync_github_device_flow",
+      "value": "Sign in with GitHub"
+    },
+    {
+      "name": "sync_huks_fallback",
+      "value": "App Sandbox Key"
+    },
+    {
+      "name": "sync_huks_hardware",
+      "value": "HUKS Hardware AES-256"
+    },
+    {
+      "name": "sync_huks_security",
+      "value": "Key Protection"
+    },
+    {
+      "name": "sync_manual_passphrase",
+      "value": "Require Manual Passphrase"
+    },
+    {
+      "name": "sync_scan_device_link",
+      "value": "Scan Device Link QR"
+    },
+    {
+      "name": "sync_title",
+      "value": "Cloud Sync"
+    },
+    {
+      "name": "sync_zero_passphrase",
+      "value": "Zero-Passphrase Instant Unlock"
+    },
+    {
+      "name": "terminal_line_placeholder",
+      "value": "Send command line…"
+    },
+    {
+      "name": "terminal_mode_line",
+      "value": "Line"
+    },
+    {
+      "name": "terminal_mode_raw",
+      "value": "Raw"
+    },
+    {
+      "name": "terminal_raw_placeholder",
+      "value": "Type raw keystrokes…"
+    },
+    {
+      "name": "terminal_spawn_shell",
+      "value": "Spawn Shell Session"
+    },
+    {
+      "name": "terminal_title",
+      "value": "PTY Terminal"
+    },
+    {
+      "name": "time_daysShort",
+      "value": "%dd"
+    },
+    {
+      "name": "time_hoursMinutesShort",
+      "value": "%1$dh %2$dm"
+    },
+    {
+      "name": "time_hoursShort",
+      "value": "%dh"
+    },
+    {
+      "name": "time_justNow",
+      "value": "now"
+    },
+    {
+      "name": "time_minutesSecondsShort",
+      "value": "%1$dm %2$ds"
+    },
+    {
+      "name": "time_minutesShort",
+      "value": "%dm"
+    },
+    {
+      "name": "time_secondsShort",
+      "value": "%ds"
+    },
+    {
+      "name": "time_weeksShort",
+      "value": "%dw"
+    },
+    {
+      "name": "topbar_conversationActions",
+      "value": "Conversation actions"
+    },
+    {
+      "name": "topbar_export",
+      "value": "Export…"
+    },
+    {
+      "name": "topbar_forkConversation",
+      "value": "Fork conversation"
+    },
+    {
+      "name": "topbar_forkInWorktree",
+      "value": "Fork in Worktree"
+    },
+    {
+      "name": "topbar_hideOverview",
+      "value": "Hide overview"
+    },
+    {
+      "name": "topbar_showOverview",
+      "value": "Show overview"
+    }
   ]
 }

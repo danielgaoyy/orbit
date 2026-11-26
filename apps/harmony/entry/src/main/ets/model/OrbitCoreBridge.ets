@@ -425,6 +425,12 @@ export class OrbitCoreBridge
     });
   }
 
+  public markAgentRead(hostId: string, agentId: string): void {
+    this.traceVoidSync('markAgentRead', 0, (): void => {
+      this.core.markAgentRead(hostId, agentId);
+    });
+  }
+
   public markAgentUnread(hostId: string, agentId: string): void {
     this.traceVoidSync('markAgentUnread', 0, (): void => {
       this.core.markAgentUnread(hostId, agentId);

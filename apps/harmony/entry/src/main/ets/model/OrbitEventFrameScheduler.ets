@@ -35,6 +35,29 @@ export interface OrbitEventFlushHandler {
   onResync(): void;
 }
 
+/**
+ * Pure Stage visibility predicate shared by `OrbitHarmonyStore` and unit tests (§3.3):
+ * When the application is in the background (`isAppInBackground === true`), even the previously
+ * selected conversation is NOT visible, so `timeline_changed` only marks it `dirty = true`
+ * without fetching Stage deltas until the user returns to the foreground.
+ */
+export function isStageScopeVisibleForEvent(
+  isAppInBackground: boolean,
+  isNewSessionDraft: boolean,
+  selectedHostId: string,
+  selectedAgentId: string,
+  hostId: string,
+  agentId: string
+): boolean {
+  if (isAppInBackground || isNewSessionDraft) {
+    return false;
+  }
+  return hostId.length > 0 &&
+    agentId.length > 0 &&
+    selectedHostId === hostId &&
+    selectedAgentId === agentId;
+}
+
 function splitScopeKey(composite: string): string[] {
   const sep = composite.indexOf('::');
   if (sep < 0) {
@@ -61,6 +84,8 @@ export class OrbitEventFrameScheduler {
   private readonly handler: OrbitEventFlushHandler;
   private uiContext: UIContext | null = null;
   private fallbackTimerId: number = -1;
+  private backgroundMode: boolean = false;
+  private flushToken: number = 0;
 
   constructor(handler: OrbitEventFlushHandler) {
     this.handler = handler;
@@ -68,6 +93,31 @@ export class OrbitEventFrameScheduler {
 
   public bindUIContext(ctx: UIContext | null): void {
     this.uiContext = ctx;
+  }
+
+  /**
+   * Switches between foreground vsync `postFrameCallback` coalescing and background timer-driven
+   * dispatch. When entering background with events already waiting on a vsync frame that will
+   * not fire while the window is hidden, immediately migrates the pending flush to `setTimeout`.
+   */
+  public setBackgroundMode(inBackground: boolean): void {
+    if (this.backgroundMode === inBackground) {
+      return;
+    }
+    this.backgroundMode = inBackground;
+    if (inBackground && this.flushScheduled && this.fallbackTimerId === -1) {
+      const token = this.flushToken;
+      this.fallbackTimerId = setTimeout((): void => {
+        this.fallbackTimerId = -1;
+        if (token === this.flushToken && this.flushScheduled) {
+          this.flush();
+        }
+      }, FALLBACK_FRAME_MS);
+    }
+  }
+
+  public isBackgroundMode(): boolean {
+    return this.backgroundMode;
   }
 
   public enqueue(payloadJson: string): void {
@@ -160,11 +210,15 @@ export class OrbitEventFrameScheduler {
       return;
     }
     this.flushScheduled = true;
+    this.flushToken += 1;
+    const token = this.flushToken;
 
-    if (this.uiContext !== null) {
+    if (!this.backgroundMode && this.uiContext !== null) {
       try {
         const cb = new OrbitSchedulerFrameCallback((): void => {
-          this.flush();
+          if (token === this.flushToken && this.flushScheduled) {
+            this.flush();
+          }
         });
         this.uiContext.postFrameCallback(cb);
         return;
@@ -175,12 +229,19 @@ export class OrbitEventFrameScheduler {
 
     this.fallbackTimerId = setTimeout((): void => {
       this.fallbackTimerId = -1;
-      this.flush();
+      if (token === this.flushToken && this.flushScheduled) {
+        this.flush();
+      }
     }, FALLBACK_FRAME_MS);
   }
 
   private flush(): void {
+    if (this.fallbackTimerId !== -1) {
+      clearTimeout(this.fallbackTimerId);
+      this.fallbackTimerId = -1;
+    }
     this.flushScheduled = false;
+    this.flushToken += 1;
 
     const doResync = this.resyncPending;
     const doFleet = this.dirtyFleet;

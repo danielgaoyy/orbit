@@ -1,183 +1,1736 @@
 {
   "string": [
-    { "name": "module_desc", "value": "Orbit マルチホスト AI コーディングエージェント制御プレーン (HarmonyOS NEXT)" },
-    { "name": "EntryAbility_desc", "value": "Orbit ネイティブ ArkUI V2 制御プレーン" },
-    { "name": "EntryAbility_label", "value": "Orbit" },
-    { "name": "permission_microphone_reason", "value": "デバイス上の音声認識を使用してエージェントへプロンプトを入力します。" },
-
-    { "name": "nav_overview", "value": "概要" },
-    { "name": "nav_new_conversation", "value": "新しい会話" },
-    { "name": "nav_settings", "value": "設定" },
-    { "name": "nav_search_fleet", "value": "フリート検索" },
-    { "name": "nav_file_explorer", "value": "ファイル" },
-    { "name": "nav_git_review", "value": "Git レビュー" },
-    { "name": "nav_terminal", "value": "ターミナル" },
-    { "name": "nav_automations", "value": "オートメーション" },
-    { "name": "nav_workspace_board", "value": "ボードとピア" },
-    { "name": "nav_side_question", "value": "サイド質問 (/btw)" },
-    { "name": "nav_personal_router", "value": "パーソナルルーター＆メッシュ" },
-    { "name": "nav_archived_sessions", "value": "アーカイブ済み" },
-    { "name": "nav_export_transcript", "value": "履歴をエクスポート" },
-
-    { "name": "overview_title", "value": "概要" },
-    { "name": "overview_all_quiet", "value": "すべてのホストは安定稼働中 · いつでも指示できます" },
-    { "name": "overview_needs_decision", "value": "承認が必要です" },
-    { "name": "overview_batch_approve_safe", "value": "低リスクを一括承認" },
-    { "name": "overview_live_fleet", "value": "オンラインホスト" },
-    { "name": "overview_active_sessions", "value": "アクティブなセッション" },
-    { "name": "overview_no_active_sessions", "value": "現在実行中のセッションはありません。" },
-    { "name": "overview_router_placeholder", "value": "パーソナルエージェントに任意のホストで依頼…" },
-    { "name": "overview_open_router_settings", "value": "ルーター設定" },
-    { "name": "overview_no_hosts_title", "value": "最初のホストをペアリング" },
-    { "name": "overview_no_hosts_body", "value": "LAN、SSH、または E2EE Noise リレー経由でワークステーションや Mac mini の orbit daemon に接続します。" },
-
-    { "name": "action_cancel", "value": "キャンセル" },
-    { "name": "action_confirm", "value": "確認" },
-    { "name": "action_save", "value": "保存" },
-    { "name": "action_delete", "value": "削除" },
-    { "name": "action_rename", "value": "名前変更" },
-    { "name": "action_create", "value": "作成" },
-    { "name": "action_refresh", "value": "更新" },
-    { "name": "action_reconnect", "value": "再接続" },
-    { "name": "action_copy", "value": "コピー" },
-    { "name": "action_quote", "value": "引用" },
-    { "name": "action_open", "value": "開く" },
-    { "name": "action_close", "value": "閉じる" },
-    { "name": "action_send", "value": "送信" },
-    { "name": "action_stop", "value": "停止" },
-    { "name": "action_edit", "value": "編集" },
-    { "name": "action_done", "value": "完了" },
-    { "name": "action_pause", "value": "一時停止" },
-    { "name": "action_resume", "value": "再開" },
-    { "name": "action_run_now", "value": "実行" },
-    { "name": "action_allow_once", "value": "1回のみ許可" },
-    { "name": "action_allow_session", "value": "セッション中許可" },
-    { "name": "action_decline", "value": "拒否" },
-
-    { "name": "composer_placeholder", "value": "質問や指示を入力、@ で参照、/ で操作" },
-    { "name": "composer_voice_listening", "value": "聞き取り中…" },
-    { "name": "composer_voice_tap_done", "value": "チェックを押してテキストを挿入" },
-    { "name": "composer_voice_start", "value": "音声入力を開始" },
-    { "name": "composer_voice_stop", "value": "音声入力を完了" },
-    { "name": "composer_voice_cancel", "value": "音声入力をキャンセル" },
-    { "name": "composer_plan_progress", "value": "プラン進捗" },
-
-    { "name": "stage_load_older", "value": "以前の履歴を読み込む" },
-    { "name": "stage_loading_older", "value": "以前のターンを読み込み中…" },
-    { "name": "stage_offline_banner", "value": "ホストはオフラインです · 再接続時に同期されます" },
-    { "name": "stage_reconnecting_banner", "value": "ホストへ再接続中…" },
-    { "name": "stage_lineage_parent", "value": "親スレッド" },
-    { "name": "stage_lineage_subagents", "value": "サブエージェント" },
-    { "name": "stage_lineage_peers", "value": "ピア" },
-    { "name": "stage_delivery_queued", "value": "待機中" },
-    { "name": "stage_delivery_dispatched", "value": "配信済み" },
-    { "name": "stage_delivery_settled", "value": "完了" },
-    { "name": "stage_delivery_dropped", "value": "破棄" },
-    { "name": "stage_interrupt_and_continue", "value": "中断して続行" },
-    { "name": "stage_interrupt_and_deliver", "value": "中断して配信" },
-
-    { "name": "plan_review_title", "value": "実装プランのレビュー" },
-    { "name": "plan_approve_build", "value": "承認してビルド開始" },
-    { "name": "plan_request_changes", "value": "修正を依頼" },
-    { "name": "plan_dismiss", "value": "却下" },
-    { "name": "plan_edit_markdown", "value": "プラン編集" },
-    { "name": "plan_preview_markdown", "value": "プレビュー" },
-    { "name": "plan_feedback_placeholder", "value": "修正指示やコメント（任意）…" },
-
-    { "name": "terminal_title", "value": "PTY ターミナル" },
-    { "name": "terminal_mode_raw", "value": "Raw" },
-    { "name": "terminal_mode_line", "value": "行入力" },
-    { "name": "terminal_raw_placeholder", "value": "生のキー入力を送信…" },
-    { "name": "terminal_line_placeholder", "value": "コマンドを入力して送信…" },
-    { "name": "terminal_spawn_shell", "value": "シェルセッションを開始" },
-
-    { "name": "files_title", "value": "ファイルエクスプローラー" },
-    { "name": "files_search_placeholder", "value": "ワークスペースのファイルを絞り込む…" },
-    { "name": "files_new_entry", "value": "新規" },
-    { "name": "files_empty", "value": "このワークスペースに読み込まれたファイルはありません。" },
-    { "name": "files_truncated_notice", "value": "先頭プレビューを表示中（ファイルは省略されました）" },
-    { "name": "files_edit_mode", "value": "編集" },
-    { "name": "files_save_file", "value": "ファイルを保存" },
-    { "name": "files_new_path_placeholder", "value": "相対パス（例: src/main.ts）" },
-    { "name": "files_create_as_dir", "value": "ディレクトリを作成" },
-
-    { "name": "git_stage_all", "value": "すべてステージ" },
-    { "name": "git_unstage_all", "value": "すべて解除" },
-    { "name": "git_stage", "value": "ステージ" },
-    { "name": "git_unstage", "value": "解除" },
-    { "name": "git_commit", "value": "コミット" },
-    { "name": "git_commit_placeholder", "value": "コミットメッセージ…" },
-    { "name": "git_generate_message", "value": "AI 生成" },
-    { "name": "git_amend", "value": "直前のコミットを修正 (Amend)" },
-    { "name": "git_pr_section", "value": "Pull Request" },
-    { "name": "git_create_pr", "value": "PR を作成" },
-    { "name": "git_pr_title_placeholder", "value": "Pull Request タイトル" },
-    { "name": "git_pr_body_placeholder", "value": "変更の概要…" },
-    { "name": "git_pr_draft", "value": "ドラフト PR" },
-    { "name": "git_stash_save", "value": "スタッシュ" },
-    { "name": "git_stash_pop", "value": "スタッシュ適用" },
-    { "name": "git_rebase_continue", "value": "リベース続行" },
-    { "name": "git_rebase_abort", "value": "リベース中止" },
-    { "name": "git_conflicts_detected", "value": "マージ競合を検出" },
-
-    { "name": "search_title", "value": "グローバル検索" },
-    { "name": "search_placeholder", "value": "全ホストのメッセージを検索…" },
-    { "name": "search_remote_action", "value": "リモートホストも検索" },
-    { "name": "search_empty_hint", "value": "キーワードを入力して全フリートの FTS5 履歴を検索します。" },
-    { "name": "search_no_results", "value": "一致する会話は見つかりませんでした。" },
-
-    { "name": "automations_schedules", "value": "スケジュール" },
-    { "name": "automations_timers", "value": "タイマー" },
-    { "name": "automations_goals", "value": "ゴール" },
-    { "name": "automations_monitors", "value": "モニター" },
-    { "name": "automations_workflows", "value": "ワークフロー" },
-    { "name": "automations_new_timer", "value": "新規タイマー" },
-    { "name": "automations_new_goal", "value": "新規ゴール" },
-    { "name": "automations_new_monitor", "value": "新規モニター" },
-    { "name": "automations_new_workflow", "value": "新規ワークフロー" },
-    { "name": "automations_verify_now", "value": "今すぐ検証" },
-
-    { "name": "router_mesh_title", "value": "パーソナルルーター＆メッシュ" },
-    { "name": "router_section_hosts", "value": "ルーター候補ホスト" },
-    { "name": "router_section_config", "value": "ルーターポリシー" },
-    { "name": "router_section_mesh", "value": "フリートメッシュピア" },
-    { "name": "router_enable_toggle", "value": "パーソナルルーターを有効化" },
-    { "name": "router_share_hermes", "value": "ホストの Hermes メモリを共有" },
-    { "name": "router_apply", "value": "ポリシーを保存" },
-
-    { "name": "sync_title", "value": "クラウド同期" },
-    { "name": "sync_device_link_qr", "value": "デバイス連携 QR" },
-    { "name": "sync_scan_device_link", "value": "連携 QR をスキャン" },
-    { "name": "sync_export_qr", "value": "デバイス連携 QR を表示" },
-    { "name": "sync_zero_passphrase", "value": "パスフレーズ不要の即時解除" },
-    { "name": "sync_manual_passphrase", "value": "手動パスフレーズを必須にする" },
-    { "name": "sync_github_device_flow", "value": "GitHub でサインイン" },
-    { "name": "sync_huks_security", "value": "鍵保護" },
-    { "name": "sync_huks_hardware", "value": "HUKS ハードウェア AES-256" },
-    { "name": "sync_huks_fallback", "value": "アプリサンドボックス鍵" },
-
-    { "name": "push_title", "value": "Push Kit と通知" },
-    { "name": "push_test_button", "value": "テスト通知を送信" },
-    { "name": "push_sync_hosts", "value": "全ホストへトークン同期" },
-    { "name": "push_pref_permissions", "value": "承認リクエスト" },
-    { "name": "push_pref_turns", "value": "ターン完了" },
-    { "name": "push_pref_errors", "value": "エージェントエラー" },
-    { "name": "push_pref_goals", "value": "ゴール・タイマー通知" },
-    { "name": "push_pref_preview", "value": "メッセージ概要を含める" },
-
-    { "name": "export_title", "value": "履歴をエクスポート" },
-    { "name": "export_format_md", "value": "Markdown" },
-    { "name": "export_format_json", "value": "JSON" },
-    { "name": "export_format_html", "value": "HTML" },
-    { "name": "export_include_thinking", "value": "思考ログを含める" },
-    { "name": "export_include_tools", "value": "ツール呼び出しを含める" },
-    { "name": "export_include_timestamps", "value": "タイムスタンプを含める" },
-    { "name": "export_copy_action", "value": "エクスポート結果をコピー" },
-
-    { "name": "sidebar_search", "value": "検索" },
-    { "name": "sidebar_needs_attention", "value": "要確認" },
-    { "name": "sidebar_pinned", "value": "ピン留め" },
-    { "name": "sidebar_projects", "value": "プロジェクト" },
-    { "name": "settings_upgrade_daemon", "value": "デーモンをリモート更新" }
+    {
+      "name": "EntryAbility_desc",
+      "value": "Orbit ネイティブ ArkUI V2 制御プレーン"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Orbit"
+    },
+    {
+      "name": "action_allow_once",
+      "value": "1回のみ許可"
+    },
+    {
+      "name": "action_allow_session",
+      "value": "セッション中許可"
+    },
+    {
+      "name": "action_cancel",
+      "value": "キャンセル"
+    },
+    {
+      "name": "action_close",
+      "value": "閉じる"
+    },
+    {
+      "name": "action_confirm",
+      "value": "確認"
+    },
+    {
+      "name": "action_copy",
+      "value": "コピー"
+    },
+    {
+      "name": "action_create",
+      "value": "作成"
+    },
+    {
+      "name": "action_decline",
+      "value": "拒否"
+    },
+    {
+      "name": "action_delete",
+      "value": "削除"
+    },
+    {
+      "name": "action_done",
+      "value": "完了"
+    },
+    {
+      "name": "action_edit",
+      "value": "編集"
+    },
+    {
+      "name": "action_open",
+      "value": "開く"
+    },
+    {
+      "name": "action_pause",
+      "value": "一時停止"
+    },
+    {
+      "name": "action_quote",
+      "value": "引用"
+    },
+    {
+      "name": "action_reconnect",
+      "value": "再接続"
+    },
+    {
+      "name": "action_refresh",
+      "value": "更新"
+    },
+    {
+      "name": "action_rename",
+      "value": "名前変更"
+    },
+    {
+      "name": "action_resume",
+      "value": "再開"
+    },
+    {
+      "name": "action_run_now",
+      "value": "実行"
+    },
+    {
+      "name": "action_save",
+      "value": "保存"
+    },
+    {
+      "name": "action_send",
+      "value": "送信"
+    },
+    {
+      "name": "action_stop",
+      "value": "停止"
+    },
+    {
+      "name": "approval_allow",
+      "value": "許可"
+    },
+    {
+      "name": "approval_alwaysAllow",
+      "value": "常に許可"
+    },
+    {
+      "name": "approval_approveSafeBatch",
+      "value": "安全な項目を許可 (%d)"
+    },
+    {
+      "name": "approval_approveSafeBatchDone",
+      "value": "%d 件の権限リクエストを許可しました"
+    },
+    {
+      "name": "approval_approveSafeBatchNone",
+      "value": "許可可能なリクエストはありませんでした（%d 件スキップ）"
+    },
+    {
+      "name": "approval_approveSafeBatchPartial",
+      "value": "%d 件許可 · 高リスクまたは制限対象 %d 件をスキップ"
+    },
+    {
+      "name": "approval_approveSafeBatchSubmitting",
+      "value": "許可中…"
+    },
+    {
+      "name": "approval_approveSafeBatchTooltip",
+      "value": "キュー内の安全な権限リクエストを一括許可します。高リスク操作・質問・計画は除外されます。"
+    },
+    {
+      "name": "approval_criticalRisk",
+      "value": "重大リスク"
+    },
+    {
+      "name": "approval_decline",
+      "value": "辞退"
+    },
+    {
+      "name": "approval_deny",
+      "value": "拒否"
+    },
+    {
+      "name": "approval_highRisk",
+      "value": "高リスク"
+    },
+    {
+      "name": "approval_mediumRisk",
+      "value": "中リスク"
+    },
+    {
+      "name": "approval_permissionFailed",
+      "value": "権限操作に失敗しました：%s"
+    },
+    {
+      "name": "approval_viewDiff",
+      "value": "Diff を表示"
+    },
+    {
+      "name": "automations_goals",
+      "value": "ゴール"
+    },
+    {
+      "name": "automations_monitors",
+      "value": "モニター"
+    },
+    {
+      "name": "automations_new_goal",
+      "value": "新規ゴール"
+    },
+    {
+      "name": "automations_new_monitor",
+      "value": "新規モニター"
+    },
+    {
+      "name": "automations_new_timer",
+      "value": "新規タイマー"
+    },
+    {
+      "name": "automations_new_workflow",
+      "value": "新規ワークフロー"
+    },
+    {
+      "name": "automations_schedules",
+      "value": "スケジュール"
+    },
+    {
+      "name": "automations_timers",
+      "value": "タイマー"
+    },
+    {
+      "name": "automations_verify_now",
+      "value": "今すぐ検証"
+    },
+    {
+      "name": "automations_workflows",
+      "value": "ワークフロー"
+    },
+    {
+      "name": "avatar_name_arctic_fox",
+      "value": "ホッキョクギツネ"
+    },
+    {
+      "name": "avatar_name_barn_owl",
+      "value": "メンフクロウ"
+    },
+    {
+      "name": "avatar_name_capybara",
+      "value": "カピバラ"
+    },
+    {
+      "name": "avatar_name_corgi",
+      "value": "コーギー"
+    },
+    {
+      "name": "avatar_name_cream_alpaca",
+      "value": "アルパカ"
+    },
+    {
+      "name": "avatar_name_emperor_penguin",
+      "value": "コウテイペンギン"
+    },
+    {
+      "name": "avatar_name_european_hedgehog",
+      "value": "ハリネズミ"
+    },
+    {
+      "name": "avatar_name_giant_panda",
+      "value": "ジャイアントパンダ"
+    },
+    {
+      "name": "avatar_name_gray_chinchilla",
+      "value": "チンチラ"
+    },
+    {
+      "name": "avatar_name_harbor_seal",
+      "value": "ゼニガタアザラシ"
+    },
+    {
+      "name": "avatar_name_holland_lop",
+      "value": "ホーランドロップ"
+    },
+    {
+      "name": "avatar_name_husky",
+      "value": "ハスキー"
+    },
+    {
+      "name": "avatar_name_koala",
+      "value": "コアラ"
+    },
+    {
+      "name": "avatar_name_mallard_duck",
+      "value": "マガモ"
+    },
+    {
+      "name": "avatar_name_orange_tabby",
+      "value": "茶トラ猫"
+    },
+    {
+      "name": "avatar_name_raccoon",
+      "value": "アライグマ"
+    },
+    {
+      "name": "avatar_name_red_fox",
+      "value": "アカギツネ"
+    },
+    {
+      "name": "avatar_name_red_panda",
+      "value": "レッサーパンダ"
+    },
+    {
+      "name": "avatar_name_red_squirrel",
+      "value": "キタリス"
+    },
+    {
+      "name": "avatar_name_russian_blue",
+      "value": "ロシアンブルー"
+    },
+    {
+      "name": "avatar_name_sea_otter",
+      "value": "ラッコ"
+    },
+    {
+      "name": "avatar_name_shiba_inu",
+      "value": "柴犬"
+    },
+    {
+      "name": "avatar_name_sika_deer",
+      "value": "ニホンジカ"
+    },
+    {
+      "name": "avatar_name_snowy_owl",
+      "value": "シロフクロウ"
+    },
+    {
+      "name": "briefing_actorGuardian",
+      "value": "Guardian"
+    },
+    {
+      "name": "briefing_actorPersonalAgent",
+      "value": "パーソナルエージェント"
+    },
+    {
+      "name": "briefing_actorRule",
+      "value": "ルール"
+    },
+    {
+      "name": "briefing_agentFallback",
+      "value": "エージェント"
+    },
+    {
+      "name": "briefing_agentStoppedError",
+      "value": "エージェントがエラーで停止しました"
+    },
+    {
+      "name": "briefing_allQuiet",
+      "value": "すべて正常です。現在対応が必要な項目はありません。"
+    },
+    {
+      "name": "briefing_approvalWaiting",
+      "value": "承認の確認待ちです"
+    },
+    {
+      "name": "briefing_approveAll",
+      "value": "すべて許可 (%d)"
+    },
+    {
+      "name": "briefing_approveLowRiskBatch",
+      "value": "低リスク %d 件を一括許可"
+    },
+    {
+      "name": "briefing_ariaLabel",
+      "value": "パーソナルエージェントブリーフィング"
+    },
+    {
+      "name": "briefing_batchAllSkipped",
+      "value": "%d 件スキップされ、許可された項目はありません"
+    },
+    {
+      "name": "briefing_batchApprovedCount",
+      "value": "%d 件の安全なリクエストを許可しました"
+    },
+    {
+      "name": "briefing_batchApprovedToast",
+      "value": "低リスクのリクエストを %d 件許可しました。"
+    },
+    {
+      "name": "briefing_batchApprovedWithSkipped",
+      "value": "%d 件を許可 · %d 件は手動確認が必要です。"
+    },
+    {
+      "name": "briefing_batchFailed",
+      "value": "一括許可に失敗しました"
+    },
+    {
+      "name": "briefing_batchNothingEligible",
+      "value": "確認済みの対象リクエストは残っていません"
+    },
+    {
+      "name": "briefing_batchPartialFailure",
+      "value": "%1$d 件許可・%2$d 件スキップ（%3$d 台のホストで失敗）"
+    },
+    {
+      "name": "briefing_batchSkippedAndFailed",
+      "value": "%1$d 件スキップ（%2$d 台のホストで失敗）"
+    },
+    {
+      "name": "briefing_collapseSection",
+      "value": "セクションを折りたたむ"
+    },
+    {
+      "name": "briefing_completedTitle",
+      "value": "完了"
+    },
+    {
+      "name": "briefing_confirmBatchMessage",
+      "value": "一括承認対象の低リスク権限リクエストをすべて許可します。高リスクや手動確認必須の項目は除外されます。"
+    },
+    {
+      "name": "briefing_confirmBatchTitle",
+      "value": "低リスクのリクエスト %d 件を一括許可しますか？"
+    },
+    {
+      "name": "briefing_decisionAllowed",
+      "value": "許可"
+    },
+    {
+      "name": "briefing_decisionDenied",
+      "value": "拒否"
+    },
+    {
+      "name": "briefing_diffTargetUnavailable",
+      "value": "このリクエストのワークスペースパスを特定できません"
+    },
+    {
+      "name": "briefing_errorBadge",
+      "value": "エラー"
+    },
+    {
+      "name": "briefing_expandSection",
+      "value": "セクションを展開"
+    },
+    {
+      "name": "briefing_handledForYouTitle",
+      "value": "自動処理済み"
+    },
+    {
+      "name": "briefing_hideBriefing",
+      "value": "ブリーフィングを隠す"
+    },
+    {
+      "name": "briefing_hostsOnlineSummary",
+      "value": "%d/%d オンライン"
+    },
+    {
+      "name": "briefing_hostsTitle",
+      "value": "ホスト"
+    },
+    {
+      "name": "briefing_inProgressTitle",
+      "value": "進行中"
+    },
+    {
+      "name": "briefing_lowRisk",
+      "value": "低リスク"
+    },
+    {
+      "name": "briefing_needsYouTitle",
+      "value": "対応が必要"
+    },
+    {
+      "name": "briefing_openDiffPreview",
+      "value": "差分"
+    },
+    {
+      "name": "briefing_openSession",
+      "value": "セッションを開く"
+    },
+    {
+      "name": "briefing_openSettings",
+      "value": "パーソナルエージェント設定"
+    },
+    {
+      "name": "briefing_openWorkerHint",
+      "value": "クリックでサイドパネル表示 · Cmd/Ctrl+クリックで移動"
+    },
+    {
+      "name": "briefing_otherActiveLabel",
+      "value": "その他実行中"
+    },
+    {
+      "name": "briefing_paHostTooltip",
+      "value": "%s · パーソナルエージェントホスト"
+    },
+    {
+      "name": "briefing_paRecommendAllow",
+      "value": "パーソナルエージェントの提案：許可"
+    },
+    {
+      "name": "briefing_paRecommendDeny",
+      "value": "パーソナルエージェントの提案：拒否"
+    },
+    {
+      "name": "briefing_planReviewBadge",
+      "value": "プラン確認"
+    },
+    {
+      "name": "briefing_reviewAction",
+      "value": "確認"
+    },
+    {
+      "name": "briefing_sessionNotFound",
+      "value": "セッションが見つかりません"
+    },
+    {
+      "name": "briefing_settingsSaved",
+      "value": "パーソナルエージェント設定を保存しました"
+    },
+    {
+      "name": "briefing_setupCreateOneClick",
+      "value": "ワンクリックで作成して有効化"
+    },
+    {
+      "name": "briefing_setupCustomSettings",
+      "value": "詳細設定"
+    },
+    {
+      "name": "briefing_setupDefaultModel",
+      "value": "プロバイダー既定"
+    },
+    {
+      "name": "briefing_setupDescription",
+      "value": "常駐ホスト上で 1 つのコーディネーターを動かし、ホスト横断でワーカーを指揮して中リスク操作を事前審査し、重要な判断だけをあなたに届けます。"
+    },
+    {
+      "name": "briefing_setupDiscovering",
+      "value": "接続中のホストを確認中…"
+    },
+    {
+      "name": "briefing_setupEnableDefault",
+      "value": "ワンクリック有効化"
+    },
+    {
+      "name": "briefing_setupEnableOnHost",
+      "value": "%s でワンクリック有効化"
+    },
+    {
+      "name": "briefing_setupEnabling",
+      "value": "有効化中…"
+    },
+    {
+      "name": "briefing_setupLoadConfigFailed",
+      "value": "対象ホストの既存設定の読み込みに失敗しました。上書きを防ぐため再試行してください。"
+    },
+    {
+      "name": "briefing_setupNoHosts",
+      "value": "利用可能なオンラインホストがありません。ホストを接続するか設定で構成してください。"
+    },
+    {
+      "name": "briefing_setupRecommendedHost",
+      "value": "%s での有効化を推奨"
+    },
+    {
+      "name": "briefing_setupSelectHost",
+      "value": "プライマリホスト"
+    },
+    {
+      "name": "briefing_setupSelectModel",
+      "value": "モデル"
+    },
+    {
+      "name": "briefing_setupSelectProvider",
+      "value": "プロバイダー"
+    },
+    {
+      "name": "briefing_setupTagAlwaysOn",
+      "value": "常駐ホスト"
+    },
+    {
+      "name": "briefing_setupTagLocal",
+      "value": "このマシン"
+    },
+    {
+      "name": "briefing_setupTitle",
+      "value": "パーソナルエージェントを設定"
+    },
+    {
+      "name": "briefing_showBriefing",
+      "value": "ブリーフィングを表示"
+    },
+    {
+      "name": "briefing_title",
+      "value": "ブリーフィング"
+    },
+    {
+      "name": "briefing_viewAction",
+      "value": "表示"
+    },
+    {
+      "name": "briefing_waitingTitle",
+      "value": "待機中"
+    },
+    {
+      "name": "briefing_whileAwayBoth",
+      "value": "不在の間：%d 件完了 · %d 件の判断を自動処理"
+    },
+    {
+      "name": "briefing_whileAwayCompletedOnly",
+      "value": "不在の間：%d 件完了"
+    },
+    {
+      "name": "briefing_whileAwayHandledOnly",
+      "value": "不在の間：%d 件の判断を自動処理"
+    },
+    {
+      "name": "common_actionFailed",
+      "value": "操作に失敗しました。もう一度お試しください。"
+    },
+    {
+      "name": "common_archive",
+      "value": "アーカイブ"
+    },
+    {
+      "name": "common_automations",
+      "value": "オートメーション"
+    },
+    {
+      "name": "common_cancel",
+      "value": "キャンセル"
+    },
+    {
+      "name": "common_close",
+      "value": "閉じる"
+    },
+    {
+      "name": "common_confirm",
+      "value": "確認"
+    },
+    {
+      "name": "common_connecting",
+      "value": "接続中"
+    },
+    {
+      "name": "common_conversation",
+      "value": "会話"
+    },
+    {
+      "name": "common_copied",
+      "value": "コピーしました"
+    },
+    {
+      "name": "common_copy",
+      "value": "コピー"
+    },
+    {
+      "name": "common_default",
+      "value": "デフォルト"
+    },
+    {
+      "name": "common_delete",
+      "value": "削除"
+    },
+    {
+      "name": "common_direct",
+      "value": "直接接続"
+    },
+    {
+      "name": "common_edit",
+      "value": "編集"
+    },
+    {
+      "name": "common_hide",
+      "value": "折りたたむ"
+    },
+    {
+      "name": "common_loading",
+      "value": "読み込み中…"
+    },
+    {
+      "name": "common_local",
+      "value": "ローカル"
+    },
+    {
+      "name": "common_more",
+      "value": "その他"
+    },
+    {
+      "name": "common_newConversation",
+      "value": "新しい会話"
+    },
+    {
+      "name": "common_newSession",
+      "value": "新しいセッション"
+    },
+    {
+      "name": "common_offline",
+      "value": "オフライン"
+    },
+    {
+      "name": "common_online",
+      "value": "オンライン"
+    },
+    {
+      "name": "common_recommended",
+      "value": "推奨"
+    },
+    {
+      "name": "common_refresh",
+      "value": "更新"
+    },
+    {
+      "name": "common_relay",
+      "value": "Relay"
+    },
+    {
+      "name": "common_remote",
+      "value": "リモート"
+    },
+    {
+      "name": "common_rename",
+      "value": "名前を変更"
+    },
+    {
+      "name": "common_retry",
+      "value": "再試行"
+    },
+    {
+      "name": "common_save",
+      "value": "保存"
+    },
+    {
+      "name": "common_send",
+      "value": "送信"
+    },
+    {
+      "name": "common_settings",
+      "value": "設定"
+    },
+    {
+      "name": "common_showLess",
+      "value": "折りたたむ"
+    },
+    {
+      "name": "common_showMore",
+      "value": "さらに %d 件表示…"
+    },
+    {
+      "name": "common_start",
+      "value": "開始"
+    },
+    {
+      "name": "composer_placeholder",
+      "value": "質問や指示を入力、@ で参照、/ で操作"
+    },
+    {
+      "name": "composer_plan_progress",
+      "value": "プラン進捗"
+    },
+    {
+      "name": "composer_voice_cancel",
+      "value": "音声入力をキャンセル"
+    },
+    {
+      "name": "composer_voice_listening",
+      "value": "聞き取り中…"
+    },
+    {
+      "name": "composer_voice_start",
+      "value": "音声入力を開始"
+    },
+    {
+      "name": "composer_voice_stop",
+      "value": "音声入力を完了"
+    },
+    {
+      "name": "composer_voice_tap_done",
+      "value": "チェックを押してテキストを挿入"
+    },
+    {
+      "name": "conn_connecting",
+      "value": "接続中"
+    },
+    {
+      "name": "conn_direct",
+      "value": "直接"
+    },
+    {
+      "name": "conn_offline",
+      "value": "オフライン"
+    },
+    {
+      "name": "conn_relay",
+      "value": "リレー"
+    },
+    {
+      "name": "conn_ssh",
+      "value": "SSH"
+    },
+    {
+      "name": "export_copy_action",
+      "value": "エクスポート結果をコピー"
+    },
+    {
+      "name": "export_format_html",
+      "value": "HTML"
+    },
+    {
+      "name": "export_format_json",
+      "value": "JSON"
+    },
+    {
+      "name": "export_format_md",
+      "value": "Markdown"
+    },
+    {
+      "name": "export_include_thinking",
+      "value": "思考ログを含める"
+    },
+    {
+      "name": "export_include_timestamps",
+      "value": "タイムスタンプを含める"
+    },
+    {
+      "name": "export_include_tools",
+      "value": "ツール呼び出しを含める"
+    },
+    {
+      "name": "export_title",
+      "value": "履歴をエクスポート"
+    },
+    {
+      "name": "files_create_as_dir",
+      "value": "ディレクトリを作成"
+    },
+    {
+      "name": "files_edit_mode",
+      "value": "編集"
+    },
+    {
+      "name": "files_empty",
+      "value": "このワークスペースに読み込まれたファイルはありません。"
+    },
+    {
+      "name": "files_new_entry",
+      "value": "新規"
+    },
+    {
+      "name": "files_new_path_placeholder",
+      "value": "相対パス（例: src/main.ts）"
+    },
+    {
+      "name": "files_save_file",
+      "value": "ファイルを保存"
+    },
+    {
+      "name": "files_search_placeholder",
+      "value": "ワークスペースのファイルを絞り込む…"
+    },
+    {
+      "name": "files_title",
+      "value": "ファイルエクスプローラー"
+    },
+    {
+      "name": "files_truncated_notice",
+      "value": "先頭プレビューを表示中（ファイルは省略されました）"
+    },
+    {
+      "name": "git_amend",
+      "value": "直前のコミットを修正 (Amend)"
+    },
+    {
+      "name": "git_commit",
+      "value": "コミット"
+    },
+    {
+      "name": "git_commit_placeholder",
+      "value": "コミットメッセージ…"
+    },
+    {
+      "name": "git_conflicts_detected",
+      "value": "マージ競合を検出"
+    },
+    {
+      "name": "git_create_pr",
+      "value": "PR を作成"
+    },
+    {
+      "name": "git_generate_message",
+      "value": "AI 生成"
+    },
+    {
+      "name": "git_pr_body_placeholder",
+      "value": "変更の概要…"
+    },
+    {
+      "name": "git_pr_draft",
+      "value": "ドラフト PR"
+    },
+    {
+      "name": "git_pr_section",
+      "value": "Pull Request"
+    },
+    {
+      "name": "git_pr_title_placeholder",
+      "value": "Pull Request タイトル"
+    },
+    {
+      "name": "git_rebase_abort",
+      "value": "リベース中止"
+    },
+    {
+      "name": "git_rebase_continue",
+      "value": "リベース続行"
+    },
+    {
+      "name": "git_stage",
+      "value": "ステージ"
+    },
+    {
+      "name": "git_stage_all",
+      "value": "すべてステージ"
+    },
+    {
+      "name": "git_stash_pop",
+      "value": "スタッシュ適用"
+    },
+    {
+      "name": "git_stash_save",
+      "value": "スタッシュ"
+    },
+    {
+      "name": "git_unstage",
+      "value": "解除"
+    },
+    {
+      "name": "git_unstage_all",
+      "value": "すべて解除"
+    },
+    {
+      "name": "module_desc",
+      "value": "Orbit マルチホスト AI コーディングエージェント制御プレーン (HarmonyOS NEXT)"
+    },
+    {
+      "name": "nav_archived_sessions",
+      "value": "アーカイブ済み"
+    },
+    {
+      "name": "nav_automations",
+      "value": "オートメーション"
+    },
+    {
+      "name": "nav_export_transcript",
+      "value": "履歴をエクスポート"
+    },
+    {
+      "name": "nav_file_explorer",
+      "value": "ファイル"
+    },
+    {
+      "name": "nav_git_review",
+      "value": "Git レビュー"
+    },
+    {
+      "name": "nav_new_conversation",
+      "value": "新しい会話"
+    },
+    {
+      "name": "nav_overview",
+      "value": "概要"
+    },
+    {
+      "name": "nav_personal_router",
+      "value": "パーソナルエージェント＆メッシュ"
+    },
+    {
+      "name": "nav_search_fleet",
+      "value": "フリート検索"
+    },
+    {
+      "name": "nav_settings",
+      "value": "設定"
+    },
+    {
+      "name": "nav_side_question",
+      "value": "サイド質問 (/btw)"
+    },
+    {
+      "name": "nav_terminal",
+      "value": "ターミナル"
+    },
+    {
+      "name": "nav_workspace_board",
+      "value": "ボードとピア"
+    },
+    {
+      "name": "notify_agent_error_body",
+      "value": "エージェントがエラーで停止しました。"
+    },
+    {
+      "name": "notify_agent_error_title",
+      "value": "エージェントエラー"
+    },
+    {
+      "name": "notify_goal_finished_body",
+      "value": "自律ゴールが終了状態に到達しました。"
+    },
+    {
+      "name": "notify_goal_finished_title",
+      "value": "ゴールが完了しました"
+    },
+    {
+      "name": "notify_permission_body",
+      "value": "エージェントが承認を待っています。"
+    },
+    {
+      "name": "notify_permission_title",
+      "value": "承認が必要です"
+    },
+    {
+      "name": "notify_timer_fired_body",
+      "value": "スケジュールされたタイマーが作動しました。"
+    },
+    {
+      "name": "notify_timer_fired_title",
+      "value": "タイマーが作動しました"
+    },
+    {
+      "name": "notify_turn_completed_body",
+      "value": "エージェントのバックグラウンドターンが完了しました。"
+    },
+    {
+      "name": "notify_turn_completed_title",
+      "value": "ターンが完了しました"
+    },
+    {
+      "name": "overview_active_sessions",
+      "value": "アクティブなセッション"
+    },
+    {
+      "name": "overview_all_quiet",
+      "value": "すべてのホストは安定稼働中 · いつでも指示できます"
+    },
+    {
+      "name": "overview_archiveDone",
+      "value": "完了をアーカイブ"
+    },
+    {
+      "name": "overview_archiveSubagent",
+      "value": "サブエージェントをアーカイブ"
+    },
+    {
+      "name": "overview_batch_approve_safe",
+      "value": "低リスクを一括承認"
+    },
+    {
+      "name": "overview_focusSession",
+      "value": "セッションへ移動"
+    },
+    {
+      "name": "overview_globalOverviewTooltip",
+      "value": "パーソナルエージェント"
+    },
+    {
+      "name": "overview_live_fleet",
+      "value": "オンラインホスト"
+    },
+    {
+      "name": "overview_moreSubagents",
+      "value": "他 %d 件のサブエージェント"
+    },
+    {
+      "name": "overview_needs_decision",
+      "value": "承認が必要です"
+    },
+    {
+      "name": "overview_no_active_sessions",
+      "value": "現在実行中のセッションはありません。"
+    },
+    {
+      "name": "overview_no_hosts_body",
+      "value": "LAN、SSH、または E2EE Noise リレー経由でワークステーションや Mac mini の orbit daemon に接続します。"
+    },
+    {
+      "name": "overview_no_hosts_title",
+      "value": "最初のホストをペアリング"
+    },
+    {
+      "name": "overview_openSubagent",
+      "value": "%s を開く"
+    },
+    {
+      "name": "overview_open_router_settings",
+      "value": "パーソナルエージェント設定"
+    },
+    {
+      "name": "overview_router_placeholder",
+      "value": "パーソナルエージェントに任意のホストで依頼…"
+    },
+    {
+      "name": "overview_stopSubagent",
+      "value": "サブエージェントを停止"
+    },
+    {
+      "name": "overview_subagentApprovalRequired",
+      "value": "承認待ち"
+    },
+    {
+      "name": "overview_subagentFailed",
+      "value": "失敗"
+    },
+    {
+      "name": "overview_subagentFinished",
+      "value": "完了"
+    },
+    {
+      "name": "overview_subagentIdle",
+      "value": "待機中"
+    },
+    {
+      "name": "overview_subagentReview",
+      "value": "確認"
+    },
+    {
+      "name": "overview_subagentStopped",
+      "value": "停止"
+    },
+    {
+      "name": "overview_subagentWorking",
+      "value": "実行中…"
+    },
+    {
+      "name": "overview_title",
+      "value": "概要"
+    },
+    {
+      "name": "overview_viewFileDiff",
+      "value": "差分を表示"
+    },
+    {
+      "name": "permission_microphone_reason",
+      "value": "デバイス上の音声認識を使用してエージェントへプロンプトを入力します。"
+    },
+    {
+      "name": "plan_approve_build",
+      "value": "承認してビルド開始"
+    },
+    {
+      "name": "plan_dismiss",
+      "value": "却下"
+    },
+    {
+      "name": "plan_edit_markdown",
+      "value": "プラン編集"
+    },
+    {
+      "name": "plan_feedback_placeholder",
+      "value": "修正指示やコメント（任意）…"
+    },
+    {
+      "name": "plan_preview_markdown",
+      "value": "プレビュー"
+    },
+    {
+      "name": "plan_request_changes",
+      "value": "修正を依頼"
+    },
+    {
+      "name": "plan_review_title",
+      "value": "実装プランのレビュー"
+    },
+    {
+      "name": "push_pref_errors",
+      "value": "エージェントエラー"
+    },
+    {
+      "name": "push_pref_goals",
+      "value": "ゴール・タイマー通知"
+    },
+    {
+      "name": "push_pref_permissions",
+      "value": "承認リクエスト"
+    },
+    {
+      "name": "push_pref_preview",
+      "value": "メッセージ概要を含める"
+    },
+    {
+      "name": "push_pref_turns",
+      "value": "ターン完了"
+    },
+    {
+      "name": "push_sync_hosts",
+      "value": "全ホストへトークン同期"
+    },
+    {
+      "name": "push_test_button",
+      "value": "テスト通知を送信"
+    },
+    {
+      "name": "push_title",
+      "value": "Push Kit と通知"
+    },
+    {
+      "name": "router_apply",
+      "value": "ポリシーを保存"
+    },
+    {
+      "name": "router_enable_toggle",
+      "value": "パーソナルエージェントを有効化"
+    },
+    {
+      "name": "router_mesh_title",
+      "value": "パーソナルエージェント＆メッシュ"
+    },
+    {
+      "name": "router_section_config",
+      "value": "パーソナルエージェントポリシー"
+    },
+    {
+      "name": "router_section_hosts",
+      "value": "候補ホスト"
+    },
+    {
+      "name": "router_section_mesh",
+      "value": "接続済みホストピア"
+    },
+    {
+      "name": "router_share_hermes",
+      "value": "ホストの外部メモリを共有"
+    },
+    {
+      "name": "search_empty_hint",
+      "value": "キーワードを入力して全フリートの FTS5 履歴を検索します。"
+    },
+    {
+      "name": "search_no_results",
+      "value": "一致する会話は見つかりませんでした。"
+    },
+    {
+      "name": "search_placeholder",
+      "value": "全ホストのメッセージを検索…"
+    },
+    {
+      "name": "search_remote_action",
+      "value": "リモートホストも検索"
+    },
+    {
+      "name": "search_title",
+      "value": "グローバル検索"
+    },
+    {
+      "name": "settings_upgrade_daemon",
+      "value": "デーモンをリモート更新"
+    },
+    {
+      "name": "sidebar_activeCount",
+      "value": "%d 件実行中"
+    },
+    {
+      "name": "sidebar_addProject",
+      "value": "プロジェクトを追加"
+    },
+    {
+      "name": "sidebar_archiveConversation",
+      "value": "会話をアーカイブ"
+    },
+    {
+      "name": "sidebar_archived",
+      "value": "アーカイブ済み"
+    },
+    {
+      "name": "sidebar_automations",
+      "value": "オートメーション"
+    },
+    {
+      "name": "sidebar_backgroundTaskRunning",
+      "value": "バックグラウンドタスク実行中"
+    },
+    {
+      "name": "sidebar_browseDirectoryAria",
+      "value": "リモートディレクトリを参照"
+    },
+    {
+      "name": "sidebar_clearThreadFilter",
+      "value": "フィルタをクリア"
+    },
+    {
+      "name": "sidebar_closeDrawerAria",
+      "value": "ナビゲーションドロワーを閉じる"
+    },
+    {
+      "name": "sidebar_collapseAll",
+      "value": "すべて折りたたむ"
+    },
+    {
+      "name": "sidebar_collapseSidebarAria",
+      "value": "サイドバーを折りたたむ"
+    },
+    {
+      "name": "sidebar_connectHost",
+      "value": "ホストを接続"
+    },
+    {
+      "name": "sidebar_connectLocalDaemon",
+      "value": "ローカルデーモンに接続"
+    },
+    {
+      "name": "sidebar_connectLocalHost",
+      "value": "ローカルホストに接続"
+    },
+    {
+      "name": "sidebar_connectingToHost",
+      "value": "ホストに接続中… · ホスト管理"
+    },
+    {
+      "name": "sidebar_conversationOptions",
+      "value": "会話オプション"
+    },
+    {
+      "name": "sidebar_copiedPath",
+      "value": "パスをコピーしました"
+    },
+    {
+      "name": "sidebar_copiedProjectPath",
+      "value": "プロジェクトパスをコピーしました"
+    },
+    {
+      "name": "sidebar_copyPath",
+      "value": "パスをコピー"
+    },
+    {
+      "name": "sidebar_draft",
+      "value": "下書き"
+    },
+    {
+      "name": "sidebar_error",
+      "value": "エラー"
+    },
+    {
+      "name": "sidebar_expandAll",
+      "value": "すべて展開"
+    },
+    {
+      "name": "sidebar_expandSidebarAria",
+      "value": "サイドバーを展開"
+    },
+    {
+      "name": "sidebar_filesCountMany",
+      "value": "%d 件のファイル"
+    },
+    {
+      "name": "sidebar_filesCountOne",
+      "value": "1 件のファイル"
+    },
+    {
+      "name": "sidebar_filterActiveUnread",
+      "value": "実行中と未読"
+    },
+    {
+      "name": "sidebar_filterAll",
+      "value": "すべて"
+    },
+    {
+      "name": "sidebar_filterThreadsAria",
+      "value": "会話を絞り込む"
+    },
+    {
+      "name": "sidebar_filterThreadsPlaceholder",
+      "value": "会話を絞り込む…"
+    },
+    {
+      "name": "sidebar_fullDiff",
+      "value": "フル差分"
+    },
+    {
+      "name": "sidebar_hideDiffReview",
+      "value": "差分レビューを隠す"
+    },
+    {
+      "name": "sidebar_hostLocal",
+      "value": "ローカル"
+    },
+    {
+      "name": "sidebar_hostOffline",
+      "value": "ホストがオフライン · ホスト管理"
+    },
+    {
+      "name": "sidebar_hostRemote",
+      "value": "リモート"
+    },
+    {
+      "name": "sidebar_hostSelectProject",
+      "value": "%s · プロジェクトを選択"
+    },
+    {
+      "name": "sidebar_hostsCount",
+      "value": "%d 台のホスト"
+    },
+    {
+      "name": "sidebar_hostsOnline",
+      "value": "%2$d 台中 %1$d 台オンライン · ホスト管理"
+    },
+    {
+      "name": "sidebar_manageHosts",
+      "value": "ホストを管理"
+    },
+    {
+      "name": "sidebar_markRead",
+      "value": "既読にする"
+    },
+    {
+      "name": "sidebar_markUnread",
+      "value": "未読にする"
+    },
+    {
+      "name": "sidebar_moreActionsAria",
+      "value": "その他の操作"
+    },
+    {
+      "name": "sidebar_needsAttention",
+      "value": "要確認"
+    },
+    {
+      "name": "sidebar_newConversation",
+      "value": "新しい会話"
+    },
+    {
+      "name": "sidebar_newConversationInTarget",
+      "value": "%s で新しい会話を開始"
+    },
+    {
+      "name": "sidebar_newSessionHere",
+      "value": "ここで新規セッション"
+    },
+    {
+      "name": "sidebar_noActiveOrUnread",
+      "value": "実行中または未読の会話はありません"
+    },
+    {
+      "name": "sidebar_noHostConnected",
+      "value": "ホストが接続されていません"
+    },
+    {
+      "name": "sidebar_noHostShort",
+      "value": "ホストなし"
+    },
+    {
+      "name": "sidebar_noHostsBody",
+      "value": "リモートの Orbit デーモンをペアリングするかローカルデーモンに接続してワークスペースとセッションを表示します。"
+    },
+    {
+      "name": "sidebar_noHostsTitle",
+      "value": "ホスト未ペアリング"
+    },
+    {
+      "name": "sidebar_noMatchingThreads",
+      "value": "一致する会話がありません"
+    },
+    {
+      "name": "sidebar_noProjectsYet",
+      "value": "プロジェクトはまだありません"
+    },
+    {
+      "name": "sidebar_offlineReconnect",
+      "value": "オフライン · %s に再接続"
+    },
+    {
+      "name": "sidebar_openDrawerAria",
+      "value": "ナビゲーションドロワーを開く"
+    },
+    {
+      "name": "sidebar_openFolder",
+      "value": "フォルダを開く"
+    },
+    {
+      "name": "sidebar_pairHostAria",
+      "value": "ホストをペアリング"
+    },
+    {
+      "name": "sidebar_pairNewHost",
+      "value": "新しいホストをペアリング"
+    },
+    {
+      "name": "sidebar_pairRemoteHost",
+      "value": "リモートホストをペアリング (QR / URI)"
+    },
+    {
+      "name": "sidebar_personalAgentNeedsYou",
+      "value": "%d 件要対応"
+    },
+    {
+      "name": "sidebar_personalRouter",
+      "value": "パーソナルエージェント"
+    },
+    {
+      "name": "sidebar_pin",
+      "value": "ピン留め"
+    },
+    {
+      "name": "sidebar_pinProject",
+      "value": "プロジェクトをピン留め"
+    },
+    {
+      "name": "sidebar_pinned",
+      "value": "ピン留め"
+    },
+    {
+      "name": "sidebar_projects",
+      "value": "プロジェクト"
+    },
+    {
+      "name": "sidebar_running",
+      "value": "実行中"
+    },
+    {
+      "name": "sidebar_search",
+      "value": "検索"
+    },
+    {
+      "name": "sidebar_selectProject",
+      "value": "プロジェクトを選択"
+    },
+    {
+      "name": "sidebar_selectWorkspace",
+      "value": "ワークスペースを選択"
+    },
+    {
+      "name": "sidebar_settings",
+      "value": "設定"
+    },
+    {
+      "name": "sidebar_settingsAndHostsAria",
+      "value": "設定とホスト"
+    },
+    {
+      "name": "sidebar_show",
+      "value": "表示"
+    },
+    {
+      "name": "sidebar_showAllConversations",
+      "value": "すべての会話を表示"
+    },
+    {
+      "name": "sidebar_showingActiveUnread",
+      "value": "実行中と未読のみ表示"
+    },
+    {
+      "name": "sidebar_sortAndFilter",
+      "value": "並び替えとフィルタ"
+    },
+    {
+      "name": "sidebar_sortAndFilterAria",
+      "value": "プロジェクトの並び替えとフィルタ"
+    },
+    {
+      "name": "sidebar_sortBy",
+      "value": "並び替え"
+    },
+    {
+      "name": "sidebar_sortCustom",
+      "value": "カスタム"
+    },
+    {
+      "name": "sidebar_sortName",
+      "value": "名前"
+    },
+    {
+      "name": "sidebar_sortRecent",
+      "value": "最近"
+    },
+    {
+      "name": "sidebar_startConversation",
+      "value": "会話を開始"
+    },
+    {
+      "name": "sidebar_subagentRunning",
+      "value": "サブエージェント実行中"
+    },
+    {
+      "name": "sidebar_switchHostAria",
+      "value": "アクティブホストを切り替え"
+    },
+    {
+      "name": "sidebar_tapToPairHost",
+      "value": "タップしてホストをペアリング"
+    },
+    {
+      "name": "sidebar_timerArmed",
+      "value": "タイマー待機中"
+    },
+    {
+      "name": "sidebar_unpin",
+      "value": "ピン留めを外す"
+    },
+    {
+      "name": "sidebar_unpinProject",
+      "value": "プロジェクトのピン留めを解除"
+    },
+    {
+      "name": "sidebar_waitingForApproval",
+      "value": "承認待ち"
+    },
+    {
+      "name": "stage_delivery_dispatched",
+      "value": "配信済み"
+    },
+    {
+      "name": "stage_delivery_dropped",
+      "value": "破棄"
+    },
+    {
+      "name": "stage_delivery_queued",
+      "value": "待機中"
+    },
+    {
+      "name": "stage_delivery_settled",
+      "value": "完了"
+    },
+    {
+      "name": "stage_interrupt_and_continue",
+      "value": "中断して続行"
+    },
+    {
+      "name": "stage_interrupt_and_deliver",
+      "value": "中断して配信"
+    },
+    {
+      "name": "stage_lineage_parent",
+      "value": "親スレッド"
+    },
+    {
+      "name": "stage_lineage_peers",
+      "value": "ピア"
+    },
+    {
+      "name": "stage_lineage_subagents",
+      "value": "サブエージェント"
+    },
+    {
+      "name": "stage_load_older",
+      "value": "以前の履歴を読み込む"
+    },
+    {
+      "name": "stage_loading_older",
+      "value": "以前のターンを読み込み中…"
+    },
+    {
+      "name": "stage_offline_banner",
+      "value": "ホストはオフラインです · 再接続時に同期されます"
+    },
+    {
+      "name": "stage_reconnecting_banner",
+      "value": "ホストへ再接続中…"
+    },
+    {
+      "name": "sync_device_link_qr",
+      "value": "デバイス連携 QR"
+    },
+    {
+      "name": "sync_export_qr",
+      "value": "デバイス連携 QR を表示"
+    },
+    {
+      "name": "sync_github_device_flow",
+      "value": "GitHub でサインイン"
+    },
+    {
+      "name": "sync_huks_fallback",
+      "value": "アプリサンドボックス鍵"
+    },
+    {
+      "name": "sync_huks_hardware",
+      "value": "HUKS ハードウェア AES-256"
+    },
+    {
+      "name": "sync_huks_security",
+      "value": "鍵保護"
+    },
+    {
+      "name": "sync_manual_passphrase",
+      "value": "手動パスフレーズを必須にする"
+    },
+    {
+      "name": "sync_scan_device_link",
+      "value": "連携 QR をスキャン"
+    },
+    {
+      "name": "sync_title",
+      "value": "クラウド同期"
+    },
+    {
+      "name": "sync_zero_passphrase",
+      "value": "パスフレーズ不要の即時解除"
+    },
+    {
+      "name": "terminal_line_placeholder",
+      "value": "コマンドを入力して送信…"
+    },
+    {
+      "name": "terminal_mode_line",
+      "value": "行入力"
+    },
+    {
+      "name": "terminal_mode_raw",
+      "value": "Raw"
+    },
+    {
+      "name": "terminal_raw_placeholder",
+      "value": "生のキー入力を送信…"
+    },
+    {
+      "name": "terminal_spawn_shell",
+      "value": "シェルセッションを開始"
+    },
+    {
+      "name": "terminal_title",
+      "value": "PTY ターミナル"
+    },
+    {
+      "name": "time_daysShort",
+      "value": "%d日"
+    },
+    {
+      "name": "time_hoursMinutesShort",
+      "value": "%1$d時間%2$d分"
+    },
+    {
+      "name": "time_hoursShort",
+      "value": "%d時間"
+    },
+    {
+      "name": "time_justNow",
+      "value": "たった今"
+    },
+    {
+      "name": "time_minutesSecondsShort",
+      "value": "%1$d分%2$d秒"
+    },
+    {
+      "name": "time_minutesShort",
+      "value": "%d分"
+    },
+    {
+      "name": "time_secondsShort",
+      "value": "%d秒"
+    },
+    {
+      "name": "time_weeksShort",
+      "value": "%d週間"
+    },
+    {
+      "name": "topbar_conversationActions",
+      "value": "会話アクション"
+    },
+    {
+      "name": "topbar_export",
+      "value": "エクスポート…"
+    },
+    {
+      "name": "topbar_forkConversation",
+      "value": "会話をフォーク"
+    },
+    {
+      "name": "topbar_forkInWorktree",
+      "value": "Worktree でフォーク"
+    },
+    {
+      "name": "topbar_hideOverview",
+      "value": "概要を非表示"
+    },
+    {
+      "name": "topbar_showOverview",
+      "value": "概要を表示"
+    }
   ]
 }

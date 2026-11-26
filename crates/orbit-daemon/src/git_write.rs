@@ -284,7 +284,9 @@ pub(crate) async fn resolve_git_repo_context(cwd: &Path) -> Result<GitRepoContex
             canon_cwd.display()
         )));
     }
-    let raw_root = String::from_utf8_lossy(&top_out.stdout).trim().to_string();
+    let raw_root = String::from_utf8_lossy(&top_out.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
     if raw_root.is_empty() {
         return Err(GitWriteError::NotAGitRepo(
             "unable to determine git repository root".to_string(),

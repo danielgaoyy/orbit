@@ -115,9 +115,13 @@ export interface AgentCardDto {
   is_running: boolean;
   has_background_tasks?: boolean;
   has_armed_timers?: boolean;
+  has_running_subagents?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
+  parent_host_id?: string | null;
+  acp_agent_id?: string | null;
   archived_at_rfc3339?: string | null;
+  labels?: Record<string, string>;
   handle?: string | null;
   latest_seq: number;
   created_at_rfc3339?: string | null;
@@ -1032,6 +1036,12 @@ export interface SessionSubagentEntryDto {
   child_agent_id: string | null;
   provider_subagent_id?: string | null;
   last_seq: number;
+  host_id?: string | null;
+  host_name?: string | null;
+  parent_agent_id?: string | null;
+  parent_host_id?: string | null;
+  depth?: number;
+  lineage?: string[];
 }
 
 export interface SessionInsightsDto {
@@ -1690,8 +1700,11 @@ function stripHomePrefixToRel(normPath: string): string | null {
 }
 
 export function cwdPathsEquivalent(pathA: string, pathB: string): boolean {
-  let a = pathA.trim();
-  let b = pathB.trim();
+  if (pathA.trim().length === 0 || pathB.trim().length === 0) {
+    return pathA.trim() === pathB.trim();
+  }
+  let a = pathA;
+  let b = pathB;
   while (a.length > 1 && a.endsWith('/')) {
     a = a.substring(0, a.length - 1);
   }
@@ -1701,10 +1714,17 @@ export function cwdPathsEquivalent(pathA: string, pathB: string): boolean {
   if (a === b) {
     return true;
   }
-  const relA = stripHomePrefixToRel(a);
-  const relB = stripHomePrefixToRel(b);
-  if (relA !== null && relB !== null) {
-    return relA === relB;
+  // Only fall back to home-relative comparison when exactly one path uses `~` shorthand;
+  // two distinct absolute user directories (e.g. `/home/worker/project` vs `/home/pa/project`)
+  // are NEVER equivalent.
+  const aIsTilde = a === '~' || a.startsWith('~/');
+  const bIsTilde = b === '~' || b.startsWith('~/');
+  if (aIsTilde !== bIsTilde) {
+    const relA = stripHomePrefixToRel(a);
+    const relB = stripHomePrefixToRel(b);
+    if (relA !== null && relB !== null) {
+      return relA === relB;
+    }
   }
   return false;
 }
@@ -1925,6 +1945,18 @@ export interface PermissionBatchItemDto {
   permission_request_id: string;
 }
 
+export interface BatchPermissionSkipReasonDto {
+  agent_id: string;
+  permission_request_id: string;
+  reason: string;
+}
+
+export interface ResolvePermissionsBatchResultDto {
+  resolved_count: number;
+  skipped_count: number;
+  skipped_reasons?: BatchPermissionSkipReasonDto[];
+}
+
 export interface OverviewPendingApprovalItem {
   key: string;
   host_id: string;
@@ -2074,17 +2106,17 @@ export interface RouterHostCapabilitiesDto {
 
 export interface PersonalRouterConfigDto {
   enabled: boolean;
-  router_agent_id: string | null;
+  router_agent_id?: string | null;
   provider: string;
-  acp_agent_id: string | null;
-  model: string | null;
-  effort: string | null;
-  cwd: string | null;
+  acp_agent_id?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  cwd?: string | null;
   scope: string; // 'global_fleet' | 'local_host_only'
   pre_review_mode: string; // 'disabled' | 'medium_risk_only' | 'assist_only'
   share_host_hermes_memory: boolean;
-  soul_prompt_override: string | null;
-  external_webhook_url: string | null;
+  soul_prompt_override?: string | null;
+  external_webhook_url?: string | null;
   has_external_webhook_secret: boolean;
 }
 
@@ -2246,6 +2278,16 @@ export interface BriefingSinceLastVisitDto {
   auto_handled: number;
 }
 
+export interface BriefingGoalSnapshotDto {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  goal_id: string;
+  status: string;
+  objective: string;
+  updated_at_ms: number;
+}
+
 export interface PersonalAgentBriefingDto {
   personal_agent: BriefingAgentRefDto | null;
   needs_you: BriefingDecisionDto[];
@@ -2255,6 +2297,7 @@ export interface PersonalAgentBriefingDto {
   hosts: BriefingHostDto[];
   counts: BriefingCountsDto;
   since_last_visit: BriefingSinceLastVisitDto;
+  goal_snapshots?: BriefingGoalSnapshotDto[];
 }
 
 export interface AgentStageDeltaRequestDto {

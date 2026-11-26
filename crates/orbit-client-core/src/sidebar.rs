@@ -133,14 +133,13 @@ pub struct FleetSidebarParams<'a> {
 }
 
 pub fn normalize_project_path(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "~" {
+    if raw.trim().is_empty() || raw == "~" {
         return "~".to_string();
     }
-    if trimmed == "/" {
+    if raw == "/" {
         return "/".to_string();
     }
-    let clean = trimmed.trim_end_matches('/');
+    let clean = raw.trim_end_matches('/');
     if clean.is_empty() {
         "/".to_string()
     } else {

@@ -29,6 +29,10 @@
       "value": "#14161D"
     },
     {
+      "name": "icon_primary",
+      "value": "#14161D"
+    },
+    {
       "name": "orbit_ink_secondary",
       "value": "#4A5060"
     },
@@ -155,6 +159,102 @@
     {
       "name": "orbit_syntax_error",
       "value": "#C8283B"
+    },
+    {
+      "name": "orbit_avatar_arctic_fox_bg",
+      "value": "#E4EDF3"
+    },
+    {
+      "name": "orbit_avatar_barn_owl_bg",
+      "value": "#F3EDE2"
+    },
+    {
+      "name": "orbit_avatar_capybara_bg",
+      "value": "#F3EDE2"
+    },
+    {
+      "name": "orbit_avatar_corgi_bg",
+      "value": "#F3EDE2"
+    },
+    {
+      "name": "orbit_avatar_cream_alpaca_bg",
+      "value": "#F3EDE2"
+    },
+    {
+      "name": "orbit_avatar_emperor_penguin_bg",
+      "value": "#E4EDF3"
+    },
+    {
+      "name": "orbit_avatar_european_hedgehog_bg",
+      "value": "#F3EDE2"
+    },
+    {
+      "name": "orbit_avatar_giant_panda_bg",
+      "value": "#E7EFE9"
+    },
+    {
+      "name": "orbit_avatar_gray_chinchilla_bg",
+      "value": "#EDEBF2"
+    },
+    {
+      "name": "orbit_avatar_harbor_seal_bg",
+      "value": "#E5EFF2"
+    },
+    {
+      "name": "orbit_avatar_holland_lop_bg",
+      "value": "#F4E9E7"
+    },
+    {
+      "name": "orbit_avatar_husky_bg",
+      "value": "#E4EDF3"
+    },
+    {
+      "name": "orbit_avatar_koala_bg",
+      "value": "#E7EFE9"
+    },
+    {
+      "name": "orbit_avatar_mallard_duck_bg",
+      "value": "#E7EFE9"
+    },
+    {
+      "name": "orbit_avatar_orange_tabby_bg",
+      "value": "#F5ECE3"
+    },
+    {
+      "name": "orbit_avatar_raccoon_bg",
+      "value": "#EDEBF2"
+    },
+    {
+      "name": "orbit_avatar_red_fox_bg",
+      "value": "#F5ECE3"
+    },
+    {
+      "name": "orbit_avatar_red_panda_bg",
+      "value": "#F4E9E7"
+    },
+    {
+      "name": "orbit_avatar_red_squirrel_bg",
+      "value": "#F5ECE3"
+    },
+    {
+      "name": "orbit_avatar_russian_blue_bg",
+      "value": "#EDEBF2"
+    },
+    {
+      "name": "orbit_avatar_sea_otter_bg",
+      "value": "#E5EFF2"
+    },
+    {
+      "name": "orbit_avatar_shiba_inu_bg",
+      "value": "#F3EDE2"
+    },
+    {
+      "name": "orbit_avatar_sika_deer_bg",
+      "value": "#E7EFE9"
+    },
+    {
+      "name": "orbit_avatar_snowy_owl_bg",
+      "value": "#E4EDF3"
     }
   ]
 }

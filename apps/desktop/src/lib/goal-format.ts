@@ -1,6 +1,9 @@
-import type { GoalRunRecord } from "./orbit-ipc";
+import type { GoalRunRecord } from "./orbit-ipc.ts";
 
-export const GOAL_SUCCEEDED_AUTO_DISMISS_MS = 15_000;
+/** Brief completion dwell before a live-achieved goal banner auto-dismisses cleanly. */
+export const GOAL_SUCCEEDED_AUTO_DISMISS_MS = 4_000;
+/** Grace window so a goal that finished right before switching into a thread can still confirm once. */
+export const GOAL_SUCCEEDED_FRESH_HANDOFF_MS = 10_000;
 export const GOAL_SUCCEEDED_RECENT_WINDOW_MS = 120_000;
 
 /** Formats elapsed seconds in concise human units (`45s`, `4m 12s`, `2h 19m`, `1d 3h`). */

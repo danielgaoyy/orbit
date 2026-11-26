@@ -29,8 +29,14 @@ import { StageFindBar } from "@/components/stage/stage-find-bar";
 import { useStageFind } from "@/components/stage/use-stage-find";
 import { ChatOutlineRail, type OutlinePromptItem } from "@/components/stage/stage-outline-rail";
 import { resolveOutlinePrompts } from "@/lib/outline-rail";
+import {
+  PersonalAgentBriefingRail,
+  PersonalAgentStageAwayBanner,
+} from "@/components/personal-agent/personal-agent-briefing-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
 import { StreamStageActivityWave } from "@/components/stage/stage-activity-wave";
+import { selectIsSelectedAgentPersonalAgent } from "@/state/selectors/personal-agent-selectors";
+import { FileDropOverlay } from "@/components/ui/drag-feedback";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -41,6 +47,7 @@ import {
   type TimelineItemView,
   isAgentForegroundRunning,
 } from "@/lib/orbit-ipc";
+import { useFileDrop } from "@/lib/drag/use-file-drop";
 import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import {
@@ -174,17 +181,30 @@ const StageHydratingFallback = memo(function StageHydratingFallback({
   );
 });
 
+function stageDroppedComposerFiles(files: File[], container: HTMLElement | null) {
+  for (const file of files) void orbitActions.stageAndAttachFile(file);
+  container?.querySelector<HTMLTextAreaElement>('[data-orbit-composer-input="true"]')?.focus();
+}
+
 const NewSessionLaunchpad = memo(function NewSessionLaunchpad() {
   const { t } = useI18n();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const { isDraggingFiles, dropHandlers } = useFileDrop({
+    onDropFiles: (files) => stageDroppedComposerFiles(files, containerRef.current),
+  });
   return (
-    <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]">
+    <div
+      ref={containerRef}
+      {...dropHandlers}
+      className="orbit-stage-enter relative flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]"
+    >
       <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] flex-col gap-6">
         <h1 className="text-ink-primary px-1 text-center text-[24px] font-medium tracking-[-0.02em]">
           {t("composer.heroTitle")}
         </h1>
-
-        <OmniComposer variant="hero" />
+        <OmniComposer variant="hero" stageDraggingFiles={isDraggingFiles} externalDropSurface />
       </div>
+      <FileDropOverlay visible={isDraggingFiles} label={t("composer.dropToAttach")} />
     </div>
   );
 });
@@ -317,9 +337,11 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
 const StageDockedComposer = memo(function StageDockedComposer({
   scrollUiStore,
   hasPendingDecisions,
+  stageDraggingFiles,
 }: {
   scrollUiStore: StageScrollUiStore;
   hasPendingDecisions: boolean;
+  stageDraggingFiles: boolean;
 }) {
   const isOccludingText = useSyncExternalStore(
     scrollUiStore.subscribe,
@@ -331,6 +353,8 @@ const StageDockedComposer = memo(function StageDockedComposer({
       variant="docked"
       occluding={isOccludingText}
       hasPendingDecisions={hasPendingDecisions}
+      stageDraggingFiles={stageDraggingFiles}
+      externalDropSurface
     />
   );
 });
@@ -929,6 +953,7 @@ export function StreamStage() {
   const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const isPersonalAgentSession = useOrbitSelector(selectIsSelectedAgentPersonalAgent);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
@@ -2171,6 +2196,12 @@ export function StreamStage() {
     [overviewReservePx, overviewReserveTransition],
   );
 
+  const { isDraggingFiles: isStageDraggingFiles, dropHandlers: stageFileDropHandlers } =
+    useFileDrop({
+      disabled: !selectedHostId || isDraft || !selectedAgentId,
+      onDropFiles: (files) => stageDroppedComposerFiles(files, stageContainerRef.current),
+    });
+
   if (!selectedHostId) {
     if (!fleetHydrated) {
       return <StageHydratingFallback bootstrapError={bootstrapError} />;
@@ -2227,6 +2258,7 @@ export function StreamStage() {
   return (
     <div
       ref={stageContainerRef}
+      {...stageFileDropHandlers}
       data-orbit-stage="true"
       tabIndex={-1}
       style={
@@ -2263,6 +2295,17 @@ export function StreamStage() {
             <ForkedFromBanner hostId={selectedHostId} agent={currentAgent} />
           </div>
         </div>
+      )}
+
+      {/* Dismissible 1-line "While you were away" summary when viewing Personal Agent */}
+      {isPersonalAgentSession && selectedHostId && selectedAgentId && (
+        <PersonalAgentStageAwayBanner
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          overviewReservePx={overviewReservePx}
+          overviewReserveTransition={overviewReserveTransition}
+          stagePushStyle={stagePushStyle}
+        />
       )}
 
       {/* 1. Unified Scrollable Conversation Viewport + Floating Overlays */}
@@ -2441,6 +2484,7 @@ export function StreamStage() {
               <ComposerGoalShelf
                 hostId={selectedHostId}
                 agentId={selectedAgentId}
+                latestTurnAnchorSeq={latestTurn?.anchor_seq ?? null}
                 hasPendingDecisions={hasPendingDecisions}
               />
             )}
@@ -2458,22 +2502,32 @@ export function StreamStage() {
             <StageDockedComposer
               scrollUiStore={scrollUiStore}
               hasPendingDecisions={hasPendingDecisions}
+              stageDraggingFiles={isStageDraggingFiles}
             />
           </div>
         </div>
       </div>
 
-      {/* 3. Top-Right Viewport-Anchored Overview Card Overlay (to the left of the far-right scrollbar) */}
-      <StageOverviewPanel
-        canDock={canDockOverview}
-        hostId={selectedHostId}
-        agentId={selectedAgentId}
-        cwd={effectiveCwd}
-        insights={stageInsights}
-        sessionTurnDiffs={sessionTurnDiffs}
-        currentAgent={currentAgent}
-        stageContainerRef={stageContainerRef}
-      />
+      {/* 3. Top-Right Viewport-Anchored Rail (Personal Agent Briefing Rail vs Session Overview HUD) */}
+      {isPersonalAgentSession ? (
+        <PersonalAgentBriefingRail
+          canDock={canDockOverview}
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          stageContainerRef={stageContainerRef}
+        />
+      ) : (
+        <StageOverviewPanel
+          canDock={canDockOverview}
+          hostId={selectedHostId}
+          agentId={selectedAgentId}
+          cwd={effectiveCwd}
+          insights={stageInsights}
+          sessionTurnDiffs={sessionTurnDiffs}
+          currentAgent={currentAgent}
+          stageContainerRef={stageContainerRef}
+        />
+      )}
 
       <RewindTurnDialog
         hostId={selectedHostId}
@@ -2489,6 +2543,8 @@ export function StreamStage() {
         target={imagePreviewTarget}
         onClose={handleCloseImagePreview}
       />
+
+      <FileDropOverlay visible={isStageDraggingFiles} label={t("composer.dropToAttach")} />
     </div>
   );
 }

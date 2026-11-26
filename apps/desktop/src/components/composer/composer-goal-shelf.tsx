@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -20,8 +20,6 @@ import { IconButton } from "@/components/ui/icon-button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
-  GOAL_SUCCEEDED_AUTO_DISMISS_MS,
-  GOAL_SUCCEEDED_RECENT_WINDOW_MS,
   computeGoalElapsedSecs,
   countGoalCriteria,
   formatGoalDuration,
@@ -33,8 +31,17 @@ import type { GoalControlAction, GoalRunRecord } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { selectDockGoalForAgent } from "@/state/selectors/session-selectors";
+import {
+  GOAL_SUCCEEDED_AUTO_DISMISS_MS,
+  createDismissedGoalStore,
+  createGoalShelfCache,
+  reconcileGoalShelf,
+  type GoalShelfPreference,
+} from "./composer-goal-shelf-model";
 
-const dismissedSucceededGoalIds = new Set<string>();
+const sessionPreferences = createGoalShelfCache();
+const dismissedGoals = createDismissedGoalStore();
+const COLLAPSE_HOVER_RESYNC_MS = 220;
 
 const GoalElapsedLabel = memo(function GoalElapsedLabel({ goal }: { goal: GoalRunRecord }) {
   const isLive = goal.status === "running" || goal.status === "verifying";
@@ -66,75 +73,147 @@ function GoalStatusIcon({ status }: { status: GoalRunRecord["status"] }) {
 interface ComposerGoalShelfProps {
   hostId: string;
   agentId: string;
+  latestTurnAnchorSeq?: number | null;
   hasPendingDecisions: boolean;
 }
 
 export const ComposerGoalShelf = memo(function ComposerGoalShelf({
   hostId,
   agentId,
+  latestTurnAnchorSeq = null,
   hasPendingDecisions,
 }: ComposerGoalShelfProps) {
-  const goal = useOrbitSelector((s) => selectDockGoalForAgent(s.hostDetails[hostId], agentId));
-  const [dismissVersion, setDismissVersion] = useState(0);
-
-  const handleDismissSucceeded = useCallback((goalId: string) => {
-    dismissedSucceededGoalIds.add(goalId);
-    setDismissVersion((v) => v + 1);
-  }, []);
-
-  if (!goal) return null;
-
-  // Never show stale completed goals when reopening an old thread.
-  if (goal.status === "succeeded") {
-    if (dismissedSucceededGoalIds.has(goal.goal_id)) return null;
-    const finishedAt = goal.finished_at_ms ?? goal.updated_at_ms;
-    if (Date.now() - finishedAt > GOAL_SUCCEEDED_RECENT_WINDOW_MS) {
-      return null;
-    }
-  }
-
+  const scope = JSON.stringify([hostId, agentId]);
   return (
-    <VisibleGoalShelf
-      key={`${hostId}::${agentId}::${goal.goal_id}::${dismissVersion}`}
+    <SessionGoalShelf
+      key={scope}
+      scope={scope}
       hostId={hostId}
-      goal={goal}
+      agentId={agentId}
+      latestTurnAnchorSeq={latestTurnAnchorSeq}
       hasPendingDecisions={hasPendingDecisions}
-      onDismissSucceeded={handleDismissSucceeded}
     />
   );
 });
 
+function SessionGoalShelf({
+  scope,
+  hostId,
+  agentId,
+  latestTurnAnchorSeq,
+  hasPendingDecisions,
+}: {
+  scope: string;
+  hostId: string;
+  agentId: string;
+  latestTurnAnchorSeq: number | null;
+  hasPendingDecisions: boolean;
+}) {
+  const goal = useOrbitSelector((s) => selectDockGoalForAgent(s.hostDetails[hostId], agentId));
+  const [saved, setSaved] = useState<GoalShelfPreference | null>(() => sessionPreferences.get(scope));
+  const isDismissed = useCallback((goalId: string) => dismissedGoals.has(goalId), []);
+  const preference = reconcileGoalShelf(saved, goal, latestTurnAnchorSeq, isDismissed, Date.now());
+  if (preference !== saved) setSaved(preference);
+
+  useLayoutEffect(() => {
+    sessionPreferences.save(scope, preference);
+  }, [scope, preference]);
+
+  const handleDismissSucceeded = useCallback((goalId: string) => {
+    dismissedGoals.add(goalId);
+    setSaved((prev) =>
+      prev && prev.goalId === goalId
+        ? { ...prev, open: false, dismissed: true, settledLive: false }
+        : prev,
+    );
+  }, []);
+
+  if (!goal || !preference || preference.dismissed) return null;
+
+  const open = Boolean(preference.open && !hasPendingDecisions);
+
+  return (
+    <VisibleGoalShelf
+      key={goal.goal_id}
+      hostId={hostId}
+      goal={goal}
+      preference={preference}
+      open={open}
+      hasPendingDecisions={hasPendingDecisions}
+      onOpenChange={(nextOpen) => {
+        if (!hasPendingDecisions) {
+          setSaved({
+            ...preference,
+            open: nextOpen,
+            settledLive: nextOpen ? false : goal.status === "succeeded",
+          });
+        }
+      }}
+      onDismissSucceeded={handleDismissSucceeded}
+    />
+  );
+}
+
 function VisibleGoalShelf({
   hostId,
   goal,
+  preference,
+  open,
   hasPendingDecisions,
+  onOpenChange,
   onDismissSucceeded,
 }: {
   hostId: string;
   goal: GoalRunRecord;
+  preference: GoalShelfPreference;
+  open: boolean;
   hasPendingDecisions: boolean;
+  onOpenChange: (nextOpen: boolean) => void;
   onDismissSucceeded: (goalId: string) => void;
 }) {
   const { t } = useI18n();
-  const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [busyAction, setBusyAction] = useState<GoalControlAction | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
 
   const isRunning = goal.status === "running";
   const isVerifying = goal.status === "verifying";
   const isPaused = goal.status === "paused";
   const isSucceeded = goal.status === "succeeded";
   const isControllable = isGoalActiveOrPaused(goal.status);
-  const effectiveOpen = Boolean(open && !hasPendingDecisions);
 
-  // Auto-dismiss a live completion banner after a brief dwell unless inspected or hovered.
+  useLayoutEffect(() => {
+    if (!open && viewportRef.current?.contains(document.activeElement)) {
+      triggerRef.current?.focus({ preventScroll: true });
+    }
+  }, [open]);
+
   useEffect(() => {
-    if (!isSucceeded || effectiveOpen || hovered || hasPendingDecisions) return;
+    if (open) return;
+    // Re-sync hover after collapse so a stationary pointer in WebKit/Chromium never stalls auto-dismiss.
+    const syncHover = () => {
+      setHovered(Boolean(containerRef.current?.matches(":hover")));
+    };
+    const raf = window.requestAnimationFrame(syncHover);
+    const settleTimer = window.setTimeout(syncHover, COLLAPSE_HOVER_RESYNC_MS);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.clearTimeout(settleTimer);
+    };
+  }, [open]);
+
+  const shouldScheduleAutoDismiss = Boolean(
+    preference.settledLive && isSucceeded && !open && !hovered && !hasPendingDecisions,
+  );
+  useEffect(() => {
+    if (!shouldScheduleAutoDismiss) return;
     const timer = window.setTimeout(() => {
       onDismissSucceeded(goal.goal_id);
     }, GOAL_SUCCEEDED_AUTO_DISMISS_MS);
     return () => window.clearTimeout(timer);
-  }, [isSucceeded, effectiveOpen, hovered, hasPendingDecisions, goal.goal_id, onDismissSucceeded]);
+  }, [shouldScheduleAutoDismiss, goal.goal_id, onDismissSucceeded]);
 
   const handleControl = async (action: GoalControlAction) => {
     if (busyAction !== null) return;
@@ -158,11 +237,10 @@ function VisibleGoalShelf({
   return (
     <div className="w-full px-[24px] pb-2">
       <Collapsible
+        ref={containerRef}
         data-slot="composer-goal-shelf"
-        open={effectiveOpen}
-        onOpenChange={(next) => {
-          if (!hasPendingDecisions) setOpen(next);
-        }}
+        open={open}
+        onOpenChange={onOpenChange}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         className={cn(
@@ -178,7 +256,11 @@ function VisibleGoalShelf({
           )}
         >
           <CollapsibleTrigger
+            ref={triggerRef}
             aria-disabled={hasPendingDecisions || undefined}
+            onClick={(e) => {
+              if (e.detail > 0) e.currentTarget.blur();
+            }}
             className={cn(
               "group/goal flex min-h-[34px] min-w-0 flex-1 cursor-pointer items-center gap-2 pl-[14px] text-left text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50 aria-disabled:cursor-default",
               isControllable || isSucceeded ? "pr-2" : "pr-[14px]",
@@ -199,7 +281,7 @@ function VisibleGoalShelf({
             >
               {statusLabel}
             </span>
-            {!effectiveOpen && (
+            {!open && (
               <>
                 <span aria-hidden="true" className="shrink-0 text-ink-faint">·</span>
                 <span
@@ -212,7 +294,7 @@ function VisibleGoalShelf({
                 </span>
               </>
             )}
-            {effectiveOpen && <span className="min-w-0 flex-1" />}
+            {open && <span className="min-w-0 flex-1" />}
             {total > 0 && (
               <span
                 title={t("goal.criteriaProgress", { done: passed, total })}
@@ -233,6 +315,7 @@ function VisibleGoalShelf({
               <IconButton
                 size="xs"
                 tooltip={t("overview.verifyNow")}
+                tooltipSide="top"
                 disabled={busyAction !== null}
                 onClick={() => void handleControl("verify_now")}
               >
@@ -243,6 +326,7 @@ function VisibleGoalShelf({
               <IconButton
                 size="xs"
                 tooltip={isPaused ? t("overview.resumeGoal") : t("overview.pauseGoal")}
+                tooltipSide="top"
                 disabled={busyAction !== null}
                 onClick={() => void handleControl(isPaused ? "resume" : "pause")}
               >
@@ -253,6 +337,7 @@ function VisibleGoalShelf({
               <IconButton
                 size="xs"
                 tooltip={t("goal.editAction")}
+                tooltipSide="top"
                 disabled={busyAction !== null}
                 onClick={() => orbitActions.openGoalEditDialog(hostId, goal)}
               >
@@ -264,6 +349,7 @@ function VisibleGoalShelf({
                 size="xs"
                 tone="danger"
                 tooltip={t("overview.stopGoal")}
+                tooltipSide="top"
                 disabled={busyAction !== null}
                 onClick={() => void handleControl("cancel")}
               >
@@ -274,6 +360,7 @@ function VisibleGoalShelf({
               <IconButton
                 size="xs"
                 tooltip={t("plan.dismiss")}
+                tooltipSide="top"
                 onClick={() => onDismissSucceeded(goal.goal_id)}
               >
                 <X className="size-3" />
@@ -284,7 +371,10 @@ function VisibleGoalShelf({
 
         <CollapsibleContent className="motion-reduce:transition-none">
           <div className="border-t border-border-subtle/80">
-            <ScrollArea viewportClassName="max-h-[216px] overscroll-contain">
+            <ScrollArea
+              viewportRef={viewportRef}
+              viewportClassName="max-h-[216px] overscroll-contain"
+            >
               <div className="space-y-2.5 px-[14px] py-2.5 text-[13px] leading-[1.45]">
                 <p className="select-text whitespace-pre-wrap break-words text-ink-primary">
                   {goal.objective}
@@ -374,31 +464,6 @@ function VisibleGoalShelf({
                       )}
                   </div>
                 )}
-
-                <div className="flex items-center justify-between gap-2 pt-0.5 text-[11.5px] text-ink-tertiary">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono tabular-nums">
-                      {t("goal.turnCount", {
-                        current: goal.current_iteration,
-                        max: goal.max_iterations,
-                      })}
-                    </span>
-                    <span className="opacity-45">·</span>
-                    <GoalElapsedLabel goal={goal} />
-                  </div>
-                  {isControllable && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="xs"
-                      className="h-[22px] px-2 text-[11.5px] text-ink-secondary hover:text-ink-primary"
-                      onClick={() => orbitActions.openGoalEditDialog(hostId, goal)}
-                    >
-                      <Pencil className="mr-1 size-3" />
-                      {t("goal.editAction")}
-                    </Button>
-                  )}
-                </div>
               </div>
             </ScrollArea>
           </div>

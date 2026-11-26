@@ -248,6 +248,9 @@ function VisiblePlanShelf({
           <CollapsibleTrigger
             ref={triggerRef}
             aria-disabled={hasPendingDecisions || undefined}
+            onClick={(e) => {
+              if (e.detail > 0) e.currentTarget.blur();
+            }}
             className={cn(
               "group/plan flex min-h-[34px] min-w-0 flex-1 cursor-pointer items-center gap-2 pl-[14px] text-left text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50 aria-disabled:cursor-default",
               plan.canDismiss ? "pr-2" : "pr-[14px]",

@@ -2651,6 +2651,23 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
+    async resetWorkspaceBoard(
+      hostId: string,
+      workspaceId: string,
+      params?: { newGoal?: string | null; keepNotes?: string | null },
+    ): Promise<void> {
+      await orbitIpc.resetWorkspaceBoard({
+        hostId,
+        workspaceId,
+        newGoal: params?.newGoal ?? null,
+        keepNotes: params?.keepNotes ?? null,
+      });
+      await ctx.actions.fetchWorkspaceBoardAndEvents(hostId, workspaceId);
+      ctx.actions.refreshSidebarView();
+      notifyToast(t("board.resetSuccessToast"));
+    },
+
+
     async renameWorkspace(hostId: string, workspaceId: string, title: string): Promise<void> {
       const trimmed = title.trim();
       if (!trimmed) return;

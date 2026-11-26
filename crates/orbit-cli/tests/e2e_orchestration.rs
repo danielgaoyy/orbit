@@ -2042,5 +2042,327 @@ async fn scenario_11_personal_router_cross_host_project_context_and_dispatch() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_12_session_sovereignty_router_dispatch_reclaim_and_board_reset() {
+    ensure_mock_claude_installed();
+    let home_a = new_temp_dir("orbit_e2e_s12_home_a");
+    let home_b = new_temp_dir("orbit_e2e_s12_home_b");
+    let repo_a = new_temp_dir("orbit_e2e_s12_repo_a");
+    let repo_b = new_temp_dir("orbit_e2e_s12_repo_b");
+    init_temp_git_repo(&repo_a);
+    init_temp_git_repo(&repo_b);
+
+    let (_addr_a, rt_a) = spawn_embedded_daemon(home_a.to_path_buf(), None)
+        .await
+        .expect("daemon A");
+    let (addr_b, rt_b) = spawn_embedded_daemon(home_b.to_path_buf(), None)
+        .await
+        .expect("daemon B");
+
+    let offer_b = rt_b
+        .build_pairing_offer(vec![format!("ws://{addr_b}/ws")], None)
+        .expect("pairing offer b");
+    let uri_b = offer_b.to_qr_uri().expect("pair uri b");
+    rt_a.connected_hosts
+        .add_from_pairing_uri(Some("Linux-Worker-B".into()), &uri_b)
+        .await
+        .expect("add peer B");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            rt_a.connected_hosts.list_summaries().await.iter().any(|h| {
+                h.host_id.as_deref() == Some(rt_b.host_info.host_id.as_str())
+                    && h.status == ConnectedHostStatus::Online
+            })
+        })
+        .await,
+        "Daemon A must connect to Daemon B"
+    );
+
+    // 1. Create a curated Workspace on Host B + test bidirectional Goal <-> BOARD.md sync & reset_board
+    let ws_create = orbit_daemon::tools::execute_tool(
+        &rt_b,
+        None,
+        "orbit_workspace",
+        serde_json::json!({
+            "action": "create",
+            "cwd": repo_b.to_string_lossy().to_string(),
+            "title": "Auth Platform",
+            "goal": "Phase 1: OAuth Token Exchange"
+        }),
+    )
+    .await;
+    assert!(
+        !ws_create.is_error,
+        "create workspace B: {}",
+        ws_create.text
+    );
+    let ws_b_id = ws_create
+        .structured
+        .get("workspace")
+        .and_then(|w| w.get("workspace_id"))
+        .and_then(|v| v.as_str())
+        .expect("ws_b_id")
+        .to_string();
+
+    // Record substantive notes on BOARD.md, then update_goal and verify bidirectional sync
+    let note_exec = orbit_daemon::tools::execute_tool(
+        &rt_b,
+        None,
+        "workspace_board",
+        serde_json::json!({
+            "action": "update",
+            "workspace_id": ws_b_id,
+            "section": "Decisions & Contracts",
+            "content": "- Phase 1 PKCE flow shipped"
+        }),
+    )
+    .await;
+    assert!(!note_exec.is_error, "update board B: {}", note_exec.text);
+
+    let goal_exec = orbit_daemon::tools::execute_tool(
+        &rt_b,
+        None,
+        "orbit_workspace",
+        serde_json::json!({
+            "action": "update_goal",
+            "workspace_id": ws_b_id,
+            "goal": "Phase 1.5: Refresh Token Rotation"
+        }),
+    )
+    .await;
+    assert!(!goal_exec.is_error, "update_goal B: {}", goal_exec.text);
+    let synced_board = rt_b
+        .store
+        .get_workspace_board(&ws_b_id)
+        .expect("board")
+        .expect("board exists");
+    assert!(
+        synced_board
+            .content
+            .contains("Phase 1.5: Refresh Token Rotation"),
+        "BOARD.md must sync when workspace goal updates: {}",
+        synced_board.content
+    );
+
+    // 2. Activate Personal Router on Host A and dispatch BOTH a local Conversation & a remote Conversation
+    let router_snap = rt_a
+        .personal_router
+        .configure(
+            orbit_protocol::PersonalRouterConfig {
+                enabled: true,
+                provider: ProviderKind::ClaudeCode,
+                cwd: Some(repo_a.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+            None,
+            true,
+        )
+        .await
+        .expect("activate router");
+    let router_agent = router_snap.router_agent.expect("router agent");
+    assert_eq!(
+        router_agent.session_tier(),
+        orbit_protocol::SessionTier::PersonalRouter
+    );
+
+    let local_routed_exec = orbit_daemon::tools::execute_tool(
+        &rt_a,
+        Some(&router_agent.agent_id),
+        "dispatch_conversation",
+        serde_json::json!({
+            "cwd": repo_a.to_string_lossy().to_string(),
+            "provider": "claude_code",
+            "mode": "accept_edits",
+            "title": "Local Router Dispatched Thread",
+            "initial_prompt": "[MOCK:QUICK] local-routed-complete",
+            "notify_on_finish": true
+        }),
+    )
+    .await;
+    assert!(
+        !local_routed_exec.is_error,
+        "local dispatch_conversation failed: {}",
+        local_routed_exec.text
+    );
+    let local_routed_id = local_routed_exec
+        .structured
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .expect("local_routed_id")
+        .to_string();
+    let local_routed = rt_a
+        .store
+        .get_agent(&local_routed_id)
+        .expect("get")
+        .expect("exists");
+    assert!(
+        local_routed.parent_agent_id.is_none(),
+        "Local Router-dispatched thread must NOT set parent_agent_id (must appear in Sidebar)"
+    );
+    assert!(local_routed.is_primary_conversation());
+    assert_eq!(
+        local_routed.routed_by_agent_id(),
+        Some(router_agent.agent_id.as_str())
+    );
+
+    // Local routed thread still wakes Router via FinishNotification (`routed_by` ownership)
+    assert!(
+        wait_until(Duration::from_secs(15), || async {
+            rt_a.store
+                .fetch_timeline_since(&router_agent.agent_id, 0, 500)
+                .map(|(evs, _)| {
+                    evs.iter().any(|e| {
+                        matches!(
+                            &e.payload,
+                            TimelinePayload::AgentMessage {
+                                kind: AgentMessageKind::FinishNotification,
+                                source_agent_id: Some(src),
+                                ..
+                            } if src == &local_routed_id
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .await,
+        "Local routed Conversation must deliver FinishNotification to PersonalRouter"
+    );
+
+    // 3. Regular Worker Conversation spawns a local worktree subagent AND a cross-host subagent:
+    //    both must be strictly `SessionTier::Subagent`, and archiving the worker must NOT detach/promote the worktree subagent!
+    let local_wt_sub_exec = orbit_daemon::tools::execute_tool(
+        &rt_a,
+        Some(&local_routed_id),
+        "create_agent",
+        serde_json::json!({
+            "cwd": repo_a.to_string_lossy().to_string(),
+            "provider": "claude_code",
+            "mode": "accept_edits",
+            "worktree": true,
+            "title": "Internal Worktree Subagent",
+            "initial_prompt": "[MOCK:QUICK] wt-sub-done"
+        }),
+    )
+    .await;
+    assert!(!local_wt_sub_exec.is_error, "{}", local_wt_sub_exec.text);
+    let local_wt_sub_id = local_wt_sub_exec
+        .structured
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .expect("local_wt_sub_id")
+        .to_string();
+
+    let remote_sub_exec = orbit_daemon::tools::execute_tool(
+        &rt_a,
+        Some(&local_routed_id),
+        "create_agent",
+        serde_json::json!({
+            "host_id": rt_b.host_info.host_id,
+            "cwd": repo_b.to_string_lossy().to_string(),
+            "workspace_id": ws_b_id,
+            "provider": "claude_code",
+            "mode": "accept_edits",
+            "title": "Cross-Host Subagent On B",
+            "initial_prompt": "[MOCK:QUICK] remote-sub-done"
+        }),
+    )
+    .await;
+    assert!(!remote_sub_exec.is_error, "{}", remote_sub_exec.text);
+    let remote_sub_id = remote_sub_exec
+        .structured
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .expect("remote_sub_id")
+        .to_string();
+    let remote_sub = rt_b
+        .store
+        .get_agent(&remote_sub_id)
+        .expect("get")
+        .expect("exists");
+    assert!(
+        remote_sub.is_subagent(),
+        "Cross-host child spawned by regular Conversation must be locked to Subagent"
+    );
+
+    // Fleet Atlas on Host A must include Host B's Workspace & Goal, and EXCLUDE `remote_sub_id`!
+    rt_a.personal_router.reset_fleet_context_state().await;
+    let fleet_xml = rt_a
+        .personal_router
+        .build_fleet_context_incremental(&router_agent.agent_id)
+        .await
+        .expect("fleet xml");
+    assert!(
+        fleet_xml.contains("Phase 1.5: Refresh Token Rotation"),
+        "Fleet state must surface remote curated Workspace Goal: {fleet_xml}"
+    );
+    assert!(
+        !fleet_xml.contains(&remote_sub_id),
+        "Fleet state must NEVER leak cross-host Subagents: {fleet_xml}"
+    );
+
+    // 4. Reclaim `local_routed_id` explicitly; verify `local_wt_sub_id` stays Subagent (not promoted!)
+    let reclaim_exec = orbit_daemon::tools::execute_tool(
+        &rt_a,
+        Some(&router_agent.agent_id),
+        "reclaim_conversation",
+        serde_json::json!({
+            "agent_id": local_routed_id,
+            "summary_note": "Completed local routing verification"
+        }),
+    )
+    .await;
+    assert!(!reclaim_exec.is_error, "{}", reclaim_exec.text);
+    assert!(
+        rt_a.store
+            .get_agent(&local_routed_id)
+            .expect("get")
+            .expect("some")
+            .archived_at
+            .is_some()
+    );
+    let wt_sub_after = rt_a
+        .store
+        .get_agent(&local_wt_sub_id)
+        .expect("get")
+        .expect("some");
+    assert!(
+        wt_sub_after.is_subagent() && wt_sub_after.parent_agent_id.is_some(),
+        "Archiving parent must NEVER detach/promote worktree subagent into Sidebar Conversation"
+    );
+
+    // 5. Reset Workspace B's board for Milestone 2: archives old notes to BOARD.history.md
+    let reset_exec = orbit_daemon::tools::execute_tool(
+        &rt_b,
+        None,
+        "orbit_workspace",
+        serde_json::json!({
+            "action": "reset_board",
+            "workspace_id": ws_b_id,
+            "new_goal": "Phase 2: Passkey WebAuthn",
+            "keep_notes": "- Keep zero-downtime token compatibility"
+        }),
+    )
+    .await;
+    assert!(!reset_exec.is_error, "reset_board B: {}", reset_exec.text);
+    let ws_b_after = rt_b
+        .store
+        .get_workspace(&ws_b_id)
+        .expect("ws")
+        .expect("ws exists");
+    assert_eq!(
+        ws_b_after.mission_goal.as_deref(),
+        Some("Phase 2: Passkey WebAuthn")
+    );
+    let history_path = home_b
+        .join("workspaces")
+        .join(&ws_b_id)
+        .join("BOARD.history.md");
+    let history_md = std::fs::read_to_string(&history_path).expect("BOARD.history.md must exist");
+    assert!(
+        history_md.contains("Phase 1 PKCE flow shipped"),
+        "Previous board notes must be preserved in BOARD.history.md: {history_md}"
+    );
+}
+
 #[path = "plugins/lifecycle.rs"]
 mod plugin_lifecycle;

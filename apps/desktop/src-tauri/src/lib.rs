@@ -1080,6 +1080,22 @@ fn detach_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: St
 }
 
 #[tauri::command]
+fn harvest_conversation(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    summary_note: Option<String>,
+    append_to_workspace_board: Option<bool>,
+) {
+    state.core.harvest_conversation(
+        &host_id,
+        &agent_id,
+        summary_note,
+        append_to_workspace_board.unwrap_or(false),
+    );
+}
+
+#[tauri::command]
 async fn mark_agent_read(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -1169,6 +1185,19 @@ fn update_workspace_goal(
     state
         .core
         .update_workspace_goal(&host_id, &workspace_id, goal);
+}
+
+#[tauri::command]
+fn reset_workspace_board(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    new_goal: Option<String>,
+    keep_notes: Option<String>,
+) {
+    state
+        .core
+        .reset_workspace_board(&host_id, &workspace_id, new_goal, keep_notes);
 }
 
 #[tauri::command]
@@ -5308,6 +5337,7 @@ pub fn run() {
             unarchive_agent,
             delete_agent,
             detach_agent,
+            harvest_conversation,
             mark_agent_read,
             update_agent,
             fetch_workspace_board,
@@ -5316,6 +5346,7 @@ pub fn run() {
             fetch_workspace_events,
             get_workspace_events,
             update_workspace_goal,
+            reset_workspace_board,
             move_agent_to_workspace,
             move_agent_to_workspace_v2,
             organize_project_workspaces,

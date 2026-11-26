@@ -77,6 +77,164 @@ pub struct SemanticIdentityOptions {
     pub force_title: bool,
 }
 
+/// Atomic outcome of [`OrbitStore::reset_workspace_board`], returning any non-empty previous board
+/// Markdown so the caller can append a timestamped archive entry to `BOARD.history.md` on disk.
+#[derive(Debug, Clone)]
+pub struct ResetWorkspaceBoardOutcome {
+    pub previous_content: Option<String>,
+    pub previous_revision: u64,
+    pub board: WorkspaceBoardSnapshot,
+    pub workspace: WorkspaceSummary,
+}
+
+pub const DEFAULT_BOARD_GOAL_PLACEHOLDER: &str = "Coordinate peers in this Mission Workspace.";
+
+/// Build the canonical default Shared Blackboard Markdown for a Mission Workspace, optionally
+/// including a `## Standing Notes` section when resetting a long-lived workspace.
+pub fn build_clean_board_markdown(
+    title: &str,
+    mission_goal: Option<&str>,
+    keep_notes: Option<&str>,
+) -> String {
+    let goal_line = mission_goal
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BOARD_GOAL_PLACEHOLDER);
+    let mut out = format!("# {title}\n\n## Goal\n{goal_line}\n");
+    if let Some(notes) = keep_notes.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("\n## Standing Notes\n{notes}\n"));
+    }
+    out.push_str(
+        "\n## Decisions & Contracts\n- (Record shared APIs, invariants, and architectural decisions here)\n\n## Tasks\n- (Track peer ownership and status here)\n\n## Findings\n- (Record review findings and verification results here)\n",
+    );
+    out
+}
+
+/// Upsert a `## <section>` Markdown section inside `existing`, replacing its body if present
+/// or appending a new `## <section>` block at the end if absent.
+pub fn upsert_board_markdown_section(existing: &str, section_name: &str, body: &str) -> String {
+    let clean_sec = section_name.trim().trim_start_matches('#').trim();
+    if clean_sec.is_empty() {
+        return body.to_string();
+    }
+    let clean_body = body.trim();
+    let target_lower = clean_sec.to_ascii_lowercase();
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut start_idx: Option<usize> = None;
+    let mut end_idx: usize = lines.len();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            let heading = rest.trim().to_ascii_lowercase();
+            if start_idx.is_none() {
+                if heading == target_lower {
+                    start_idx = Some(idx);
+                }
+            } else {
+                end_idx = idx;
+                break;
+            }
+        } else if start_idx.is_some() && trimmed.starts_with("# ") {
+            end_idx = idx;
+            break;
+        }
+    }
+
+    if let Some(start) = start_idx {
+        let mut out: Vec<String> = Vec::with_capacity(lines.len() + 4);
+        for l in &lines[..start] {
+            out.push((*l).to_string());
+        }
+        out.push(format!("## {clean_sec}"));
+        if !clean_body.is_empty() {
+            out.push(clean_body.to_string());
+        }
+        if end_idx < lines.len() {
+            out.push(String::new());
+            for l in &lines[end_idx..] {
+                out.push((*l).to_string());
+            }
+        }
+        let mut joined = out.join("\n");
+        if !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined
+    } else {
+        let mut out = existing.trim_end().to_string();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("## {clean_sec}\n"));
+        if !clean_body.is_empty() {
+            out.push_str(clean_body);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Extract a non-boilerplate `## Goal` / `## Mission Goal` / `## 目标` value from `BOARD.md`.
+/// Returns `Some(None)` if an explicit Goal section was cleared to empty/boilerplate,
+/// `Some(Some(goal))` if a concrete goal is present, or `None` if no Goal heading exists in `raw`.
+pub fn extract_goal_section_from_board(raw: &str) -> Option<Option<String>> {
+    let mut in_goal = false;
+    let mut goal_lines: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            let h = rest.trim().to_ascii_lowercase();
+            if in_goal {
+                break;
+            }
+            if h == "goal" || h == "mission goal" || rest.trim() == "目标" {
+                in_goal = true;
+                continue;
+            }
+        } else if in_goal && trimmed.starts_with("# ") {
+            break;
+        } else if in_goal {
+            goal_lines.push(line);
+        }
+    }
+    if !in_goal {
+        return None;
+    }
+    let joined = goal_lines.join("\n");
+    let cleaned = joined.trim().trim_start_matches(['-', '*', '•']).trim();
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case(DEFAULT_BOARD_GOAL_PLACEHOLDER) {
+        Some(None)
+    } else {
+        Some(Some(cleaned.to_string()))
+    }
+}
+
+/// Returns `true` if `content` contains substantive user/agent notes beyond the default boilerplate.
+pub fn board_has_substantive_content(content: &str) -> bool {
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let body = t.trim_start_matches(['-', '*', '•']).trim();
+        if body.is_empty() {
+            continue;
+        }
+        let lower = body.to_ascii_lowercase();
+        if lower == DEFAULT_BOARD_GOAL_PLACEHOLDER.to_ascii_lowercase()
+            || lower.starts_with("(record shared apis")
+            || lower.starts_with("(track peer ownership")
+            || lower.starts_with("(record review findings")
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 pub(crate) fn migrate_sync_and_mission_schema(
     conn: &rusqlite::Connection,
 ) -> Result<(), StoreError> {
@@ -84,6 +242,7 @@ pub(crate) fn migrate_sync_and_mission_schema(
         "ALTER TABLE workspaces ADD COLUMN mission_goal TEXT",
         "ALTER TABLE workspaces ADD COLUMN project_root TEXT",
         "ALTER TABLE workspaces ADD COLUMN board_revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workspaces ADD COLUMN board_reset_seq INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workspaces ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workspaces ADD COLUMN auto_clustered INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workspaces ADD COLUMN is_curated INTEGER NOT NULL DEFAULT 0",
@@ -148,6 +307,88 @@ pub(crate) fn migrate_sync_and_mission_schema(
             ON workspace_events(workspace_id, file_path, created_at DESC);
         ",
     )?;
+    backfill_legacy_session_tiers(conn)?;
+    Ok(())
+}
+
+/// Idempotent startup backfill ensuring every legacy `agents` row carries an authoritative
+/// `orbit.session_tier` label, and rescuing legacy local conversations dispatched by a
+/// `PersonalRouter` that previously got hidden under `parent_agent_id = router_id`.
+fn backfill_legacy_session_tiers(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+    type LegacyRow = (String, Option<String>, Option<String>, i32, String);
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, parent_agent_id, parent_host_id, background, labels_json FROM agents",
+    )?;
+    let rows: Vec<LegacyRow> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut router_ids = std::collections::HashSet::new();
+    for (aid, _, _, _, labels_raw) in &rows {
+        if let Ok(labels) =
+            serde_json::from_str::<std::collections::HashMap<String, String>>(labels_raw)
+            && labels
+                .get(orbit_protocol::LABEL_AGENT_ROLE)
+                .is_some_and(|v| {
+                    orbit_protocol::AgentRole::from_slug(v)
+                        == orbit_protocol::AgentRole::PersonalRouter
+                })
+        {
+            router_ids.insert(aid.clone());
+        }
+    }
+
+    for (aid, parent_id, parent_host, bg, labels_raw) in rows {
+        let mut labels: std::collections::HashMap<String, String> =
+            serde_json::from_str(&labels_raw).unwrap_or_default();
+        if labels.contains_key(orbit_protocol::LABEL_SESSION_TIER) {
+            continue;
+        }
+        let is_router = router_ids.contains(&aid);
+        // Rescue legacy same-host sessions spawned by PersonalRouter (`parent_agent_id == router_id`)
+        // so they surface as proper user-visible Conversations with `orbit.routed_by_agent`.
+        if bg == 0
+            && !is_router
+            && parent_host.is_none()
+            && let Some(ref pid) = parent_id
+            && router_ids.contains(pid)
+        {
+            labels.insert(orbit_protocol::LABEL_ROUTED_BY_AGENT.into(), pid.clone());
+            labels.insert(
+                orbit_protocol::LABEL_SESSION_TIER.into(),
+                orbit_protocol::SESSION_TIER_CONVERSATION.into(),
+            );
+            let next_json = serde_json::to_string(&labels)?;
+            conn.execute(
+                "UPDATE agents SET parent_agent_id = NULL, labels_json = ?1 WHERE agent_id = ?2",
+                params![next_json, aid],
+            )?;
+            continue;
+        }
+
+        let tier = orbit_protocol::resolve_session_tier(bg != 0, parent_id.as_deref(), &labels);
+        labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.into(),
+            tier.slug().to_string(),
+        );
+        let next_json = serde_json::to_string(&labels)?;
+        conn.execute(
+            "UPDATE agents SET labels_json = ?1 WHERE agent_id = ?2",
+            params![next_json, aid],
+        )?;
+    }
     Ok(())
 }
 
@@ -603,6 +844,8 @@ impl OrbitStore {
     }
 
     /// Update Mission Workspace title, goal, and optional `title_locked` flag.
+    /// When `mission_goal` is supplied and a `workspace_boards` row already exists, its `## Goal`
+    /// section is updated atomically inside the same SQLite transaction so DB and `BOARD.md` never diverge.
     pub fn update_workspace_goal(
         &self,
         workspace_id: &str,
@@ -611,22 +854,79 @@ impl OrbitStore {
         title_locked: Option<bool>,
         auto_clustered: Option<bool>,
     ) -> Result<Option<WorkspaceSummary>, StoreError> {
+        let (ws, _) = self.update_workspace_goal_and_board(
+            workspace_id,
+            title,
+            mission_goal,
+            title_locked,
+            auto_clustered,
+        )?;
+        Ok(ws)
+    }
+
+    /// Atomically update `workspaces.{title, mission_goal}` and synchronize any persisted
+    /// `workspace_boards` row's `## Goal` section in the same transaction, returning both updated snapshots.
+    pub fn update_workspace_goal_and_board(
+        &self,
+        workspace_id: &str,
+        title: Option<&str>,
+        mission_goal: Option<&str>,
+        title_locked: Option<bool>,
+        auto_clustered: Option<bool>,
+    ) -> Result<(Option<WorkspaceSummary>, Option<WorkspaceBoardSnapshot>), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
         if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
             tx.execute(
                 "UPDATE workspaces SET title = ?1, is_curated = 1, updated_at = ?2 WHERE workspace_id = ?3",
-                params![t, now, workspace_id],
+                params![t, now_str, workspace_id],
             )?;
         }
+        let mut synced_board: Option<WorkspaceBoardSnapshot> = None;
         if let Some(g) = mission_goal {
             let clean = g.trim();
             let val = (!clean.is_empty()).then_some(clean);
             tx.execute(
                 "UPDATE workspaces SET mission_goal = ?1, is_curated = 1, updated_at = ?2 WHERE workspace_id = ?3",
-                params![val, now, workspace_id],
+                params![val, now_str, workspace_id],
             )?;
+            // Keep persisted `workspace_boards` `## Goal` section in lockstep when a board row exists.
+            type BoardRow = (String, i64, Option<String>, Option<String>);
+            let board_row: Option<BoardRow> = tx
+                .query_row(
+                    "SELECT content, revision, updated_by, board_path
+                     FROM workspace_boards WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((cur_content, cur_rev, cur_by, cur_path)) = board_row {
+                let goal_body = val.unwrap_or(DEFAULT_BOARD_GOAL_PLACEHOLDER);
+                let next_content = upsert_board_markdown_section(&cur_content, "Goal", goal_body);
+                if next_content != cur_content {
+                    let next_rev = cur_rev.max(0).saturating_add(1);
+                    tx.execute(
+                        "UPDATE workspace_boards
+                         SET content = ?1, revision = ?2, updated_at = ?3
+                         WHERE workspace_id = ?4",
+                        params![next_content, next_rev, now_str, workspace_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE workspaces SET board_revision = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+                        params![next_rev, now_str, workspace_id],
+                    )?;
+                    synced_board = Some(WorkspaceBoardSnapshot {
+                        workspace_id: workspace_id.to_string(),
+                        content: next_content,
+                        revision: next_rev as u64,
+                        updated_by: cur_by,
+                        updated_at: now,
+                        board_path: cur_path,
+                    });
+                }
+            }
         }
         if let Some(locked) = title_locked {
             tx.execute(
@@ -646,7 +946,7 @@ impl OrbitStore {
             .query_row(&select_sql, params![workspace_id], map_workspace_row)
             .optional()?;
         tx.commit()?;
-        Ok(updated)
+        Ok((updated, synced_board))
     }
 
     // --- Host-Authoritative Projects & Ordering Sync ---
@@ -1016,10 +1316,17 @@ impl OrbitStore {
                 now_str
             ],
         )?;
-        tx.execute(
-            "UPDATE workspaces SET board_revision = ?1, updated_at = ?2 WHERE workspace_id = ?3",
-            params![next_rev, now_str, workspace_id],
-        )?;
+        if let Some(extracted_goal) = extract_goal_section_from_board(&final_content) {
+            tx.execute(
+                "UPDATE workspaces SET board_revision = ?1, mission_goal = ?2, is_curated = 1, updated_at = ?3 WHERE workspace_id = ?4",
+                params![next_rev, extracted_goal, now_str, workspace_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE workspaces SET board_revision = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+                params![next_rev, now_str, workspace_id],
+            )?;
+        }
         let final_path: Option<String> = tx
             .query_row(
                 "SELECT board_path FROM workspace_boards WHERE workspace_id = ?1",
@@ -1037,6 +1344,124 @@ impl OrbitStore {
             updated_at: now,
             board_path: final_path,
         }))
+    }
+
+    /// Atomically reset a workspace's Shared Blackboard (`BOARD.md`) for a new objective while
+    /// preserving sidebar Conversations, returning any substantive previous board content for
+    /// on-disk `BOARD.history.md` archiving and advancing `board_reset_seq` so prior file edits
+    /// no longer trigger stale conflict warnings or stale auto-clustering matches.
+    pub fn reset_workspace_board(
+        &self,
+        workspace_id: &str,
+        new_goal: Option<&str>,
+        keep_notes: Option<&str>,
+        updated_by: Option<&str>,
+        board_path: Option<&str>,
+    ) -> Result<ResetWorkspaceBoardOutcome, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+
+        let ws_title: String = tx
+            .query_row(
+                "SELECT title FROM workspaces WHERE workspace_id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidArgument(format!("workspace `{workspace_id}` not found"))
+            })?;
+
+        let existing_row: Option<(String, i64, Option<String>)> = tx
+            .query_row(
+                "SELECT content, revision, board_path FROM workspace_boards WHERE workspace_id = ?1",
+                params![workspace_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let prev_rev = existing_row
+            .as_ref()
+            .map(|r| r.1.max(0) as u64)
+            .unwrap_or(0);
+        let previous_content = existing_row
+            .as_ref()
+            .map(|r| r.0.clone())
+            .filter(|c| board_has_substantive_content(c));
+
+        let clean_goal = new_goal.map(str::trim).filter(|s| !s.is_empty());
+        let fresh_content = build_clean_board_markdown(&ws_title, clean_goal, keep_notes);
+        let next_rev = (prev_rev as i64).saturating_add(1);
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        let max_event_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM workspace_events WHERE workspace_id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        tx.execute(
+            "INSERT INTO workspace_boards (
+                workspace_id, content, revision, updated_by, board_path, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                content = excluded.content,
+                revision = excluded.revision,
+                updated_by = excluded.updated_by,
+                board_path = COALESCE(excluded.board_path, workspace_boards.board_path),
+                updated_at = excluded.updated_at",
+            params![
+                workspace_id,
+                fresh_content,
+                next_rev,
+                updated_by,
+                board_path,
+                now_str
+            ],
+        )?;
+
+        tx.execute(
+            "UPDATE workspaces
+             SET mission_goal = ?1,
+                 board_revision = ?2,
+                 board_reset_seq = ?3,
+                 is_curated = 1,
+                 updated_at = ?4
+             WHERE workspace_id = ?5",
+            params![clean_goal, next_rev, max_event_seq, now_str, workspace_id],
+        )?;
+
+        let final_path: Option<String> = tx
+            .query_row(
+                "SELECT board_path FROM workspace_boards WHERE workspace_id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let select_sql =
+            format!("SELECT {WORKSPACE_SELECT_COLS} FROM workspaces WHERE workspace_id = ?1");
+        let updated_ws = tx.query_row(&select_sql, params![workspace_id], map_workspace_row)?;
+
+        tx.commit()?;
+
+        Ok(ResetWorkspaceBoardOutcome {
+            previous_content,
+            previous_revision: prev_rev,
+            board: WorkspaceBoardSnapshot {
+                workspace_id: workspace_id.to_string(),
+                content: fresh_content,
+                revision: next_rev as u64,
+                updated_by: updated_by.map(ToOwned::to_owned),
+                updated_at: now,
+                board_path: final_path,
+            },
+            workspace: updated_ws,
+        })
     }
 
     pub fn append_workspace_event(
@@ -1126,7 +1551,7 @@ impl OrbitStore {
     }
 
     /// Return distinct peer `(agent_id, agent_handle)` pairs who edited `file_path` in `workspace_id`
-    /// after `since` (excluding `exclude_agent_id`). Used by the live Conflict Radar.
+    /// after `since` AND after the latest `board_reset_seq` (excluding `exclude_agent_id`). Used by the live Conflict Radar.
     pub fn recent_workspace_file_editors(
         &self,
         workspace_id: &str,
@@ -1139,6 +1564,7 @@ impl OrbitStore {
             "SELECT DISTINCT agent_id, agent_handle
              FROM workspace_events
              WHERE workspace_id = ?1
+               AND seq > COALESCE((SELECT board_reset_seq FROM workspaces WHERE workspace_id = ?1), 0)
                AND kind = 'file_edited'
                AND file_path = ?2
                AND agent_id IS NOT NULL
@@ -1157,7 +1583,7 @@ impl OrbitStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Return distinct recently edited file paths in `workspace_id` (used by auto-clustering).
+    /// Return distinct recently edited file paths in `workspace_id` since the latest `board_reset_seq` (used by auto-clustering).
     pub fn list_workspace_edited_files(
         &self,
         workspace_id: &str,
@@ -1168,6 +1594,7 @@ impl OrbitStore {
             "SELECT DISTINCT file_path
              FROM workspace_events
              WHERE workspace_id = ?1
+               AND seq > COALESCE((SELECT board_reset_seq FROM workspaces WHERE workspace_id = ?1), 0)
                AND kind = 'file_edited'
                AND file_path IS NOT NULL
              ORDER BY seq DESC
@@ -1177,6 +1604,41 @@ impl OrbitStore {
             r.get::<_, String>(0)
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Return workspace events occurring after `board_reset_seq` (used by live Conflict Radar & `<orbit-workspace>` injection).
+    pub fn list_active_workspace_events(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEventRecord>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, workspace_id, agent_id, agent_handle, kind, summary, file_path, created_at
+             FROM workspace_events
+             WHERE workspace_id = ?1
+               AND seq > COALESCE((SELECT board_reset_seq FROM workspaces WHERE workspace_id = ?1), 0)
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let mut rows: Vec<WorkspaceEventRecord> = stmt
+            .query_map(params![workspace_id, limit.clamp(1, 200) as i64], |row| {
+                let kind_s: String = row.get(4)?;
+                let ts_s: String = row.get(7)?;
+                Ok(WorkspaceEventRecord {
+                    seq: row.get::<_, i64>(0)? as u64,
+                    workspace_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    agent_handle: row.get(3)?,
+                    kind: parse_workspace_event_kind(&kind_s),
+                    summary: row.get(5)?,
+                    file_path: row.get(6)?,
+                    created_at: parse_ts(&ts_s),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
     }
 }
 
@@ -1689,5 +2151,245 @@ mod tests {
                 .map(String::as_str),
             Some("beta-renamed,beta")
         );
+    }
+
+    #[test]
+    fn goal_and_board_stay_bidirectionally_synced_and_reset_advances_conflict_watermark() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_reuse".into(),
+                title: "Auth Arena".into(),
+                cwd: "/repo".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: Some("Initial JWT migration".into()),
+                project_root: Some("/repo".into()),
+                board_revision: 0,
+                title_locked: true,
+                auto_clustered: false,
+                is_curated: true,
+            })
+            .expect("ws");
+
+        // 1. Editing `## Goal` via board CAS automatically updates `workspaces.mission_goal`
+        let board_v1 = store
+            .upsert_workspace_board(
+                "ws_reuse",
+                "# Auth Arena\n\n## Goal\nImplement OAuth2 PKCE\n\n## Tasks\n- Old task A\n",
+                Some("lead"),
+                Some("/tmp/BOARD.md"),
+            )
+            .expect("board v1");
+        assert_eq!(board_v1.revision, 1);
+        let ws_after_board = store
+            .get_workspace("ws_reuse")
+            .expect("get ws")
+            .expect("exists");
+        assert_eq!(
+            ws_after_board.mission_goal.as_deref(),
+            Some("Implement OAuth2 PKCE")
+        );
+
+        // 2. Updating workspace goal via `update_workspace_goal_and_board` syncs `BOARD.md` `## Goal`
+        let (ws_v2, synced_board) = store
+            .update_workspace_goal_and_board(
+                "ws_reuse",
+                None,
+                Some("Harden refresh token rotation"),
+                None,
+                None,
+            )
+            .expect("update goal");
+        assert_eq!(
+            ws_v2.expect("ws").mission_goal.as_deref(),
+            Some("Harden refresh token rotation")
+        );
+        let synced = synced_board.expect("synced board");
+        assert!(
+            synced
+                .content
+                .contains("## Goal\nHarden refresh token rotation")
+        );
+        assert!(synced.content.contains("- Old task A"));
+
+        // Record a file edit in phase 1
+        store
+            .append_workspace_event(
+                "ws_reuse",
+                Some("ag_old"),
+                Some("lead"),
+                WorkspaceEventKind::FileEdited,
+                "Edited src/jwt.rs",
+                Some("src/jwt.rs"),
+            )
+            .expect("append event");
+        assert_eq!(
+            store
+                .list_workspace_edited_files("ws_reuse", 10)
+                .expect("edited")
+                .len(),
+            1
+        );
+
+        // 3. Resetting board captures old content for `BOARD.history.md`, sets clean Goal + Standing Notes,
+        //    and advances `board_reset_seq` so old file edits no longer pollute clustering/conflicts.
+        let reset = store
+            .reset_workspace_board(
+                "ws_reuse",
+                Some("Add WebAuthn passkeys"),
+                Some("- Never store raw credential secrets in logs"),
+                Some("router"),
+                Some("/tmp/BOARD.md"),
+            )
+            .expect("reset board");
+        assert!(
+            reset
+                .previous_content
+                .as_deref()
+                .is_some_and(|c| c.contains("- Old task A")),
+            "previous substantive board content must be returned for history backup"
+        );
+        assert_eq!(
+            reset.workspace.mission_goal.as_deref(),
+            Some("Add WebAuthn passkeys")
+        );
+        assert!(
+            reset
+                .board
+                .content
+                .contains("## Goal\nAdd WebAuthn passkeys")
+        );
+        assert!(
+            reset
+                .board
+                .content
+                .contains("## Standing Notes\n- Never store raw credential secrets in logs")
+        );
+        assert!(!reset.board.content.contains("- Old task A"));
+        assert!(
+            store
+                .list_workspace_edited_files("ws_reuse", 10)
+                .expect("edited after reset")
+                .is_empty(),
+            "stale file edits before board reset must not pollute active workspace edited files"
+        );
+    }
+
+    #[test]
+    fn legacy_backfill_rescues_router_conversations_and_locks_subagents() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_mig".into(),
+                title: "Mig".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mk_ag = |id: &str,
+                     parent: Option<&str>,
+                     parent_host: Option<&str>,
+                     labels: HashMap<String, String>| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_mig".into(),
+            cwd: "/repo".into(),
+            title: id.into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: parent.map(ToOwned::to_owned),
+            parent_host_id: parent_host.map(ToOwned::to_owned),
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels,
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        let mut router_labels = HashMap::new();
+        router_labels.insert("orbit.role".into(), "personal_router".into());
+        store
+            .upsert_agent(&mk_ag("ag_router", None, None, router_labels), None)
+            .expect("router");
+        store
+            .upsert_agent(
+                &mk_ag("ag_routed_local", Some("ag_router"), None, HashMap::new()),
+                None,
+            )
+            .expect("routed local");
+        store
+            .upsert_agent(
+                &mk_ag(
+                    "ag_remote_sub",
+                    Some("ag_conv_on_host_a"),
+                    Some("host_a"),
+                    HashMap::new(),
+                ),
+                None,
+            )
+            .expect("remote sub");
+
+        {
+            let conn = store.conn.lock().expect("lock");
+            super::backfill_legacy_session_tiers(&conn).expect("backfill");
+        }
+
+        let routed = store
+            .get_agent("ag_routed_local")
+            .expect("get")
+            .expect("some");
+        assert!(routed.is_primary_conversation());
+        assert_eq!(routed.parent_agent_id, None);
+        assert_eq!(routed.routed_by_agent_id(), Some("ag_router"));
+
+        let remote_sub = store
+            .get_agent("ag_remote_sub")
+            .expect("get")
+            .expect("some");
+        assert!(remote_sub.is_subagent());
     }
 }

@@ -12,10 +12,12 @@
 
 ---
 
-## 2. 共享看板 `BOARD.md` 与乐观锁（CAS）
+## 2. 共享看板 `BOARD.md`、双向目标同步与阶段重置（`reset_board`）
 
-- 每个 Mission Workspace 维护共享 `BOARD.md`（由 `crates/orbit-daemon/src/workspace_board.rs` 管理）。
+- 每个 Mission Workspace 维护共享 `BOARD.md`（由 `crates/orbit-daemon/src/workspace_board.rs` 与 `crates/orbit-store/src/workspace_sync.rs` 管理）。
 - **分节局部更新 + 乐观并发控制**：修改特定 `## Section` 时应传入 `section` 与 `expected_revision`，通过 Compare-And-Swap（CAS）避免并发全量覆盖他人刚写入的决策与进展。
+- **`mission_goal` 与 `## Goal` 原子双向同步**：`update_workspace_goal_and_board` 与 `upsert_workspace_board_with_cas` 在同一 SQLite 事务内保持 `workspaces.mission_goal` 与 `BOARD.md` 中 `## Goal` 的一致性，避免创建期目标锁定。
+- **长期复用阶段重置（`reset_board` + `BOARD.history.md`）**：长期复用的 Workspace 可通过 `orbit_workspace(action="reset_board")` 或 `WireMessage::ResetWorkspaceBoard` 开启新阶段——若旧看板包含实质笔记，先追加备份至 `$ORBIT_HOME/workspaces/<ws_id>/BOARD.history.md`，再写入干净的 `BOARD.md`（新目标 + 可选保留约定）并推进 `workspaces.board_reset_seq` 文件编辑/冲突水位线，**同时保持左侧边栏中的历史会话完全不变**。
 
 ---
 
@@ -38,9 +40,11 @@ Mission Workspace 中会话标题与 `@handle` 会根据进展自动或手动更
 
 ---
 
-## 5. Personal Router（常驻分工师）与跨主机项目上下文编排
+## 5. 会话主权分层（`SessionTier`）与 Personal Router（常驻分工师）
 
-- **一等公民角色与全局主主机选择**：`AgentRole::PersonalRouter`（`orbit-protocol/src/router.rs`）允许用户在多主机 Fleet 中显式选择**任意一台在线主机**（例如远程常驻 Mac mini / 云端 Devbox 或本机）作为全局唯一主分工师（持久化于客户端 `primary_router_selection` 并通过 Cloud Sync preferences 跨设备同步），通过 `DiscoverFleetRouterHosts` 结合权威 `is_local` 身份标识探测各主机的 `hermes` 安装状态与已有 `~/.hermes/memories/` 记忆，且不在 ACP 模式强制开启 `fast_mode`。
-- **跨主机项目发现、Peer-Bridge 连通性与上下文注入**：主分工师所在的 Host A 通过 `PersonalRouterManager`（`crates/orbit-daemon/src/personal_router.rs`）聚合全部在线远端主机的项目与活跃 Worker 注入 `<orbit-fleet-state>` / `<orbit-fleet-delta>`，并通过 Core Pack 的 `orbit_control(action="list_projects" | "inspect_project_context")`（`host="all"`/`"*"`/省略时默认返回全部启用主机项目）在派单前免 SSH 拉取任意远端仓库的 `AGENTS.md` / `README.md` / 目录结构与 Git 分支上下文；无法直连或上 Relay 的内网隔绝主机可通过已配对节点的 `/ws/e2ee` Peer-Bridge 与 SSH Forward 隧道连通。
+- **严格会话主权（Zero Surprise Sidebar Threads）**：`SessionTier`（`orbit-protocol/src/router.rs`，持久化于 `labels["orbit.session_tier"]`）将所有会话划分为 `Conversation`、`Subagent`、`PersonalRouter`、`Automation`。**仅人类与 `PersonalRouter` 可创建侧边栏可见的 `Conversation`**；普通 `Conversation` 或 `Subagent` 通过 `create_agent`、`spawn_workspace_peer`、`orbit_agent(action="fork")` 或 `orbit run` 派生的本机/跨主机子会话一律锁定为 `SessionTier::Subagent`，在侧边栏、全局总控台与自动归类中严格隐藏（跨主机/多级子代理待审批时将审批徽章冒泡至根 `Conversation`）；归档父会话时绝不自动调用 `detach_agent` 将子代理提升为顶层会话（仅用户显式执行 `DetachAgent` 时才提升为 `Conversation`）。
+- **`routed_by` 与手动收回会话（Manual Reclaim Only）**：`PersonalRouter` 通过 `dispatch_conversation`（或 `create_agent`）派发的本机/远端会话统一标记 `labels["orbit.routed_by_agent"]`（`parent_agent_id = None`，`SessionTier::Conversation`），确保本机与远端派单一致显示在侧边栏并支持 `finish_subscriptions` 与 Tier-2 预审归属校验。已完成会话仅在用户发出明确指令或点击 UI「收回 / Reclaim」按钮（`reclaim_conversation` / `WireMessage::HarvestConversation`）时才提炼结论归档，禁止分工师擅自自动归档。
+- **一等公民角色与持久化 Router 宪法**：`AgentRole::PersonalRouter` 允许用户在多主机 Fleet 中显式选择任意在线主机作为全局唯一主分工师（持久化于 `primary_router_selection` 并自动同步全网 `ConnectedHostsManager`）。启动时必须预先注入角色标签并通过 `SessionLaunchConfig.system_prompt_append` 跨回合持久挂载精炼分工师宪法：保留原生只读侦察/技能能力以精准拆解任务，禁止直接修改业务仓库代码或调用 Harness 黑盒内部子代理，强制使用高信噪比短回复汇报路由坐标。
+- **跨主机项目 + Workspace 目标全景地图（Fleet Atlas）**：`PersonalRouterManager`（`crates/orbit-daemon/src/personal_router.rs`）聚合全部在线远端主机的能力摘要、项目、精编 Workspace（含 `mission_goal`）与活跃 `Conversation` 注入 `<orbit-fleet-state>` / `<orbit-fleet-delta>`，配合 `orbit_control(action="list_projects" | "inspect_project_context")` 实现零盲区跨设备精准派单。
 - **后台定时器（Timer）空闲可对话不变量**：仅持有关闭后待触发定时器（`schedule` / `orbit_timer` / `waiting:N timer`）的会话与子代理保持 Idle 可随时继续对话（`is_running == false`，`has_background_tasks == true`，`has_armed_timers == true`），禁止在对话输入框或侧边栏显示阻塞性停止按钮或旋转加载圈。
-- **三级风控与飞书双向闭环**：Tier-1 低危由 `GuardianManager`（需底层认证就绪，且默认放行只读 Orbit MCP / 看板工具）自动放行；Tier-2 中危可由分工师结合上下文预审（严格校验目标 Worker 归属当前分工师 `parent_agent_id`）；Tier-3 高危（`High` / `Critical`）在协议层硬禁止分工师自动放行并剥离 `allow_always`，强制交由人类在原生端或飞书交互卡片拍板。飞书通道支持 `ImRoutingMode::PersonalRouter` 直接路由至唯一常驻分工师会话。
+- **三级风控与飞书双向闭环**：Tier-1 低危由 `GuardianManager`（需底层认证就绪，且默认放行只读 Orbit MCP / 看板工具）自动放行；Tier-2 中危可由分工师结合上下文预审（严格校验目标会话归属当前分工师 `parent_agent_id` 或 `orbit.routed_by_agent`）；Tier-3 高危（`High` / `Critical`）在协议层硬禁止分工师自动放行并剥离 `allow_always`，强制交由人类在原生端或飞书交互卡片拍板。飞书通道支持 `ImRoutingMode::PersonalRouter` 直接路由至唯一常驻分工师会话。

@@ -36,15 +36,50 @@ pub fn board_file_path(home_dir: &Path, workspace_id: &str) -> PathBuf {
     home_dir.join("workspaces").join(dir_name).join("BOARD.md")
 }
 
+/// Canonical on-disk archive file for prior board cycles (`$ORBIT_HOME/workspaces/<ws_id>/BOARD.history.md`).
+pub fn board_history_file_path(home_dir: &Path, workspace_id: &str) -> PathBuf {
+    let mut path = board_file_path(home_dir, workspace_id);
+    path.set_file_name("BOARD.history.md");
+    path
+}
+
+/// Append a timestamped snapshot of the previous `BOARD.md` onto `BOARD.history.md` before a clean reset.
+pub fn append_board_history_file(
+    home_dir: &Path,
+    workspace_id: &str,
+    previous_revision: u64,
+    previous_content: &str,
+) -> Option<String> {
+    let trimmed = previous_content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = board_history_file_path(home_dir, workspace_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let stamp = chrono::Utc::now().to_rfc3339();
+    let separator = if file.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        "\n\n---\n\n"
+    } else {
+        ""
+    };
+    let entry = format!(
+        "{separator}<!-- Archived Board rev={previous_revision} at={stamp} -->\n{trimmed}\n"
+    );
+    file.write_all(entry.as_bytes()).ok()?;
+    Some(path.to_string_lossy().to_string())
+}
+
 /// Default initial Markdown template for a workspace's Shared Blackboard.
 pub fn default_board_template(title: &str, mission_goal: Option<&str>) -> String {
-    let goal_line = mission_goal
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Coordinate peers in this Mission Workspace.");
-    format!(
-        "# {title}\n\n## Goal\n{goal_line}\n\n## Decisions & Contracts\n- (Record shared APIs, invariants, and architectural decisions here)\n\n## Tasks\n- (Track peer ownership and status here)\n\n## Findings\n- (Record review findings and verification results here)\n"
-    )
+    orbit_store::build_clean_board_markdown(title, mission_goal, None)
 }
 
 /// Persist the workspace's Shared Blackboard to `$ORBIT_HOME/workspaces/<ws_id>/BOARD.md`.
@@ -63,67 +98,7 @@ pub fn write_board_file(home_dir: &Path, workspace_id: &str, content: &str) -> O
 /// Upsert a `## <section>` Markdown section inside `existing`, replacing its body if present
 /// or appending a new `## <section>` block at the end if absent.
 pub fn upsert_markdown_section(existing: &str, section_name: &str, body: &str) -> String {
-    let clean_sec = section_name.trim().trim_start_matches('#').trim();
-    if clean_sec.is_empty() {
-        return body.to_string();
-    }
-    let clean_body = body.trim();
-    let target_lower = clean_sec.to_ascii_lowercase();
-
-    let lines: Vec<&str> = existing.lines().collect();
-    let mut start_idx: Option<usize> = None;
-    let mut end_idx: usize = lines.len();
-
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("## ") {
-            let heading = rest.trim().to_ascii_lowercase();
-            if start_idx.is_none() {
-                if heading == target_lower {
-                    start_idx = Some(idx);
-                }
-            } else {
-                end_idx = idx;
-                break;
-            }
-        } else if start_idx.is_some() && trimmed.starts_with("# ") {
-            end_idx = idx;
-            break;
-        }
-    }
-
-    if let Some(start) = start_idx {
-        let mut out: Vec<String> = Vec::with_capacity(lines.len() + 4);
-        for l in &lines[..start] {
-            out.push((*l).to_string());
-        }
-        out.push(format!("## {clean_sec}"));
-        if !clean_body.is_empty() {
-            out.push(clean_body.to_string());
-        }
-        if end_idx < lines.len() {
-            out.push(String::new());
-            for l in &lines[end_idx..] {
-                out.push((*l).to_string());
-            }
-        }
-        let mut joined = out.join("\n");
-        if !joined.ends_with('\n') {
-            joined.push('\n');
-        }
-        joined
-    } else {
-        let mut out = existing.trim_end().to_string();
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("## {clean_sec}\n"));
-        if !clean_body.is_empty() {
-            out.push_str(clean_body);
-            out.push('\n');
-        }
-        out
-    }
+    orbit_store::upsert_board_markdown_section(existing, section_name, body)
 }
 
 fn sha256_hex_str(s: &str) -> String {
@@ -312,7 +287,7 @@ pub fn build_workspace_roster_context(
 
     let active_peers: Vec<&AgentSummary> = peers
         .iter()
-        .filter(|a| a.archived_at.is_none() && !a.background && a.parent_agent_id.is_none())
+        .filter(|a| a.archived_at.is_none() && a.is_primary_conversation())
         .collect();
     let has_other_peers = active_peers.iter().any(|a| a.agent_id != current_agent_id);
     let has_board = board.is_some_and(|b| !b.content.trim().is_empty());
@@ -355,7 +330,7 @@ pub fn build_workspace_roster_context_incremental(
 
     let active_peers: Vec<&AgentSummary> = peers
         .iter()
-        .filter(|a| a.archived_at.is_none() && !a.background && a.parent_agent_id.is_none())
+        .filter(|a| a.archived_at.is_none() && a.is_primary_conversation())
         .collect();
     let has_other_peers = active_peers.iter().any(|a| a.agent_id != current_agent_id);
     let has_board = board.is_some_and(|b| !b.content.trim().is_empty());

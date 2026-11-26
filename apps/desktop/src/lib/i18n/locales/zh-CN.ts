@@ -2606,4 +2606,19 @@ export const zhCN: MessageDictionary = {
   "usage.durationDaysHours": "{days} 天 {hours} 小时",
   "stage.stagedDiff": "暂存区 Diff",
   "stage.workingTreeDiff": "工作区 Diff",
+
+  // 会话主权、手动收回会话与长期 Workspace 白板重置
+  "sidebar.reclaimConversation": "收回会话",
+  "overview.reclaimConversation": "收回",
+  "overview.reclaimedToast": "已收回会话并归档结论",
+  "board.resetBoardButton": "重置白板",
+  "board.resetBoardTitle": "开启新阶段并重置共享白板",
+  "board.resetBoardDescription":
+    "当前白板内容会自动备份至磁盘 BOARD.history.md，左侧边栏中的会话保持不变。",
+  "board.resetNewGoalLabel": "新阶段目标",
+  "board.resetNewGoalPlaceholder": "输入当前工作区的新目标…",
+  "board.resetKeepNotesLabel": "保留的长期约定（可选）",
+  "board.resetKeepNotesPlaceholder": "需要延续到新白板的架构红线或接口约定…",
+  "board.resetConfirmAction": "确认重置白板",
+  "board.resetSuccessToast": "共享白板已重置（旧内容已备份至 BOARD.history.md）",
 };

@@ -681,11 +681,8 @@ pub fn build_personal_agent_briefing(
         if entry.agent.background {
             continue;
         }
-        // Keep primary foreground threads crisp by excluding same-host child subagents when their parent exists.
-        if let Some(ref pid) = entry.agent.parent_agent_id
-            && entry.agent.parent_host_id.is_none()
-            && all_agents.contains_key(&(entry.host_id, pid.as_str()))
-        {
+        // Keep primary foreground threads crisp by excluding all Subagents (local, cross-host, or orphaned).
+        if entry.agent.is_subagent() {
             continue;
         }
         let effective_state = if matches!(
@@ -941,18 +938,34 @@ fn parent_agent_key<'a>(
     child_host_id: &'a str,
     child: &'a AgentCardView,
 ) -> Option<(&'a str, &'a str)> {
-    let parent_aid = child
+    if let Some(parent_aid) = child
         .parent_agent_id
         .as_deref()
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let parent_hid = child
+            .parent_host_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(child_host_id);
+        return Some((parent_hid, parent_aid));
+    }
+    let routed_aid = child
+        .labels
+        .get(orbit_protocol::LABEL_ROUTED_BY_AGENT)
+        .map(String::as_str)
+        .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    let parent_hid = child
-        .parent_host_id
-        .as_deref()
+    let routed_hid = child
+        .labels
+        .get(orbit_protocol::LABEL_ROUTED_BY_HOST)
+        .map(String::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(child_host_id);
-    Some((parent_hid, parent_aid))
+    Some((routed_hid, routed_aid))
 }
 
 fn is_foreground_running(agent: &AgentCardView) -> bool {

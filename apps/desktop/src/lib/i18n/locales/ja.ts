@@ -2634,4 +2634,19 @@ export const ja: MessageDictionary = {
   "usage.durationDaysHours": "{days} 日 {hours} 時間",
   "stage.stagedDiff": "ステージ済み Diff",
   "stage.workingTreeDiff": "作業ツリー Diff",
+
+  // セッション主権・会話の回収・長期ワークスペースボードのリセット
+  "sidebar.reclaimConversation": "会話を回収",
+  "overview.reclaimConversation": "回収",
+  "overview.reclaimedToast": "会話を回収して履歴にアーカイブしました",
+  "board.resetBoardButton": "ボードをリセット",
+  "board.resetBoardTitle": "次のフェーズ向けに共有ボードをリセット",
+  "board.resetBoardDescription":
+    "現在のボード内容はディスク上の BOARD.history.md に自動保存され、サイドバーの会話はそのまま維持されます。",
+  "board.resetNewGoalLabel": "新しい目標",
+  "board.resetNewGoalPlaceholder": "このワークスペースの新しい目標を入力…",
+  "board.resetKeepNotesLabel": "引き継ぐ共通ルール（任意）",
+  "board.resetKeepNotesPlaceholder": "次フェーズでも維持する設計方針や規約…",
+  "board.resetConfirmAction": "ボードをリセット",
+  "board.resetSuccessToast": "共有ボードをリセットしました（旧内容は BOARD.history.md に保存済み）",
 };

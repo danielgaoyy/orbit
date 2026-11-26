@@ -2178,6 +2178,10 @@ pub enum WireMessage {
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         initial_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_host_id: Option<String>,
     },
     AgentForked {
         request_id: Uuid,
@@ -2997,6 +3001,36 @@ pub enum WireMessage {
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mission_goal: Option<String>,
+    },
+    /// Archive the current Shared Blackboard (`BOARD.md`) to on-disk `BOARD.history.md`,
+    /// write a clean board with `new_goal` and optional `keep_notes`, and advance the
+    /// workspace conflict-radar watermark while leaving sidebar Conversations untouched.
+    ResetWorkspaceBoard {
+        request_id: Uuid,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_notes: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_by: Option<String>,
+    },
+    /// Explicitly reclaim/harvest a completed `Conversation` (triggered ONLY by user button or command):
+    /// distills concise summary notes (optionally into the Workspace `BOARD.md`) and archives the thread.
+    HarvestConversation {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_note: Option<String>,
+        #[serde(default)]
+        append_to_workspace_board: bool,
+    },
+    ConversationHarvested {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        summary: String,
     },
     MoveAgentToWorkspace {
         request_id: Uuid,
@@ -5363,6 +5397,8 @@ mod tests {
             },
             title: Some("Experiment".into()),
             initial_prompt: Some("Try approach B".into()),
+            parent_agent_id: None,
+            parent_host_id: None,
         };
         let encoded = req.encode_zstd(3).expect("encode fork request");
         match WireMessage::decode_zstd(&encoded).expect("decode fork request") {
@@ -5373,6 +5409,7 @@ mod tests {
                 target,
                 title,
                 initial_prompt,
+                ..
             } => {
                 assert_eq!(request_id, req_id);
                 assert_eq!(source_agent_id, "ag_source");

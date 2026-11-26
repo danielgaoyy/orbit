@@ -2636,6 +2636,21 @@ export const en = {
   "usage.durationDaysHours": "{days}d {hours}h",
   "stage.stagedDiff": "Staged Diff",
   "stage.workingTreeDiff": "Working Tree Diff",
+
+  // Session Sovereignty, Conversation Reclaim & Long-Lived Workspace Board Reset
+  "sidebar.reclaimConversation": "Reclaim conversation",
+  "overview.reclaimConversation": "Reclaim",
+  "overview.reclaimedToast": "Reclaimed conversation into workspace history",
+  "board.resetBoardButton": "Reset board",
+  "board.resetBoardTitle": "Reset shared board for next milestone",
+  "board.resetBoardDescription":
+    "Current board notes are archived to BOARD.history.md on disk, while sidebar conversations stay untouched.",
+  "board.resetNewGoalLabel": "New goal",
+  "board.resetNewGoalPlaceholder": "Describe the new goal for this workspace…",
+  "board.resetKeepNotesLabel": "Standing notes to keep (optional)",
+  "board.resetKeepNotesPlaceholder": "Architecture invariants or conventions to carry forward…",
+  "board.resetConfirmAction": "Reset board",
+  "board.resetSuccessToast": "Shared board reset (previous notes backed up to BOARD.history.md)",
 } as const;
 
 export type MessageKey = keyof typeof en;

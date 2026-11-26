@@ -80,6 +80,17 @@ mod tests {
             .expect("upsert project");
         assert!(proj_json.contains("orbit-harmony"));
 
+        let space_proj_json = facade
+            .upsert_project_json(None, "host_ohos", "project", r#"["/tmp/project "]"#)
+            .expect("upsert trailing-space project");
+        let space_proj_val: serde_json::Value =
+            serde_json::from_str(&space_proj_json).expect("parse space project json");
+        assert_eq!(
+            space_proj_val["directories"][0].as_str(),
+            Some("/tmp/project "),
+            "OHOS facade upsert_project_json must preserve trailing space in directory path"
+        );
+
         let opt_id = facade
             .create_agent_full(
                 "host_ohos",
@@ -186,6 +197,8 @@ mod tests {
             )
             .expect("seed prefs");
         facade.mark_agent_seen("host_ohos_2", "ag_hist", 20);
+        facade.mark_agent_unread("host_ohos_2", "ag_hist");
+        facade.mark_agent_read("host_ohos_2", "ag_hist");
 
         let sidebar: serde_json::Value = serde_json::from_str(
             &facade
@@ -375,5 +388,134 @@ mod tests {
                 .cancel_workflow_run_json(r#"{"host_id":"host_parity","run_id":"wf1"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ohos_facade_mark_agent_read_clears_only_target_conversation() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "orbit_ohos_mark_read_{}_{}.sqlite",
+            std::process::id(),
+            nanos
+        ));
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        // Pair host first so its saved profile exists in the SQLite store.
+        {
+            let facade = OhosCoreFacade::open(&db_str).expect("open initial");
+            let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+            let offer = orbit_crypto::PairingOffer {
+                host_id: "host_ohos_read".into(),
+                hostname: "read-check-host".into(),
+                daemon_pubkey_b64: kp.public_key_b64,
+                direct_endpoints: Vec::new(),
+                relay_url: None,
+                pairing_secret: "secret".into(),
+            };
+            facade
+                .pair_host_json(&offer.to_qr_uri().expect("uri"))
+                .expect("pair");
+        }
+
+        // Seed two non-optimistic replica agents directly into the client SQLite cache.
+        {
+            let store = orbit_store::OrbitStore::open(&db_path).expect("open store");
+            let now = chrono::Utc::now();
+            for (agent_id, title) in [
+                ("ag_read_target", "Target Thread"),
+                ("ag_unread_peer", "Peer Thread"),
+            ] {
+                let summary = orbit_protocol::AgentSummary {
+                    agent_id: agent_id.into(),
+                    workspace_id: "ws_read_1".into(),
+                    cwd: "/repo/orbit".into(),
+                    title: title.into(),
+                    provider: orbit_protocol::ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: orbit_protocol::SessionMode::Default,
+                    status: orbit_protocol::AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 12,
+                    timeline_epoch: 0,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    profile_id: None,
+                    acp_agent_id: None,
+                    background: false,
+                    auto_archive: false,
+                    attention: orbit_protocol::AttentionState::Finished,
+                    last_activity_at: Some(now),
+                    archived_at: None,
+                    labels: std::collections::HashMap::new(),
+                    created_at: now,
+                    updated_at: now,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: Vec::new(),
+                };
+                store
+                    .upsert_single_replica_agent("host_ohos_read", &summary)
+                    .expect("upsert replica agent");
+            }
+        }
+
+        // Re-open facade so OrbitAppCore hydrates both cached agents from SQLite.
+        let facade = OhosCoreFacade::open(&db_str).expect("reopen facade");
+        facade.mark_agent_unread("host_ohos_read", "ag_read_target");
+        facade.mark_agent_unread("host_ohos_read", "ag_unread_peer");
+
+        let find_unread = |sidebar_json: &str, target_id: &str| -> Option<bool> {
+            let val: serde_json::Value = serde_json::from_str(sidebar_json).expect("sidebar json");
+            for group in val["projects"].as_array()? {
+                for conv in group["conversations"].as_array()? {
+                    if conv["agent"]["agent_id"].as_str() == Some(target_id) {
+                        return conv["is_unread"].as_bool();
+                    }
+                }
+            }
+            None
+        };
+
+        let before = facade
+            .fleet_sidebar_json(
+                Some("recent"),
+                Some("all"),
+                None,
+                Some("host_ohos_read"),
+                None,
+                Some("/repo/orbit"),
+            )
+            .expect("sidebar before");
+        assert_eq!(find_unread(&before, "ag_read_target"), Some(true));
+        assert_eq!(find_unread(&before, "ag_unread_peer"), Some(true));
+
+        facade.mark_agent_read("host_ohos_read", "ag_read_target");
+
+        let after = facade
+            .fleet_sidebar_json(
+                Some("recent"),
+                Some("all"),
+                None,
+                Some("host_ohos_read"),
+                None,
+                Some("/repo/orbit"),
+            )
+            .expect("sidebar after");
+        assert_eq!(find_unread(&after, "ag_read_target"), Some(false));
+        assert_eq!(find_unread(&after, "ag_unread_peer"), Some(true));
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
     }
 }

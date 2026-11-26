@@ -2583,12 +2583,14 @@ name = "orbit-ffi-ohos"
 version = "0.11.11"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "napi-build-ohos",
  "napi-derive-ohos",
  "napi-ohos",
  "orbit-client-core",
  "orbit-crypto",
  "orbit-protocol",
+ "orbit-store",
  "serde",
  "serde_json",
  "zeroize",

@@ -1662,3 +1662,184 @@ async fn test_05_workspace_management_unclassified_inbox_ai_triage_and_tab_renam
     drop_core(client_b).await;
     drop(rt);
 }
+
+// ============================================================================
+// TEST 5: Trailing-Space POSIX Directory Isolation (Browse -> Upsert -> Diff -> Stage)
+// ============================================================================
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_05_upsert_project_and_git_stage_preserve_trailing_space_directories() {
+    let home = new_temp_dir("ts_home");
+    let repos_root = new_temp_dir("ts_repos");
+    let plain_repo = repos_root.join("project");
+    let space_repo = repos_root.join("project ");
+    init_git_repo(&plain_repo, "main");
+    init_git_repo(&space_repo, "main");
+
+    let stage_and_modify = |dir: &Path, filename: &str| {
+        std::fs::write(dir.join(filename), "v1\n").expect("write v1");
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git cmd");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", filename]);
+        run(&["commit", "-m", "add unique file"]);
+        std::fs::write(dir.join(filename), "v2\n").expect("write v2");
+    };
+    stage_and_modify(&plain_repo, "plain-only.txt");
+    stage_and_modify(&space_repo, "space-only.txt");
+
+    let plain_canon = std::fs::canonicalize(&plain_repo).expect("canon plain");
+    let space_canon = std::fs::canonicalize(&space_repo).expect("canon space");
+    let plain_str = plain_canon.to_string_lossy().to_string();
+    let space_str = space_canon.to_string_lossy().to_string();
+    assert_ne!(plain_str, space_str);
+    assert!(space_str.ends_with("project "));
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("daemon");
+    let offer = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("pairing offer");
+    let uri = offer.to_qr_uri().expect("pair uri");
+
+    let (core, host_id) = open_and_connect_core(home.join("client_space.db"), uri).await;
+
+    // 1. Directory browser RPC on `project ` MUST return `current_path` ending in `project `.
+    core.list_directory(&host_id, Some(space_str.clone()));
+    let listed_ok = wait_until(Duration::from_secs(10), || {
+        let c = Arc::clone(&core);
+        let hid = host_id.clone();
+        let expected = space_str.clone();
+        async move {
+            c.host_detail(&hid)
+                .and_then(|d| d.directory_listing)
+                .is_some_and(|l| l.current_path == expected)
+        }
+    })
+    .await;
+    assert!(
+        listed_ok,
+        "list_directory must preserve trailing space in current_path"
+    );
+
+    // 2. Register ONLY `project ` via real `OrbitAppCore::upsert_project` — both client return
+    //    value, daemon persisted host_projects, and sidebar primary_cwd MUST preserve the space.
+    let saved = core
+        .upsert_project(None, &host_id, "project", vec![space_str.clone()])
+        .expect("upsert_project");
+    assert_eq!(saved.directories, vec![space_str.clone()]);
+
+    let daemon_persisted = wait_until(Duration::from_secs(10), || {
+        let store = rt.store.clone();
+        let expected = space_str.clone();
+        async move {
+            store.get_host_sync_state().ok().is_some_and(|st| {
+                st.projects
+                    .iter()
+                    .any(|p| p.directories == vec![expected.clone()])
+            })
+        }
+    })
+    .await;
+    assert!(
+        daemon_persisted,
+        "daemon must persist exact trailing-space directory from UpsertHostProject"
+    );
+
+    let sidebar = core.fleet_sidebar(
+        SidebarProjectSort::Recent,
+        SidebarThreadFilter::All,
+        "",
+        Some(&host_id),
+        None,
+        Some(&space_str),
+    );
+    assert!(
+        sidebar.projects.iter().any(|g| g.primary_cwd == space_str),
+        "sidebar project primary_cwd must preserve trailing space"
+    );
+
+    // 3. Git status & diff on `project ` MUST return ONLY `space-only.txt` (never `plain-only.txt`).
+    core.fetch_git_status(&host_id, &space_str);
+    core.fetch_git_diff(&host_id, &space_str, None, false);
+    let diff_ready = wait_until(Duration::from_secs(10), || {
+        let c = Arc::clone(&core);
+        let hid = host_id.clone();
+        let cwd = space_str.clone();
+        async move {
+            let gr = c.git_review(&hid, &cwd, None);
+            gr.status.is_some() && !gr.diff_files.is_empty()
+        }
+    })
+    .await;
+    assert!(diff_ready, "git review for `project ` must hydrate");
+    let space_review = core.git_review(&host_id, &space_str, None);
+    let space_status_files: Vec<&str> = space_review
+        .status
+        .as_ref()
+        .expect("status")
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(space_status_files, vec!["space-only.txt"]);
+    let space_diff_files: Vec<&str> = space_review
+        .diff_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(space_diff_files, vec!["space-only.txt"]);
+
+    // 4. Real `git_stage_files_on_host` on `project ` MUST succeed (no git_mutation_denied),
+    //    stage ONLY `space-only.txt` in `project `, leave `project` index completely empty,
+    //    and reject staging in unregistered sibling `project`.
+    core.git_stage_files_on_host(&host_id, &space_str, vec!["space-only.txt".into()], false)
+        .await
+        .expect("staging space-only.txt in registered `project ` must succeed");
+
+    let git_out = |dir: &Path, args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git cmd");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        git_out(&space_canon, &["diff", "--cached", "--name-only"]),
+        "space-only.txt"
+    );
+    assert_eq!(git_out(&space_canon, &["diff", "--name-only"]), "");
+    assert_eq!(
+        git_out(&plain_canon, &["diff", "--cached", "--name-only"]),
+        ""
+    );
+    assert_eq!(
+        git_out(&plain_canon, &["diff", "--name-only"]),
+        "plain-only.txt"
+    );
+
+    let sibling_err = core
+        .git_stage_files_on_host(&host_id, &plain_str, vec!["plain-only.txt".into()], false)
+        .await
+        .expect_err("unregistered sibling `project` must remain denied");
+    assert!(
+        sibling_err.contains("git_mutation_denied") || sibling_err.contains("not a registered"),
+        "unexpected error for unregistered sibling repo: {sibling_err}"
+    );
+
+    drop_core(core).await;
+    drop(rt);
+}

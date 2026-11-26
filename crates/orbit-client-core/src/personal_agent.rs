@@ -218,6 +218,20 @@ pub struct BriefingSinceLastVisit {
     pub auto_handled: u32,
 }
 
+/// Lightweight goal run snapshot across all hosts (both active and terminal, for both Personal Agent
+/// and regular sessions) enabling zero-IO cross-host `goal_finished` notification tracking without
+/// polling full `HostDetail`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefingGoalSnapshot {
+    pub host_id: String,
+    pub host_name: String,
+    pub agent_id: String,
+    pub goal_id: String,
+    pub status: String,
+    pub objective: String,
+    pub updated_at_ms: i64,
+}
+
 /// Complete Personal Agent Home briefing snapshot computed purely in Rust.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersonalAgentBriefingView {
@@ -229,6 +243,8 @@ pub struct PersonalAgentBriefingView {
     pub hosts: Vec<BriefingHost>,
     pub counts: BriefingCounts,
     pub since_last_visit: BriefingSinceLastVisit,
+    #[serde(default)]
+    pub goal_snapshots: Vec<BriefingGoalSnapshot>,
 }
 
 /// Pure projection builder for [`PersonalAgentBriefingView`].
@@ -885,6 +901,27 @@ pub fn build_personal_agent_briefing(
     let hosts_online = briefing_hosts.iter().filter(|h| h.online).count() as u32;
     let hosts_total = briefing_hosts.len() as u32;
 
+    // 9. `goal_snapshots` — lightweight cross-host goal status feed (active + terminal, all sessions)
+    let mut goal_snapshots: Vec<BriefingGoalSnapshot> = Vec::new();
+    for h in hosts {
+        for goal in h.goal_runs {
+            goal_snapshots.push(BriefingGoalSnapshot {
+                host_id: h.host_id.to_string(),
+                host_name: h.host_name.to_string(),
+                agent_id: goal.agent_id.clone(),
+                goal_id: goal.goal_id.clone(),
+                status: goal.status.as_str().to_string(),
+                objective: compact_line(&goal.objective, 120),
+                updated_at_ms: i64::try_from(goal.updated_at_ms).unwrap_or(0),
+            });
+        }
+    }
+    goal_snapshots.sort_by(|a, b| {
+        a.host_id
+            .cmp(&b.host_id)
+            .then_with(|| a.goal_id.cmp(&b.goal_id))
+    });
+
     PersonalAgentBriefingView {
         personal_agent,
         counts: BriefingCounts {
@@ -903,6 +940,7 @@ pub fn build_personal_agent_briefing(
             completed: completed_since_last_visit,
             auto_handled: 0,
         },
+        goal_snapshots,
     }
 }
 
@@ -1804,5 +1842,60 @@ mod tests {
         // Running count must be exactly 4: ag_child_run + ag_native_sub + ag_init + ag_wakeup
         // (done_parent is NOT double-counted).
         assert_eq!(view.counts.running, 4);
+    }
+
+    #[test]
+    fn briefing_goal_snapshots_include_terminal_goals_on_unselected_regular_sessions() {
+        let now_ms = 1_700_000_000_000;
+        let regular_agent = make_agent("ag_regular", "Deploy Worker", AgentStatus::Idle, now_ms);
+        let agents = vec![regular_agent];
+        let goal = orbit_protocol::GoalRunRecord {
+            goal_id: "goal_42".into(),
+            agent_id: "ag_regular".into(),
+            workspace_id: "ws_remote".into(),
+            objective: "Ship release artifacts".into(),
+            criteria: vec![],
+            verify_command: None,
+            max_iterations: 3,
+            current_iteration: 2,
+            max_duration_secs: 600,
+            status: orbit_protocol::GoalStatus::Succeeded,
+            last_verify_exit_code: Some(0),
+            last_verify_output: None,
+            consecutive_identical_failures: 0,
+            pause_reason: None,
+            paused_by_user: false,
+            active_duration_secs: 45,
+            started_at_ms: (now_ms - 45_000) as u64,
+            updated_at_ms: now_ms as u64,
+            finished_at_ms: Some(now_ms as u64),
+        };
+        let goals = vec![goal];
+        let empty_read = HashMap::new();
+        let empty_preview = HashMap::new();
+
+        let view = build_personal_agent_briefing(
+            &[BriefingHostInput {
+                host_id: "host_remote",
+                host_name: "Linux Build Box",
+                online: true,
+                agents: &agents,
+                pending_permissions: &[],
+                conditional_timers: &[],
+                goal_runs: &goals,
+                agent_read_at_ms: &empty_read,
+                step_previews: &empty_preview,
+            }],
+            None,
+            now_ms,
+        );
+
+        // Terminal goals are filtered out of `waiting`, yet preserved in lightweight `goal_snapshots`.
+        assert!(view.waiting.is_empty());
+        assert_eq!(view.goal_snapshots.len(), 1);
+        assert_eq!(view.goal_snapshots[0].host_id, "host_remote");
+        assert_eq!(view.goal_snapshots[0].agent_id, "ag_regular");
+        assert_eq!(view.goal_snapshots[0].goal_id, "goal_42");
+        assert_eq!(view.goal_snapshots[0].status, "succeeded");
     }
 }

@@ -1,7 +1,9 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { display, FrameCallback, KeyboardAvoidMode, ThemeControl, window } from '@kit.ArkUI';
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { connection } from '@kit.NetworkKit';
+import { parseOrbitOpenDeepLink } from '../model/OrbitDeepLink';
 import { OrbitHarmonyStore } from '../model/OrbitHarmonyStore';
 import { OrbitHuksMasterKey, OrbitMasterKeyResult } from '../model/OrbitHuksMasterKey';
 import { orbitLogError, orbitLogInfo, orbitLogWarn } from '../model/OrbitLogger';
@@ -47,6 +49,10 @@ interface OrbitPushExtraPayload {
   agent_id?: string;
   orbit_agent_id?: string;
   event_kind?: string;
+  request_id?: string;
+  orbit_request_id?: string;
+  seq?: string | number;
+  orbit_target_seq?: string | number;
 }
 
 function zeroInsets(): OrbitEdgeInsetsPx {
@@ -128,6 +134,7 @@ export default class EntryAbility extends UIAbility {
   private foldStatusHandler: ((status: display.FoldStatus) => void) | null = null;
   private coldLoadContentMarked: boolean = false;
   private coldFirstFrameMarked: boolean = false;
+  private suspendDelayId: number = -1;
 
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     OrbitPerfProbe.mark('cold.create_start');
@@ -176,6 +183,15 @@ export default class EntryAbility extends UIAbility {
     const store = OrbitHarmonyStore.getInstance();
     const params = want.parameters;
     let eventKind = readParamString(params, 'event_kind');
+    let requestId = readParamString(params, 'orbit_request_id');
+    if (requestId.length === 0) {
+      requestId = readParamString(params, 'request_id');
+    }
+    const rawSeqStr = readParamString(params, 'orbit_target_seq') || readParamString(params, 'seq');
+    let targetSeq = rawSeqStr.length > 0 ? Number.parseInt(rawSeqStr, 10) : 0;
+    if (!Number.isFinite(targetSeq) || targetSeq < 0) {
+      targetSeq = 0;
+    }
     let deepLink = want.uri !== undefined ? want.uri.trim() : '';
     let hostId = readParamString(params, 'orbit_host_id');
     if (hostId.length === 0) {
@@ -222,6 +238,26 @@ export default class EntryAbility extends UIAbility {
         if (agentId.length === 0 && typeof parsed.orbit_agent_id === 'string') {
           agentId = parsed.orbit_agent_id.trim();
         }
+        if (requestId.length === 0 && typeof parsed.request_id === 'string') {
+          requestId = parsed.request_id.trim();
+        }
+        if (requestId.length === 0 && typeof parsed.orbit_request_id === 'string') {
+          requestId = parsed.orbit_request_id.trim();
+        }
+        if (targetSeq === 0 && parsed.seq !== undefined) {
+          const parsedSeq = typeof parsed.seq === 'number' ? parsed.seq : Number.parseInt(String(parsed.seq), 10);
+          if (Number.isFinite(parsedSeq) && parsedSeq > 0) {
+            targetSeq = Math.floor(parsedSeq);
+          }
+        }
+        if (targetSeq === 0 && parsed.orbit_target_seq !== undefined) {
+          const parsedSeq = typeof parsed.orbit_target_seq === 'number'
+            ? parsed.orbit_target_seq
+            : Number.parseInt(String(parsed.orbit_target_seq), 10);
+          if (Number.isFinite(parsedSeq) && parsedSeq > 0) {
+            targetSeq = Math.floor(parsedSeq);
+          }
+        }
       } catch (err) {
         orbitLogWarn('OrbitEntry', 'Failed to parse push extraData JSON', err as Object);
       }
@@ -244,12 +280,25 @@ export default class EntryAbility extends UIAbility {
       return;
     }
 
+    if (deepLink.length > 0) {
+      const parsedOpen = parseOrbitOpenDeepLink(deepLink, eventKind, requestId, targetSeq);
+      if (parsedOpen !== null) {
+        store.openSessionFromDeepLink(
+          parsedOpen.hostId,
+          parsedOpen.agentId,
+          parsedOpen.eventKind,
+          parsedOpen.requestId,
+          parsedOpen.targetSeq
+        );
+        return;
+      }
+    }
     if (hostId.length > 0) {
-      store.openSessionFromDeepLink(hostId, agentId, eventKind);
+      store.openSessionFromDeepLink(hostId, agentId, eventKind, requestId, targetSeq);
       return;
     }
     if (deepLink.length > 0) {
-      store.handleDeepLinkUri(deepLink, eventKind);
+      store.handleDeepLinkUri(deepLink, eventKind, requestId, targetSeq);
     }
   }
 
@@ -261,12 +310,51 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
+  private cancelSuspendDelayIfActive(): void {
+    if (this.suspendDelayId < 0) {
+      return;
+    }
+    const reqId = this.suspendDelayId;
+    this.suspendDelayId = -1;
+    if (!canIUse('SystemCapability.ResourceSchedule.BackgroundTaskManager.TransientTask')) {
+      return;
+    }
+    try {
+      backgroundTaskManager.cancelSuspendDelay(reqId);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'cancelSuspendDelay warning', err as Object);
+    }
+  }
+
+  private requestBackgroundSuspendDelay(): void {
+    this.cancelSuspendDelayIfActive();
+    if (!canIUse('SystemCapability.ResourceSchedule.BackgroundTaskManager.TransientTask')) {
+      return;
+    }
+    try {
+      const delayInfo = backgroundTaskManager.requestSuspendDelay('orbit-sync', (): void => {
+        orbitLogInfo('OrbitEntry', 'Transient background suspend delay expiring; cancelling');
+        this.cancelSuspendDelayIfActive();
+      });
+      this.suspendDelayId = delayInfo.requestId;
+      orbitLogInfo(
+        'OrbitEntry',
+        `Requested transient suspend delay id=${delayInfo.requestId} actualMs=${delayInfo.actualDelayTime}`
+      );
+    } catch (err) {
+      this.suspendDelayId = -1;
+      orbitLogWarn('OrbitEntry', 'requestSuspendDelay unavailable', err as Object);
+    }
+  }
+
   onForeground(): void {
+    this.cancelSuspendDelayIfActive();
     OrbitHarmonyStore.getInstance().onAppForeground();
   }
 
   onBackground(): void {
     OrbitHarmonyStore.getInstance().onAppBackground();
+    this.requestBackgroundSuspendDelay();
   }
 
   onMemoryLevel(level: AbilityConstant.MemoryLevel): void {
@@ -280,6 +368,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    this.cancelSuspendDelayIfActive();
     if (this.netConn !== null) {
       try {
         this.netConn.unregister((err) => {

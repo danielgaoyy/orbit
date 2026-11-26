@@ -3,6 +3,7 @@ import { preferences } from '@kit.ArkData';
 import { fileIo } from '@kit.CoreFileKit';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { orbitLogWarn } from './OrbitLogger';
+import { PushPreferencesDto } from './OrbitTypes';
 
 const PREFS_NAME: string = 'orbit_harmony_prefs';
 const KEY_THEME_MODE: string = 'orbit.harmony.v2.theme_mode';
@@ -11,6 +12,8 @@ const KEY_MIGRATED_THREAD_PREFS_V1: string = 'orbit.harmony.v2.migrated_thread_p
 const KEY_DRAFT_PREFS: string = 'orbit.harmony.v2.draft_prefs';
 const KEY_DEVICE_ID: string = 'orbit.harmony.v2.device_id';
 const KEY_PRIMARY_ROUTER_HOST: string = 'orbit.harmony.v2.primary_router_host_id';
+const KEY_PUSH_PREFS_BY_HOST: string = 'orbit.harmony.v2.push_prefs_by_host_json';
+const KEY_PA_LAST_VISIT_MAP: string = 'orbit.harmony.v2.pa_last_visit_map_json';
 
 export interface OrbitDraftPrefs {
   provider: string;
@@ -107,6 +110,97 @@ export class OrbitPreferencesStore {
       });
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to save primary router host', err as Object);
+    }
+  }
+
+  public getPushPreferencesMap(): Record<string, PushPreferencesDto> {
+    if (this.prefs === null) {
+      return {};
+    }
+    try {
+      const raw = this.prefs.getSync(KEY_PUSH_PREFS_BY_HOST, '') as string;
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        return {};
+      }
+      const parsed = JSON.parse(raw) as Record<string, PushPreferencesDto>;
+      return parsed !== null && typeof parsed === 'object' ? parsed : {};
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read push preferences map', err as Object);
+      return {};
+    }
+  }
+
+  public savePushPreferencesForHost(hostId: string, nextPrefs: PushPreferencesDto): void {
+    const scopeKey = hostId.trim().length > 0 ? hostId.trim() : '__default__';
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      const map = this.getPushPreferencesMap();
+      map[scopeKey] = {
+        enabled: nextPrefs.enabled === true,
+        notify_permission_required: nextPrefs.notify_permission_required === true,
+        notify_turn_completed: nextPrefs.notify_turn_completed === true,
+        notify_agent_error: nextPrefs.notify_agent_error === true,
+        notify_goal_finished: nextPrefs.notify_goal_finished === true,
+        notify_timer_fired: nextPrefs.notify_timer_fired === true,
+        include_message_preview: nextPrefs.include_message_preview === true
+      };
+      this.prefs.putSync(KEY_PUSH_PREFS_BY_HOST, JSON.stringify(map));
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush push preferences map', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save push preferences map', err as Object);
+    }
+  }
+
+  public getPersonalAgentLastVisitMap(): Record<string, number> {
+    if (this.prefs === null) {
+      return {};
+    }
+    try {
+      const raw = this.prefs.getSync(KEY_PA_LAST_VISIT_MAP, '') as string;
+      if (typeof raw !== 'string' || raw.trim().length === 0) {
+        return {};
+      }
+      const parsed = JSON.parse(raw) as Record<string, number>;
+      return parsed !== null && typeof parsed === 'object' ? parsed : {};
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read PA last-visit map', err as Object);
+      return {};
+    }
+  }
+
+  public getPersonalAgentLastVisitMs(hostId: string, agentId: string): number {
+    const h = hostId.trim();
+    const a = agentId.trim();
+    if (h.length === 0 || a.length === 0) {
+      return 0;
+    }
+    const map = this.getPersonalAgentLastVisitMap();
+    const val = map[`${h}::${a}`];
+    return typeof val === 'number' && Number.isFinite(val) && val > 0 ? val : 0;
+  }
+
+  public setPersonalAgentLastVisitMs(hostId: string, agentId: string, tsMs: number): void {
+    const h = hostId.trim();
+    const a = agentId.trim();
+    if (h.length === 0 || a.length === 0 || !Number.isFinite(tsMs) || tsMs <= 0) {
+      return;
+    }
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      const map = this.getPersonalAgentLastVisitMap();
+      map[`${h}::${a}`] = Math.floor(tsMs);
+      this.prefs.putSync(KEY_PA_LAST_VISIT_MAP, JSON.stringify(map));
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush PA last-visit map', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save PA last-visit map', err as Object);
     }
   }
 

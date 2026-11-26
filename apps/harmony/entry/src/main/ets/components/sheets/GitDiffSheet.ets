@@ -13,6 +13,7 @@ import {
   isAutoCollapsedDiffPath
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { selectDisplayedDiffFiles } from '../../model/OrbitDiffInspectorModel';
 import {
   OrbitTokens,
   orbitButtonMeta,
@@ -80,10 +81,11 @@ export struct GitDiffSheet {
 
   @Computed
   get displayedDiffFiles(): DiffFileDto[] {
-    if (this.store.gitDiffFiles.length > 0) {
-      return this.store.gitDiffFiles;
-    }
-    return this.store.sessionDiffs;
+    return selectDisplayedDiffFiles(
+      this.store.isDiffTargetPinned,
+      this.store.gitDiffFiles,
+      this.store.sessionDiffs
+    );
   }
 
   @Computed
@@ -205,7 +207,7 @@ export struct GitDiffSheet {
       }
       return `${st.branch}${suffix}`;
     }
-    return basenameOfPath(this.store.activeCwd);
+    return basenameOfPath(this.store.resolvedDiffCwd());
   }
 
   private toggleCollapseExpandCode(): void {
@@ -299,7 +301,7 @@ export struct GitDiffSheet {
         .backgroundColor(this.store.palette.subtleSurface)
         .accessibilityText('Close Git Diff Inspector')
         .onClick(() => {
-          this.store.showInlineDiffInspector = false;
+          this.store.closeGitInspector();
           this.store.triggerHaptic(6);
         })
       }

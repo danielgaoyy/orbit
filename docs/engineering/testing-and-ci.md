@@ -89,9 +89,13 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 Rust 质量任务通过 `bash scripts/check-ohos-dts-sync.sh --print-count` 核对 N-API 声明。脚本先读 crate 根文件，再按路径字典序读取 `src/napi/**/*.rs`。同一类重名或签名漂移会导致失败。修改导出后使用 `--write` 重新生成声明。
 
-[HarmonyOS PR Build](../../.github/workflows/harmony-ci.yml) 在鸿蒙相关 PR 上检查 Rust fixture 可再生性、ArkTS DTO 顶层字段与 d.ts，在宿主验证 500 帧回放后，交叉编译 x86_64 并组装 unsigned debug HAP。工具链沿用 Release 的 Temurin 17 与 API 26（26.0.0.821），关闭 SDK 缓存。该任务独立显示结果，稳定运行两周后再评估纳入 Ruleset。
+[HarmonyOS PR Build](../../.github/workflows/harmony-ci.yml) 在鸿蒙相关 PR 上检查 Rust fixture 可再生性、ArkTS DTO 顶层字段、d.ts 同步及以下三项 HarmonyOS 资源与文案门禁（均运行于 Node 24），在宿主验证 500 帧回放后，交叉编译 x86_64 并组装 unsigned debug HAP。工具链沿用 Release 的 Temurin 17 与 API 26（26.0.0.821），关闭 SDK 缓存。该任务独立显示结果，稳定运行两周后再评估纳入 Ruleset。
 
-本机双 ABI 构建使用 `bash apps/harmony/scripts/build-rust-ohos.sh`。该脚本与 Swift/Kotlin 绑定检查 `bash scripts/sync-bindings.sh --check` 均支持 `CARGO_TARGET_DIR`。绑定检查生成到临时目录并比较两端生成树。
+- **`node scripts/gen-harmony-strings.mjs --check`**：以 `apps/desktop/src/lib/i18n/locales/{en,zh-CN,ja}.ts`、`apps/harmony/i18n-keys.txt`（桌面 key 白名单）与 `apps/harmony/i18n-harmony-only.json`（鸿蒙独有文案）为输入，在内存中重新生成 `resources/{base,zh_CN,ja_JP}/element/string.json` 并逐字节比对，防止三语资源漂移或 key 冲突。
+- **`bash scripts/check-harmony-i18n.sh`**：校验三套 `string.json` 的 key 集合、每个槽位的占位符类型与出现次数（拦截混用、空槽与同槽冲突）、禁用术语（如旧“个人路由/机群网/Personal Router/Hermes/パーソナルルーター”），并对渐进式覆盖清单中的 `.ets` 文件执行单行及跨行裸英文扫描（支持 `--all` 扫描全仓）。
+- **`node scripts/gen-harmony-avatars.mjs --check`**：直接通过 Node 24 原生 TS 剥离导入 `apps/desktop/src/lib/subagent-avatar.ts` 的 `SUBAGENT_AVATAR_ROSTER`，在内存中校验 24 个无背景静态 SVG（`orbit_avatar_*.svg`）、浅/深色 `color.json` 背景色条目与 `OrbitAvatarRoster.ets` 是否与桌面端保持逐项一致。
+
+本机双 ABI 构建使用 `bash apps/harmony/scripts/build-rust-ohos.sh`。该脚本与 Swift/Kotlin 绑定检查 `bash scripts/sync-bindings.sh --check` 均支持 `CARGO_TARGET_DIR`。绑定检查生成到临时目录并使用 Node 逐字节比对两端生成树（不受 DevEco `toolchains/diff` 路径遮蔽影响）。
 
 [Orbit Patrol’s opt-in workflow](../../.github/workflows/orbit-pr-review.yml.example) runs on read-only pull request events. It builds the reviewer at the trusted base SHA and reads the fork head as Git objects. Download the JSON report from the run artifacts.
 

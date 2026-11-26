@@ -6,7 +6,6 @@ import {
 import {
   AgentCardDto,
   WorkspaceEventRecordDto,
-  formatAgentStatusLabel,
   formatCompactRelativeTime,
   formatProviderLabel
 } from '../../model/OrbitTypes';
@@ -28,6 +27,12 @@ import {
   OrbitSectionHeader,
   dismissHarmonyKeyboard
 } from '../common/OrbitCommonControls';
+import {
+  OrbitAgentListItem,
+  mapAgentCardToListStatus,
+  resolveAgentEffortDisplay,
+  resolveCompactAgentModelLabel
+} from '../common/OrbitAgentListItem';
 
 @ComponentV2
 export struct WorkspaceBoardSheet {
@@ -226,65 +231,30 @@ export struct WorkspaceBoardSheet {
           this.peerList,
           (peer: AgentCardDto) => {
             ListItem() {
-              Button({ type: ButtonType.Normal, stateEffect: true }) {
-                Row({ space: OrbitTokens.SPACE_SM }) {
-                  Row()
-                    .width(8)
-                    .height(8)
-                    .borderRadius(4)
-                    .backgroundColor(
-                      peer.is_awaiting_permission
-                        ? this.store.palette.statusWarning
-                        : (peer.is_running ? this.store.palette.accentPrimary : this.store.palette.statusDirect)
-                    )
-
-                  Column({ space: 2 }) {
-                    Row({ space: 6 }) {
-                      if (peer.handle !== undefined && peer.handle !== null && peer.handle.length > 0) {
-                        Text(`@${peer.handle}`)
-                          .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Medium))
-                      }
-                      Text(peer.title.trim().length > 0 ? peer.title : peer.provider_label)
-                        .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .layoutWeight(1)
-                    }
-                    .width('100%')
-                    .alignItems(VerticalAlign.Center)
-
-                    Text(`${formatProviderLabel(peer.provider)} · ${formatAgentStatusLabel(peer)}`)
-                      .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                  }
-                  .alignItems(HorizontalAlign.Start)
-                  .layoutWeight(1)
-
-                  if (peer.agent_id === this.store.selectedAgentId) {
-                    Text('Current')
-                      .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-                      .padding({ left: 8, right: 8, top: 2, bottom: 2 })
-                      .borderRadius(OrbitTokens.RADIUS_SM)
-                      .backgroundColor(this.store.palette.subtleSurface)
-                  } else {
-                    SymbolGlyph($r('sys.symbol.chevron_right'))
-                      .fontSize(13)
-                      .fontColor([this.store.palette.fgMuted])
-                  }
+              OrbitAgentListItem({
+                variant: 'card',
+                title: (peer.handle !== undefined && peer.handle !== null && peer.handle.length > 0)
+                  ? `@${peer.handle} · ${peer.title.trim().length > 0 ? peer.title : peer.provider_label}`
+                  : (peer.title.trim().length > 0 ? peer.title : peer.provider_label),
+                status: mapAgentCardToListStatus(peer),
+                avatarSeedKey: peer.agent_id,
+                provider: peer.provider,
+                modelLabel: resolveCompactAgentModelLabel(
+                  peer,
+                  this.store.currentHostDetail?.provider_catalogs ?? []
+                ),
+                effortLabel: resolveAgentEffortDisplay(peer),
+                agentLabel: formatProviderLabel(peer.provider),
+                isSelected: peer.agent_id === this.store.selectedAgentId,
+                titleTrailingText: peer.agent_id === this.store.selectedAgentId ? 'Current' : '',
+                onItemClick: () => {
+                  this.store.selectAgent(peer.agent_id);
+                  this.store.showWorkspaceBoardSheet = false;
                 }
-                .width('100%')
-                .alignItems(VerticalAlign.Center)
-              }
-              .width('100%')
-              .padding(OrbitTokens.SPACE_LG)
-              .backgroundColor(this.store.palette.listCard)
-              .borderRadius(OrbitTokens.RADIUS_LG)
-              .onClick(() => {
-                this.store.selectAgent(peer.agent_id);
-                this.store.showWorkspaceBoardSheet = false;
               })
             }
           },
-          (peer: AgentCardDto): string => `peer_${peer.agent_id}_${peer.status.state}`
+          (peer: AgentCardDto): string => `peer_${peer.agent_id}`
         )
       }
 

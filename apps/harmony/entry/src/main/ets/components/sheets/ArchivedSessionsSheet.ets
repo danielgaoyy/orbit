@@ -4,6 +4,7 @@ import {
   formatCompactRelativeTime,
   formatProviderLabel
 } from '../../model/OrbitTypes';
+import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
@@ -12,10 +13,16 @@ import {
   orbitTextSubhead,
   orbitTextTitle
 } from '../../theme/OrbitTokens';
+import {
+  OrbitAgentListItem,
+  mapAgentCardToListStatus,
+  resolveAgentEffortDisplay,
+  resolveCompactAgentModelLabel
+} from '../common/OrbitAgentListItem';
 
 @ComponentV2
 export struct ArchivedSessionsSheet {
-  private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  private readonly store: OrbitHarmonyStore = orbitRuntime();
 
   @Computed
   get archivedList(): AgentCardDto[] {
@@ -43,6 +50,36 @@ export struct ArchivedSessionsSheet {
         }
       }
     });
+  }
+
+  @Builder
+  private renderArchivedActions(ag: AgentCardDto) {
+    Row({ space: OrbitTokens.SPACE_XS }) {
+      Button('Restore', { type: ButtonType.Capsule, stateEffect: true })
+        .attributeModifier(
+          orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.subtleSurface)
+        )
+        .height(34)
+        .padding({ left: 12, right: 12 })
+        .onClick(() => {
+          this.store.unarchiveSession(ag.agent_id);
+        })
+
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        SymbolGlyph($r('sys.symbol.trash'))
+          .fontSize(15)
+          .fontColor([this.store.palette.statusDanger])
+      }
+      .width(34)
+      .height(34)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText('Delete session permanently')
+      .onClick(() => {
+        this.confirmPermanentDelete(ag);
+      })
+    }
+    .alignItems(VerticalAlign.Center)
   }
 
   build() {
@@ -78,52 +115,25 @@ export struct ArchivedSessionsSheet {
             this.archivedList,
             (ag: AgentCardDto) => {
               ListItem() {
-                Row({ space: OrbitTokens.SPACE_SM }) {
-                  Column({ space: 3 }) {
-                    Text(ag.title.trim().length > 0 ? ag.title : ag.provider_label)
-                      .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-                    Text(
-                      `${basenameOfPath(ag.cwd)} · ${formatProviderLabel(ag.provider)}${formatCompactRelativeTime(ag.updated_at_rfc3339).length > 0 ? ` · ${formatCompactRelativeTime(ag.updated_at_rfc3339)}` : ''}`
-                    )
-                      .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                OrbitAgentListItem({
+                  variant: 'card',
+                  title: ag.title.trim().length > 0 ? ag.title : ag.provider_label,
+                  status: mapAgentCardToListStatus(ag),
+                  avatarSeedKey: ag.agent_id,
+                  provider: ag.provider,
+                  modelLabel: resolveCompactAgentModelLabel(
+                    ag,
+                    this.store.currentHostDetail?.provider_catalogs ?? []
+                  ),
+                  effortLabel: resolveAgentEffortDisplay(ag),
+                  agentLabel: formatProviderLabel(ag.provider),
+                  secondaryMeta: basenameOfPath(ag.cwd),
+                  titleTrailingText: formatCompactRelativeTime(ag.updated_at_rfc3339),
+                  interactive: false,
+                  trailingSlot: (): void => {
+                    this.renderArchivedActions(ag);
                   }
-                  .alignItems(HorizontalAlign.Start)
-                  .layoutWeight(1)
-
-                  Button('Restore', { type: ButtonType.Capsule, stateEffect: true })
-                    .attributeModifier(
-                      orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.subtleSurface)
-                    )
-                    .height(34)
-                    .padding({ left: 12, right: 12 })
-                    .onClick(() => {
-                      this.store.unarchiveSession(ag.agent_id);
-                    })
-
-                  Button({ type: ButtonType.Circle, stateEffect: true }) {
-                    SymbolGlyph($r('sys.symbol.trash'))
-                      .fontSize(15)
-                      .fontColor([this.store.palette.statusDanger])
-                  }
-                  .width(34)
-                  .height(34)
-                  .padding(0)
-                  .backgroundColor(Color.Transparent)
-                  .accessibilityText('Delete session permanently')
-                  .onClick(() => {
-                    this.confirmPermanentDelete(ag);
-                  })
-                }
-                .width('100%')
-                .padding(OrbitTokens.SPACE_MD)
-                .backgroundColor(this.store.palette.listCard)
-                .borderRadius(OrbitTokens.RADIUS_LG)
-                .alignItems(VerticalAlign.Center)
+                })
               }
             },
             (ag: AgentCardDto): string => `arch_${ag.agent_id}_${ag.updated_at_rfc3339}`

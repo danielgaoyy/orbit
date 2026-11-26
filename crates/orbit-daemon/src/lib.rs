@@ -10247,18 +10247,15 @@ fn hash_payload(val: &serde_json::Value) -> String {
 }
 
 pub(crate) fn expand_host_path(raw: &str) -> PathBuf {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "~" {
+    if raw.trim().is_empty() || raw == "~" {
         return crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("."));
     }
-    if let Some(rest) = trimmed
-        .strip_prefix("~/")
-        .or_else(|| trimmed.strip_prefix(r"~\"))
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix(r"~\"))
         && let Some(home) = crate::platform::resolve_user_home_dir()
     {
         return home.join(rest);
     }
-    PathBuf::from(trimmed)
+    PathBuf::from(raw)
 }
 
 async fn bind_terminal_stream_to_client(
@@ -11010,7 +11007,7 @@ async fn authorize_optional_skills_cwd(
     if trimmed.is_empty() || trimmed == "~" {
         return Ok(None);
     }
-    let expanded = expand_host_path(trimmed);
+    let expanded = expand_host_path(&raw);
     if is_user_home_dir_path(&expanded) {
         return Ok(None);
     }
@@ -11029,7 +11026,7 @@ async fn authorize_path_rules_cwd(
     if trimmed.is_empty() || trimmed == "~" {
         return Ok(None);
     }
-    let resolved = expand_host_path(trimmed);
+    let resolved = expand_host_path(raw_cwd);
     if is_user_home_dir_path(&resolved) {
         return Ok(None);
     }
@@ -11061,7 +11058,7 @@ async fn authorize_optional_mcp_cwd(
     store: &Arc<OrbitStore>,
     cwd: Option<String>,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(raw) = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(raw) = cwd.as_deref().filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
     };
     let expanded = expand_host_path(raw);
@@ -11147,11 +11144,10 @@ async fn authorize_optional_hooks_cwd(
     store: &Arc<OrbitStore>,
     cwd: Option<String>,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(raw) = cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "~")
-    else {
+    let Some(raw) = cwd.as_deref().filter(|s| {
+        let t = s.trim();
+        !t.is_empty() && t != "~"
+    }) else {
         return Ok(None);
     };
     let expanded = expand_host_path(raw);
@@ -11198,11 +11194,10 @@ fn authorize_workspace_mutation_cwd_sync(
     }
 
     for raw_root in candidate_roots {
-        let trimmed = raw_root.trim();
-        if trimmed.is_empty() {
+        if raw_root.trim().is_empty() {
             continue;
         }
-        let expanded = expand_host_path(trimmed);
+        let expanded = expand_host_path(&raw_root);
         // `canonicalize_workspace_root` automatically filters out `/`, `$HOME`, `.git`, and missing dirs.
         if let Ok(canon_root) = canonicalize_workspace_root(&expanded)
             && (canon_cwd == canon_root || canon_cwd.starts_with(&canon_root))
@@ -13119,5 +13114,127 @@ mod self_upgrade_tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn expand_host_path_preserves_trailing_space_strings() {
+        let abs_with_space = "/tmp/orbit_space_test/project ";
+        assert_eq!(
+            expand_host_path(abs_with_space),
+            PathBuf::from(abs_with_space)
+        );
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
+            assert_eq!(expand_host_path("~/project "), home.join("project "));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expand_host_path_and_git_ops_preserve_trailing_space_directories() {
+        let root =
+            std::env::temp_dir().join(format!("orbit_space_git_{}", Uuid::new_v4().simple()));
+        let plain_repo = root.join("project");
+        let space_repo = root.join("project ");
+        std::fs::create_dir_all(&plain_repo).expect("mkdir plain");
+        std::fs::create_dir_all(&space_repo).expect("mkdir space");
+
+        let init_repo = |dir: &Path, filename: &str| {
+            let run_git = |args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("GIT_AUTHOR_NAME", "Orbit Test")
+                    .env("GIT_AUTHOR_EMAIL", "test@orbit.local")
+                    .env("GIT_COMMITTER_NAME", "Orbit Test")
+                    .env("GIT_COMMITTER_EMAIL", "test@orbit.local")
+                    .status()
+                    .expect("run git");
+                assert!(
+                    status.success(),
+                    "git {:?} failed in {}",
+                    args,
+                    dir.display()
+                );
+            };
+            run_git(&["init", "-q"]);
+            std::fs::write(dir.join(filename), "initial\n").expect("write initial");
+            run_git(&["add", filename]);
+            run_git(&["commit", "-q", "-m", "init"]);
+            std::fs::write(dir.join(filename), "modified\n").expect("write modified");
+        };
+
+        init_repo(&plain_repo, "plain-only.txt");
+        init_repo(&space_repo, "space-only.txt");
+
+        let plain_str = plain_repo.to_string_lossy().to_string();
+        let space_str = space_repo.to_string_lossy().to_string();
+        assert_ne!(plain_str, space_str);
+
+        // `expand_host_path` MUST preserve significant trailing spaces for both absolute and `~/` paths.
+        assert_eq!(expand_host_path(&space_str), space_repo);
+        assert_eq!(expand_host_path(&plain_str), plain_repo);
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
+            assert_eq!(expand_host_path(""), home);
+            assert_eq!(expand_host_path("   "), home);
+            assert_eq!(expand_host_path("~"), home);
+            assert_eq!(expand_host_path("~/project "), home.join("project "));
+        }
+
+        // Git status + diff on `project ` MUST strictly read `space-only.txt` and NEVER `plain-only.txt`.
+        let resolved_space = expand_host_path(&space_str);
+        let space_status = inspect_git_status(&resolved_space).await;
+        let space_paths: Vec<&str> = space_status.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(space_paths, vec!["space-only.txt"]);
+        let space_diff = compute_git_diff(&resolved_space, None, false)
+            .await
+            .expect("space diff");
+        assert!(space_diff.contains("space-only.txt"));
+        assert!(!space_diff.contains("plain-only.txt"));
+
+        // Control: Git status + diff on `project` strictly reads `plain-only.txt` and NEVER `space-only.txt`.
+        let resolved_plain = expand_host_path(&plain_str);
+        let plain_status = inspect_git_status(&resolved_plain).await;
+        let plain_paths: Vec<&str> = plain_status.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(plain_paths, vec!["plain-only.txt"]);
+        let plain_diff = compute_git_diff(&resolved_plain, None, false)
+            .await
+            .expect("plain diff");
+        assert!(plain_diff.contains("plain-only.txt"));
+        assert!(!plain_diff.contains("space-only.txt"));
+
+        // Write/stage authorization & staging on `project ` MUST authorize `project ` without matching `project`.
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_space".into(),
+                name: "Project Space".into(),
+                directories: vec![space_str.clone()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert space project");
+        let authorized_space = authorize_workspace_mutation_cwd(&store, &resolved_space)
+            .await
+            .expect("authorize space repo");
+        assert!(
+            authorize_workspace_mutation_cwd(&store, &resolved_plain)
+                .await
+                .is_err(),
+            "registering `project ` must not authorize sibling `project`"
+        );
+        crate::git_write::stage_files(&authorized_space, &["space-only.txt".into()], false)
+            .await
+            .expect("stage space-only.txt");
+        let staged_space_diff = compute_git_diff(&authorized_space, None, true)
+            .await
+            .expect("staged space diff");
+        assert!(staged_space_diff.contains("space-only.txt"));
+        let staged_plain_diff = compute_git_diff(&resolved_plain, None, true)
+            .await
+            .expect("staged plain diff");
+        assert!(staged_plain_diff.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1727,6 +1727,9 @@ export interface GoalRunRecord {
   last_verify_exit_code?: number | null;
   last_verify_output?: string | null;
   consecutive_identical_failures: number;
+  pause_reason?: string | null;
+  paused_by_user?: boolean;
+  active_duration_secs?: number;
   started_at_ms: number;
   updated_at_ms: number;
   finished_at_ms?: number | null;
@@ -3008,6 +3011,7 @@ export interface ResolvedModelSelectionView {
 export type ClientPlatform = "desktop" | "ios" | "android" | "harmony" | "web";
 export type SlashDirective =
   | "plan"
+  | "goal"
   | "review"
   | "compact"
   | "orbit"
@@ -7290,6 +7294,8 @@ export const orbitIpc = {
     verifyCommand?: string | null;
     maxIterations?: number | null;
     maxDurationSecs?: number | null;
+    replaceExisting?: boolean;
+    dispatchInitialPrompt?: boolean | null;
   }): Promise<GoalRunRecord> => {
     return invoke<GoalRunRecord>("start_goal_run", {
       hostId: req.hostId,
@@ -7297,6 +7303,29 @@ export const orbitIpc = {
       objective: req.objective,
       criteria: req.criteria ?? null,
       verifyCommand: req.verifyCommand?.trim() ? req.verifyCommand.trim() : null,
+      maxIterations: req.maxIterations ?? null,
+      maxDurationSecs: req.maxDurationSecs ?? null,
+      replaceExisting: req.replaceExisting ?? false,
+      dispatchInitialPrompt:
+        req.dispatchInitialPrompt === undefined ? null : req.dispatchInitialPrompt,
+    });
+  },
+
+  updateGoalRun: async (req: {
+    hostId: string;
+    goalId: string;
+    objective?: string | null;
+    criteria?: string[] | null;
+    verifyCommand?: string | null;
+    maxIterations?: number | null;
+    maxDurationSecs?: number | null;
+  }): Promise<GoalRunRecord> => {
+    return invoke<GoalRunRecord>("update_goal_run", {
+      hostId: req.hostId,
+      goalId: req.goalId,
+      objective: req.objective ?? null,
+      criteria: req.criteria ?? null,
+      verifyCommand: req.verifyCommand === undefined ? null : req.verifyCommand,
       maxIterations: req.maxIterations ?? null,
       maxDurationSecs: req.maxDurationSecs ?? null,
     });

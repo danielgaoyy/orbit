@@ -105,6 +105,7 @@ export interface OrbitCrossSliceActions {
     steerImmediately: boolean,
     rawDraft: string,
     storedDirective: SlashDirective | null,
+    options?: { replaceExistingGoalConfirmed?: boolean },
   ): Promise<void>;
   forkAgent(opts: {
     hostId: string;
@@ -193,7 +194,34 @@ export interface OrbitCrossSliceActions {
     verifyCommand?: string | null;
     maxIterations?: number | null;
     maxDurationSecs?: number | null;
+    replaceExisting?: boolean;
+    dispatchInitialPrompt?: boolean | null;
+    silentToast?: boolean;
   }): Promise<GoalRunRecord | null>;
+  updateGoalRun(req: {
+    hostId: string;
+    goalId: string;
+    objective?: string | null;
+    criteria?: string[] | null;
+    verifyCommand?: string | null;
+    maxIterations?: number | null;
+    maxDurationSecs?: number | null;
+  }): Promise<GoalRunRecord | null>;
+  controlGoalRun(
+    hostId: string,
+    goalId: string,
+    action: "pause" | "resume" | "cancel" | "verify_now",
+  ): Promise<GoalRunRecord | null>;
+  openGoalEditDialog(hostId: string, goal: GoalRunRecord): void;
+  closeGoalEditDialog(): void;
+  openGoalReplaceConfirm(target: {
+    hostId: string;
+    agentId: string;
+    currentGoal: GoalRunRecord;
+    newObjective: string;
+    onConfirm: () => Promise<void>;
+  }): void;
+  closeGoalReplaceConfirm(): void;
   executeBrowserAction(
     hostId: string,
     sessionId: string,

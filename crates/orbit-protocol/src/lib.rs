@@ -3701,6 +3701,10 @@ pub enum WireMessage {
         max_iterations: Option<u32>,
         #[serde(default)]
         max_duration_secs: Option<u64>,
+        #[serde(default)]
+        replace_existing: bool,
+        #[serde(default)]
+        dispatch_initial_prompt: Option<bool>,
     },
     ListGoalRuns {
         request_id: Uuid,
@@ -3711,6 +3715,20 @@ pub enum WireMessage {
         request_id: Uuid,
         goal_id: String,
         action: GoalControlAction,
+    },
+    UpdateGoalRun {
+        request_id: Uuid,
+        goal_id: String,
+        #[serde(default)]
+        objective: Option<String>,
+        #[serde(default)]
+        criteria: Option<Vec<String>>,
+        #[serde(default)]
+        verify_command: Option<Option<String>>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
+        #[serde(default)]
+        max_duration_secs: Option<u64>,
     },
     GoalRunUpdated {
         request_id: Uuid,
@@ -6000,6 +6018,9 @@ mod tests {
             last_verify_exit_code: Some(1),
             last_verify_output: Some("1 failed".into()),
             consecutive_identical_failures: 1,
+            pause_reason: None,
+            paused_by_user: false,
+            active_duration_secs: 42,
             started_at_ms: 1_760_000_000_000,
             updated_at_ms: 1_760_000_005_000,
             finished_at_ms: None,
@@ -6030,6 +6051,8 @@ mod tests {
                 verify_command: Some("cargo test".into()),
                 max_iterations: Some(10),
                 max_duration_secs: Some(3600),
+                replace_existing: true,
+                dispatch_initial_prompt: Some(false),
             },
             WireMessage::ListGoalRuns {
                 request_id: req_id,
@@ -6039,6 +6062,15 @@ mod tests {
                 request_id: req_id,
                 goal_id: "goal_abc".into(),
                 action: GoalControlAction::VerifyNow,
+            },
+            WireMessage::UpdateGoalRun {
+                request_id: req_id,
+                goal_id: "goal_abc".into(),
+                objective: Some("Updated objective".into()),
+                criteria: Some(vec!["cargo test exits 0".into()]),
+                verify_command: Some(Some("cargo test".into())),
+                max_iterations: Some(25),
+                max_duration_secs: Some(0),
             },
             WireMessage::GoalRunUpdated {
                 request_id: req_id,

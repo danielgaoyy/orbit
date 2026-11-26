@@ -2493,6 +2493,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     private fun parseSlashDirectiveEnum(raw: String?): FfiSlashDirective? =
         when (raw?.trim()?.lowercase()?.removePrefix("/")) {
             "plan" -> FfiSlashDirective.PLAN
+            "goal" -> FfiSlashDirective.GOAL
             "review" -> FfiSlashDirective.REVIEW
             "compact" -> FfiSlashDirective.COMPACT
             "orbit" -> FfiSlashDirective.ORBIT
@@ -4762,6 +4763,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         verifyCommand = verifyCommand?.trim()?.ifEmpty { null },
                         maxIterations = maxIterations,
                         maxDurationSecs = null,
+                        replaceExisting = false,
+                        dispatchInitialPrompt = null,
                     )
                 )
                 refreshAutomations()

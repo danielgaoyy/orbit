@@ -3571,6 +3571,8 @@ async fn start_goal_run(
     verify_command: Option<String>,
     max_iterations: Option<u32>,
     max_duration_secs: Option<u64>,
+    replace_existing: Option<bool>,
+    dispatch_initial_prompt: Option<bool>,
 ) -> Result<orbit_protocol::GoalRunRecord, String> {
     state
         .core
@@ -3582,6 +3584,8 @@ async fn start_goal_run(
             verify_command,
             max_iterations,
             max_duration_secs,
+            replace_existing: replace_existing.unwrap_or(false),
+            dispatch_initial_prompt,
         })
         .await
 }
@@ -3608,6 +3612,32 @@ async fn control_goal_run(
             host_id,
             goal_id,
             action,
+        })
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn update_goal_run(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    goal_id: String,
+    objective: Option<String>,
+    criteria: Option<Vec<String>>,
+    verify_command: Option<Option<String>>,
+    max_iterations: Option<u32>,
+    max_duration_secs: Option<u64>,
+) -> Result<orbit_protocol::GoalRunRecord, String> {
+    state
+        .core
+        .update_goal_run_on_host(orbit_client_core::contract::UpdateGoalRunRequest {
+            host_id,
+            goal_id,
+            objective,
+            criteria,
+            verify_command,
+            max_iterations,
+            max_duration_secs,
         })
         .await
 }
@@ -5438,6 +5468,7 @@ pub fn run() {
             start_goal_run,
             list_goal_runs,
             control_goal_run,
+            update_goal_run,
             start_monitor_watch,
             list_monitor_watches,
             stop_monitor_watch,

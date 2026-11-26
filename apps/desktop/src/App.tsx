@@ -11,6 +11,7 @@ import {
 import { MarkdownThemeProvider } from "@/components/markdown-blocks";
 import { CopyCodeBlocksModal } from "@/components/modals/copy-code-blocks-modal";
 import { ExportTranscriptModal } from "@/components/modals/export-transcript-modal";
+import { GoalDialogs } from "@/components/composer/goal-dialogs";
 import { WorktreeHandoffModal } from "@/components/modals/worktree-handoff-modal";
 import { OnboardingGuide } from "@/components/onboarding/onboarding-guide";
 import { MediaPreviewModal } from "@/components/viewers/media-preview-modal";
@@ -305,6 +306,7 @@ function MainDesktopApp() {
         <QuickOpenFileDialog />
         <RemoteFolderPickerDialog />
         <ExportTranscriptModal />
+        <GoalDialogs />
         <CopyCodeBlocksModal />
         <WorktreeHandoffModal />
         <OnboardingGuide />

@@ -1061,6 +1061,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_agent_identity(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_goal_run(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config_request(
@@ -1543,6 +1545,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_agent_identity(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`handle`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`taskSummary`: RustBuffer.ByValue,`lockHandle`: Byte,`lockTitle`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_goal_run(`ptr`: Long,`hostId`: RustBuffer.ByValue,`goalId`: RustBuffer.ByValue,`objective`: RustBuffer.ByValue,`criteria`: RustBuffer.ByValue,`verifyCommand`: RustBuffer.ByValue,`clearVerifyCommand`: Byte,`maxIterations`: RustBuffer.ByValue,`maxDurationSecs`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_host_config(`ptr`: Long,`hostId`: RustBuffer.ByValue,`customName`: RustBuffer.ByValue,`routeMode`: RustBuffer.ByValue,`sshAlias`: RustBuffer.ByValue,`remoteDaemonPort`: RustBuffer.ByValue,`customDirectEndpoint`: RustBuffer.ByValue,`relayUrl`: RustBuffer.ByValue,`reconnect`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_host_config_request(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -2303,6 +2307,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_agent_identity() and 0xFFFF) != 9558) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_goal_run() and 0xFFFF) != 12586) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config() and 0xFFFF) != 12313) {
@@ -3690,6 +3697,8 @@ public interface OrbitMobileCoreInterface {
     fun `unregisterPushToken`(`platform`: kotlin.String)
     
     fun `updateAgentIdentity`(`hostId`: kotlin.String, `agentId`: kotlin.String, `handle`: kotlin.String?, `title`: kotlin.String?, `taskSummary`: kotlin.String?, `lockHandle`: kotlin.Boolean, `lockTitle`: kotlin.Boolean)
+    
+    fun `updateGoalRun`(`hostId`: kotlin.String, `goalId`: kotlin.String, `objective`: kotlin.String?, `criteria`: List<kotlin.String>?, `verifyCommand`: kotlin.String?, `clearVerifyCommand`: kotlin.Boolean, `maxIterations`: kotlin.UInt?, `maxDurationSecs`: kotlin.ULong?): FfiGoalRunRecord
     
     fun `updateHostConfig`(`hostId`: kotlin.String, `customName`: kotlin.String?, `routeMode`: FfiHostRouteMode?, `sshAlias`: kotlin.String?, `remoteDaemonPort`: kotlin.UShort?, `customDirectEndpoint`: kotlin.String?, `relayUrl`: kotlin.String?, `reconnect`: kotlin.Boolean): FfiHostCard
     
@@ -6337,6 +6346,28 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
 }
     }
     
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `updateGoalRun`(`hostId`: kotlin.String, `goalId`: kotlin.String, `objective`: kotlin.String?, `criteria`: List<kotlin.String>?, `verifyCommand`: kotlin.String?, `clearVerifyCommand`: kotlin.Boolean, `maxIterations`: kotlin.UInt?, `maxDurationSecs`: kotlin.ULong?): FfiGoalRunRecord {
+            return FfiConverterTypeFfiGoalRunRecord.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_goal_run(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`goalId`),
+        FfiConverterOptionalString.lower(`objective`),
+        FfiConverterOptionalSequenceString.lower(`criteria`),
+        FfiConverterOptionalString.lower(`verifyCommand`),
+        FfiConverterBoolean.lower(`clearVerifyCommand`),
+        FfiConverterOptionalUInt.lower(`maxIterations`),
+        FfiConverterOptionalULong.lower(`maxDurationSecs`),_status)
+}
+    }
+    )
+    }
     
 
     
@@ -11218,6 +11249,12 @@ data class FfiGoalRunRecord (
     , 
     var `consecutiveIdenticalFailures`: kotlin.UInt
     , 
+    var `pauseReason`: kotlin.String?
+    , 
+    var `pausedByUser`: kotlin.Boolean
+    , 
+    var `activeDurationSecs`: kotlin.ULong
+    , 
     var `startedAtMs`: kotlin.ULong
     , 
     var `updatedAtMs`: kotlin.ULong
@@ -11252,6 +11289,9 @@ public object FfiConverterTypeFfiGoalRunRecord: FfiConverterRustBuffer<FfiGoalRu
             FfiConverterOptionalInt.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterOptionalULong.read(buf),
@@ -11272,6 +11312,9 @@ public object FfiConverterTypeFfiGoalRunRecord: FfiConverterRustBuffer<FfiGoalRu
             FfiConverterOptionalInt.allocationSize(value.`lastVerifyExitCode`) +
             FfiConverterOptionalString.allocationSize(value.`lastVerifyOutput`) +
             FfiConverterUInt.allocationSize(value.`consecutiveIdenticalFailures`) +
+            FfiConverterOptionalString.allocationSize(value.`pauseReason`) +
+            FfiConverterBoolean.allocationSize(value.`pausedByUser`) +
+            FfiConverterULong.allocationSize(value.`activeDurationSecs`) +
             FfiConverterULong.allocationSize(value.`startedAtMs`) +
             FfiConverterULong.allocationSize(value.`updatedAtMs`) +
             FfiConverterOptionalULong.allocationSize(value.`finishedAtMs`)
@@ -11291,6 +11334,9 @@ public object FfiConverterTypeFfiGoalRunRecord: FfiConverterRustBuffer<FfiGoalRu
             FfiConverterOptionalInt.write(value.`lastVerifyExitCode`, buf)
             FfiConverterOptionalString.write(value.`lastVerifyOutput`, buf)
             FfiConverterUInt.write(value.`consecutiveIdenticalFailures`, buf)
+            FfiConverterOptionalString.write(value.`pauseReason`, buf)
+            FfiConverterBoolean.write(value.`pausedByUser`, buf)
+            FfiConverterULong.write(value.`activeDurationSecs`, buf)
             FfiConverterULong.write(value.`startedAtMs`, buf)
             FfiConverterULong.write(value.`updatedAtMs`, buf)
             FfiConverterOptionalULong.write(value.`finishedAtMs`, buf)
@@ -18625,6 +18671,10 @@ data class StartGoalRunRequest (
     var `maxIterations`: kotlin.UInt?
     , 
     var `maxDurationSecs`: kotlin.ULong?
+    , 
+    var `replaceExisting`: kotlin.Boolean
+    , 
+    var `dispatchInitialPrompt`: kotlin.Boolean?
     
 ){
     
@@ -18648,6 +18698,8 @@ public object FfiConverterTypeStartGoalRunRequest: FfiConverterRustBuffer<StartG
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalUInt.read(buf),
             FfiConverterOptionalULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalBoolean.read(buf),
         )
     }
 
@@ -18658,7 +18710,9 @@ public object FfiConverterTypeStartGoalRunRequest: FfiConverterRustBuffer<StartG
             FfiConverterSequenceString.allocationSize(value.`criteria`) +
             FfiConverterOptionalString.allocationSize(value.`verifyCommand`) +
             FfiConverterOptionalUInt.allocationSize(value.`maxIterations`) +
-            FfiConverterOptionalULong.allocationSize(value.`maxDurationSecs`)
+            FfiConverterOptionalULong.allocationSize(value.`maxDurationSecs`) +
+            FfiConverterBoolean.allocationSize(value.`replaceExisting`) +
+            FfiConverterOptionalBoolean.allocationSize(value.`dispatchInitialPrompt`)
     )
 
     override fun write(value: StartGoalRunRequest, buf: ByteBuffer) {
@@ -18669,6 +18723,8 @@ public object FfiConverterTypeStartGoalRunRequest: FfiConverterRustBuffer<StartG
             FfiConverterOptionalString.write(value.`verifyCommand`, buf)
             FfiConverterOptionalUInt.write(value.`maxIterations`, buf)
             FfiConverterOptionalULong.write(value.`maxDurationSecs`, buf)
+            FfiConverterBoolean.write(value.`replaceExisting`, buf)
+            FfiConverterOptionalBoolean.write(value.`dispatchInitialPrompt`, buf)
     }
 }
 
@@ -21308,6 +21364,7 @@ public object FfiConverterTypeFfiSidebarThreadFilter: FfiConverterRustBuffer<Ffi
 enum class FfiSlashDirective {
     
     PLAN,
+    GOAL,
     REVIEW,
     COMPACT,
     ORBIT,
@@ -25248,6 +25305,38 @@ public object FfiConverterOptionalTypeSessionMode: FfiConverterRustBuffer<Sessio
         } else {
             buf.put(1)
             FfiConverterTypeSessionMode.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalSequenceString: FfiConverterRustBuffer<List<kotlin.String>?> {
+    override fun read(buf: ByteBuffer): List<kotlin.String>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceString.read(buf)
+    }
+
+    override fun allocationSize(value: List<kotlin.String>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<kotlin.String>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceString.write(value, buf)
         }
     }
 }

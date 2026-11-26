@@ -18,6 +18,7 @@ import {
   type Virtualizer,
 } from "@tanstack/react-virtual";
 import { ArrowDown, GitBranch, RotateCcw, RotateCw } from "lucide-react";
+import { ComposerGoalShelf } from "@/components/composer/composer-goal-shelf";
 import { ComposerPlanShelf } from "@/components/composer/composer-plan-shelf";
 import { planSourceTurn } from "@/components/composer/composer-plan-shelf-model";
 import { OmniComposer } from "@/components/composer/omni-composer";
@@ -2436,6 +2437,13 @@ export function StreamStage() {
               questions={pendingQuestions}
               subagentPermissions={subagentPermissions}
             />
+            {stageView && (
+              <ComposerGoalShelf
+                hostId={selectedHostId}
+                agentId={selectedAgentId}
+                hasPendingDecisions={hasPendingDecisions}
+              />
+            )}
             {stageView && (
               <ComposerPlanShelf
                 hostId={selectedHostId}

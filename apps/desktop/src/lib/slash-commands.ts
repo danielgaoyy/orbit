@@ -1,7 +1,7 @@
 import type { MessageKey } from "./i18n/index.ts";
 import type { SlashCommandView, SlashDirective } from "./orbit-ipc.ts";
 
-export type ComposerInlineDirective = SlashDirective | "btw" | "goal";
+export type ComposerInlineDirective = SlashDirective | "btw";
 
 const inlineDirectives: ReadonlySet<string> = new Set<ComposerInlineDirective>([
   "btw", "goal", "plan", "review", "compact", "orbit",
@@ -17,14 +17,33 @@ export function normalizeDirectiveLabel(raw: string): string {
   return raw.trim().replace(/^\/+/, "");
 }
 
+const GOAL_CLEAR_ARGS = /^(clear|stop|off|cancel|reset|none)$/i;
+const GOAL_EDIT_ARGS = /^edit$/i;
+
 export function resolveComposerSubmission(directive: ComposerInlineDirective | null, draft: string) {
-  if (directive === "btw" || directive === "goal") {
-    return { kind: directive, text: draft.trim() } as const;
+  if (directive === "btw") {
+    return { kind: "btw", text: draft.trim() } as const;
+  }
+  if (directive === "goal") {
+    const text = draft.trim();
+    if (!text) return { kind: "goal_inspect" } as const;
+    if (GOAL_CLEAR_ARGS.test(text)) return { kind: "goal_clear" } as const;
+    if (GOAL_EDIT_ARGS.test(text)) return { kind: "goal_edit" } as const;
+    return { kind: "prompt", directive: "goal" as SlashDirective } as const;
   }
   const match = !directive && /^\s*\/(btw|goal)(?=\s|$)/i.exec(draft);
   if (match) {
-    const kind = match[1].toLowerCase() === "goal" ? "goal" : "btw";
-    return { kind, text: draft.slice(match[0].length).trim() } as const;
+    const cmd = match[1].toLowerCase();
+    const rest = draft.slice(match[0].length).trim();
+    if (cmd === "btw") {
+      return { kind: "btw", text: rest } as const;
+    }
+    if (!rest) return { kind: "goal_inspect" } as const;
+    if (GOAL_CLEAR_ARGS.test(rest)) return { kind: "goal_clear" } as const;
+    if (GOAL_EDIT_ARGS.test(rest)) return { kind: "goal_edit" } as const;
+    // Route `/goal <objective>` through the full prompt pipeline so the user's message renders as
+    // a clean User Message bubble (preserving attachments, mentions, quotes, and draft mode).
+    return { kind: "prompt", directive: null } as const;
   }
   return { kind: "prompt", directive } as const;
 }
@@ -46,7 +65,7 @@ export const SLASH_GROUP_ORDER: readonly SlashCommandGroupId[] = [
   "skills",
 ];
 
-const SESSION_REQUIRED_IDS = new Set(["fork", "goal", "compact", "export", "copy"]);
+const SESSION_REQUIRED_IDS = new Set(["fork", "compact", "export", "copy"]);
 
 export const SLASH_DESC_KEY_BY_ID: Readonly<Record<string, MessageKey>> = {
   fork: "composer.slashDescFork",

@@ -302,6 +302,9 @@ export interface GoalRunRecordDto {
   status: string; // 'running' | 'verifying' | 'paused' | 'succeeded' | 'failed' | 'canceled'
   last_verify_exit_code?: number | null;
   last_verify_output?: string | null;
+  pause_reason?: string | null;
+  paused_by_user?: boolean;
+  active_duration_secs?: number;
   started_at_ms: number;
   updated_at_ms: number;
   finished_at_ms?: number | null;
@@ -1883,6 +1886,8 @@ export interface StartGoalRunRequestDto {
   verify_command: string | null;
   max_iterations: number | null;
   max_duration_secs: number | null;
+  replace_existing?: boolean;
+  dispatch_initial_prompt?: boolean | null;
 }
 
 export interface StartMonitorWatchRequestDto {

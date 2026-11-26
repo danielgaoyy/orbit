@@ -752,6 +752,9 @@ impl DaemonRuntime {
             delivery.clone(),
             keep_awake.clone(),
         );
+        goals.set_evaluator(Arc::new(crate::goals::HardenedCliGoalEvaluator::new(Some(
+            provider_catalogs.clone(),
+        ))));
         let triggers = EventTriggerEngine::new(
             store.clone(),
             orchestrator.clone(),
@@ -5499,6 +5502,18 @@ async fn handle_wire_rpc(
             let subs = Arc::clone(subscribed_agents);
             let parent_id_for_watch = parent_agent_id.clone();
             let parent_host_for_watch = parent_host_id.clone();
+            let initial_goal_objective = initial_badges
+                .iter()
+                .any(|b| b.kind == "slash" && b.label.eq_ignore_ascii_case("/goal"))
+                .then(|| {
+                    initial_display_prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| initial_prompt.trim())
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty());
             tokio::spawn(async move {
                 let reply = match rt
                     .orchestrator
@@ -5532,6 +5547,21 @@ async fn handle_wire_rpc(
                     .await
                 {
                     Ok(agent) => {
+                        if let Some(goal_obj) = initial_goal_objective {
+                            let _ = rt
+                                .goals
+                                .start_goal(StartGoalSpec {
+                                    agent_id: agent.agent_id.clone(),
+                                    objective: goal_obj,
+                                    criteria: Vec::new(),
+                                    verify_command: None,
+                                    max_iterations: None,
+                                    max_duration_secs: None,
+                                    dispatch_initial_prompt: false,
+                                    replace_existing: false,
+                                })
+                                .await;
+                        }
                         // Subscribe before sending `AgentCreated` so no subsequent `TimelineLive`
                         // frames for the newly created agent are filtered out on this session.
                         subs.lock()
@@ -5687,6 +5717,7 @@ async fn handle_wire_rpc(
                     .await
                 {
                     Ok(()) => {
+                        runtime.goals.on_user_prompt_sent(&agent_id).await;
                         if let Some(body) = broadcast_body
                             && let Ok(Some(cur_ag)) = runtime.store.get_agent(&agent_id)
                             && let Ok(peers) = runtime.store.list_agents_filtered(
@@ -5744,7 +5775,10 @@ async fn handle_wire_rpc(
                 .enqueue_user_prompt(&agent_id, prompt, display_prompt, badges, queue_id)
                 .await
             {
-                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Ok(()) => {
+                    runtime.goals.on_user_prompt_sent(&agent_id).await;
+                    Some(WireMessage::Ack { request_id })
+                }
                 Err(e) => Some(rpc_err(request_id, "enqueue_prompt_failed", e)),
             }
         }
@@ -5819,7 +5853,12 @@ async fn handle_wire_rpc(
             .interrupt_agent_with_options(&agent_id, preserve_queue)
             .await
         {
-            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Ok(()) => {
+                if !preserve_queue {
+                    runtime.goals.on_agent_interrupted(&agent_id).await;
+                }
+                Some(WireMessage::Ack { request_id })
+            }
             Err(e) => Some(rpc_err(request_id, "interrupt_failed", e)),
         },
         WireMessage::SetSessionMode {
@@ -7537,6 +7576,8 @@ async fn handle_wire_rpc(
             verify_command,
             max_iterations,
             max_duration_secs,
+            replace_existing,
+            dispatch_initial_prompt,
         } => {
             let goals = Arc::clone(&runtime.goals);
             let tx = out_tx.clone();
@@ -7550,7 +7591,8 @@ async fn handle_wire_rpc(
                         verify_command,
                         max_iterations,
                         max_duration_secs,
-                        dispatch_initial_prompt: true,
+                        dispatch_initial_prompt: dispatch_initial_prompt.unwrap_or(true),
+                        replace_existing,
                     })
                     .await
                 {
@@ -7596,6 +7638,40 @@ async fn handle_wire_rpc(
                 let reply = match goals.control_goal(&goal_id, action).await {
                     Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
                     Err(e) => rpc_err(request_id, "control_goal_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::UpdateGoalRun {
+            request_id,
+            goal_id,
+            objective,
+            criteria,
+            verify_command,
+            max_iterations,
+            max_duration_secs,
+        } => {
+            let goals = Arc::clone(&runtime.goals);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match goals
+                    .update_goal_spec(
+                        &goal_id,
+                        crate::goals::UpdateGoalSpec {
+                            objective,
+                            criteria,
+                            verify_command,
+                            max_iterations,
+                            max_duration_secs,
+                        },
+                    )
+                    .await
+                {
+                    Ok(goal) => WireMessage::GoalRunUpdated { request_id, goal },
+                    Err(e) => rpc_err(request_id, "update_goal_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

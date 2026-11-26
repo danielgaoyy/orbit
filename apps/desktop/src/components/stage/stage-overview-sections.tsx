@@ -14,6 +14,7 @@ import {
   Link2,
   MessageCircleQuestion,
   Pause,
+  Pencil,
   Play,
   Square,
   Target,
@@ -42,6 +43,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
+import { computeGoalElapsedSecs, countGoalCriteria, formatGoalDuration } from "@/lib/goal-format";
 import type { OverviewLinkItem } from "@/state/selectors/session-selectors";
 import {
   type OverviewSectionId,
@@ -115,6 +117,10 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
   const [busyAction, setBusyAction] = useState<GoalControlAction | null>(null);
   const isPaused = goal.status === "paused";
   const isVerifying = goal.status === "verifying";
+  const isLive = goal.status === "running" || isVerifying;
+  const nowMs = useLiveSecondClock(isLive);
+  const elapsedLabel = formatGoalDuration(computeGoalElapsedSecs(goal, isLive ? nowMs : Date.now()));
+  const { passed, total } = countGoalCriteria(goal);
 
   const handleControl = async (action: GoalControlAction) => {
     setBusyAction(action);
@@ -128,9 +134,11 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
   return (
     <div
       title={
-        goal.verify_command
-          ? `${goal.objective}\n${t("overview.goalVerifyPrefix", { command: goal.verify_command })}`
-          : goal.objective
+        goal.pause_reason
+          ? `${goal.objective}\n${goal.pause_reason}`
+          : goal.verify_command
+            ? `${goal.objective}\n${t("overview.goalVerifyPrefix", { command: goal.verify_command })}`
+            : goal.objective
       }
       className="group/goalrow hover:bg-accent/70 relative flex min-h-[38px] w-full items-center gap-2 rounded-[8px] px-2 py-1.5 transition-colors"
     >
@@ -160,19 +168,27 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
                   ? t("overview.goalStatusPaused")
                   : t("overview.goalStatusRunning")}
             </span>
+            {total > 0 && (
+              <>
+                <span className="opacity-45">·</span>
+                <span className="font-mono tabular-nums">
+                  {passed}/{total}
+                </span>
+              </>
+            )}
             <span className="opacity-45">·</span>
-            <span className="font-mono tabular-nums">
-              {t("overview.goalIteration", {
-                current: goal.current_iteration,
-                max: goal.max_iterations,
-              })}
-            </span>
+            <span className="font-mono tabular-nums">{elapsedLabel}</span>
           </div>
+          {isPaused && goal.pause_reason && (
+            <div className="text-signal-warning mt-0.5 truncate text-[11px] leading-[14px]">
+              {goal.pause_reason}
+            </div>
+          )}
         </div>
       </div>
 
       <div className="bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs transition-opacity duration-150 motion-reduce:transition-none group-focus-within/goalrow:pointer-events-auto group-focus-within/goalrow:opacity-100 group-hover/goalrow:pointer-events-auto group-hover/goalrow:opacity-100">
-        {!isVerifying && (
+        {!isVerifying && goal.verify_command && (
           <IconButton
             size="xs"
             tooltip={t("overview.verifyNow")}
@@ -189,6 +205,14 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
           onClick={() => void handleControl(isPaused ? "resume" : "pause")}
         >
           {isPaused ? <Play className="size-3" /> : <Pause className="size-3" />}
+        </IconButton>
+        <IconButton
+          size="xs"
+          tooltip={t("goal.editAction")}
+          disabled={busyAction !== null}
+          onClick={() => orbitActions.openGoalEditDialog(hostId, goal)}
+        >
+          <Pencil className="size-3" />
         </IconButton>
         <IconButton
           size="xs"

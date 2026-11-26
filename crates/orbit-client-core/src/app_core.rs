@@ -77,9 +77,10 @@ pub use crate::contract::{
     SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
     SelectBestOfNWinnerRequest, StartBatchFanoutRequest, StartBestOfNRequest,
     StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
-    StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
-    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, UpsertProjectMemoryRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    StopMonitorWatchRequest, UpdateGoalRunRequest, UpsertArtifactRequest,
+    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    UpsertProjectMemoryRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 use crate::viewmodel::*;
@@ -20493,6 +20494,8 @@ impl OrbitAppCore {
                     verify_command: req.verify_command,
                     max_iterations: req.max_iterations,
                     max_duration_secs: req.max_duration_secs,
+                    replace_existing: req.replace_existing,
+                    dispatch_initial_prompt: req.dispatch_initial_prompt,
                 })
                 .await
             {
@@ -20664,6 +20667,71 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "ControlGoalRun task cancelled".to_string())?
+    }
+
+    pub async fn update_goal_run_on_host(
+        self: &Arc<Self>,
+        req: UpdateGoalRunRequest,
+    ) -> Result<GoalRunRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before updating goal run".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpdateGoalRun {
+                    request_id: req_id,
+                    goal_id: req.goal_id,
+                    objective: req.objective,
+                    criteria: req.criteria,
+                    verify_command: req.verify_command,
+                    max_iterations: req.max_iterations,
+                    max_duration_secs: req.max_duration_secs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send UpdateGoalRun: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while updating goal run".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for UpdateGoalRun reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "UpdateGoalRun task cancelled".to_string())?
     }
 
     pub async fn start_monitor_watch_on_host(

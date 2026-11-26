@@ -418,6 +418,7 @@ export class WasmWebBackend implements OrbitTransportBackend {
       "list_models",
       "list_provider_models",
       "list_pending_permissions",
+      "list_goal_runs",
     ])
       this.send(h, { op, request_id: crypto.randomUUID() });
   }
@@ -949,6 +950,44 @@ export class WasmWebBackend implements OrbitTransportBackend {
           130000,
         );
         return reply.report;
+      }
+      case "start_goal_run": {
+        const reply = await this.rpc(h, "start_goal_run", {
+          agent_id: agent,
+          objective: String(a.objective ?? ""),
+          criteria: a.criteria ?? [],
+          verify_command: a.verifyCommand ?? null,
+          max_iterations: a.maxIterations ?? null,
+          max_duration_secs: a.maxDurationSecs ?? null,
+          replace_existing: Boolean(a.replaceExisting),
+          dispatch_initial_prompt:
+            a.dispatchInitialPrompt === undefined ? null : a.dispatchInitialPrompt,
+        });
+        return reply.goal;
+      }
+      case "update_goal_run": {
+        const reply = await this.rpc(h, "update_goal_run", {
+          goal_id: String(a.goalId ?? ""),
+          objective: a.objective ?? null,
+          criteria: a.criteria ?? null,
+          verify_command: a.verifyCommand === undefined ? null : a.verifyCommand,
+          max_iterations: a.maxIterations ?? null,
+          max_duration_secs: a.maxDurationSecs ?? null,
+        });
+        return reply.goal;
+      }
+      case "list_goal_runs": {
+        const reply = await this.rpc(h, "list_goal_runs", {
+          agent_id: a.agentId ?? null,
+        });
+        return reply.goals ?? [];
+      }
+      case "control_goal_run": {
+        const reply = await this.rpc(h, "control_goal_run", {
+          goal_id: String(a.goalId ?? ""),
+          action: a.action,
+        });
+        return reply.goal;
       }
     }
     throw new Error("This action is unavailable in Orbit Web (" + cmd + ")");

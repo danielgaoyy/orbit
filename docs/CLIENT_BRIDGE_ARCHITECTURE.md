@@ -12,7 +12,7 @@ Desktop, Web PWA, iOS, Android and HarmonyOS share the Rust presentation model i
    - Unified sidebar tree (`Needs Attention`, `Pinned`, `Projects`, `Launchpad`), git branch enrichment, worktree folding, filter/sort/search, and persisted thread `pinned` + `seen_seq` flags (`client_thread_prefs` in `orbit-store`)
    - Incremental conversation stage projection (`AgentStageDelta` / `TurnLiveSegment` with `Wakeup` & `StepGroup`)
    - Canonical provider fallback model catalogs, retired-slug migration, and effort resolution (`resolve_model_selection`)
-   - Platform-filtered slash command catalog (`slash_commands`), fuzzy `@` mention candidate ranking (`rank_mention_candidates`), and prompt/workflow composition (`compose_prompt` including `/plan`, `/review`, `/compact`, `/btw`)
+   - Platform-filtered slash command catalog (`slash_commands`), fuzzy `@` mention candidate ranking (`rank_mention_candidates`), and prompt/workflow composition (`compose_prompt` including `/plan`, `/goal`, `/review`, `/compact`, `/btw`, plus leading `\/` verbatim escape passthrough)
    - Detached multi-slot VT100 terminal emulation (`terminal_screen_slot`)
    - Conversation rewind (`rewind_agent`), workspace file preview (`read_workspace_file`), and side-question context & streaming (`build_side_question_context`, `ask_side_question`)
    - Pure-Rust native diagram rendering (`diagram.rs`: Mermaid via `mermaid-rs-renderer`, Graphviz DOT via `layout-rs`, XSS-sanitized inline SVG, deterministic SVG `id` namespacing, and a 128-entry LRU cache)
@@ -81,7 +81,8 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Model catalogs & effort resolution | `fallback_provider_catalogs`, `resolve_model_selection` | `get_fallback_provider_catalogs`, `resolve_model_selection` | `fallback_provider_catalogs`, `resolve_model_selection` | `fallbackProviderCatalogsJson`, `resolveModelSelectionJson` |
 | Slash command catalog | `slash_commands(platform, query)` | `get_slash_commands` | `slash_commands(platform, query)` | `slashCommandsJson(platform, query)` |
 | `@` Mention fuzzy ranking | `rank_mention_candidates` | `rank_mention_candidates` | `rank_mention_candidates` | `rankMentionCandidatesJson` |
-| Prompt & workflow composition | `compose_prompt` | `compose_prompt` | `compose_prompt` | `composePromptJson` |
+| Prompt & workflow composition | `compose_prompt` (`SlashDirective::Goal` + `\/` escape) | `compose_prompt` + `ComposerGoalShelf` / `GoalDialogs` | `compose_prompt` (`FfiSlashDirective::Goal`) | `composePromptJson` |
+| Autonomous Goal runs | `start_goal_run_on_host` (`replace_existing`, `dispatch_initial_prompt`), `update_goal_run_on_host`, `control_goal_run_on_host` | `start_goal_run`, `update_goal_run`, `control_goal_run` (+ `WasmWebBackend` & `WasmHost` parity) | `start_goal`, `update_goal_run`, `control_goal_run` | `startGoalRunJson`, `updateGoalRunJson`, `controlGoalRunJson` |
 | Conversation rewind | `rewind_agent` | `rewind_agent` | `rewind_agent_request` / `rewind_agent` | `rewindAgentJson` |
 | Workspace file viewer | `read_workspace_file` | `read_workspace_file` | `read_workspace_file_request` / `read_workspace_file` | `readWorkspaceFileJson` |
 | Diagram detection & rendering | `detect_diagram_kind`, `render_diagram` (`diagram.rs`) | `render_diagram` | `detect_diagram_kind`, `render_diagram` | `detectDiagramKind`, `renderDiagramJson` |

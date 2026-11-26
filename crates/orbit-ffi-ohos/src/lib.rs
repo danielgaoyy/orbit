@@ -23,8 +23,8 @@ use orbit_client_core::contract::{
     CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
     FleetSidebarRequest, ForkAgentRequest, MentionRankRequest, ModelSelectionRequest,
     PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
-    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateHostConfigRequest,
-    UpsertArtifactRequest, WriteWorkspaceFileRequest,
+    SendPromptRequest, SpawnWorkspacePeerRequest, StopMonitorWatchRequest, UpdateGoalRunRequest,
+    UpdateHostConfigRequest, UpsertArtifactRequest, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, detect_diagram_kind as core_detect_diagram_kind,
@@ -1596,6 +1596,13 @@ impl OhosCoreFacade {
         serde_json::to_string(&record).map_err(|e| e.to_string())
     }
 
+    pub fn update_goal_run_json(&self, req_json: &str) -> Result<String, String> {
+        let req: UpdateGoalRunRequest = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid UpdateGoalRunRequest: {e}"))?;
+        let record = block_on_core_rpc(self.inner.update_goal_run_on_host(req))?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
+
     pub fn list_monitor_watches_json(
         &self,
         host_id: &str,
@@ -2892,6 +2899,26 @@ mod ohos_napi {
         fn compute(&mut self) -> Result<Self::Output> {
             self.facade
                 .control_goal_run_json(&self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct UpdateGoalRunTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for UpdateGoalRunTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .update_goal_run_json(&self.req_json)
                 .map_err(Error::from_reason)
         }
 
@@ -4513,6 +4540,14 @@ mod ohos_napi {
         #[napi]
         pub fn control_goal_run_json(&self, req_json: String) -> AsyncTask<ControlGoalRunTask> {
             AsyncTask::new(ControlGoalRunTask {
+                facade: self.facade.clone(),
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn update_goal_run_json(&self, req_json: String) -> AsyncTask<UpdateGoalRunTask> {
+            AsyncTask::new(UpdateGoalRunTask {
                 facade: self.facade.clone(),
                 req_json,
             })

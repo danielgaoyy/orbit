@@ -151,6 +151,18 @@ impl WasmHost {
             ProviderModelsSnapshot { catalogs, .. } => h.provider_catalogs = catalogs,
             QuotaReport { snapshots, .. } => h.quotas = snapshots,
             PendingPermissionsSnapshot { permissions, .. } => h.pending_permissions = permissions,
+            GoalRunsSnapshot { goals, .. } => h.goal_runs = goals,
+            GoalRunUpdated { goal, .. } | GoalRunEvent { goal } => {
+                if let Some(slot) = h
+                    .goal_runs
+                    .iter_mut()
+                    .find(|existing| existing.goal_id == goal.goal_id)
+                {
+                    *slot = goal;
+                } else {
+                    h.goal_runs.insert(0, goal);
+                }
+            }
             DirectoryEntriesResponse {
                 current_path,
                 parent_path,

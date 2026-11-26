@@ -26,6 +26,7 @@ import type {
   GitHubDeviceFlowStartView,
   GitReposInspectionView,
   GitReviewView,
+  GoalRunRecord,
   GuardianAuditEntry,
   GuardianPolicyConfig,
   PermissionRuleRecord,
@@ -427,6 +428,19 @@ export interface PendingJumpTarget {
   nonce: number;
 }
 
+export interface GoalEditDialogTarget {
+  hostId: string;
+  goal: GoalRunRecord;
+}
+
+export interface GoalReplaceConfirmTarget {
+  hostId: string;
+  agentId: string;
+  currentGoal: GoalRunRecord;
+  newObjective: string;
+  onConfirm: () => Promise<void>;
+}
+
 export interface WorktreeHandoffDialogTarget {
   hostId: string;
   workspaceId: string;
@@ -583,6 +597,8 @@ export interface OrbitUiState {
   relayDialogOpen: boolean;
   remoteFolderPickerHostId: string | null;
   exportDialogTarget: { hostId: string; agentId: string } | null;
+  goalEditDialogTarget: GoalEditDialogTarget | null;
+  goalReplaceConfirmTarget: GoalReplaceConfirmTarget | null;
   copyCodeBlocksTarget: {
     hostId: string;
     agentId: string;

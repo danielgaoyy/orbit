@@ -683,6 +683,8 @@ export function createDefaultInitialState(
     relayDialogOpen: false,
     remoteFolderPickerHostId: null,
     exportDialogTarget: null,
+    goalEditDialogTarget: null,
+    goalReplaceConfirmTarget: null,
     copyCodeBlocksTarget: null,
     handoffDialogTarget: null,
     mediaPreviewTarget: null,

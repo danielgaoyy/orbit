@@ -208,6 +208,8 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   relayDialogOpen: "ui",
   remoteFolderPickerHostId: "ui",
   exportDialogTarget: "ui",
+  goalEditDialogTarget: "ui",
+  goalReplaceConfirmTarget: "ui",
   copyCodeBlocksTarget: "ui",
   handoffDialogTarget: "ui",
   mediaPreviewTarget: "ui",

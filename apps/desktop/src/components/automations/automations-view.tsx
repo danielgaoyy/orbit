@@ -41,6 +41,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
+import { computeGoalElapsedSecs, countGoalCriteria, formatGoalDuration } from "@/lib/goal-format";
 import { useLiveSecondClock } from "@/lib/live-clock";
 
 const LiveTimerCountdown = memo(function LiveTimerCountdown({
@@ -1504,9 +1505,24 @@ export function AutomationsView() {
                               <span className="text-foreground truncate text-[13px] font-medium">
                                 {goal.objective}
                               </span>
-                              <span className="text-muted-foreground/80 tabular-nums shrink-0 font-mono text-[11px]">
-                                Iter {goal.current_iteration}/{goal.max_iterations}
-                              </span>
+                              {(() => {
+                                const { passed, total } = countGoalCriteria(goal);
+                                const elapsed = formatGoalDuration(
+                                  computeGoalElapsedSecs(goal, Date.now()),
+                                );
+                                return (
+                                  <>
+                                    {total > 0 && (
+                                      <span className="text-muted-foreground/80 tabular-nums shrink-0 font-mono text-[11px]">
+                                        {passed}/{total}
+                                      </span>
+                                    )}
+                                    <span className="text-muted-foreground/80 tabular-nums shrink-0 font-mono text-[11px]">
+                                      {elapsed}
+                                    </span>
+                                  </>
+                                );
+                              })()}
                             </div>
                             <div className="text-muted-foreground/75 flex items-center gap-2 truncate text-[11.5px]">
                               <span className="capitalize">{goal.status}</span>
@@ -1525,6 +1541,11 @@ export function AutomationsView() {
                                 </>
                               )}
                             </div>
+                            {isPaused && goal.pause_reason && (
+                              <div className="text-signal-warning mt-0.5 truncate text-[11.5px]">
+                                {goal.pause_reason}
+                              </div>
+                            )}
                           </div>
                         </div>
 
@@ -1540,7 +1561,21 @@ export function AutomationsView() {
                               <span>Open</span>
                               <ArrowUpRight className="size-3" />
                             </button>
-                            {isActive && !isVerifying && (
+                            {isActive && (
+                              <SimpleTooltip label="Edit goal">
+                                <button
+                                  type="button"
+                                  aria-label="Edit goal"
+                                  onClick={() =>
+                                    orbitActions.openGoalEditDialog(selectedHostId, goal)
+                                  }
+                                  className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
+                                >
+                                  <Pencil className="size-3.5 stroke-[1.75]" />
+                                </button>
+                              </SimpleTooltip>
+                            )}
+                            {isActive && !isVerifying && goal.verify_command && (
                               <SimpleTooltip label="Verify now">
                                 <button
                                   type="button"

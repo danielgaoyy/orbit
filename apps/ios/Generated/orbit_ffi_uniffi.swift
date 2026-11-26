@@ -1211,6 +1211,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func updateAgentIdentity(hostId: String, agentId: String, handle: String?, title: String?, taskSummary: String?, lockHandle: Bool, lockTitle: Bool) 
     
+    func updateGoalRun(hostId: String, goalId: String, objective: String?, criteria: [String]?, verifyCommand: String?, clearVerifyCommand: Bool, maxIterations: UInt32?, maxDurationSecs: UInt64?) throws  -> FfiGoalRunRecord
+    
     func updateHostConfig(hostId: String, customName: String?, routeMode: FfiHostRouteMode?, sshAlias: String?, remoteDaemonPort: UInt16?, customDirectEndpoint: String?, relayUrl: String?, reconnect: Bool) throws  -> FfiHostCard
     
     func updateHostConfigRequest(req: FfiUpdateHostConfigRequest) throws  -> FfiHostCard
@@ -3144,6 +3146,23 @@ open func updateAgentIdentity(hostId: String, agentId: String, handle: String?, 
         FfiConverterBool.lower(lockTitle),uniffiCallStatus
     )
 }
+}
+    
+open func updateGoalRun(hostId: String, goalId: String, objective: String?, criteria: [String]?, verifyCommand: String?, clearVerifyCommand: Bool, maxIterations: UInt32?, maxDurationSecs: UInt64?)throws  -> FfiGoalRunRecord  {
+    return try  FfiConverterTypeFfiGoalRunRecord_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_goal_run(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(goalId),
+        FfiConverterOptionString.lower(objective),
+        FfiConverterOptionSequenceString.lower(criteria),
+        FfiConverterOptionString.lower(verifyCommand),
+        FfiConverterBool.lower(clearVerifyCommand),
+        FfiConverterOptionUInt32.lower(maxIterations),
+        FfiConverterOptionUInt64.lower(maxDurationSecs),uniffiCallStatus
+    )
+})
 }
     
 open func updateHostConfig(hostId: String, customName: String?, routeMode: FfiHostRouteMode?, sshAlias: String?, remoteDaemonPort: UInt16?, customDirectEndpoint: String?, relayUrl: String?, reconnect: Bool)throws  -> FfiHostCard  {
@@ -8132,13 +8151,16 @@ public struct FfiGoalRunRecord: Equatable, Hashable {
     public var lastVerifyExitCode: Int32?
     public var lastVerifyOutput: String?
     public var consecutiveIdenticalFailures: UInt32
+    public var pauseReason: String?
+    public var pausedByUser: Bool
+    public var activeDurationSecs: UInt64
     public var startedAtMs: UInt64
     public var updatedAtMs: UInt64
     public var finishedAtMs: UInt64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(goalId: String, agentId: String, workspaceId: String, objective: String, criteria: [FfiGoalCriterion], verifyCommand: String?, maxIterations: UInt32, currentIteration: UInt32, maxDurationSecs: UInt64, status: FfiGoalStatus, lastVerifyExitCode: Int32?, lastVerifyOutput: String?, consecutiveIdenticalFailures: UInt32, startedAtMs: UInt64, updatedAtMs: UInt64, finishedAtMs: UInt64?) {
+    public init(goalId: String, agentId: String, workspaceId: String, objective: String, criteria: [FfiGoalCriterion], verifyCommand: String?, maxIterations: UInt32, currentIteration: UInt32, maxDurationSecs: UInt64, status: FfiGoalStatus, lastVerifyExitCode: Int32?, lastVerifyOutput: String?, consecutiveIdenticalFailures: UInt32, pauseReason: String?, pausedByUser: Bool, activeDurationSecs: UInt64, startedAtMs: UInt64, updatedAtMs: UInt64, finishedAtMs: UInt64?) {
         self.goalId = goalId
         self.agentId = agentId
         self.workspaceId = workspaceId
@@ -8152,6 +8174,9 @@ public struct FfiGoalRunRecord: Equatable, Hashable {
         self.lastVerifyExitCode = lastVerifyExitCode
         self.lastVerifyOutput = lastVerifyOutput
         self.consecutiveIdenticalFailures = consecutiveIdenticalFailures
+        self.pauseReason = pauseReason
+        self.pausedByUser = pausedByUser
+        self.activeDurationSecs = activeDurationSecs
         self.startedAtMs = startedAtMs
         self.updatedAtMs = updatedAtMs
         self.finishedAtMs = finishedAtMs
@@ -8186,6 +8211,9 @@ public struct FfiConverterTypeFfiGoalRunRecord: FfiConverterRustBuffer {
                 lastVerifyExitCode: FfiConverterOptionInt32.read(from: &buf), 
                 lastVerifyOutput: FfiConverterOptionString.read(from: &buf), 
                 consecutiveIdenticalFailures: FfiConverterUInt32.read(from: &buf), 
+                pauseReason: FfiConverterOptionString.read(from: &buf), 
+                pausedByUser: FfiConverterBool.read(from: &buf), 
+                activeDurationSecs: FfiConverterUInt64.read(from: &buf), 
                 startedAtMs: FfiConverterUInt64.read(from: &buf), 
                 updatedAtMs: FfiConverterUInt64.read(from: &buf), 
                 finishedAtMs: FfiConverterOptionUInt64.read(from: &buf)
@@ -8206,6 +8234,9 @@ public struct FfiConverterTypeFfiGoalRunRecord: FfiConverterRustBuffer {
         FfiConverterOptionInt32.write(value.lastVerifyExitCode, into: &buf)
         FfiConverterOptionString.write(value.lastVerifyOutput, into: &buf)
         FfiConverterUInt32.write(value.consecutiveIdenticalFailures, into: &buf)
+        FfiConverterOptionString.write(value.pauseReason, into: &buf)
+        FfiConverterBool.write(value.pausedByUser, into: &buf)
+        FfiConverterUInt64.write(value.activeDurationSecs, into: &buf)
         FfiConverterUInt64.write(value.startedAtMs, into: &buf)
         FfiConverterUInt64.write(value.updatedAtMs, into: &buf)
         FfiConverterOptionUInt64.write(value.finishedAtMs, into: &buf)
@@ -16776,10 +16807,12 @@ public struct StartGoalRunRequest: Equatable, Hashable {
     public var verifyCommand: String?
     public var maxIterations: UInt32?
     public var maxDurationSecs: UInt64?
+    public var replaceExisting: Bool
+    public var dispatchInitialPrompt: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostId: String, agentId: String, objective: String, criteria: [String], verifyCommand: String?, maxIterations: UInt32?, maxDurationSecs: UInt64?) {
+    public init(hostId: String, agentId: String, objective: String, criteria: [String], verifyCommand: String?, maxIterations: UInt32?, maxDurationSecs: UInt64?, replaceExisting: Bool, dispatchInitialPrompt: Bool?) {
         self.hostId = hostId
         self.agentId = agentId
         self.objective = objective
@@ -16787,6 +16820,8 @@ public struct StartGoalRunRequest: Equatable, Hashable {
         self.verifyCommand = verifyCommand
         self.maxIterations = maxIterations
         self.maxDurationSecs = maxDurationSecs
+        self.replaceExisting = replaceExisting
+        self.dispatchInitialPrompt = dispatchInitialPrompt
     }
 
     
@@ -16811,7 +16846,9 @@ public struct FfiConverterTypeStartGoalRunRequest: FfiConverterRustBuffer {
                 criteria: FfiConverterSequenceString.read(from: &buf), 
                 verifyCommand: FfiConverterOptionString.read(from: &buf), 
                 maxIterations: FfiConverterOptionUInt32.read(from: &buf), 
-                maxDurationSecs: FfiConverterOptionUInt64.read(from: &buf)
+                maxDurationSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                replaceExisting: FfiConverterBool.read(from: &buf), 
+                dispatchInitialPrompt: FfiConverterOptionBool.read(from: &buf)
         )
     }
 
@@ -16823,6 +16860,8 @@ public struct FfiConverterTypeStartGoalRunRequest: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.verifyCommand, into: &buf)
         FfiConverterOptionUInt32.write(value.maxIterations, into: &buf)
         FfiConverterOptionUInt64.write(value.maxDurationSecs, into: &buf)
+        FfiConverterBool.write(value.replaceExisting, into: &buf)
+        FfiConverterOptionBool.write(value.dispatchInitialPrompt, into: &buf)
     }
 }
 
@@ -20537,6 +20576,7 @@ public func FfiConverterTypeFfiSidebarThreadFilter_lower(_ value: FfiSidebarThre
 public enum FfiSlashDirective: Equatable, Hashable {
     
     case plan
+    case goal
     case review
     case compact
     case orbit
@@ -20566,17 +20606,19 @@ public struct FfiConverterTypeFfiSlashDirective: FfiConverterRustBuffer {
         
         case 1: return .plan
         
-        case 2: return .review
+        case 2: return .goal
         
-        case 3: return .compact
+        case 3: return .review
         
-        case 4: return .orbit
+        case 4: return .compact
         
-        case 5: return .orbitHandoff
+        case 5: return .orbit
         
-        case 6: return .orbitCommittee
+        case 6: return .orbitHandoff
         
-        case 7: return .orbitAdvisor
+        case 7: return .orbitCommittee
+        
+        case 8: return .orbitAdvisor
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -20590,28 +20632,32 @@ public struct FfiConverterTypeFfiSlashDirective: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .review:
+        case .goal:
             writeInt(&buf, Int32(2))
         
         
-        case .compact:
+        case .review:
             writeInt(&buf, Int32(3))
         
         
-        case .orbit:
+        case .compact:
             writeInt(&buf, Int32(4))
         
         
-        case .orbitHandoff:
+        case .orbit:
             writeInt(&buf, Int32(5))
         
         
-        case .orbitCommittee:
+        case .orbitHandoff:
             writeInt(&buf, Int32(6))
         
         
-        case .orbitAdvisor:
+        case .orbitCommittee:
             writeInt(&buf, Int32(7))
+        
+        
+        case .orbitAdvisor:
+            writeInt(&buf, Int32(8))
         
         }
     }
@@ -24691,6 +24737,30 @@ fileprivate struct FfiConverterOptionTypeSessionMode: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [[String]]?
 
@@ -27743,6 +27813,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_agent_identity() != 9558) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_goal_run() != 12586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config() != 12313) {

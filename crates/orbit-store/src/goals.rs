@@ -33,7 +33,10 @@ pub(crate) fn migrate_goals_schema(conn: &Connection) -> Result<(), StoreError> 
             last_failure_hash              TEXT,
             started_at_ms                  INTEGER NOT NULL,
             updated_at_ms                  INTEGER NOT NULL,
-            finished_at_ms                 INTEGER
+            finished_at_ms                 INTEGER,
+            pause_reason                   TEXT,
+            paused_by_user                 INTEGER NOT NULL DEFAULT 0,
+            active_duration_secs           INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_goal_runs_agent_updated
@@ -62,6 +65,31 @@ pub(crate) fn migrate_goals_schema(conn: &Connection) -> Result<(), StoreError> 
             ON monitor_watches(status, created_at_ms DESC);
         ",
     )?;
+
+    // Idempotently add newer columns for existing databases without bumping user_version.
+    let mut existing_cols = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(goal_runs)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for col in rows.flatten() {
+            existing_cols.insert(col);
+        }
+    }
+    if !existing_cols.contains("pause_reason") {
+        conn.execute("ALTER TABLE goal_runs ADD COLUMN pause_reason TEXT", [])?;
+    }
+    if !existing_cols.contains("paused_by_user") {
+        conn.execute(
+            "ALTER TABLE goal_runs ADD COLUMN paused_by_user INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !existing_cols.contains("active_duration_secs") {
+        conn.execute(
+            "ALTER TABLE goal_runs ADD COLUMN active_duration_secs INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -80,6 +108,9 @@ fn map_goal_run_row(row: &Row<'_>) -> rusqlite::Result<(GoalRunRecord, Option<St
     let started_at_ms: i64 = row.get(14)?;
     let updated_at_ms: i64 = row.get(15)?;
     let finished_at_ms: Option<i64> = row.get(16)?;
+    let pause_reason: Option<String> = row.get(17)?;
+    let paused_by_user_i64: i64 = row.get(18)?;
+    let active_duration_i64: i64 = row.get(19)?;
 
     Ok((
         GoalRunRecord {
@@ -96,6 +127,9 @@ fn map_goal_run_row(row: &Row<'_>) -> rusqlite::Result<(GoalRunRecord, Option<St
             last_verify_exit_code,
             last_verify_output,
             consecutive_identical_failures: consecutive_i64.clamp(0, i64::from(u32::MAX)) as u32,
+            pause_reason,
+            paused_by_user: paused_by_user_i64 != 0,
+            active_duration_secs: active_duration_i64.max(0) as u64,
             started_at_ms: started_at_ms.max(0) as u64,
             updated_at_ms: updated_at_ms.max(0) as u64,
             finished_at_ms: finished_at_ms.map(|v| v.max(0) as u64),
@@ -134,7 +168,8 @@ const GOAL_SELECT_COLS: &str = "
     goal_id, agent_id, workspace_id, objective, criteria_json, verify_command,
     max_iterations, current_iteration, max_duration_secs, status,
     last_verify_exit_code, last_verify_output, consecutive_identical_failures,
-    last_failure_hash, started_at_ms, updated_at_ms, finished_at_ms
+    last_failure_hash, started_at_ms, updated_at_ms, finished_at_ms,
+    pause_reason, paused_by_user, active_duration_secs
 ";
 
 const MONITOR_SELECT_COLS: &str = "
@@ -156,8 +191,9 @@ impl OrbitStore {
                 goal_id, agent_id, workspace_id, objective, criteria_json, verify_command,
                 max_iterations, current_iteration, max_duration_secs, status,
                 last_verify_exit_code, last_verify_output, consecutive_identical_failures,
-                last_failure_hash, started_at_ms, updated_at_ms, finished_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                last_failure_hash, started_at_ms, updated_at_ms, finished_at_ms,
+                pause_reason, paused_by_user, active_duration_secs
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             ON CONFLICT(goal_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 workspace_id = excluded.workspace_id,
@@ -174,7 +210,10 @@ impl OrbitStore {
                 last_failure_hash = excluded.last_failure_hash,
                 started_at_ms = excluded.started_at_ms,
                 updated_at_ms = excluded.updated_at_ms,
-                finished_at_ms = excluded.finished_at_ms",
+                finished_at_ms = excluded.finished_at_ms,
+                pause_reason = excluded.pause_reason,
+                paused_by_user = excluded.paused_by_user,
+                active_duration_secs = excluded.active_duration_secs",
             params![
                 goal.goal_id,
                 goal.agent_id,
@@ -193,6 +232,9 @@ impl OrbitStore {
                 goal.started_at_ms as i64,
                 goal.updated_at_ms as i64,
                 goal.finished_at_ms.map(|v| v as i64),
+                goal.pause_reason,
+                if goal.paused_by_user { 1i64 } else { 0i64 },
+                goal.active_duration_secs as i64,
             ],
         )?;
         Ok(())
@@ -441,6 +483,9 @@ mod tests {
             last_verify_exit_code: Some(1),
             last_verify_output: Some("1 test failed".into()),
             consecutive_identical_failures: 1,
+            pause_reason: Some("Waiting for API credentials".into()),
+            paused_by_user: false,
+            active_duration_secs: 95,
             started_at_ms: 1_760_000_000_000,
             updated_at_ms: 1_760_000_005_000,
             finished_at_ms: None,
@@ -524,6 +569,9 @@ mod tests {
             last_verify_exit_code: None,
             last_verify_output: None,
             consecutive_identical_failures: 0,
+            pause_reason: None,
+            paused_by_user: false,
+            active_duration_secs: 0,
             started_at_ms: 1000,
             updated_at_ms: 1000,
             finished_at_ms: None,
@@ -570,6 +618,9 @@ mod tests {
                         last_verify_exit_code: Some(0),
                         last_verify_output: None,
                         consecutive_identical_failures: 0,
+                        pause_reason: None,
+                        paused_by_user: false,
+                        active_duration_secs: 10,
                         started_at_ms: ts,
                         updated_at_ms: ts,
                         finished_at_ms: Some(ts),

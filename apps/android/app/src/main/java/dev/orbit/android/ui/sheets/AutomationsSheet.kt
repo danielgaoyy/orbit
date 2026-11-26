@@ -830,6 +830,15 @@ private fun GoalRunCard(
                     style = typography.code,
                     color = colors.fgMuted,
                 )
+                if (isPaused && !goal.pauseReason.isNullOrBlank()) {
+                    Text(
+                        text = goal.pauseReason!!,
+                        style = typography.meta,
+                        color = colors.warning,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             StatusPill(label = goal.status.name.lowercase().replaceFirstChar { it.uppercase() }, color = statusColor)
         }

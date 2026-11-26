@@ -141,7 +141,7 @@ pub fn resolve_effective_packs(
     if !policy.enabled {
         return Vec::new();
     }
-    let base: Vec<McpToolPack> = if let Some(ref explicit) = policy.enabled_packs {
+    let mut base: Vec<McpToolPack> = if let Some(ref explicit) = policy.enabled_packs {
         explicit.clone()
     } else if let Some(cid) = caller_agent_id {
         if let Some(agent) = runtime.store.get_agent(cid).ok().flatten() {
@@ -157,6 +157,21 @@ pub fn resolve_effective_packs(
         // External MCP clients (no caller_agent_id) see the full 20-tool catalog unless disabled.
         McpToolPack::ALL.to_vec()
     };
+
+    // Dynamically expose `orbit_goal` whenever the calling agent has an active or paused Goal so
+    // the agent can call `get_goal` / `update_goal` / `pause_goal` / `complete_goal` immediately
+    // without requiring an extra `orbit_tool_search` hop.
+    if let Some(cid) = caller_agent_id
+        && !base.contains(&McpToolPack::Goals)
+        && runtime
+            .store
+            .get_active_goal_for_agent(cid)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        base.push(McpToolPack::Goals);
+    }
 
     let mut out = Vec::with_capacity(base.len());
     for pack in base {
@@ -260,7 +275,9 @@ fn tool_pack_for_canonical_name(canonical_name: &str) -> McpToolPack {
         | "cancel_workflow"
         | "orbit_workflow" => McpToolPack::Workflows,
         "start_goal"
+        | "get_goal"
         | "update_goal_progress"
+        | "pause_goal"
         | "complete_goal"
         | "start_monitor"
         | "stop_monitor"
@@ -388,7 +405,9 @@ fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'stat
         },
         "orbit_goal" => match req_action()? {
             "start_goal" | "start" => Ok("start_goal"),
+            "get_goal" | "get" | "status" => Ok("get_goal"),
             "update_goal" | "update_goal_progress" | "update" => Ok("update_goal_progress"),
+            "pause_goal" | "pause" => Ok("pause_goal"),
             "complete_goal" | "complete" => Ok("complete_goal"),
             "start_monitor" => Ok("start_monitor"),
             "stop_monitor" => Ok("stop_monitor"),
@@ -3367,6 +3386,11 @@ async fn execute_tool_inner(
                             verify_command,
                             max_iterations,
                             max_duration_secs,
+                            replace_existing: args
+                                .get("replace_existing")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            dispatch_initial_prompt: None,
                         },
                         Duration::from_secs(20),
                     )
@@ -3392,6 +3416,10 @@ async fn execute_tool_inner(
                         max_duration_secs,
                         // Don't interrupt the calling agent's own active turn
                         dispatch_initial_prompt: !is_self_call,
+                        replace_existing: args
+                            .get("replace_existing")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -3400,6 +3428,59 @@ async fn execute_tool_inner(
             Ok(json!({
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
                 "goal": goal,
+            }))
+        }
+
+        "get_goal" => {
+            if target_host.is_some() {
+                anyhow::bail!("`get_goal` operates on the local host goal run");
+            }
+            let goal_id = opt_str(args, "goal_id");
+            let agent_id =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let goal = rt
+                .goals
+                .get_goal_for_tool(caller_agent_id, goal_id.as_deref(), agent_id.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let elapsed_secs = goal
+                .as_ref()
+                .map(|g| crate::goals::effective_active_duration_secs(g, now_ms));
+            Ok(json!({
+                "active": goal.is_some(),
+                "goal": goal,
+                "elapsed_secs": elapsed_secs,
+                "elapsed_human": elapsed_secs.map(crate::goals::format_duration_human),
+            }))
+        }
+
+        "pause_goal" => {
+            if target_host.is_some() {
+                anyhow::bail!("`pause_goal` operates on the local host goal run");
+            }
+            let goal_id = opt_str(args, "goal_id");
+            let agent_id =
+                opt_str(args, "agent_id").or_else(|| caller_agent_id.map(ToOwned::to_owned));
+            let reason = opt_str(args, "reason")
+                .or_else(|| opt_str(args, "summary"))
+                .or_else(|| opt_str(args, "note"))
+                .unwrap_or_default();
+            let goal = rt
+                .goals
+                .pause_goal_by_agent(
+                    caller_agent_id,
+                    goal_id.as_deref(),
+                    agent_id.as_deref(),
+                    &reason,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(json!({
+                "goal": goal,
+                "message": "Goal paused until the user sends a follow-up message or clicks Resume."
             }))
         }
 
@@ -5549,11 +5630,11 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Goals,
             def: ToolDefinition {
                 name: "orbit_goal",
-                description: "Manage autonomous `/goal` verification loops and streaming background monitors (`start_goal`, `update_goal`, `complete_goal`, `start_monitor`, `stop_monitor`).",
+                description: "Manage autonomous `/goal` verification loops and streaming background monitors (`start_goal`, `get_goal`, `update_goal`, `pause_goal`, `complete_goal`, `start_monitor`, `stop_monitor`).",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["start_goal", "update_goal", "complete_goal", "start_monitor", "stop_monitor"] },
+                        "action": { "type": "string", "enum": ["start_goal", "get_goal", "update_goal", "pause_goal", "complete_goal", "start_monitor", "stop_monitor"] },
                         "goal_id": { "type": "string" },
                         "monitor_id": { "type": "string" },
                         "objective": { "type": "string" },
@@ -5574,6 +5655,9 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "verify_command": { "type": "string" },
                         "max_iterations": { "type": "integer" },
                         "max_duration_secs": { "type": "integer" },
+                        "replace_existing": { "type": "boolean" },
+                        "reason": { "type": "string" },
+                        "note": { "type": "string" },
                         "summary": { "type": "string" },
                         "failed": { "type": "boolean" },
                         "kind": { "type": "string", "enum": ["command_stream", "log_file_tail", "http_health"] },

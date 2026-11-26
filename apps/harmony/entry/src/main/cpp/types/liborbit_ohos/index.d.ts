@@ -140,6 +140,7 @@ export class OrbitHarmonyCore {
   fireConditionalTimerNowJson(hostId: string, timerId: string): Promise<string>;
   listGoalRunsJson(hostId: string, agentId?: string | null): Promise<string>;
   controlGoalRunJson(reqJson: string): Promise<string>;
+  updateGoalRunJson(reqJson: string): Promise<string>;
   listMonitorWatchesJson(hostId: string, agentId?: string | null): Promise<string>;
   stopMonitorWatchJson(reqJson: string): Promise<string>;
   listWorkflowRunsJson(hostId: string, includeCompleted: boolean): Promise<string>;

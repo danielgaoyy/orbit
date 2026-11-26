@@ -1473,14 +1473,71 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       verifyCommand?: string | null;
       maxIterations?: number | null;
       maxDurationSecs?: number | null;
+      replaceExisting?: boolean;
+      dispatchInitialPrompt?: boolean | null;
+      silentToast?: boolean;
     }): Promise<GoalRunRecord | null> {
       try {
         const goal = await orbitIpc.startGoalRun(req);
-        notifyToast("Goal loop started");
+        setState((s) => {
+          const detail = s.hostDetails[req.hostId];
+          if (!detail) return s;
+          const prev = detail.goal_runs ?? [];
+          const next = [
+            goal,
+            ...prev.filter((g) => g.goal_id !== goal.goal_id),
+          ];
+          return {
+            ...s,
+            hostDetails: {
+              ...s.hostDetails,
+              [req.hostId]: { ...detail, goal_runs: next },
+            },
+          };
+        });
+        if (!req.silentToast) {
+          notifyToast("Goal loop started");
+        }
         void ctx.actions.reloadHostDetail(req.hostId, true);
         return goal;
       } catch (err) {
         notifyToast(`Failed to start goal: ${String(err)}`);
+        return null;
+      }
+    },
+
+
+    async updateGoalRun(req: {
+      hostId: string;
+      goalId: string;
+      objective?: string | null;
+      criteria?: string[] | null;
+      verifyCommand?: string | null;
+      maxIterations?: number | null;
+      maxDurationSecs?: number | null;
+    }): Promise<GoalRunRecord | null> {
+      try {
+        const goal = await orbitIpc.updateGoalRun(req);
+        setState((s) => {
+          const detail = s.hostDetails[req.hostId];
+          if (!detail) return s;
+          const prev = detail.goal_runs ?? [];
+          const exists = prev.some((g) => g.goal_id === goal.goal_id);
+          const next = exists
+            ? prev.map((g) => (g.goal_id === goal.goal_id ? goal : g))
+            : [goal, ...prev];
+          return {
+            ...s,
+            hostDetails: {
+              ...s.hostDetails,
+              [req.hostId]: { ...detail, goal_runs: next },
+            },
+          };
+        });
+        void ctx.actions.reloadHostDetail(req.hostId, true);
+        return goal;
+      } catch (err) {
+        notifyToast(`Failed to update goal: ${String(err)}`);
         return null;
       }
     },
@@ -1493,6 +1550,22 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
     ): Promise<GoalRunRecord | null> {
       try {
         const goal = await orbitIpc.controlGoalRun(hostId, goalId, action);
+        setState((s) => {
+          const detail = s.hostDetails[hostId];
+          if (!detail) return s;
+          const prev = detail.goal_runs ?? [];
+          const exists = prev.some((g) => g.goal_id === goal.goal_id);
+          const next = exists
+            ? prev.map((g) => (g.goal_id === goal.goal_id ? goal : g))
+            : [goal, ...prev];
+          return {
+            ...s,
+            hostDetails: {
+              ...s.hostDetails,
+              [hostId]: { ...detail, goal_runs: next },
+            },
+          };
+        });
         const label =
           action === "pause"
             ? "Goal paused"
@@ -1510,6 +1583,40 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
         notifyToast(`Goal action failed: ${String(err)}`);
         return null;
       }
+    },
+
+
+    openGoalEditDialog(hostId: string, goal: GoalRunRecord): void {
+      setState((s) => ({
+        ...s,
+        goalEditDialogTarget: { hostId, goal },
+      }));
+    },
+
+
+    closeGoalEditDialog(): void {
+      setState((s) => (s.goalEditDialogTarget ? { ...s, goalEditDialogTarget: null } : s));
+    },
+
+
+    openGoalReplaceConfirm(target: {
+      hostId: string;
+      agentId: string;
+      currentGoal: GoalRunRecord;
+      newObjective: string;
+      onConfirm: () => Promise<void>;
+    }): void {
+      setState((s) => ({
+        ...s,
+        goalReplaceConfirmTarget: target,
+      }));
+    },
+
+
+    closeGoalReplaceConfirm(): void {
+      setState((s) =>
+        s.goalReplaceConfirmTarget ? { ...s, goalReplaceConfirmTarget: null } : s,
+      );
     },
 
 

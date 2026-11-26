@@ -964,12 +964,6 @@ export const OmniComposer = memo(function OmniComposer({
         }
         break;
       case "goal":
-        if (isDraft || !hasCurrentAgent) {
-          orbitActions.showToast(t("composer.toastSessionRequiredGoal"));
-          break;
-        }
-        orbitActions.setSlashDirective(cmd.id);
-        break;
       case "btw":
       case "plan":
       case "review":

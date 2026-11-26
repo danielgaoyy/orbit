@@ -60,7 +60,9 @@ extension OrbitIosStore {
             criteria: criteria.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty },
             verifyCommand: (cleanVerify?.isEmpty == false) ? cleanVerify : nil,
             maxIterations: maxIterations,
-            maxDurationSecs: maxDurationSecs
+            maxDurationSecs: maxDurationSecs,
+            replaceExisting: false,
+            dispatchInitialPrompt: nil
         )
         Task { @MainActor [weak self] in
             do {

@@ -437,6 +437,33 @@ export function selectActiveGoalForAgent(
 }
 
 /**
+ * Finds the active goal for `agentId`, or falls back to the latest succeeded goal on that session
+ * so the Composer Goal Dock can briefly surface completion before dismissal.
+ */
+export function selectDockGoalForAgent(
+  hostDetail: HostDetailView | null | undefined,
+  agentId: string | null,
+): GoalRunRecord | null {
+  if (!hostDetail || !agentId) return null;
+  const goals = hostDetail.goal_runs;
+  if (!goals || goals.length === 0) return null;
+  let latestSucceeded: GoalRunRecord | null = null;
+  for (const g of goals) {
+    if (g.agent_id !== agentId) continue;
+    if (ACTIVE_GOAL_STATUSES_LOOKUP.has(g.status)) {
+      return g;
+    }
+    if (
+      g.status === "succeeded" &&
+      (!latestSucceeded || (g.finished_at_ms ?? g.updated_at_ms) > (latestSucceeded.finished_at_ms ?? latestSucceeded.updated_at_ms))
+    ) {
+      latestSucceeded = g;
+    }
+  }
+  return latestSucceeded;
+}
+
+/**
  * Counts armed conditional timers for `agentId` on `hostDetail` without allocating.
  * Safe to invoke directly inside `useOrbitSelector` because it returns a primitive number.
  */

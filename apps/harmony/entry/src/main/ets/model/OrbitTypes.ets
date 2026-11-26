@@ -130,7 +130,6 @@ export interface AgentCardDto {
   seen_seq?: number;
   is_unread?: boolean;
   queued_prompts?: QueuedPromptDto[];
-  labels?: Record<string, string>;
 }
 
 export interface ThinkingOptionSpecDto {

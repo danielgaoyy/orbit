@@ -9,6 +9,10 @@ use tauri::{App, AppHandle, Emitter, Manager, Wry};
 pub const TRAY_ID: &str = "orbit-main-tray";
 pub const TRAY_NEW_CONVERSATION_EVENT: &str = "orbit://tray-new-conversation";
 
+#[cfg(target_os = "macos")]
+const MACOS_TRAY_TEMPLATE_ICON: tauri::image::Image<'static> =
+    tauri::include_image!("./icons/tray-template@2x.png");
+
 const MENU_ID_STATUS: &str = "tray_status";
 const MENU_ID_SHOW: &str = "tray_show";
 const MENU_ID_NEW_CONVERSATION: &str = "tray_new_conversation";
@@ -122,12 +126,17 @@ pub fn setup_system_tray(app: &App) {
             }
         });
 
+    #[cfg(target_os = "macos")]
+    {
+        // Monochrome template glyph (black + alpha, 36px tall = 18pt @2x); AppKit tints it
+        // for light/dark menu bars and the highlighted state. Source: docs/assets/brand/.
+        builder = builder
+            .icon(MACOS_TRAY_TEMPLATE_ICON)
+            .icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon().cloned() {
         builder = builder.icon(icon);
-        #[cfg(target_os = "macos")]
-        {
-            builder = builder.icon_as_template(false);
-        }
     } else {
         tracing::warn!("Default window icon unavailable; skipping system tray icon");
         return;

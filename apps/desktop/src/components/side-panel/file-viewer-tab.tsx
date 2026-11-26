@@ -369,14 +369,25 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   const codeLineCount = rawCodeLines.length;
   const preHighlightedLineCount = data?.highlighted_lines.length ?? 0;
+  const codeFontSize = useOrbitSelector((s) => s.codeFontSize);
+  const codeLinePx = Math.round(20 * (codeFontSize / 13));
 
   const codeVirtualizer = useVirtualizer({
     count: isCodeViewActive ? codeLineCount : 0,
     getScrollElement: () => codeViewportRef.current,
-    estimateSize: () => 20,
+    estimateSize: () => codeLinePx,
     useAnimationFrameWithResizeObserver: true,
     overscan: 28,
   });
+
+  const prevCodeLinePxRef = useRef(codeLinePx);
+  useLayoutEffect(() => {
+    if (prevCodeLinePxRef.current === codeLinePx) return;
+    prevCodeLinePxRef.current = codeLinePx;
+    if (isCodeViewActive) {
+      codeVirtualizer.measure();
+    }
+  }, [codeLinePx, isCodeViewActive, codeVirtualizer]);
 
   const virtualCodeItems = codeVirtualizer.getVirtualItems();
 
@@ -390,7 +401,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       if (targetLine == null) {
         const scrollEl = codeViewportRef.current;
         if (scrollEl && isCodeViewActive && codeLineCount > 0) {
-          const topLine = Math.floor(scrollEl.scrollTop / 20) + 1;
+          const topLine = Math.floor(scrollEl.scrollTop / codeLinePx) + 1;
           targetLine = Math.max(1, Math.min(topLine + 4, codeLineCount));
         } else if (firstVisibleIdx >= 0) {
           targetLine = firstVisibleIdx + 1;
@@ -401,7 +412,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       setPendingMarkdownTarget(null);
       orbitActions.enterFileEditMode(hostId, cwd, path);
     },
-    [isCodeViewActive, codeLineCount, firstVisibleIdx, hostId, cwd, path],
+    [isCodeViewActive, codeLineCount, codeLinePx, firstVisibleIdx, hostId, cwd, path],
   );
   useEffect(() => {
     if (!isCodeViewActive || !data || data.language === "text" || firstVisibleIdx < 0) return;
@@ -1356,7 +1367,7 @@ export const FileViewerTab = memo(function FileViewerTab({
             orientation="both"
             viewportRef={codeViewportRef}
             className="bg-canvas min-h-0 flex-1"
-            viewportClassName="selectable-text py-2.5 font-mono text-[12px] leading-[20px]"
+            viewportClassName="selectable-text py-2.5 font-(family-name:--orbit-font-code-surface) text-(length:--orbit-code-pane-size) leading-(--orbit-code-line)"
           >
             {data.truncated && (
               <div className="border-border text-muted-foreground mx-3 mb-2 rounded-lg border bg-amber-500/[0.06] px-3 py-1.5 font-sans text-[11.5px]">
@@ -1463,7 +1474,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                       }
                     }}
                     className={cn(
-                      "group/fln flex h-[20px] min-w-fit items-center px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",
+                      "group/fln flex h-(--orbit-code-line) min-w-fit items-center px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",
                       isFocused &&
                         "bg-signal-info/[0.12] shadow-[inset_2px_0_0_0_var(--signal-info)]",
                       !isFocused && isMatched && "bg-amber-500/[0.12]",

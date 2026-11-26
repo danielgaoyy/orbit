@@ -1000,6 +1000,22 @@ export class WasmWebBackend implements OrbitTransportBackend {
         });
         return reply.goal;
       }
+      case "reset_workspace_board": {
+        await this.rpc(h, "reset_workspace_board", {
+          workspace_id: String(a.workspaceId ?? ""),
+          new_goal: a.newGoal ?? null,
+          keep_notes: a.keepNotes ?? null,
+        });
+        return;
+      }
+      case "harvest_conversation": {
+        await this.rpc(h, "harvest_conversation", {
+          agent_id: agent,
+          summary_note: a.summaryNote ?? null,
+          append_to_workspace_board: Boolean(a.appendToWorkspaceBoard),
+        });
+        return;
+      }
       case "list_personal_agent_activity": {
         const reply = await this.rpc(h, "list_personal_agent_activity", {
           limit: Number(a.limit ?? 50),

@@ -204,7 +204,12 @@ export function searchSettingsEntries(
   const results: SettingsSearchResult[] = [];
   const phrase = terms.join(" ");
   for (const { entry, fields, labels, keywords, parentLabelKey } of index) {
-    if (options.isDesktop === false && (entry.settingId === "settings.appVersion" || entry.settingId === "settings.externalEditor")) continue;
+    if (
+      options.isDesktop === false &&
+      (entry.settingId === "settings.appVersion" ||
+        entry.settingId === "settings.externalEditor" ||
+        entry.settingId === "settings.windowZoom")
+    ) continue;
     if (
       options.hasHost === false &&
       (hostRequiredTargets.has(entry.target) || entry.settingId?.startsWith("securityOps.migration"))

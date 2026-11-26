@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Check,
@@ -502,7 +502,7 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
   );
 });
 
-function estimateRowHeight(row: DiffVirtualRow): number {
+function estimateRowHeight(row: DiffVirtualRow, codeLinePx = 20): number {
   switch (row.kind) {
     case "file_header":
       return 38;
@@ -510,7 +510,7 @@ function estimateRowHeight(row: DiffVirtualRow): number {
       return 28;
     case "unified_line":
     case "split_pair":
-      return 20;
+      return codeLinePx;
     case "patrol_finding_list":
       return 68 + Math.max(0, row.findings.length - 1) * 56;
     case "comment_list":
@@ -1094,14 +1094,26 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     expandedPatrolKeys,
   ]);
 
+  const codeFontSize = useOrbitSelector((s) => s.codeFontSize);
+  const codeLinePx = Math.round(20 * (codeFontSize / 13));
+
   const virtualizer = useVirtualizer({
     count: virtualized ? flatRows.length : 0,
     getScrollElement: () => scrollRef.current,
-    estimateSize: (index) => estimateRowHeight(flatRows[index]),
+    estimateSize: (index) => estimateRowHeight(flatRows[index], codeLinePx),
     overscan: 16,
     useAnimationFrameWithResizeObserver: true,
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
+
+  const prevCodeLinePxRef = useRef(codeLinePx);
+  useLayoutEffect(() => {
+    if (prevCodeLinePxRef.current === codeLinePx) return;
+    prevCodeLinePxRef.current = codeLinePx;
+    if (virtualized) {
+      virtualizer.measure();
+    }
+  }, [codeLinePx, virtualized, virtualizer]);
 
   // Diff-local Cmd+F match calculation
   const normalizedFindQuery = findOpen ? findQuery.trim().toLowerCase() : "";
@@ -1504,7 +1516,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         return (
           <div
             className={cn(
-              "border-border group selectable-text flex w-full items-start border-x px-2 font-mono text-[12px] leading-[20px] transition-colors",
+              "border-border group selectable-text flex w-full items-start border-x px-2 font-(family-name:--orbit-font-code-surface) text-(length:--orbit-code-pane-size) leading-(--orbit-code-line) transition-colors",
               isLastInFile && !isPatrolExpanded && "rounded-b-lg border-b",
               rowClass,
               !inActiveSelection &&
@@ -1703,7 +1715,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         return (
           <div
             className={cn(
-              "border-border-subtle divide-border-subtle selectable-text bg-surface-recessed grid w-full grid-cols-2 divide-x border-x font-mono text-[12px] leading-[20px]",
+              "border-border-subtle divide-border-subtle selectable-text bg-surface-recessed grid w-full grid-cols-2 divide-x border-x font-(family-name:--orbit-font-code-surface) text-(length:--orbit-code-pane-size) leading-(--orbit-code-line)",
               isLastInFile && !isPatrolExpanded && "overflow-hidden rounded-b-lg border-b",
               isActiveFindMatch
                 ? "bg-amber-400/24 ring-1 ring-inset ring-amber-500/65 dark:bg-amber-400/20"

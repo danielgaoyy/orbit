@@ -173,12 +173,14 @@ impl FinishSubscriptionManager {
         if sub.require_parent_owner
             && let Some(c) = child
         {
-            if c.parent_agent_id.as_deref() != Some(sub.caller_agent_id.as_str()) {
-                return false;
-            }
-            if let Some(ref ph) = c.parent_host_id
-                && ph != &self.self_host_id
-            {
+            let matches_parent = c.parent_agent_id.as_deref() == Some(sub.caller_agent_id.as_str())
+                && c.parent_host_id
+                    .as_deref()
+                    .is_none_or(|ph| ph == self.self_host_id);
+            let matches_router = c.routed_by_agent_id() == Some(sub.caller_agent_id.as_str())
+                && c.routed_by_host_id()
+                    .is_none_or(|rh| rh == self.self_host_id);
+            if !matches_parent && !matches_router {
                 return false;
             }
         }

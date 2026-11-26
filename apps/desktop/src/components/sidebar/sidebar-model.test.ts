@@ -326,4 +326,122 @@ describe("sidebar-model pure derivation & invariants", () => {
       );
     }
   });
+
+  it("hides cross-host and orphaned subagents while keeping router-dispatched conversations visible", () => {
+    const crossHostSub = makeAgent("sub_cross", "Remote Helper", {
+      parent_agent_id: "conv_local",
+      parent_host_id: "h1",
+      labels: { "orbit.session_tier": "subagent" },
+    });
+    const orphanSub = makeAgent("sub_orphan", "Orphan Helper", {
+      parent_agent_id: "conv_archived",
+      labels: { "orbit.session_tier": "subagent" },
+    });
+    const routedConv = makeAgent("conv_routed", "Investigate Latency", {
+      parent_agent_id: null,
+      labels: {
+        "orbit.routed_by_agent": "ag_router",
+        "orbit.session_tier": "conversation",
+      },
+    });
+
+    const sidebarView: FleetSidebarView = {
+      revision: 1,
+      launchpad_projects: [],
+      needs_attention: [
+        {
+          host_id: "h2",
+          is_pinned: false,
+          is_unread: false,
+          seen_seq: 0,
+          is_worktree: false,
+          agent: crossHostSub,
+        },
+      ],
+      pinned_conversations: [
+        {
+          host_id: "h1",
+          is_pinned: true,
+          is_unread: false,
+          seen_seq: 0,
+          is_worktree: false,
+          agent: orphanSub,
+        },
+      ],
+      projects: [
+        {
+          id: "h2::/repo",
+          host_id: "h2",
+          name: "repo",
+          is_home_workspace: false,
+          primary_cwd: "/repo",
+          directories: ["/repo"],
+          git_branch: "main",
+          is_git_repo: true,
+          nested_git_repos: [],
+          pinned_project_id: null,
+          sort_weight_ms: 1000,
+          sort_order_key: "h2::/repo",
+          conversations: [
+            {
+              host_id: "h2",
+              is_pinned: false,
+              is_unread: false,
+              seen_seq: 0,
+              is_worktree: false,
+              agent: crossHostSub,
+            },
+            {
+              host_id: "h2",
+              is_pinned: false,
+              is_unread: false,
+              seen_seq: 0,
+              is_worktree: false,
+              agent: orphanSub,
+            },
+            {
+              host_id: "h2",
+              is_pinned: false,
+              is_unread: false,
+              seen_seq: 0,
+              is_worktree: false,
+              agent: routedConv,
+            },
+          ],
+          workspaces: [],
+          unclassified_conversations: [],
+        },
+      ],
+    };
+
+    const model = buildSidebarDisplayModel({
+      hosts: [
+        { host_id: "h1", display_name: "Mac" } as HostCardView,
+        { host_id: "h2", display_name: "Linux" } as HostCardView,
+      ],
+      sidebarView,
+      hostDetails: {},
+      archivedThreads: {},
+      hiddenProjectKeys: {},
+      threadCustomTitles: {},
+      collapsedProjectIds: {},
+      collapsedWorkspaceIds: {},
+      sidebarProjectSort: "recent",
+      threadManualOrder: {},
+      workspacePanel: "conversation",
+      isDraftNewSession: false,
+      selectedHostId: "h2",
+      selectedAgentId: "conv_routed",
+      selectedWorkspaceCwd: "/repo",
+      expandedMoreProjects: {},
+      filterQuery: "",
+    });
+
+    assert.equal(model.filteredAttentionItems.length, 0);
+    assert.equal(model.filteredPinnedEntries.length, 0);
+    assert.deepEqual(
+      model.projectRenderModels[0].visibleConversations.map((c) => c.agent.agent_id),
+      ["conv_routed"],
+    );
+  });
 });

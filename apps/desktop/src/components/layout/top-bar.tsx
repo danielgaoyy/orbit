@@ -334,9 +334,9 @@ export const TopBar = memo(function TopBar() {
           : undefined
       }
       className={cn(
-        "@container bg-surface-base flex h-[40px] min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden select-none @[460px]:gap-3",
+        "@container bg-surface-base flex h-(--orbit-titlebar-h) min-w-0 shrink-0 items-center justify-between gap-2 overflow-hidden select-none @[460px]:gap-3",
         showBottomBorder && "border-border-subtle border-b",
-        topbarUseOpenLeftPad ? "pl-[16px]" : isMac ? "pl-[114px]" : "pl-[48px]",
+        topbarUseOpenLeftPad ? "pl-[16px]" : isMac ? "pl-(--orbit-traffic-pad)" : "pl-[48px]",
         topbarReserveRightToggle ? "pr-[42px]" : "pr-[12px]",
       )}
     >

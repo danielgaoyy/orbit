@@ -17,6 +17,7 @@ import { OnboardingGuide } from "@/components/onboarding/onboarding-guide";
 import { MediaPreviewModal } from "@/components/viewers/media-preview-modal";
 import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
+import { GlobalZoomHudHost } from "@/components/layout/zoom-hud";
 import { SettingsView } from "@/components/settings/settings-view";
 import { QuickOpenFileDialog } from "@/components/side-panel/quick-open-file-dialog";
 import {
@@ -319,6 +320,9 @@ function MainDesktopApp() {
 
         {/* Isolated Toast & Undo Host so ephemeral toasts never re-render Settings or Workspace */}
         <GlobalToastHost />
+
+        {/* Isolated Native Window Zoom bootstrap, event sync & ephemeral HUD */}
+        <GlobalZoomHudHost />
       </MarkdownThemeProvider>
     </TooltipProvider>
   );
@@ -484,8 +488,8 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
         {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
         <div
           className={cn(
-            "pointer-events-none fixed top-0 z-30 flex h-[40px] items-center",
-            isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
+            "pointer-events-none fixed top-0 z-30 flex h-(--orbit-titlebar-h) items-center",
+            isMac ? "left-(--orbit-traffic-x) translate-y-[1px]" : "left-[12px]",
           )}
         >
           <IconButton
@@ -503,7 +507,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
         {hasSelectedHost && (
           <div
             className={cn(
-              "pointer-events-none fixed top-0 right-[10px] z-30 flex h-[40px] items-center",
+              "pointer-events-none fixed top-0 right-[10px] z-30 flex h-(--orbit-titlebar-h) items-center",
               isMac && "translate-y-[1px]",
             )}
           >

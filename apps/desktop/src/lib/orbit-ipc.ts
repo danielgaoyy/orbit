@@ -75,6 +75,26 @@ export interface SystemAudioInputDevice {
   transport?: string | null;
 }
 
+export type ZoomSource = "startup" | "menu" | "shortcut" | "settings";
+
+export interface UiZoomState {
+  zoom_percent: number;
+  min_percent: number;
+  max_percent: number;
+  step_percent: number;
+}
+
+export interface UiZoomChangedPayload extends UiZoomState {
+  source: ZoomSource;
+}
+
+const DEFAULT_UI_ZOOM_STATE: UiZoomState = {
+  zoom_percent: 100,
+  min_percent: 80,
+  max_percent: 150,
+  step_percent: 10,
+};
+
 export interface AcpAgentSpec {
   id: string;
   name: string;
@@ -1035,6 +1055,13 @@ export interface WorkspaceOrganizeEvent {
   grouped_agents: number;
   summarized_agents: number;
 }
+
+export {
+  type SessionTier,
+  resolveAgentSessionTier,
+  isSubagentCard,
+  isRoutedConversationCard,
+} from "./session-tier.ts";
 
 const GENERIC_HARNESS_HANDLES = new Set([
   "peer",
@@ -4803,6 +4830,36 @@ export const orbitIpc = {
     await invoke<void>("update_workspace_goal", { hostId, workspaceId, goal });
   },
 
+  resetWorkspaceBoard: async (params: {
+    hostId: string;
+    workspaceId: string;
+    newGoal?: string | null;
+    keepNotes?: string | null;
+  }): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("reset_workspace_board", {
+      hostId: params.hostId,
+      workspaceId: params.workspaceId,
+      newGoal: params.newGoal ?? null,
+      keepNotes: params.keepNotes ?? null,
+    });
+  },
+
+  harvestConversation: async (params: {
+    hostId: string;
+    agentId: string;
+    summaryNote?: string | null;
+    appendToWorkspaceBoard?: boolean;
+  }): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("harvest_conversation", {
+      hostId: params.hostId,
+      agentId: params.agentId,
+      summaryNote: params.summaryNote ?? null,
+      appendToWorkspaceBoard: params.appendToWorkspaceBoard ?? false,
+    });
+  },
+
   moveAgentToWorkspace: async (
     hostId: string,
     agentId: string,
@@ -7079,7 +7136,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!transport()) return "0.11.7";
+    if (!transport()) return "0.11.8";
     return invoke<string>("get_app_version");
   },
 
@@ -7840,6 +7897,42 @@ export const orbitIpc = {
   ): Promise<() => void> => {
     if (!isTauriRuntime()) return () => {};
     return listen<NativeNotificationResolvedPayload>("orbit://notification-action-resolved", (ev) => {
+      if (ev.payload) handler(ev.payload);
+    });
+  },
+
+  getUiZoom: async (): Promise<UiZoomState> => {
+    if (!isTauriRuntime()) {
+      return { ...DEFAULT_UI_ZOOM_STATE };
+    }
+    return invoke<UiZoomState>("get_ui_zoom");
+  },
+
+  stepUiZoom: async (
+    delta: -1 | 1,
+    source: "shortcut" | "settings",
+  ): Promise<UiZoomState> => {
+    if (!isTauriRuntime()) {
+      return { ...DEFAULT_UI_ZOOM_STATE };
+    }
+    return invoke<UiZoomState>("step_ui_zoom", { delta, source });
+  },
+
+  setUiZoom: async (
+    zoomPercent: number,
+    source: "shortcut" | "settings",
+  ): Promise<UiZoomState> => {
+    if (!isTauriRuntime()) {
+      return { ...DEFAULT_UI_ZOOM_STATE };
+    }
+    return invoke<UiZoomState>("set_ui_zoom", { zoomPercent, source });
+  },
+
+  onUiZoomChanged: async (
+    handler: (payload: UiZoomChangedPayload) => void,
+  ): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen<UiZoomChangedPayload>("orbit://zoom-changed", (ev) => {
       if (ev.payload) handler(ev.payload);
     });
   },

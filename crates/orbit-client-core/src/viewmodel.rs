@@ -209,6 +209,35 @@ pub struct AgentCardView {
     pub acp_agent_id: Option<String>,
 }
 
+impl AgentCardView {
+    /// Resolve canonical session sovereignty tier (`Conversation`, `Subagent`, `PersonalRouter`, `Automation`).
+    pub fn session_tier(&self) -> SessionTier {
+        resolve_session_tier(
+            self.background,
+            self.parent_agent_id.as_deref(),
+            &self.labels,
+        )
+    }
+
+    /// True if this session is a managed subagent/helper that must remain hidden from primary conversation lists.
+    pub fn is_subagent(&self) -> bool {
+        self.session_tier() == SessionTier::Subagent
+    }
+
+    /// True if this session is a user-visible primary `Conversation`.
+    pub fn is_primary_conversation(&self) -> bool {
+        self.session_tier() == SessionTier::Conversation
+    }
+
+    /// Router agent ID if this conversation was dispatched by a `PersonalRouter`.
+    pub fn routed_by_agent_id(&self) -> Option<&str> {
+        self.labels
+            .get(LABEL_ROUTED_BY_AGENT)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostDetailView {
     pub revision: u64,

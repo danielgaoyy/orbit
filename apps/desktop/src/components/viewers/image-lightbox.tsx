@@ -91,6 +91,7 @@ export const ImageLightbox = memo(function ImageLightbox({
   useEffect(() => {
     if (!isOpen) return;
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === "ArrowLeft" && count > 1) {
         ev.preventDefault();
         stepGallery(-1);

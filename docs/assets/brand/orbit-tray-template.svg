@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="53" height="36" viewBox="2.1 6.15 32.94 22.37" fill="none">
+  <!-- macOS menu bar template image: black + alpha only; AppKit tints it for light/dark menu bars.
+       Cropped to the mark so the 18pt-tall status item shows it at ~16pt like system glyphs. -->
+  <defs>
+    <mask id="orbit-tray-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="36" height="36">
+      <rect x="0" y="0" width="38" height="36" fill="#fff"/>
+      <path d="M31.24 10.96A15 4.15 -28 0 1 4.76 25.04" stroke="#000" stroke-width="4.6"/>
+      <circle cx="30.84" cy="10.52" r="4.2" fill="#000"/>
+    </mask>
+  </defs>
+  <path d="M4.76 25.04A15 4.15 -28 0 1 31.24 10.96" stroke="#000" stroke-opacity=".55" stroke-width="2.0" stroke-linecap="round"/>
+  <circle cx="18" cy="18" r="8.6" stroke="#000" stroke-width="3.5" mask="url(#orbit-tray-cut)"/>
+  <path d="M31.24 10.96A15 4.15 -28 0 1 4.76 25.04" stroke="#000" stroke-width="2.0" stroke-linecap="round"/>
+  <circle cx="30.84" cy="10.52" r="2.7" fill="#000"/>
+</svg>

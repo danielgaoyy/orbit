@@ -95,6 +95,46 @@
   --duration-panel-out: 225ms;
 }
 
+:root {
+  /* Window Zoom & Titlebar Compensation (no transitions — instantaneous scale alignment) */
+  --orbit-zoom: 1;
+  --orbit-titlebar-h: 40px;
+  --orbit-traffic-x: 80px;
+  --orbit-traffic-pad: 114px;
+  --orbit-detached-pad: 78px;
+  --orbit-detached-titlebar-h: 36px;
+
+  /* Orthogonal Reading & Code Typography Variables (default values match v0.11.7 pixel-for-pixel) */
+  --orbit-read-body: 15px;
+  --orbit-read-leading: 1.65;
+  --orbit-read-compact: 13px;
+  --orbit-read-compact-leading: 1.55;
+  --orbit-read-h1: 20px;
+  --orbit-read-h2: 17px;
+  --orbit-read-h3: 15px;
+  --orbit-read-table: 13px;
+  --orbit-read-th: 12px;
+  --orbit-composer-size: 15px;
+  --orbit-composer-leading: 22px;
+  --orbit-composer-max-h: 200px;
+  --orbit-code-size: 13px;
+  --orbit-code-pane-size: 12px;
+  --orbit-code-line: 20px;
+  --orbit-code-block-leading: 1.6;
+  --orbit-font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Inter", "Segoe UI", Roboto, sans-serif;
+  --orbit-font-content: var(--orbit-font-ui);
+  --orbit-font-code: "JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --orbit-font-code-surface: var(--font-mono);
+}
+
+html.orbit-mac {
+  --orbit-titlebar-h: max(calc(40px / var(--orbit-zoom)), 30px);
+  --orbit-traffic-x: calc(80px / var(--orbit-zoom));
+  --orbit-traffic-pad: calc(80px / var(--orbit-zoom) + 34px);
+  --orbit-detached-pad: calc(78px / var(--orbit-zoom));
+  --orbit-detached-titlebar-h: max(calc(36px / var(--orbit-zoom)), 30px);
+}
+
 .dark,
 [data-orbit-theme-preview="dark"] {
   /* 4-Layer Same-Hue Neutral Surfaces (Deep Observatory Graphite) */
@@ -236,8 +276,7 @@
   html,
   body {
     @apply bg-surface-base text-ink-primary;
-    font-family:
-      -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Inter", "Segoe UI", Roboto, sans-serif;
+    font-family: var(--orbit-font-ui);
     font-size: 13px;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
     -webkit-font-smoothing: antialiased;
@@ -982,6 +1021,39 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
 .orbit-find-bar-exit {
   transform-origin: top right;
   animation: orbit-find-bar-out var(--dur-exit) var(--ease-exit) forwards;
+}
+
+/* Ephemeral Window Zoom HUD (compositor-only opacity + transform) */
+@keyframes orbit-zoom-hud-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-zoom-hud-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0) scale(0.98);
+  }
+}
+
+.orbit-zoom-hud-enter {
+  transform-origin: top right;
+  animation: orbit-zoom-hud-in 140ms var(--ease-out-expo);
+}
+
+.orbit-zoom-hud-exit {
+  transform-origin: top right;
+  animation: orbit-zoom-hud-out 175ms var(--ease-exit) forwards;
 }
 
 /* Zero-DOM-mutation CSS Custom Highlight API styling for in-session `⌘F` matches */

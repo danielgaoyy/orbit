@@ -792,10 +792,19 @@ const BriefingRailBody = memo(function BriefingRailBody({
 
   const handleArchiveCompletedWorkers = useCallback(() => {
     for (const item of partitioned.archivableCompletedWorkers) {
-      orbitActions.archiveThread(item.worker.host_id, item.worker.agent_id);
+      const liveAg = hostDetails[item.worker.host_id]?.agents.find(
+        (a) => a.agent_id === item.worker.agent_id,
+      );
+      if (liveAg && !liveAg.parent_agent_id && liveAg.labels?.["orbit.session_tier"] !== "subagent") {
+        void orbitActions.harvestConversation(item.worker.host_id, item.worker.agent_id, {
+          appendToWorkspaceBoard: true,
+        });
+      } else {
+        orbitActions.archiveThread(item.worker.host_id, item.worker.agent_id);
+      }
     }
     refresh({ includeActivity: false });
-  }, [partitioned.archivableCompletedWorkers, refresh]);
+  }, [hostDetails, partitioned.archivableCompletedWorkers, refresh]);
 
   const allInProgressWorkers = useMemo(
     () => [...partitioned.runningMissionWorkers, ...partitioned.runningOtherWorkers],

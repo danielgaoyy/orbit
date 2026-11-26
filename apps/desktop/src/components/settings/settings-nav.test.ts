@@ -120,7 +120,8 @@ describe("Settings search", () => {
       ["入力マイク", "voice.microphoneTitle"], ["microphone", "voice.microphoneTitle"],
       ["keep awake", "settings.agentKeepAwake"], ["cloudflare", "settings.advancedRelayTitle"],
       ["CLAUDE.md", "settings.subTabInstructions"], ["飞书", "im.configuredChannels"],
-      ["oauth-unused-term", undefined], ["   ", undefined],
+      ["缩放", "settings.windowZoom"], ["文字サイズ", "settings.conversationTextSize"],
+      ["monospace", "settings.codeTextSize"], ["oauth-unused-term", undefined], ["   ", undefined],
     ];
     for (const dict of [en, zhCN, ja]) {
       for (const [query, id] of cases) {
@@ -140,6 +141,10 @@ describe("Settings search", () => {
     const hits = searchSettingsEntries("external ide", { t, isDesktop: false });
     assert.ok(hits.every((hit) => hit.settingId !== "settings.externalEditor"));
     assert.ok(searchSettingsEntries("external ide", { t, isDesktop: true }).some((hit) => hit.settingId === "settings.externalEditor"));
+
+    const webZoomHits = searchSettingsEntries("zoom", { t, isDesktop: false });
+    assert.ok(webZoomHits.every((hit) => hit.settingId !== "settings.windowZoom"));
+    assert.ok(searchSettingsEntries("zoom", { t, isDesktop: true }).some((hit) => hit.settingId === "settings.windowZoom"));
   });
 
   it("keeps hostless searches relevant while retaining client defaults", () => {

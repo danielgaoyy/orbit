@@ -5663,15 +5663,21 @@ async fn handle_wire_rpc(
             target,
             title,
             initial_prompt,
+            parent_agent_id,
+            parent_host_id,
         } => match runtime
             .orchestrator
-            .fork_agent(crate::manager::ForkAgentSpec {
-                source_agent_id,
-                up_to_seq,
-                target,
-                title,
-                initial_prompt,
-            })
+            .fork_agent_with_parent(
+                crate::manager::ForkAgentSpec {
+                    source_agent_id,
+                    up_to_seq,
+                    target,
+                    title,
+                    initial_prompt,
+                },
+                parent_agent_id,
+                parent_host_id,
+            )
             .await
         {
             Ok(outcome) => {
@@ -6138,7 +6144,7 @@ async fn handle_wire_rpc(
             limit,
         } => match runtime
             .orchestrator
-            .list_workspace_events(&workspace_id, limit.unwrap_or(50) as usize)
+            .list_active_workspace_events(&workspace_id, limit.unwrap_or(50) as usize)
         {
             Ok(events) => Some(WireMessage::WorkspaceEventsSnapshot {
                 request_id,
@@ -6159,6 +6165,48 @@ async fn handle_wire_rpc(
             Ok(_) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "update_ws_goal_failed", e)),
         },
+        WireMessage::ResetWorkspaceBoard {
+            request_id,
+            workspace_id,
+            new_goal,
+            keep_notes,
+            updated_by,
+        } => match runtime.orchestrator.reset_workspace_board(
+            &workspace_id,
+            new_goal,
+            keep_notes,
+            updated_by.as_deref().or(Some("user")),
+            None,
+        ) {
+            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot { request_id, board }),
+            Err(e) => Some(rpc_err(request_id, "reset_board_failed", e)),
+        },
+        WireMessage::HarvestConversation {
+            request_id,
+            agent_id,
+            summary_note,
+            append_to_workspace_board,
+        } => {
+            runtime.finish_subs.cancel_for_caller(&agent_id).await;
+            match runtime
+                .orchestrator
+                .harvest_conversation(
+                    &agent_id,
+                    summary_note,
+                    append_to_workspace_board,
+                    Some("user"),
+                )
+                .await
+            {
+                Ok((summary, workspace_id)) => Some(WireMessage::ConversationHarvested {
+                    request_id,
+                    agent_id,
+                    workspace_id,
+                    summary,
+                }),
+                Err(e) => Some(rpc_err(request_id, "harvest_conversation_failed", e)),
+            }
+        }
         WireMessage::MoveAgentToWorkspace {
             request_id,
             agent_id,

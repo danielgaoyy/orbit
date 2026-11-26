@@ -850,7 +850,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
               {t("common.syncing")}
             </div>
           ) : emptyPrompt.trim() ? (
-            <p className="selectable-text text-ink-secondary text-[13px] leading-[1.55] whitespace-pre-wrap break-words">{emptyPrompt}</p>
+            <p className="selectable-text text-ink-secondary font-(family-name:--orbit-font-content) text-(length:--orbit-read-compact) leading-(--orbit-read-compact-leading) whitespace-pre-wrap break-words">{emptyPrompt}</p>
           ) : (
             <div className="text-muted-foreground flex flex-col items-center justify-center gap-2.5 py-20 text-center text-[13px]">
               {status === "running" && <OrbitSpinner size={16} className="text-foreground/65" />}

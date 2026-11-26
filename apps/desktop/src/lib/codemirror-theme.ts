@@ -2,12 +2,13 @@ import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
+import {
+  DEFAULT_CODE_METRICS,
+  ORBIT_UI_DEFAULT_STACK,
+  type CodeEditorMetrics,
+} from "./typography.ts";
 
-const ORBIT_MONO_STACK =
-  '"JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
-
-const ORBIT_SANS_STACK =
-  '-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Inter", "Segoe UI", Roboto, sans-serif';
+const ORBIT_SANS_STACK = `var(--orbit-font-ui, ${ORBIT_UI_DEFAULT_STACK})`;
 
 /**
  * Restrained OKLCH-harmonized syntax palette for Light mode (`Alabaster Paper`).
@@ -59,7 +60,15 @@ export const orbitDarkHighlightStyle = HighlightStyle.define([
 /**
  * Tear-free CodeMirror 6 chrome + syntax theme bound directly to Orbit's OKLCH CSS tokens.
  */
-export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
+export function createOrbitCodeMirrorTheme(
+  isDark: boolean,
+  metrics: CodeEditorMetrics = DEFAULT_CODE_METRICS,
+): Extension {
+  const codeFontFamily = metrics.family;
+  const codeFontPx = `${metrics.fontPx}px`;
+  const codeLinePx = `${metrics.linePx}px`;
+  const scaledButtonLinePx = `${Math.round(22 * metrics.scale)}px`;
+  const scaledTooltipLinePx = `${Math.round(18 * metrics.scale)}px`;
   const activeLineBg = isDark ? "oklch(1 0 0 / 3.6%)" : "oklch(0.18 0.01 258 / 3.2%)";
   const selectionBg = isDark ? "oklch(0.72 0.13 252 / 28%)" : "oklch(0.62 0.14 252 / 20%)";
   const selectionMatchBg = isDark ? "oklch(0.72 0.13 252 / 14%)" : "oklch(0.62 0.14 252 / 11%)";
@@ -73,18 +82,18 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         height: "100%",
         backgroundColor: "var(--surface-base)",
         color: "var(--ink-primary)",
-        fontFamily: ORBIT_MONO_STACK,
-        fontSize: "13px",
-        lineHeight: "20px",
+        fontFamily: codeFontFamily,
+        fontSize: codeFontPx,
+        lineHeight: codeLinePx,
         outline: "none",
       },
       "&.cm-focused": {
         outline: "none",
       },
       ".cm-scroller": {
-        fontFamily: ORBIT_MONO_STACK,
-        fontSize: "13px",
-        lineHeight: "20px",
+        fontFamily: codeFontFamily,
+        fontSize: codeFontPx,
+        lineHeight: codeLinePx,
         overflow: "auto",
         overscrollBehavior: "contain",
       },
@@ -116,7 +125,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         backgroundColor: "var(--surface-base)",
         color: "var(--ink-faint)",
         borderRight: "1px solid var(--border-subtle)",
-        fontFamily: ORBIT_MONO_STACK,
+        fontFamily: codeFontFamily,
         fontSize: "11px",
         fontVariantNumeric: "tabular-nums",
         userSelect: "none",
@@ -124,7 +133,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
       ".cm-lineNumbers .cm-gutterElement": {
         padding: "0 10px 0 10px",
         minWidth: "36px",
-        lineHeight: "20px",
+        lineHeight: codeLinePx,
       },
       ".cm-activeLineGutter": {
         backgroundColor: activeLineBg,
@@ -229,7 +238,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         padding: "2px 8px",
         height: "24px",
         fontSize: "12px",
-        fontFamily: ORBIT_MONO_STACK,
+        fontFamily: codeFontFamily,
         outline: "none",
         minWidth: "150px",
       },
@@ -248,7 +257,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         fontWeight: "500",
         fontFamily: ORBIT_SANS_STACK,
         cursor: "pointer",
-        lineHeight: "22px",
+        lineHeight: scaledButtonLinePx,
       },
       ".cm-panel.cm-search .cm-button:hover": {
         backgroundColor: "var(--accent)",
@@ -296,7 +305,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         maxWidth: "380px",
       },
       ".cm-tooltip.cm-tooltip-autocomplete > ul": {
-        fontFamily: ORBIT_MONO_STACK,
+        fontFamily: codeFontFamily,
         fontSize: "12px",
         maxHeight: "220px",
       },
@@ -306,7 +315,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         gap: "6px",
         padding: "3px 8px",
         borderRadius: "5px",
-        lineHeight: "18px",
+        lineHeight: scaledTooltipLinePx,
       },
       ".cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]": {
         backgroundColor: "var(--accent)",
@@ -372,7 +381,7 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         borderLeftColor: "var(--ink-tertiary)",
       },
       ".cm-diagnosticSource": {
-        fontFamily: ORBIT_MONO_STACK,
+        fontFamily: codeFontFamily,
         fontSize: "10.5px",
         color: "var(--ink-tertiary)",
         marginTop: "2px",
@@ -409,9 +418,9 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         borderRadius: "6px",
         backgroundColor: "var(--surface-recessed)",
         border: "1px solid var(--border-subtle)",
-        fontFamily: ORBIT_MONO_STACK,
+        fontFamily: codeFontFamily,
         fontSize: "12px",
-        lineHeight: "18px",
+        lineHeight: scaledTooltipLinePx,
         color: "var(--ink-primary)",
         whiteSpace: "pre-wrap",
         wordBreak: "break-word",
@@ -461,9 +470,9 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
       ".orbit-cm-ghost-text": {
         color: "var(--ink-faint)",
         opacity: isDark ? "0.78" : "0.76",
-        fontFamily: ORBIT_MONO_STACK,
-        fontSize: "13px",
-        lineHeight: "20px",
+        fontFamily: codeFontFamily,
+        fontSize: codeFontPx,
+        lineHeight: codeLinePx,
         fontStyle: "italic",
         whiteSpace: "pre",
         pointerEvents: "none",

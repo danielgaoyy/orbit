@@ -442,7 +442,7 @@
     },
     {
       "name": "briefing_openWorkerHint",
-      "value": "点击在右侧栏预览 · Cmd/Ctrl+点击跳转会话"
+      "value": "点击打开会话 · Cmd/Ctrl+点击在右侧栏预览"
     },
     {
       "name": "briefing_otherActiveLabel",

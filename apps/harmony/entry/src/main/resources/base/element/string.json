@@ -442,7 +442,7 @@
     },
     {
       "name": "briefing_openWorkerHint",
-      "value": "Click to preview in side panel · Cmd/Ctrl+Click to jump"
+      "value": "Click to open conversation · Cmd/Ctrl+Click to preview in side panel"
     },
     {
       "name": "briefing_otherActiveLabel",

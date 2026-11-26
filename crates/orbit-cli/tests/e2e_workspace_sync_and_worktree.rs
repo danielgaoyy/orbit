@@ -1666,6 +1666,7 @@ async fn test_05_workspace_management_unclassified_inbox_ai_triage_and_tab_renam
 // ============================================================================
 // TEST 5: Trailing-Space POSIX Directory Isolation (Browse -> Upsert -> Diff -> Stage)
 // ============================================================================
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_05_upsert_project_and_git_stage_preserve_trailing_space_directories() {
     let home = new_temp_dir("ts_home");

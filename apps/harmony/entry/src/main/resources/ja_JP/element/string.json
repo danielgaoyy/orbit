@@ -442,7 +442,7 @@
     },
     {
       "name": "briefing_openWorkerHint",
-      "value": "クリックでサイドパネル表示 · Cmd/Ctrl+クリックで移動"
+      "value": "クリックで会話を開く · Cmd/Ctrl+クリックでサイドパネル表示"
     },
     {
       "name": "briefing_otherActiveLabel",

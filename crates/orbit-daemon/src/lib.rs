@@ -13116,6 +13116,19 @@ mod self_upgrade_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn expand_host_path_preserves_trailing_space_strings() {
+        let abs_with_space = "/tmp/orbit_space_test/project ";
+        assert_eq!(
+            expand_host_path(abs_with_space),
+            PathBuf::from(abs_with_space)
+        );
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
+            assert_eq!(expand_host_path("~/project "), home.join("project "));
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn expand_host_path_and_git_ops_preserve_trailing_space_directories() {
         let root =

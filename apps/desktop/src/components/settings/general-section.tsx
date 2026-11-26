@@ -78,7 +78,7 @@ export const GeneralSection = memo(function GeneralSection({
     [t],
   );
 
-  const appVersion = normalizeSemver(storeAppVersion) ?? "0.11.8";
+  const appVersion = normalizeSemver(storeAppVersion) ?? "0.11.9";
   const autoCheckedRef = useRef(false);
 
   // Gently check for the latest release once when opening General settings

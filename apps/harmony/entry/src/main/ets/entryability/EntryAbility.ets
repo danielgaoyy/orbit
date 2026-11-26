@@ -1,9 +1,30 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { display, KeyboardAvoidMode, ThemeControl, window } from '@kit.ArkUI';
+import { display, FrameCallback, KeyboardAvoidMode, ThemeControl, window } from '@kit.ArkUI';
 import { connection } from '@kit.NetworkKit';
 import { OrbitHarmonyStore } from '../model/OrbitHarmonyStore';
+import { OrbitHuksMasterKey, OrbitMasterKeyResult } from '../model/OrbitHuksMasterKey';
 import { orbitLogError, orbitLogInfo, orbitLogWarn } from '../model/OrbitLogger';
+import { OrbitPerfProbe } from '../model/OrbitPerfProbe';
+import { OrbitPreferencesStore } from '../model/OrbitPreferences';
 import { ORBIT_DEFAULT_THEME } from '../theme/OrbitTokens';
+
+class OrbitFirstFrameCallback extends FrameCallback {
+  private readonly onFirstFrame: () => void;
+  private fired: boolean = false;
+
+  constructor(onFirstFrame: () => void) {
+    super();
+    this.onFirstFrame = onFirstFrame;
+  }
+
+  onFrame(_frameTimeInNano: number): void {
+    if (this.fired) {
+      return;
+    }
+    this.fired = true;
+    this.onFirstFrame();
+  }
+}
 
 interface OrbitEdgeInsetsPx {
   top: number;
@@ -99,8 +120,11 @@ export default class EntryAbility extends UIAbility {
   private avoidAreaHandler: ((opts: window.AvoidAreaOptions) => void) | null = null;
   private windowSizeHandler: ((size: window.Size) => void) | null = null;
   private foldStatusHandler: ((status: display.FoldStatus) => void) | null = null;
+  private coldLoadContentMarked: boolean = false;
+  private coldFirstFrameMarked: boolean = false;
 
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
+    OrbitPerfProbe.mark('cold.create_start');
     const store = OrbitHarmonyStore.getInstance();
     try {
       store.bindContext(this.context);
@@ -114,9 +138,18 @@ export default class EntryAbility extends UIAbility {
     } catch (err) {
       orbitLogWarn('OrbitEntry', 'Color mode / preferences setup warning', err as Object);
     }
+    OrbitPerfProbe.mark('cold.prefs_ready');
 
     const dbPath = `${this.context.databaseDir}/orbit_harmony_v2.sqlite`;
-    store.initializeWithHuksAsync(this.context, dbPath).then(() => {
+    OrbitHuksMasterKey.resolveOrCreateMasterKey(this.context).then((keyRes: OrbitMasterKeyResult) => {
+      OrbitPerfProbe.mark('cold.huks_ready');
+      store.keyProtectionMode = keyRes.protectionMode;
+      const routerPrefs = new OrbitPreferencesStore();
+      routerPrefs.init(this.context);
+      store.primaryRouterHostId = routerPrefs.getPrimaryRouterHostId();
+      store.initialize(dbPath, keyRes.masterKeyB64);
+      OrbitPerfProbe.mark('cold.core_ready');
+      OrbitPerfProbe.flushIfDue();
       orbitLogInfo('OrbitEntry', `OrbitHarmonyCore ready at ${dbPath}`);
     }).catch((err: Object) => {
       orbitLogError('OrbitEntry', 'OrbitHarmonyCore HUKS init failed', err);
@@ -257,8 +290,32 @@ export default class EntryAbility extends UIAbility {
         orbitLogError('OrbitEntry', 'Failed to load content', err as Object);
         return;
       }
+      if (!this.coldLoadContentMarked) {
+        this.coldLoadContentMarked = true;
+        OrbitPerfProbe.mark('cold.load_content');
+      }
+      this.scheduleFirstFrameMark(windowStage);
       this.setupImmersiveWindow(windowStage);
     });
+  }
+
+  private scheduleFirstFrameMark(windowStage: window.WindowStage): void {
+    if (this.coldFirstFrameMarked) {
+      return;
+    }
+    try {
+      const uiCtx = windowStage.getMainWindowSync().getUIContext();
+      const firstFrameCallback = new OrbitFirstFrameCallback((): void => {
+        if (!this.coldFirstFrameMarked) {
+          this.coldFirstFrameMarked = true;
+          OrbitPerfProbe.mark('cold.first_frame');
+          OrbitPerfProbe.flushIfDue();
+        }
+      });
+      uiCtx.postFrameCallback(firstFrameCallback);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'Failed to schedule cold.first_frame callback', err as Object);
+    }
   }
 
   onWindowStageDestroy(): void {

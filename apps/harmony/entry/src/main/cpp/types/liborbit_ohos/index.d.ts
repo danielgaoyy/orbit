@@ -227,5 +227,6 @@ export class OrbitHarmonyCore {
   static openInMemory(): OrbitHarmonyCore;
   subscribe(callback: (err: Error | null, payloadJson: string) => void): void;
   subscribeCoalesced(minIntervalMs: number, callback: (err: Error | null, payloadJson: string) => void): void;
+  debugReplayStageDeltasJson(hostId: string, agentId: string, framesJson: string): void;
 }
 export { OrbitHarmonyCore as OhosOrbitCore };

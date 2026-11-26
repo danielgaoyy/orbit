@@ -1,4 +1,3 @@
-import { OrbitHarmonyCore } from 'liborbit_ohos.so';
 import { ConfigurationConstant, common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import {
@@ -115,7 +114,6 @@ import {
   resolveOrbitPalette
 } from '../theme/OrbitTokens';
 import { OrbitCoreBridge } from './OrbitCoreBridge';
-import { OrbitHuksMasterKey } from './OrbitHuksMasterKey';
 import { OrbitVoiceInputController } from './OrbitVoiceInput';
 import { orbitLogInfo, orbitLogWarn } from './OrbitLogger';
 import { OrbitPreferencesStore } from './OrbitPreferences';
@@ -161,7 +159,6 @@ interface SideQuestionEnvelopeDto {
 export class OrbitHarmonyStore {
   private static instance: OrbitHarmonyStore | null = null;
   private bridge: OrbitCoreBridge | null = null;
-  private core: OrbitHarmonyCore | null = null;
   private appContext: common.ApplicationContext | null = null;
   private prefsStore: OrbitPreferencesStore = new OrbitPreferencesStore();
   private voiceController: OrbitVoiceInputController = new OrbitVoiceInputController();
@@ -362,16 +359,6 @@ export class OrbitHarmonyStore {
     return OrbitHarmonyStore.instance;
   }
 
-  public async initializeWithHuksAsync(
-    context: common.Context | undefined,
-    dbPath: string
-  ): Promise<void> {
-    const keyRes = await OrbitHuksMasterKey.resolveOrCreateMasterKey(context);
-    this.keyProtectionMode = keyRes.protectionMode;
-    this.primaryRouterHostId = this.prefsStore.getPrimaryRouterHostId();
-    this.initialize(dbPath, keyRes.masterKeyB64);
-  }
-
   public initialize(dbPath: string, masterKeyB64: string = ''): void {
     if (this.pinnedThreadsFilePath.length === 0 && dbPath.length > 0) {
       this.pinnedThreadsFilePath = `${dbPath}.pinned_threads.json`;
@@ -380,7 +367,7 @@ export class OrbitHarmonyStore {
       this.draftPrefsFilePath = `${dbPath}.draft_prefs.json`;
       this.loadDraftPrefsFromDisk();
     }
-    if (this.core !== null) {
+    if (this.bridge !== null) {
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
         const evKind = this.pendingDeepLinkEventKind;
@@ -392,7 +379,6 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge = OrbitCoreBridge.openWithMasterKeyOrFallback(dbPath, masterKeyB64);
-      this.core = this.bridge.raw();
       this.nativeAvailable = true;
 
       if (!this.prefsStore.hasMigratedThreadPrefsV1()) {
@@ -415,7 +401,7 @@ export class OrbitHarmonyStore {
             }
           }
           if (seeds.length > 0) {
-            this.core.seedThreadPrefsJson(JSON.stringify(seeds));
+            this.bridge.seedThreadPrefsJson(JSON.stringify(seeds));
           }
         }
         this.prefsStore.markMigratedThreadPrefsV1();
@@ -423,20 +409,20 @@ export class OrbitHarmonyStore {
 
       try {
         this.cachedFallbackCatalogs = JSON.parse(
-          this.core.fallbackProviderCatalogsJson()
+          this.bridge.fallbackProviderCatalogsJson()
         ) as ProviderModelCatalogDto[];
       } catch (err) {
         orbitLogWarn('OrbitStore', 'Failed to parse fallback catalogs', err as Object);
       }
       try {
         this.slashCommands = JSON.parse(
-          this.core.slashCommandsJson('harmony', null)
+          this.bridge.slashCommandsJson('harmony', null)
         ) as SlashCommandDto[];
       } catch (err) {
         orbitLogWarn('OrbitStore', 'Failed to parse slash commands', err as Object);
       }
 
-      this.core.subscribeEvents((err: Error | null, payloadJson: string) => {
+      this.bridge.subscribeEvents((err: Error | null, payloadJson: string) => {
         if (err !== null || payloadJson.length === 0) {
           return;
         }
@@ -445,7 +431,7 @@ export class OrbitHarmonyStore {
       this.reloadFleet();
       this.refreshSidebar();
       this.refreshCloudSyncStatus();
-      this.core.connectAllHosts();
+      this.bridge.connectAllHosts();
       if (this.pushToken.length > 0) {
         this.syncPushTokenToAllHosts(false);
       }
@@ -617,7 +603,7 @@ export class OrbitHarmonyStore {
   }
 
   public refreshSidebar(): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     try {
@@ -634,7 +620,7 @@ export class OrbitHarmonyStore {
         active_cwd: this.activeCwd.length > 0 ? this.activeCwd : null
       };
       this.sidebarView = JSON.parse(
-        this.core.fleetSidebarByRequestJson(JSON.stringify(req))
+        this.bridge.fleetSidebarByRequestJson(JSON.stringify(req))
       ) as FleetSidebarDto;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'refreshSidebar failed', err as Object);
@@ -740,19 +726,19 @@ export class OrbitHarmonyStore {
   }
 
   public togglePinThread(hostId: string, agentId: string): void {
-    if (this.core === null || hostId.length === 0 || agentId.length === 0) {
+    if (this.bridge === null || hostId.length === 0 || agentId.length === 0) {
       return;
     }
-    this.core.togglePinAgent(hostId, agentId);
+    this.bridge.togglePinAgent(hostId, agentId);
     this.refreshSidebar();
     this.triggerHaptic(8);
   }
 
   public markAgentUnread(hostId: string, agentId: string): void {
-    if (this.core === null || hostId.length === 0 || agentId.length === 0) {
+    if (this.bridge === null || hostId.length === 0 || agentId.length === 0) {
       return;
     }
-    this.core.markAgentUnread(hostId, agentId);
+    this.bridge.markAgentUnread(hostId, agentId);
     this.refreshSidebar();
     this.triggerHaptic(8);
   }
@@ -842,9 +828,9 @@ export class OrbitHarmonyStore {
   // Lifecycle & Network Hooks
 
   public onAppForeground(): void {
-    if (this.core !== null) {
+    if (this.bridge !== null) {
       try {
-        this.core.onAppForeground();
+        this.bridge.onAppForeground();
         this.reloadFleet();
         if (this.selectedHostId.length > 0) {
           this.reloadHost(this.selectedHostId);
@@ -859,9 +845,9 @@ export class OrbitHarmonyStore {
   }
 
   public onAppBackground(): void {
-    if (this.core !== null) {
+    if (this.bridge !== null) {
       try {
-        this.core.onAppBackground();
+        this.bridge.onAppBackground();
       } catch (err) {
         orbitLogWarn('OrbitStore', 'onAppBackground failed', err as Object);
       }
@@ -869,9 +855,9 @@ export class OrbitHarmonyStore {
   }
 
   public onNetworkChanged(): void {
-    if (this.core !== null) {
+    if (this.bridge !== null) {
       try {
-        this.core.onNetworkChanged();
+        this.bridge.onNetworkChanged();
       } catch (err) {
         orbitLogWarn('OrbitStore', 'onNetworkChanged failed', err as Object);
       }
@@ -886,7 +872,7 @@ export class OrbitHarmonyStore {
     if (!lower.startsWith('orbit://')) {
       return;
     }
-    if (this.core === null) {
+    if (this.bridge === null) {
       this.pendingDeepLink = clean;
       this.pendingDeepLinkEventKind = eventKind;
       return;
@@ -981,7 +967,7 @@ export class OrbitHarmonyStore {
     if (cleanHost.length === 0) {
       return;
     }
-    if (this.core === null) {
+    if (this.bridge === null) {
       this.pendingOpenHostId = cleanHost;
       this.pendingOpenAgentId = cleanAgent;
       this.pendingOpenEventKind = cleanEvent;
@@ -1124,11 +1110,11 @@ export class OrbitHarmonyStore {
   // Fleet, Host & Directory Operations
 
   public reloadFleet(): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     try {
-      const snap = JSON.parse(this.core.fleetOverviewJson()) as FleetOverviewDto;
+      const snap = JSON.parse(this.bridge.fleetOverviewJson()) as FleetOverviewDto;
       this.hosts = snap.hosts;
       this.projects = snap.projects;
       this.totalPendingApprovals = snap.total_pending_approvals;
@@ -1260,7 +1246,7 @@ export class OrbitHarmonyStore {
   }
 
   private drainQueuedPromptsForAgentIfIdle(hostId: string, agent: AgentCardDto): void {
-    if (this.core === null || hostId.length === 0 || agent.agent_id.length === 0) {
+    if (this.bridge === null || hostId.length === 0 || agent.agent_id.length === 0) {
       return;
     }
     if (this.hostSupportsServerQueueById(hostId)) {
@@ -1299,7 +1285,7 @@ export class OrbitHarmonyStore {
     }
     this.syncActiveQueuedPrompts();
     try {
-      this.core.sendPromptWithMeta(
+      this.bridge.sendPromptWithMeta(
         hostId,
         agent.agent_id,
         nextItem.wirePrompt,
@@ -1384,20 +1370,20 @@ export class OrbitHarmonyStore {
     }
     this.reloadHost(hostId);
     this.refreshSidebar();
-    if (this.core !== null) {
-      this.core.connectHost(hostId);
-      this.core.refreshHost(hostId);
-      this.core.refreshQuotas(hostId);
-      this.core.refreshProviderModels(hostId, false);
+    if (this.bridge !== null) {
+      this.bridge.connectHost(hostId);
+      this.bridge.refreshHost(hostId);
+      this.bridge.refreshQuotas(hostId);
+      this.bridge.refreshProviderModels(hostId, false);
     }
   }
 
   public reloadHost(hostId: string): void {
-    if (this.core === null || hostId.length === 0) {
+    if (this.bridge === null || hostId.length === 0) {
       return;
     }
     try {
-      const detail = JSON.parse(this.core.hostDetailJson(hostId)) as HostDetailDto | null;
+      const detail = JSON.parse(this.bridge.hostDetailJson(hostId)) as HostDetailDto | null;
       this.currentHostDetail = detail;
       if (detail === null) {
         return;
@@ -1428,7 +1414,7 @@ export class OrbitHarmonyStore {
           this.selectedAgentId = newAgentId;
           this.isNewSessionDraft = false;
           this.syncActiveQueuedPrompts();
-          this.core.openAgentTimeline(hostId, this.selectedAgentId);
+          this.bridge.openAgentTimeline(hostId, this.selectedAgentId);
           this.reloadStage();
         }
       }
@@ -1474,7 +1460,7 @@ export class OrbitHarmonyStore {
       if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
         for (let i = 0; i < detail.agents.length; i++) {
           if (detail.agents[i].agent_id === this.selectedAgentId) {
-            this.core.markAgentSeen(hostId, this.selectedAgentId, detail.agents[i].latest_seq);
+            this.bridge.markAgentSeen(hostId, this.selectedAgentId, detail.agents[i].latest_seq);
             break;
           }
         }
@@ -1503,11 +1489,11 @@ export class OrbitHarmonyStore {
         this.resetWorkspaceBoardState();
       }
     }
-    if (this.core !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
       try {
-        this.core.fetchGitStatus(this.selectedHostId, cwd);
-        this.core.fetchGitDiff(this.selectedHostId, cwd, null, this.gitStagedMode);
-        this.core.fetchWorkspaceFiles(this.selectedHostId, cwd);
+        this.bridge.fetchGitStatus(this.selectedHostId, cwd);
+        this.bridge.fetchGitDiff(this.selectedHostId, cwd, null, this.gitStagedMode);
+        this.bridge.fetchWorkspaceFiles(this.selectedHostId, cwd);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'setActiveCwd fetch failed', err as Object);
       }
@@ -1566,7 +1552,7 @@ export class OrbitHarmonyStore {
     this.stageSubagents = [];
     this.stageHasOlderHistory = false;
     this.activeSessionUsage = null;
-    if (this.core !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
       const agents = this.currentHostDetail?.agents ?? [];
       let matchedSeq = 0;
       for (let i = 0; i < agents.length; i++) {
@@ -1575,15 +1561,15 @@ export class OrbitHarmonyStore {
           break;
         }
       }
-      this.core.markAgentSeen(this.selectedHostId, agentId, matchedSeq);
+      this.bridge.markAgentSeen(this.selectedHostId, agentId, matchedSeq);
     }
     this.syncActiveQueuedPrompts();
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
-    if (this.core !== null && this.selectedHostId.length > 0) {
-      this.core.openAgentTimeline(this.selectedHostId, agentId);
-      this.core.listProviderSubagents(this.selectedHostId, agentId);
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
+      this.bridge.openAgentTimeline(this.selectedHostId, agentId);
+      this.bridge.listProviderSubagents(this.selectedHostId, agentId);
       this.reloadStage();
       this.refreshSessionUsage();
       if (this.currentHostDetail !== null) {
@@ -1597,7 +1583,7 @@ export class OrbitHarmonyStore {
   }
 
   public reloadStage(): void {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
     try {
@@ -1606,7 +1592,7 @@ export class OrbitHarmonyStore {
         this.stageAgentId === this.selectedAgentId;
       const sinceRev = sameStage ? this.stageRevision : 0;
       let delta = JSON.parse(
-        this.core.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, sinceRev)
+        this.bridge.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, sinceRev)
       ) as AgentStageDeltaDto;
       if (
         !delta.reset &&
@@ -1614,7 +1600,7 @@ export class OrbitHarmonyStore {
         delta.replace_from_turn_index > this.stageTurns.length
       ) {
         delta = JSON.parse(
-          this.core.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, 0)
+          this.bridge.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, 0)
         ) as AgentStageDeltaDto;
       }
 
@@ -1689,7 +1675,7 @@ export class OrbitHarmonyStore {
           this.composerFastMode = nextFast;
         }
         if (!this.isNewSessionDraft && this.selectedAgentId === delta.agent.agent_id) {
-          this.core.markAgentSeen(
+          this.bridge.markAgentSeen(
             this.selectedHostId,
             delta.agent.agent_id,
             Math.max(delta.agent.latest_seq, delta.latest_seq)
@@ -1700,7 +1686,7 @@ export class OrbitHarmonyStore {
         }
         this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, delta.agent);
       } else if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
-        this.core.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
+        this.bridge.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
       }
     } catch (e) {
       orbitLogWarn('OrbitStore', 'reloadStage failed', e as Object);
@@ -1748,12 +1734,12 @@ export class OrbitHarmonyStore {
     if (clean.length === 0) {
       return;
     }
-    if (this.core === null) {
+    if (this.bridge === null) {
       this.showToast('Native core unavailable in previewer', true);
       return;
     }
     try {
-      const card = JSON.parse(this.core.pairHostJson(clean)) as HostCardDto;
+      const card = JSON.parse(this.bridge.pairHostJson(clean)) as HostCardDto;
       this.lastError = '';
       this.showToast(`Paired ${card.display_name}`, false);
       this.reloadFleet();
@@ -1766,11 +1752,11 @@ export class OrbitHarmonyStore {
   }
 
   public discoverAndPairLocalDaemon(): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     try {
-      const uri = this.core.discoverLocalDaemonUri();
+      const uri = this.bridge.discoverLocalDaemonUri();
       if (uri !== null && uri.length > 0) {
         this.pairHost(uri);
       } else {
@@ -1790,11 +1776,11 @@ export class OrbitHarmonyStore {
     customDirectEndpoint: string,
     relayUrl: string
   ): void {
-    if (this.core === null || hostId.length === 0) {
+    if (this.bridge === null || hostId.length === 0) {
       return;
     }
     try {
-      this.core.updateHostConfigJson(
+      this.bridge.updateHostConfigJson(
         hostId,
         customName.trim().length > 0 ? customName.trim() : null,
         routeMode,
@@ -1817,14 +1803,14 @@ export class OrbitHarmonyStore {
   }
 
   public reconnectHost(hostId: string): void {
-    if (this.core === null || hostId.length === 0) {
+    if (this.bridge === null || hostId.length === 0) {
       return;
     }
     try {
-      this.core.connectHost(hostId);
-      this.core.refreshHost(hostId);
-      this.core.refreshQuotas(hostId);
-      this.core.refreshProviderModels(hostId, false);
+      this.bridge.connectHost(hostId);
+      this.bridge.refreshHost(hostId);
+      this.bridge.refreshQuotas(hostId);
+      this.bridge.refreshProviderModels(hostId, false);
       this.reloadFleet();
       if (hostId === this.selectedHostId) {
         this.reloadHost(hostId);
@@ -1837,32 +1823,32 @@ export class OrbitHarmonyStore {
   }
 
   public refreshActiveQuotas(): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
-    this.core.refreshQuotas(this.selectedHostId);
+    this.bridge.refreshQuotas(this.selectedHostId);
     this.reloadHost(this.selectedHostId);
     this.showToast('Refreshing account quotas…', false);
     this.triggerHaptic(8);
   }
 
   public refreshModelsAndQuotas(forceModels: boolean = true): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
-    this.core.refreshQuotas(this.selectedHostId);
-    this.core.refreshProviderModels(this.selectedHostId, forceModels);
+    this.bridge.refreshQuotas(this.selectedHostId);
+    this.bridge.refreshProviderModels(this.selectedHostId, forceModels);
     this.reloadHost(this.selectedHostId);
     this.showToast('Refreshing models…', false);
     this.triggerHaptic(8);
   }
 
   public removeHost(hostId: string): void {
-    if (this.core === null || hostId.length === 0) {
+    if (this.bridge === null || hostId.length === 0) {
       return;
     }
     try {
-      this.core.removeHost(hostId);
+      this.bridge.removeHost(hostId);
       if (this.selectedHostId === hostId) {
         this.selectedHostId = '';
         this.currentHostDetail = null;
@@ -1877,13 +1863,13 @@ export class OrbitHarmonyStore {
   }
 
   public pinDirectoryAsProject(dirPath: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || dirPath.trim().length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || dirPath.trim().length === 0) {
       return;
     }
     try {
       const clean = dirPath.trim();
       const name = basenameOfPath(clean);
-      this.core.upsertProjectJson(null, this.selectedHostId, name, JSON.stringify([clean]));
+      this.bridge.upsertProjectJson(null, this.selectedHostId, name, JSON.stringify([clean]));
       this.reloadFleet();
       this.setActiveCwd(clean);
       this.showToast(`Pinned ${name}`, false);
@@ -1922,11 +1908,11 @@ export class OrbitHarmonyStore {
   }
 
   public removePinnedProject(projectId: string): void {
-    if (this.core === null || projectId.length === 0) {
+    if (this.bridge === null || projectId.length === 0) {
       return;
     }
     try {
-      this.core.removeProject(projectId);
+      this.bridge.removeProject(projectId);
       this.reloadFleet();
     } catch (err) {
       orbitLogWarn('OrbitStore', 'removePinnedProject failed', err as Object);
@@ -1934,12 +1920,12 @@ export class OrbitHarmonyStore {
   }
 
   public browseDirectory(path: string | null): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     this.showDirBrowser = true;
     try {
-      this.core.listDirectory(this.selectedHostId, path);
+      this.bridge.listDirectory(this.selectedHostId, path);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'browseDirectory failed', err as Object);
     }
@@ -1948,12 +1934,12 @@ export class OrbitHarmonyStore {
   // Composer Context, Provider/Model/Effort & Prompt Submission
 
   public reloadWorkspaceFiles(): void {
-    if (this.core === null || this.selectedHostId.length === 0 || this.activeCwd.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.activeCwd.length === 0) {
       return;
     }
     try {
       const files = JSON.parse(
-        this.core.workspaceFilesJson(this.selectedHostId, this.activeCwd)
+        this.bridge.workspaceFilesJson(this.selectedHostId, this.activeCwd)
       ) as string[];
       this.workspaceFiles = files;
     } catch (err) {
@@ -1964,12 +1950,12 @@ export class OrbitHarmonyStore {
   public ensureWorkspaceFilesLoaded(): void {
     if (
       this.workspaceFiles.length === 0 &&
-      this.core !== null &&
+      this.bridge !== null &&
       this.selectedHostId.length > 0 &&
       this.activeCwd.length > 0
     ) {
       try {
-        this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+        this.bridge.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'ensureWorkspaceFilesLoaded failed', err as Object);
       }
@@ -1978,8 +1964,8 @@ export class OrbitHarmonyStore {
   }
 
   public openContextPicker(): void {
-    if (this.core !== null && this.selectedHostId.length > 0) {
-      this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
+      this.bridge.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       this.reloadWorkspaceFiles();
     }
     this.showContextPickerSheet = true;
@@ -2016,7 +2002,7 @@ export class OrbitHarmonyStore {
   }
 
   public attachTerminalOutputBadge(): void {
-    if (this.terminalRows.length === 0 && this.core !== null && this.selectedHostId.length > 0) {
+    if (this.terminalRows.length === 0 && this.bridge !== null && this.selectedHostId.length > 0) {
       this.reloadTerminal();
     }
     this.addUniqueComposerBadge('terminal', '@terminal');
@@ -2028,10 +2014,10 @@ export class OrbitHarmonyStore {
     if (clean.length === 0 && this.slashCommands.length > 0) {
       return this.slashCommands;
     }
-    if (this.core !== null) {
+    if (this.bridge !== null) {
       try {
         return JSON.parse(
-          this.core.slashCommandsJson('harmony', clean.length > 0 ? clean : null)
+          this.bridge.slashCommandsJson('harmony', clean.length > 0 ? clean : null)
         ) as SlashCommandDto[];
       } catch (err) {
         orbitLogWarn('OrbitStore', 'filterSlashCommands failed', err as Object);
@@ -2041,7 +2027,7 @@ export class OrbitHarmonyStore {
   }
 
   public rankMentionCandidates(query: string, limit: number = 11): MentionCandidateDto[] {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return [];
     }
     try {
@@ -2052,7 +2038,7 @@ export class OrbitHarmonyStore {
         limit: limit
       };
       return JSON.parse(
-        this.core.rankMentionCandidatesJson(JSON.stringify(req))
+        this.bridge.rankMentionCandidatesJson(JSON.stringify(req))
       ) as MentionCandidateDto[];
     } catch (err) {
       orbitLogWarn('OrbitStore', 'rankMentionCandidates failed', err as Object);
@@ -2097,7 +2083,7 @@ export class OrbitHarmonyStore {
       label: label
     });
     this.inlineMentions = next;
-    if (kind === 'terminal' && this.terminalRows.length === 0 && this.core !== null && this.selectedHostId.length > 0) {
+    if (kind === 'terminal' && this.terminalRows.length === 0 && this.bridge !== null && this.selectedHostId.length > 0) {
       this.reloadTerminal();
     }
     this.triggerHaptic(8);
@@ -2218,7 +2204,7 @@ export class OrbitHarmonyStore {
     if (uri.trim().length === 0) {
       return;
     }
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       this.showToast('Select a host first to attach files', true);
       return;
     }
@@ -2226,7 +2212,7 @@ export class OrbitHarmonyStore {
     try {
       const loaded = await readUriBytesAsync(uri, fallbackName, fallbackMime);
       const isImage = forceImage || loaded.mimeType.startsWith('image/');
-      const rawJson = await this.core.stageAttachmentJson(
+      const rawJson = await this.bridge.stageAttachmentJson(
         this.selectedHostId,
         loaded.filename,
         loaded.mimeType,
@@ -2329,8 +2315,8 @@ export class OrbitHarmonyStore {
   public setSessionMode(mode: string): void {
     const normalized = mode === 'plan' || mode.length === 0 ? 'default' : mode;
     this.composerMode = normalized;
-    if (this.core !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
-      this.core.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
+    if (this.bridge !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+      this.bridge.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
     }
     this.triggerHaptic(8);
   }
@@ -2357,10 +2343,10 @@ export class OrbitHarmonyStore {
         return this.cachedFallbackCatalogs[i];
       }
     }
-    if (this.core !== null) {
+    if (this.bridge !== null) {
       try {
         return JSON.parse(
-          this.core.fallbackProviderCatalogJson(provider)
+          this.bridge.fallbackProviderCatalogJson(provider)
         ) as ProviderModelCatalogDto;
       } catch (err) {
         orbitLogWarn('OrbitStore', 'fallbackProviderCatalogJson failed', err as Object);
@@ -2374,7 +2360,7 @@ export class OrbitHarmonyStore {
     desiredModel: string,
     desiredEffort: string
   ): ResolvedModelSelectionDto | null {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return null;
     }
     try {
@@ -2387,7 +2373,7 @@ export class OrbitHarmonyStore {
         desired_effort: cleanEffort.length > 0 ? cleanEffort : null
       };
       return JSON.parse(
-        this.core.resolveModelSelectionJson(JSON.stringify(req))
+        this.bridge.resolveModelSelectionJson(JSON.stringify(req))
       ) as ResolvedModelSelectionDto;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'resolveModelSelectionJson failed', err as Object);
@@ -2396,9 +2382,9 @@ export class OrbitHarmonyStore {
   }
 
   public effortDescriptionText(effort: string): string {
-    if (this.core !== null && effort.trim().length > 0) {
+    if (this.bridge !== null && effort.trim().length > 0) {
       try {
-        return this.core.defaultEffortDescription(effort);
+        return this.bridge.defaultEffortDescription(effort);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'defaultEffortDescription failed', err as Object);
       }
@@ -2524,11 +2510,11 @@ export class OrbitHarmonyStore {
       this.hasUserCustomizedDraftModel = true;
       this.draftSelectionByProvider.set(provider, resolved);
     }
-    if (this.core !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+    if (this.bridge !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
       const modelOpt = resolved.model.trim().length > 0 ? resolved.model.trim() : null;
       const effortOpt = resolved.effort.trim().length > 0 ? resolved.effort.trim() : null;
       if (prevProvider !== provider) {
-        this.core.switchAgentProvider(
+        this.bridge.switchAgentProvider(
           this.selectedHostId,
           this.selectedAgentId,
           provider,
@@ -2537,7 +2523,7 @@ export class OrbitHarmonyStore {
           null
         );
       } else {
-        this.core.setAgentConfig(this.selectedHostId, this.selectedAgentId, modelOpt, effortOpt);
+        this.bridge.setAgentConfig(this.selectedHostId, this.selectedAgentId, modelOpt, effortOpt);
       }
     }
     this.triggerHaptic(10);
@@ -2703,7 +2689,7 @@ export class OrbitHarmonyStore {
     sourceAttachments: ComposerAttachmentItem[],
     sourceInlineMentions: InlineMentionRegistration[]
   ): ComposedPromptDto | null {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return null;
     }
     const contexts: ComposerContextInputDto[] = [];
@@ -2804,7 +2790,7 @@ export class OrbitHarmonyStore {
       pastes: []
     };
     try {
-      return JSON.parse(this.core.composePromptJson(JSON.stringify(req))) as ComposedPromptDto;
+      return JSON.parse(this.bridge.composePromptJson(JSON.stringify(req))) as ComposedPromptDto;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'composePromptJson failed', err as Object);
       return null;
@@ -2812,7 +2798,7 @@ export class OrbitHarmonyStore {
   }
 
   public submitSlashCompact(extraFocus: string = ''): void {
-    if (this.core === null || this.selectedHostId.length === 0 || this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.isNewSessionDraft || this.selectedAgentId.length === 0) {
       this.showToast('Start an active session first to compact context', false);
       return;
     }
@@ -2828,9 +2814,9 @@ export class OrbitHarmonyStore {
       pastes: []
     };
     try {
-      const composed = JSON.parse(this.core.composePromptJson(JSON.stringify(req))) as ComposedPromptDto;
+      const composed = JSON.parse(this.bridge.composePromptJson(JSON.stringify(req))) as ComposedPromptDto;
       const badgesJson = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
-      this.core.sendPromptWithMeta(
+      this.bridge.sendPromptWithMeta(
         this.selectedHostId,
         this.selectedAgentId,
         composed.wire_prompt,
@@ -2922,9 +2908,9 @@ export class OrbitHarmonyStore {
     };
     nextList.push(item);
     this.queuedPromptsByAgent.set(key, nextList);
-    if (this.selectedHostSupportsServerQueue() && this.core !== null) {
+    if (this.selectedHostSupportsServerQueue() && this.bridge !== null) {
       try {
-        this.core.enqueuePrompt(
+        this.bridge.enqueuePrompt(
           this.selectedHostId,
           this.selectedAgentId,
           item.wirePrompt,
@@ -2967,9 +2953,9 @@ export class OrbitHarmonyStore {
         this.queuedPromptsByAgent.delete(key);
       }
     }
-    if (this.selectedHostSupportsServerQueue() && this.core !== null) {
+    if (this.selectedHostSupportsServerQueue() && this.bridge !== null) {
       try {
-        this.core.removeQueuedPrompt(this.selectedHostId, this.selectedAgentId, itemId);
+        this.bridge.removeQueuedPrompt(this.selectedHostId, this.selectedAgentId, itemId);
       } catch (_err) {
         // Ignore transient disconnect
       }
@@ -3007,9 +2993,9 @@ export class OrbitHarmonyStore {
         this.queuedPromptsByAgent.delete(key);
       }
     }
-    if (this.selectedHostSupportsServerQueue() && this.core !== null) {
+    if (this.selectedHostSupportsServerQueue() && this.bridge !== null) {
       try {
-        this.core.removeQueuedPrompt(this.selectedHostId, this.selectedAgentId, itemId);
+        this.bridge.removeQueuedPrompt(this.selectedHostId, this.selectedAgentId, itemId);
       } catch (_err) {
         // Ignore transient disconnect
       }
@@ -3071,7 +3057,7 @@ export class OrbitHarmonyStore {
 
   public sendQueuedPromptNow(itemId: string): void {
     if (
-      this.core === null ||
+      this.bridge === null ||
       this.selectedHostId.length === 0 ||
       this.selectedAgentId.length === 0
     ) {
@@ -3094,7 +3080,7 @@ export class OrbitHarmonyStore {
         }
       }
       try {
-        this.core.flushQueuedPromptNow(this.selectedHostId, this.selectedAgentId, itemId);
+        this.bridge.flushQueuedPromptNow(this.selectedHostId, this.selectedAgentId, itemId);
       } catch (_err) {
         // Ignore transient disconnect
       }
@@ -3127,9 +3113,9 @@ export class OrbitHarmonyStore {
 
     try {
       if (this.isActiveAgentRunning()) {
-        this.core.interruptAgent(this.selectedHostId, this.selectedAgentId);
+        this.bridge.interruptAgent(this.selectedHostId, this.selectedAgentId);
       }
-      this.core.sendPromptWithMeta(
+      this.bridge.sendPromptWithMeta(
         this.selectedHostId,
         this.selectedAgentId,
         target.wirePrompt,
@@ -3154,7 +3140,7 @@ export class OrbitHarmonyStore {
     if (overridePrompt !== undefined && rawInput.length === 0) {
       return;
     }
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       this.showToast(
         this.selectedHostId.length === 0
           ? 'Pair or select a host first'
@@ -3202,7 +3188,7 @@ export class OrbitHarmonyStore {
 
     try {
       if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
-        this.core.sendPromptWithMeta(
+        this.bridge.sendPromptWithMeta(
           this.selectedHostId,
           this.selectedAgentId,
           composed.wire_prompt,
@@ -3234,7 +3220,7 @@ export class OrbitHarmonyStore {
           handle: null,
           auto_cluster: null
         };
-        const optId = this.core.createSessionJson(JSON.stringify(createReq));
+        const optId = this.bridge.createSessionJson(JSON.stringify(createReq));
         this.selectedAgentId = optId;
         this.isNewSessionDraft = false;
         this.syncActiveQueuedPrompts();
@@ -3260,21 +3246,21 @@ export class OrbitHarmonyStore {
 
   public pullRefreshStage(): void {
     this.triggerHaptic(10);
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     this.reloadFleet();
     if (this.selectedHostId.length > 0) {
       try {
-        this.core.connectHost(this.selectedHostId);
-        this.core.refreshHost(this.selectedHostId);
+        this.bridge.connectHost(this.selectedHostId);
+        this.bridge.refreshHost(this.selectedHostId);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'pullRefreshStage host refresh failed', err as Object);
       }
       this.reloadHost(this.selectedHostId);
       if (this.selectedAgentId.length > 0) {
         try {
-          this.core.openAgentTimeline(this.selectedHostId, this.selectedAgentId);
+          this.bridge.openAgentTimeline(this.selectedHostId, this.selectedAgentId);
         } catch (err) {
           orbitLogWarn('OrbitStore', 'pullRefreshStage timeline open failed', err as Object);
         }
@@ -3285,7 +3271,7 @@ export class OrbitHarmonyStore {
         this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
       );
       try {
-        this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+        this.bridge.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'pullRefreshStage workspace files failed', err as Object);
       }
@@ -3295,11 +3281,11 @@ export class OrbitHarmonyStore {
 
   public pullRefreshGitReview(): void {
     this.triggerHaptic(10);
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
-      this.core.refreshHost(this.selectedHostId);
+      this.bridge.refreshHost(this.selectedHostId);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'pullRefreshGitReview host refresh failed', err as Object);
     }
@@ -3308,7 +3294,7 @@ export class OrbitHarmonyStore {
       this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
     );
     try {
-      this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.bridge.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'pullRefreshGitReview workspace files failed', err as Object);
     }
@@ -3316,11 +3302,11 @@ export class OrbitHarmonyStore {
   }
 
   public interruptCurrentAgent(): void {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
     try {
-      this.core.interruptAgent(this.selectedHostId, this.selectedAgentId);
+      this.bridge.interruptAgent(this.selectedHostId, this.selectedAgentId);
       this.triggerHaptic(16);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'interruptCurrentAgent failed', err as Object);
@@ -3329,11 +3315,11 @@ export class OrbitHarmonyStore {
   }
 
   public archiveSession(agentId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || agentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || agentId.length === 0) {
       return;
     }
     try {
-      this.core.archiveAgent(this.selectedHostId, agentId);
+      this.bridge.archiveAgent(this.selectedHostId, agentId);
       if (this.selectedAgentId === agentId) {
         this.startNewSessionDraft();
       }
@@ -3348,11 +3334,11 @@ export class OrbitHarmonyStore {
   // Sticky Decision Dock Actions
 
   public resolvePermission(requestId: string, decision: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
     try {
-      this.core.resolvePermission(this.selectedHostId, this.selectedAgentId, requestId, decision);
+      this.bridge.resolvePermission(this.selectedHostId, this.selectedAgentId, requestId, decision);
       this.triggerHaptic(14);
       this.reloadStage();
     } catch (err) {
@@ -3362,11 +3348,11 @@ export class OrbitHarmonyStore {
   }
 
   public answerQuestion(requestId: string, answers: string[][]): void {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
     try {
-      this.core.answerQuestion(
+      this.bridge.answerQuestion(
         this.selectedHostId,
         this.selectedAgentId,
         requestId,
@@ -3425,12 +3411,12 @@ export class OrbitHarmonyStore {
   }
 
   public refreshGitReview(staged: boolean, path: string | null): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
-      this.core.fetchGitStatus(this.selectedHostId, this.activeCwd);
-      this.core.fetchGitDiff(this.selectedHostId, this.activeCwd, path, staged);
+      this.bridge.fetchGitStatus(this.selectedHostId, this.activeCwd);
+      this.bridge.fetchGitDiff(this.selectedHostId, this.activeCwd, path, staged);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'refreshGitReview failed', err as Object);
     }
@@ -3438,12 +3424,12 @@ export class OrbitHarmonyStore {
   }
 
   public reloadGitDiff(cwd: string): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
       const pathOpt = this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null;
-      const gr = JSON.parse(this.core.gitReviewJson(this.selectedHostId, cwd, pathOpt)) as GitReviewDto;
+      const gr = JSON.parse(this.bridge.gitReviewJson(this.selectedHostId, cwd, pathOpt)) as GitReviewDto;
       this.gitStatus = gr.status;
       this.gitDiffFiles = gr.diff_files;
     } catch (err) {
@@ -3490,7 +3476,7 @@ export class OrbitHarmonyStore {
       this.sidebarOpen = false;
     }
     this.showPtySheet = true;
-    if (this.core !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
       const detail = this.currentHostDetail;
       let matchedTermId = '';
       if (detail !== null && clean.length > 0) {
@@ -3512,7 +3498,7 @@ export class OrbitHarmonyStore {
 
   public openPtyTerminal(): void {
     this.showPtySheet = true;
-    if (this.core !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
       const detail = this.currentHostDetail;
       if (detail === null || detail.terminals.length === 0) {
         this.startNewTerminal();
@@ -3526,11 +3512,11 @@ export class OrbitHarmonyStore {
   }
 
   public startNewTerminal(): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
-      this.core.startTerminal(
+      this.bridge.startTerminal(
         this.selectedHostId,
         this.activeCwd,
         this.terminalCols,
@@ -3544,11 +3530,11 @@ export class OrbitHarmonyStore {
   }
 
   public attachTerminal(terminalId: string, slot: number = 1): void {
-    if (this.core === null || this.selectedHostId.length === 0 || terminalId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || terminalId.length === 0) {
       return;
     }
     try {
-      this.core.attachTerminal(this.selectedHostId, terminalId, Math.max(1, slot));
+      this.bridge.attachTerminal(this.selectedHostId, terminalId, Math.max(1, slot));
       this.reloadHost(this.selectedHostId);
       this.reloadTerminal();
       this.triggerHaptic(8);
@@ -3558,11 +3544,11 @@ export class OrbitHarmonyStore {
   }
 
   public killTerminal(terminalId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || terminalId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || terminalId.length === 0) {
       return;
     }
     try {
-      this.core.killTerminal(this.selectedHostId, terminalId);
+      this.bridge.killTerminal(this.selectedHostId, terminalId);
       this.reloadHost(this.selectedHostId);
       this.triggerHaptic(10);
     } catch (err) {
@@ -3578,9 +3564,9 @@ export class OrbitHarmonyStore {
     }
     this.terminalCols = clampedCols;
     this.terminalGridRows = clampedRows;
-    if (this.core !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
       try {
-        this.core.resizeTerminal(this.selectedHostId, clampedCols, clampedRows);
+        this.bridge.resizeTerminal(this.selectedHostId, clampedCols, clampedRows);
         this.reloadTerminal();
       } catch (err) {
         orbitLogWarn('OrbitStore', 'resizeTerminal failed', err as Object);
@@ -3589,12 +3575,12 @@ export class OrbitHarmonyStore {
   }
 
   public reloadTerminal(): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
       const screen = JSON.parse(
-        this.core.terminalScreenJson(this.selectedHostId)
+        this.bridge.terminalScreenJson(this.selectedHostId)
       ) as TerminalScreenDto | null;
       this.terminalScreen = screen;
       if (screen !== null) {
@@ -3714,11 +3700,11 @@ export class OrbitHarmonyStore {
   // Client Bridge Contract v2 Wrappers
 
   public async rewindAgent(toBeforeSeq: number, restoreFiles: boolean): Promise<RewindAgentResultDto | null> {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return null;
     }
     try {
-      const json = await this.core.rewindAgentJson(
+      const json = await this.bridge.rewindAgentJson(
         this.selectedHostId,
         this.selectedAgentId,
         toBeforeSeq,
@@ -3742,12 +3728,12 @@ export class OrbitHarmonyStore {
   }
 
   public async readWorkspaceFile(path: string, cwdOverride?: string): Promise<WorkspaceFileViewDto | null> {
-    if (this.core === null || this.selectedHostId.length === 0 || path.trim().length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || path.trim().length === 0) {
       return null;
     }
     const targetCwd = cwdOverride !== undefined && cwdOverride.length > 0 ? cwdOverride : this.activeCwd;
     try {
-      const json = await this.core.readWorkspaceFileJson(this.selectedHostId, targetCwd, path);
+      const json = await this.bridge.readWorkspaceFileJson(this.selectedHostId, targetCwd, path);
       return JSON.parse(json) as WorkspaceFileViewDto;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'readWorkspaceFileJson failed', err as Object);
@@ -3757,11 +3743,11 @@ export class OrbitHarmonyStore {
   }
 
   public buildSideQuestionContext(maxChars: number = 4000): string {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return '';
     }
     try {
-      return this.core.buildSideQuestionContext(this.selectedHostId, this.selectedAgentId, maxChars);
+      return this.bridge.buildSideQuestionContext(this.selectedHostId, this.selectedAgentId, maxChars);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'buildSideQuestionContext failed', err as Object);
       return '';
@@ -3770,7 +3756,7 @@ export class OrbitHarmonyStore {
 
   public askSideQuestion(question: string, contextSummary?: string): string {
     const cleanQ = question.trim();
-    if (this.core === null || this.selectedHostId.length === 0 || cleanQ.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || cleanQ.length === 0) {
       return '';
     }
     this.sideQuestionGen += 1;
@@ -3795,7 +3781,7 @@ export class OrbitHarmonyStore {
       context_summary: resolvedContext.length > 0 ? resolvedContext : null
     };
     try {
-      return this.core.askSideQuestion(JSON.stringify(req), (err: Error | null, eventJson: string) => {
+      return this.bridge.askSideQuestion(JSON.stringify(req), (err: Error | null, eventJson: string) => {
         if (gen !== this.sideQuestionGen) {
           return;
         }
@@ -3852,11 +3838,11 @@ export class OrbitHarmonyStore {
   }
 
   public detectDiagramKind(language: string, source: string): string | null {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return null;
     }
     try {
-      return this.core.detectDiagramKind(language, source);
+      return this.bridge.detectDiagramKind(language, source);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'detectDiagramKind failed', err as Object);
       return null;
@@ -3868,7 +3854,7 @@ export class OrbitHarmonyStore {
     source: string,
     isDark: boolean
   ): Promise<RenderDiagramViewDto | null> {
-    if (this.core === null || kind.length === 0) {
+    if (this.bridge === null || kind.length === 0) {
       return null;
     }
     const themeStr = isDark ? 'dark' : 'light';
@@ -3883,7 +3869,7 @@ export class OrbitHarmonyStore {
       theme: themeStr
     };
     try {
-      const json = await this.core.renderDiagramJson(JSON.stringify(req));
+      const json = await this.bridge.renderDiagramJson(JSON.stringify(req));
       const view = JSON.parse(json) as RenderDiagramViewDto;
       if (this.diagramRenderOrder.length >= 96) {
         const oldest = this.diagramRenderOrder.shift();
@@ -3908,13 +3894,13 @@ export class OrbitHarmonyStore {
     const next = !this.composerFastMode;
     this.composerFastMode = next;
     if (
-      this.core !== null &&
+      this.bridge !== null &&
       this.selectedHostId.length > 0 &&
       this.selectedAgentId.length > 0 &&
       !this.isNewSessionDraft
     ) {
       try {
-        this.core.setAgentFastMode(this.selectedHostId, this.selectedAgentId, next);
+        this.bridge.setAgentFastMode(this.selectedHostId, this.selectedAgentId, next);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'setAgentFastMode failed', err as Object);
       }
@@ -3925,7 +3911,7 @@ export class OrbitHarmonyStore {
 
   public async forkCurrentSession(useWorktree: boolean): Promise<void> {
     if (
-      this.core === null ||
+      this.bridge === null ||
       this.selectedHostId.length === 0 ||
       this.selectedAgentId.length === 0 ||
       this.isNewSessionDraft
@@ -3945,7 +3931,7 @@ export class OrbitHarmonyStore {
       initial_prompt: null
     };
     try {
-      const json = await this.core.forkAgentJson(JSON.stringify(req));
+      const json = await this.bridge.forkAgentJson(JSON.stringify(req));
       const res = JSON.parse(json) as ForkAgentResultDto;
       if (this.selectedHostId !== hostId) {
         return;
@@ -3969,7 +3955,7 @@ export class OrbitHarmonyStore {
 
   public exportCurrentSessionMarkdown(): void {
     if (
-      this.core === null ||
+      this.bridge === null ||
       this.selectedHostId.length === 0 ||
       this.selectedAgentId.length === 0 ||
       this.isNewSessionDraft
@@ -3984,7 +3970,7 @@ export class OrbitHarmonyStore {
       include_timestamps: true
     };
     try {
-      const json = this.core.exportAgentTranscriptJson(
+      const json = this.bridge.exportAgentTranscriptJson(
         this.selectedHostId,
         this.selectedAgentId,
         JSON.stringify(opts)
@@ -4029,7 +4015,7 @@ export class OrbitHarmonyStore {
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
-    if (this.core !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && this.selectedHostId.length > 0) {
       this.reloadHost(this.selectedHostId);
     }
     this.showArchivedSessionsSheet = true;
@@ -4055,11 +4041,11 @@ export class OrbitHarmonyStore {
   }
 
   public unarchiveSession(agentId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || agentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || agentId.length === 0) {
       return;
     }
     try {
-      this.core.unarchiveAgent(this.selectedHostId, agentId);
+      this.bridge.unarchiveAgent(this.selectedHostId, agentId);
       this.reloadHost(this.selectedHostId);
       this.showToast('Session restored', false);
       this.triggerHaptic(10);
@@ -4070,11 +4056,11 @@ export class OrbitHarmonyStore {
   }
 
   public deleteSessionPermanently(agentId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || agentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || agentId.length === 0) {
       return;
     }
     try {
-      this.core.deleteAgent(this.selectedHostId, agentId);
+      this.bridge.deleteAgent(this.selectedHostId, agentId);
       if (this.selectedAgentId === agentId) {
         this.startNewSessionDraft();
       }
@@ -4183,14 +4169,14 @@ export class OrbitHarmonyStore {
 
   public refreshWorkspaceBoard(): void {
     const wsId = this.activeWorkspaceId();
-    if (this.core === null || this.selectedHostId.length === 0 || wsId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || wsId.length === 0) {
       this.resetWorkspaceBoardState();
       return;
     }
     try {
-      this.core.fetchWorkspaceBoard(this.selectedHostId, wsId);
-      this.core.fetchWorkspaceEvents(this.selectedHostId, wsId, 30);
-      const snapJson = this.core.workspaceBoardJson(this.selectedHostId, wsId);
+      this.bridge.fetchWorkspaceBoard(this.selectedHostId, wsId);
+      this.bridge.fetchWorkspaceEvents(this.selectedHostId, wsId, 30);
+      const snapJson = this.bridge.workspaceBoardJson(this.selectedHostId, wsId);
       const snap = JSON.parse(snapJson) as WorkspaceBoardSnapshotDto | null;
       if (snap !== null) {
         this.workspaceBoardContent = snap.content;
@@ -4203,7 +4189,7 @@ export class OrbitHarmonyStore {
         this.workspaceBoardUpdatedBy = '';
         this.workspaceBoardPath = '';
       }
-      const eventsJson = this.core.workspaceEventsJson(this.selectedHostId, wsId);
+      const eventsJson = this.bridge.workspaceEventsJson(this.selectedHostId, wsId);
       this.workspaceEvents = JSON.parse(eventsJson) as WorkspaceEventRecordDto[];
     } catch (err) {
       orbitLogWarn('OrbitStore', 'refreshWorkspaceBoard failed', err as Object);
@@ -4212,12 +4198,12 @@ export class OrbitHarmonyStore {
 
   public saveWorkspaceBoard(content: string): void {
     const wsId = this.activeWorkspaceId();
-    if (this.core === null || this.selectedHostId.length === 0 || wsId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || wsId.length === 0) {
       this.showToast('No active workspace selected', true);
       return;
     }
     try {
-      this.core.updateWorkspaceBoard(
+      this.bridge.updateWorkspaceBoard(
         this.selectedHostId,
         wsId,
         content,
@@ -4238,7 +4224,7 @@ export class OrbitHarmonyStore {
     const wsId = this.activeWorkspaceId();
     const cleanPrompt = prompt.trim();
     if (
-      this.core === null ||
+      this.bridge === null ||
       this.selectedHostId.length === 0 ||
       wsId.length === 0 ||
       cleanPrompt.length === 0
@@ -4259,7 +4245,7 @@ export class OrbitHarmonyStore {
       handle: cleanHandle.length > 0 ? cleanHandle : null
     };
     try {
-      const optId = this.core.spawnWorkspacePeerJson(JSON.stringify(req));
+      const optId = this.bridge.spawnWorkspacePeerJson(JSON.stringify(req));
       this.reloadHost(this.selectedHostId);
       if (optId.length > 0) {
         this.showToast(
@@ -4296,35 +4282,35 @@ export class OrbitHarmonyStore {
   }
 
   public async refreshAutomations(): Promise<void> {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     const hostId = this.selectedHostId;
     const seq = ++this.automationsRefreshSeq;
     this.automationsLoading = true;
     try {
-      this.core.refreshHost(hostId);
+      this.bridge.refreshHost(hostId);
       this.reloadHost(hostId);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'refreshAutomations host refresh failed', err as Object);
     }
 
-    const coreRef = this.core;
+    const bridgeRef = this.bridge;
     const settled: (string | null)[] = await Promise.all<string | null>([
       this.settleAutomationJson(
-        coreRef.listConditionalTimersJson(hostId, null, true),
+        bridgeRef.listConditionalTimersJson(hostId, null, true),
         'listConditionalTimersJson'
       ),
       this.settleAutomationJson(
-        coreRef.listGoalRunsJson(hostId, null),
+        bridgeRef.listGoalRunsJson(hostId, null),
         'listGoalRunsJson'
       ),
       this.settleAutomationJson(
-        coreRef.listMonitorWatchesJson(hostId, null),
+        bridgeRef.listMonitorWatchesJson(hostId, null),
         'listMonitorWatchesJson'
       ),
       this.settleAutomationJson(
-        coreRef.listWorkflowRunsJson(hostId, true),
+        bridgeRef.listWorkflowRunsJson(hostId, true),
         'listWorkflowRunsJson'
       )
     ]);
@@ -4372,7 +4358,7 @@ export class OrbitHarmonyStore {
     provider: string,
     useWorktree: boolean
   ): boolean {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       this.showToast('Select a host first', true);
       return false;
     }
@@ -4398,9 +4384,9 @@ export class OrbitHarmonyStore {
       max_runs: null
     };
     try {
-      this.core.createScheduleJson(JSON.stringify(payload));
+      this.bridge.createScheduleJson(JSON.stringify(payload));
       this.showToast(`Created schedule "${cleanName}"`, false);
-      this.core.refreshHost(this.selectedHostId);
+      this.bridge.refreshHost(this.selectedHostId);
       this.triggerHaptic(12);
       return true;
     } catch (err) {
@@ -4411,11 +4397,11 @@ export class OrbitHarmonyStore {
   }
 
   public pauseSchedule(scheduleId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
       return;
     }
     try {
-      this.core.pauseSchedule(this.selectedHostId, scheduleId);
+      this.bridge.pauseSchedule(this.selectedHostId, scheduleId);
       this.showToast('Schedule paused', false);
       this.triggerHaptic(8);
     } catch (err) {
@@ -4425,11 +4411,11 @@ export class OrbitHarmonyStore {
   }
 
   public resumeSchedule(scheduleId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
       return;
     }
     try {
-      this.core.resumeSchedule(this.selectedHostId, scheduleId);
+      this.bridge.resumeSchedule(this.selectedHostId, scheduleId);
       this.showToast('Schedule resumed', false);
       this.triggerHaptic(8);
     } catch (err) {
@@ -4439,11 +4425,11 @@ export class OrbitHarmonyStore {
   }
 
   public runScheduleOnce(scheduleId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
       return;
     }
     try {
-      this.core.runScheduleOnce(this.selectedHostId, scheduleId);
+      this.bridge.runScheduleOnce(this.selectedHostId, scheduleId);
       this.showToast('Triggered schedule run', false);
       this.triggerHaptic(10);
     } catch (err) {
@@ -4453,11 +4439,11 @@ export class OrbitHarmonyStore {
   }
 
   public deleteSchedule(scheduleId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || scheduleId.length === 0) {
       return;
     }
     try {
-      this.core.deleteSchedule(this.selectedHostId, scheduleId);
+      this.bridge.deleteSchedule(this.selectedHostId, scheduleId);
       this.reloadHost(this.selectedHostId);
       this.showToast('Schedule deleted', false);
       this.triggerHaptic(10);
@@ -4468,12 +4454,12 @@ export class OrbitHarmonyStore {
   }
 
   public async cancelConditionalTimer(timerId: string): Promise<void> {
-    if (this.core === null || this.selectedHostId.length === 0 || timerId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || timerId.length === 0) {
       return;
     }
     const hostId = this.selectedHostId;
     try {
-      const json = await this.core.cancelConditionalTimerJson(hostId, timerId);
+      const json = await this.bridge.cancelConditionalTimerJson(hostId, timerId);
       if (this.selectedHostId !== hostId) {
         return;
       }
@@ -4498,12 +4484,12 @@ export class OrbitHarmonyStore {
   }
 
   public async fireConditionalTimerNow(timerId: string): Promise<void> {
-    if (this.core === null || this.selectedHostId.length === 0 || timerId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || timerId.length === 0) {
       return;
     }
     const hostId = this.selectedHostId;
     try {
-      await this.core.fireConditionalTimerNowJson(hostId, timerId);
+      await this.bridge.fireConditionalTimerNowJson(hostId, timerId);
       if (this.selectedHostId !== hostId) {
         return;
       }
@@ -4519,7 +4505,7 @@ export class OrbitHarmonyStore {
   }
 
   public async controlGoalRun(goalId: string, action: string): Promise<void> {
-    if (this.core === null || this.selectedHostId.length === 0 || goalId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || goalId.length === 0) {
       return;
     }
     const hostId = this.selectedHostId;
@@ -4529,7 +4515,7 @@ export class OrbitHarmonyStore {
       action: action
     };
     try {
-      const json = await this.core.controlGoalRunJson(JSON.stringify(req));
+      const json = await this.bridge.controlGoalRunJson(JSON.stringify(req));
       if (this.selectedHostId !== hostId) {
         return;
       }
@@ -4562,7 +4548,7 @@ export class OrbitHarmonyStore {
   }
 
   public async stopMonitorWatch(monitorId: string): Promise<void> {
-    if (this.core === null || this.selectedHostId.length === 0 || monitorId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || monitorId.length === 0) {
       return;
     }
     const hostId = this.selectedHostId;
@@ -4571,7 +4557,7 @@ export class OrbitHarmonyStore {
       monitor_id: monitorId
     };
     try {
-      const json = await this.core.stopMonitorWatchJson(JSON.stringify(req));
+      const json = await this.bridge.stopMonitorWatchJson(JSON.stringify(req));
       if (this.selectedHostId !== hostId) {
         return;
       }
@@ -4596,7 +4582,7 @@ export class OrbitHarmonyStore {
   }
 
   public async cancelWorkflowRun(runId: string): Promise<void> {
-    if (this.core === null || this.selectedHostId.length === 0 || runId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || runId.length === 0) {
       return;
     }
     const hostId = this.selectedHostId;
@@ -4605,7 +4591,7 @@ export class OrbitHarmonyStore {
       run_id: runId
     };
     try {
-      const json = await this.core.cancelWorkflowRunJson(JSON.stringify(req));
+      const json = await this.bridge.cancelWorkflowRunJson(JSON.stringify(req));
       if (this.selectedHostId !== hostId) {
         return;
       }
@@ -4632,22 +4618,22 @@ export class OrbitHarmonyStore {
   // 6. Cloud Sync (GitHub Gist E2EE)
 
   public refreshCloudSyncStatus(): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     try {
-      this.cloudSyncStatus = JSON.parse(this.core.cloudSyncStatusJson()) as CloudSyncStatusDto;
+      this.cloudSyncStatus = JSON.parse(this.bridge.cloudSyncStatusJson()) as CloudSyncStatusDto;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncStatusJson failed', err as Object);
     }
   }
 
   public generateCloudSyncPassphrase(): string {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return '';
     }
     try {
-      return this.core.cloudSyncGeneratePassphrase();
+      return this.bridge.cloudSyncGeneratePassphrase();
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncGeneratePassphrase failed', err as Object);
       return '';
@@ -4656,12 +4642,12 @@ export class OrbitHarmonyStore {
 
   public async cloudSyncLoginWithToken(token: string): Promise<boolean> {
     const clean = token.trim();
-    if (this.core === null || clean.length === 0) {
+    if (this.bridge === null || clean.length === 0) {
       return false;
     }
     this.cloudSyncBusy = true;
     try {
-      const json = await this.core.cloudSyncLoginWithTokenJson(clean);
+      const json = await this.bridge.cloudSyncLoginWithTokenJson(clean);
       this.cloudSyncStatus = JSON.parse(json) as CloudSyncStatusDto;
       this.showToast('Connected GitHub account', false);
       this.triggerHaptic(12);
@@ -4677,12 +4663,12 @@ export class OrbitHarmonyStore {
 
   public async cloudSyncUnlockWithPassphrase(passphrase: string): Promise<boolean> {
     const clean = passphrase.trim();
-    if (this.core === null || clean.length === 0) {
+    if (this.bridge === null || clean.length === 0) {
       return false;
     }
     this.cloudSyncBusy = true;
     try {
-      const json = await this.core.cloudSyncUnlockWithPassphraseJson(clean);
+      const json = await this.bridge.cloudSyncUnlockWithPassphraseJson(clean);
       const res = JSON.parse(json) as CloudSyncResultDto;
       this.refreshCloudSyncStatus();
       this.reloadFleet();
@@ -4702,12 +4688,12 @@ export class OrbitHarmonyStore {
   }
 
   public async cloudSyncNow(): Promise<void> {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     this.cloudSyncBusy = true;
     try {
-      const json = await this.core.cloudSyncNowJson();
+      const json = await this.bridge.cloudSyncNowJson();
       const res = JSON.parse(json) as CloudSyncResultDto;
       this.refreshCloudSyncStatus();
       this.reloadFleet();
@@ -4722,12 +4708,12 @@ export class OrbitHarmonyStore {
   }
 
   public cloudSyncSetAutoSync(enabled: boolean): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     try {
       this.cloudSyncStatus = JSON.parse(
-        this.core.cloudSyncSetAutoSyncJson(enabled)
+        this.bridge.cloudSyncSetAutoSyncJson(enabled)
       ) as CloudSyncStatusDto;
       this.triggerHaptic(6);
     } catch (err) {
@@ -4737,13 +4723,13 @@ export class OrbitHarmonyStore {
   }
 
   public cloudSyncDisconnect(clearLocalHosts: boolean): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     this.cloudSyncBusy = true;
     try {
       this.cloudSyncStatus = JSON.parse(
-        this.core.cloudSyncLogoutJson(clearLocalHosts)
+        this.bridge.cloudSyncLogoutJson(clearLocalHosts)
       ) as CloudSyncStatusDto;
       this.reloadFleet();
       this.showToast('Disconnected Cloud Sync', false);
@@ -4956,7 +4942,7 @@ export class OrbitHarmonyStore {
   }
 
   public refreshOverviewApprovals(): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       this.overviewPendingApprovals = [];
       return;
     }
@@ -4967,7 +4953,7 @@ export class OrbitHarmonyStore {
         continue;
       }
       try {
-        const detail = JSON.parse(this.core.hostDetailJson(host.host_id)) as HostDetailDto;
+        const detail = JSON.parse(this.bridge.hostDetailJson(host.host_id)) as HostDetailDto;
         for (let aIdx = 0; aIdx < detail.agents.length; aIdx++) {
           const ag = detail.agents[aIdx];
           if (!ag.is_awaiting_permission) {
@@ -4975,7 +4961,7 @@ export class OrbitHarmonyStore {
           }
           try {
             const stage = JSON.parse(
-              this.core.agentStageDeltaJson(host.host_id, ag.agent_id, 0)
+              this.bridge.agentStageDeltaJson(host.host_id, ag.agent_id, 0)
             ) as AgentStageDeltaDto;
             for (let pIdx = 0; pIdx < stage.pending_permissions.length; pIdx++) {
               const perm = stage.pending_permissions[pIdx];
@@ -5017,11 +5003,11 @@ export class OrbitHarmonyStore {
   }
 
   public resolveSingleOverviewApproval(item: OverviewPendingApprovalItem, decision: string): void {
-    if (this.core === null) {
+    if (this.bridge === null) {
       return;
     }
     try {
-      this.core.resolvePermission(item.host_id, item.agent_id, item.request_id, decision);
+      this.bridge.resolvePermission(item.host_id, item.agent_id, item.request_id, decision);
       this.triggerHaptic(10);
       this.reloadFleet();
       if (this.selectedHostId === item.host_id && this.selectedAgentId === item.agent_id) {
@@ -5379,7 +5365,7 @@ export class OrbitHarmonyStore {
         initial_content: initialContent
       };
       await this.bridge.createWorkspaceEntryJson(JSON.stringify(req));
-      this.core?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.bridge?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       this.reloadWorkspaceFiles();
       this.showToast(`Created ${basenameOfPath(clean)}`, false);
       this.triggerHaptic(8);
@@ -5407,7 +5393,7 @@ export class OrbitHarmonyStore {
         new_path: cleanNew
       };
       await this.bridge.renameWorkspaceEntryJson(JSON.stringify(req));
-      this.core?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.bridge?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       this.reloadWorkspaceFiles();
       this.inspectedFilePath = cleanNew;
       await this.openWorkspaceFileInViewer(cleanNew);
@@ -5438,7 +5424,7 @@ export class OrbitHarmonyStore {
         this.inspectedFilePath = '';
         this.inspectedFileView = null;
       }
-      this.core?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      this.bridge?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       this.reloadWorkspaceFiles();
       this.showToast(`Deleted ${basenameOfPath(path)}`, false);
       return true;
@@ -6002,12 +5988,12 @@ export class OrbitHarmonyStore {
   // 16. Automations Creation & Schedule Run History
 
   public loadScheduleRuns(scheduleId: string): void {
-    if (this.core === null || this.selectedHostId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
-      this.core.fetchScheduleRuns(this.selectedHostId, scheduleId, 10);
-      const raw = this.core.scheduleRunsJson(this.selectedHostId, scheduleId);
+      this.bridge.fetchScheduleRuns(this.selectedHostId, scheduleId, 10);
+      const raw = this.bridge.scheduleRunsJson(this.selectedHostId, scheduleId);
       const parsed = JSON.parse(raw) as ScheduleRunRecordDto[];
       const next: Record<string, ScheduleRunRecordDto[]> = {};
       const keys = Object.keys(this.scheduleRunsById);
@@ -6189,7 +6175,7 @@ export class OrbitHarmonyStore {
     includeTools: boolean,
     includeTimestamps: boolean
   ): ExportedTranscriptDto | null {
-    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return null;
     }
     try {
@@ -6199,7 +6185,7 @@ export class OrbitHarmonyStore {
         include_tool_calls: includeTools,
         include_timestamps: includeTimestamps
       };
-      const raw = this.core.exportAgentTranscriptJson(
+      const raw = this.bridge.exportAgentTranscriptJson(
         this.selectedHostId,
         this.selectedAgentId,
         JSON.stringify(opts)

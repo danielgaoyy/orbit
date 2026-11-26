@@ -42,7 +42,7 @@
 | `.agents/skills/shadcn/SKILL.md` | `apps/desktop/**` | 在 Desktop 中新增、组合、重构或排查 shadcn/ui 组件、表单与样式前（必读 Skill） | 官方 shadcn/ui（Base UI）组件组合、表单 Field 原语、Styling 规范与 Registry 使用指南 | 更新或升级 `shadcn` Skill 版本（同步 `skills-lock.json`） |
 | `docs/engineering/git-pr-release-workflow.md` | `.github/**`, `Cargo.toml`, `apps/*/package.json`, `apps/ios/project.yml`, `apps/android/app/build.gradle.kts`, `apps/harmony/AppScope/app.json5` | 提交代码、创建 PR、修改分支保护、切版本号或打 `v*` Tag 发版前 | PR-First 强制工作流、GitHub Rulesets、13 文件版本清单与 Tag/Yank 规范 | 修改发版涉及的清单文件、Ruleset 策略或 Tag 触发条件 |
 | `docs/architecture/plugins.md` | `crates/orbit-{protocol,daemon,cli}`, `examples/plugins/` | 变更插件协议、能力或 ABI 前 | WASM 资源边界、声明式 UI、MCP 与 CLI | 变更插件运行时、清单或宿主导入 |
-| `docs/engineering/testing-and-ci.md` | `.github/workflows/**`, `crates/orbit-cli/tests/**`, `apps/desktop/scripts/smoke-*.mjs` | 修改 CI/Release 工作流、调整并行矩阵、或新增/排查 E2E 与 Smoke 测试前 | HarmonyOS N-API 声明门禁、PR Patrol 只读 CI 模板、并行 CI/Release 分片结构、历史踩坑 E2E 说明、Chrome 单机及多主机设置交互烟测与 Ruleset 联动要求 | 增删或重命名 CI Job、E2E 测试文件或 Smoke 检查场景 |
+| `docs/engineering/testing-and-ci.md` | `.github/workflows/**`, `crates/orbit-cli/tests/**`, `apps/desktop/scripts/smoke-*.mjs` | 修改 CI/Release 工作流、调整并行矩阵、或新增/排查 E2E 与 Smoke 测试前 | HarmonyOS PR 构建、N-API 与 DTO 契约门禁、PR Patrol 只读 CI 模板、并行 CI/Release 分片结构、历史踩坑 E2E 说明、Chrome 单机及多主机设置交互烟测与 Ruleset 联动要求 | 增删或重命名 CI Job、E2E 测试文件或 Smoke 检查场景 |
 | `docs/engineering/doc-governance.md` | `AGENTS.md`, `**/AGENTS.md`, `docs/**`, `scripts/check-docs-index.sh` | 准备新增文档、下沉局部规则或扩写根 `AGENTS.md` 时 | 四层文档治理模型、体积预算控制与自动化防漂移校验准则 | 调整层级划分、体积预算或 `check-docs-index.sh` 校验规则 |
 
 ---

@@ -1,0 +1,23 @@
+{
+  "badges": [],
+  "blocks": [
+    {
+      "kind": "paragraph",
+      "spans": [
+        {
+          "bold": false,
+          "inline_code": false,
+          "italic": false,
+          "link_url": null,
+          "strikethrough": false,
+          "text": "Show the result."
+        }
+      ]
+    }
+  ],
+  "item_type": "user_prompt",
+  "message_id": "prompt-1",
+  "seq": 1,
+  "text": "Show the result.",
+  "timestamp_ms": 25
+}

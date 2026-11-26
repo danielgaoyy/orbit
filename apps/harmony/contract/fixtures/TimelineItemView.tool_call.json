@@ -1,0 +1,32 @@
+{
+  "background_task": {
+    "task_id": "job"
+  },
+  "call_id": "read",
+  "detail": {
+    "end_line": 10,
+    "kind": "file_read",
+    "path": "README.md",
+    "start_line": 1
+  },
+  "diff_files": [],
+  "item_type": "tool_call",
+  "seq": 4,
+  "status": "completed",
+  "step_descriptor": {
+    "additions": 0,
+    "deletions": 0,
+    "exit_code": null,
+    "has_expandable_detail": false,
+    "is_denied": false,
+    "is_failed": false,
+    "is_running": false,
+    "kind": "file_read",
+    "open_path": "README.md",
+    "secondary_meta": "L1–10",
+    "target": "README.md",
+    "verb": "Read"
+  },
+  "summary_title": "Read file",
+  "timestamp_ms": 100
+}

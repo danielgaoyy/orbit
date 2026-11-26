@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "done_recent": 0,
+    "hosts_online": 0,
+    "hosts_total": 0,
+    "needs_you": 0,
+    "running": 0
+  },
+  "hosts": [],
+  "missions": [],
+  "needs_you": [],
+  "other_active": [],
+  "personal_agent": null,
+  "since_last_visit": {
+    "auto_handled": 0,
+    "completed": 0
+  },
+  "waiting": []
+}

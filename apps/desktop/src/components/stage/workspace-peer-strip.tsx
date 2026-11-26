@@ -20,6 +20,7 @@ import {
   isAgentForegroundRunning,
   isAgentTimerWaiting,
   isMacDesktop,
+  isSubagentCard,
   type ProviderKind,
   type SessionMode,
   semanticAgentTabLabel,
@@ -79,7 +80,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
     const hostDetail = s.hostDetails[s.selectedHostId];
     if (!hostDetail) return false;
     const activeAgent = hostDetail.agents.find((a) => a.agent_id === s.selectedAgentId);
-    if (!activeAgent || activeAgent.parent_agent_id) return false;
+    if (!activeAgent || isSubagentCard(activeAgent)) return false;
     const workspace = hostDetail.workspaces.find(
       (w) => w.workspace_id === activeAgent.workspace_id,
     );
@@ -90,7 +91,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
         a.workspace_id === activeAgent.workspace_id &&
         !a.archived_at_rfc3339 &&
         !a.background &&
-        !a.parent_agent_id
+        !isSubagentCard(a)
       ) {
         peerCount += 1;
         if (peerCount > 1) return true;
@@ -158,14 +159,14 @@ const WorkspacePeerStripContent = memo(function WorkspacePeerStripContent() {
   const isCuratedGroup = Boolean(workspace?.is_curated);
 
   const peers = useMemo(() => {
-    if (!hostDetail || !activeAgent || activeAgent.parent_agent_id) return [];
+    if (!hostDetail || !activeAgent || isSubagentCard(activeAgent)) return [];
     return hostDetail.agents
       .filter(
         (a) =>
           a.workspace_id === activeAgent.workspace_id &&
           !a.archived_at_rfc3339 &&
           !a.background &&
-          !a.parent_agent_id,
+          !isSubagentCard(a),
       )
       .sort((a, b) => a.updated_at_rfc3339.localeCompare(b.updated_at_rfc3339));
   }, [hostDetail, activeAgent]);
@@ -228,7 +229,7 @@ const WorkspacePeerStripContent = memo(function WorkspacePeerStripContent() {
     !selectedAgentId ||
     !activeAgent ||
     !hostDetail ||
-    activeAgent.parent_agent_id ||
+    isSubagentCard(activeAgent) ||
     (!isCuratedGroup && peers.length <= 1 && recentConflicts.length === 0)
   ) {
     return null;
@@ -462,7 +463,7 @@ const WorkspacePeerStripContent = memo(function WorkspacePeerStripContent() {
                         a.workspace_id === ws.workspace_id &&
                         !a.archived_at_rfc3339 &&
                         !a.background &&
-                        !a.parent_agent_id,
+                        !isSubagentCard(a),
                     ).length;
                     return (
                       <button

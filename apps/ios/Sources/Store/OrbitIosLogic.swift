@@ -780,6 +780,18 @@ public enum OrbitComposerLogic {
         return keyLower == "peer::all" || handleLower == "all" || handleLower == "@all"
     }
 
+    /// True only when `text` starts (after optional leading whitespace) with the exact slash
+    /// command token `command` (case-insensitive) followed by end-of-string or whitespace.
+    /// Prevents prefix collisions like `/reviewers` or escaped `\/review` from matching `/review`.
+    public static func matchesLeadingSlashCommand(_ text: String, command: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let cmdLower = command.lowercased()
+        guard lower.hasPrefix(cmdLower) else { return false }
+        let afterIdx = trimmed.index(trimmed.startIndex, offsetBy: cmdLower.count)
+        return afterIdx == trimmed.endIndex || trimmed[afterIdx].isWhitespace
+    }
+
     /// Finds an active `@mention` or `/slash` trigger immediately before `cursorUtf16Offset`,
     /// respecting word boundaries and ignoring emails (`user@domain`) or paths (`/Users/name`).
     public static func findActiveTrigger(in text: String, cursorUtf16Offset: Int) -> OrbitComposerTrigger? {
@@ -798,10 +810,25 @@ public enum OrbitComposerLogic {
                 let validBoundary: Bool
                 if idx == 0 {
                     validBoundary = true
+                } else if kind == .slash {
+                    // Slash commands only activate at start-of-input (ignoring leading whitespace)
+                    // so mid-sentence references (`/goal`) and escaped slashes (`\/goal`) never hijack typing.
+                    var allLeadingWhitespace = true
+                    var j = 0
+                    while j < idx {
+                        if !isWhitespaceUtf16(nsText.character(at: j)) {
+                            allLeadingWhitespace = false
+                            break
+                        }
+                        j += 1
+                    }
+                    validBoundary = allLeadingWhitespace
                 } else {
                     let prev = nsText.character(at: idx - 1)
                     validBoundary = isWhitespaceUtf16(prev)
-                        || (kind == .mention && (prev == 0x28 /* '(' */ || prev == 0x5B /* '[' */ || prev == 0x7B /* '{' */))
+                        || prev == 0x28 /* '(' */
+                        || prev == 0x5B /* '[' */
+                        || prev == 0x7B /* '{' */
                 }
                 if !validBoundary {
                     return nil

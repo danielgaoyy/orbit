@@ -1,6 +1,9 @@
 import { DEFAULT_LOCALE, translate, type OrbitLocale } from "./i18n/index.ts";
 import { formatDurationCompact, formatThoughtSummaryLabel } from "./timeline-coalesce.ts";
-import { extractCleanAgentMessageBody } from "./agent-message-clean.ts";
+import {
+  extractCleanAgentMessageBody,
+  extractDirectAgentMessagePresentation,
+} from "./agent-message-clean.ts";
 import type { StageTurnView, TimelineItemView, TurnLiveSegmentView, WorkSummaryResultView } from "@/lib/orbit-ipc";
 import { classifyGenericSubagentTool, resolveToolCallSubagent } from "./subagents.ts";
 
@@ -58,20 +61,38 @@ export function peerFinishStatus(item: AgentMessage, cleanBody?: string): Coales
 }
 
 /**
- * Returns true when an incoming `agent_message` is an inter-agent communication item
- * (`direct_message`, routine/queued `finish_notification`, etc.) that should stay silent
- * across both main stage and subagent/peer conversation streams.
+ * Returns true when an incoming `agent_message` is a real dispatched prompt/instruction
+ * (`create_agent`, `spawn_workspace_peer`, `send_agent_prompt`, `message_peer`) that
+ * should render inside the recipient timeline using the shared `UserPromptBubble`.
  *
- * Preserves only:
- * - `heartbeat` wakeup dividers
- * - `permission_context` approval checkpoints (rendered only while still pending)
- * - failed `finish_notification` alerts
+ * Strictly excludes notifications, heartbeats, permission checkpoints, and pure
+ * protocol/system noise (`<orbit-fleet-state>`, `<orbit-fleet-delta>`, control signals).
+ */
+export function isDirectAgentPromptBubble(item: AgentMessage): boolean {
+  if (item.kind !== "direct_message") return false;
+  if (item.permission_context) return false;
+  const parsed = extractDirectAgentMessagePresentation(item.text, item);
+  return !parsed.isSystemNoise && parsed.cleanText.length > 0;
+}
+
+/**
+ * Returns true when an incoming `agent_message` is routine system noise that should stay
+ * silent across both main stage and subagent/peer conversation streams.
+ *
+ * Preserves:
+ * - visible `direct_message` dispatch prompts (rendered via shared `UserPromptBubble`)
+ * - `heartbeat` wakeup dividers (rendered via `AgentMessageCard`)
+ * - `permission_context` approval checkpoints (rendered via `AgentMessageCard` while pending)
+ * - failed `finish_notification` alerts (rendered via `AgentMessageCard`)
  */
 export function isTimelineAgentMessageHidden(item: AgentMessage): boolean {
   if (item.kind === "heartbeat") return false;
   if (item.permission_context) return false;
   if (item.kind === "finish_notification") {
     return peerFinishStatus(item) !== "failed";
+  }
+  if (item.kind === "direct_message") {
+    return !isDirectAgentPromptBubble(item);
   }
   return true;
 }
@@ -88,19 +109,18 @@ export function coalescePeerFinishes(
 ) {
   const finishStatuses = new Map<AgentMessage, CoalescedFinishStatus>();
   const visible: TurnLiveSegmentView[] = [];
-  let removedHidden = false;
   for (const seg of segments) {
     if (
       seg.kind === "agent_message" &&
       seg.item.item_type === "agent_message" &&
       isTimelineAgentMessageHidden(seg.item)
     ) {
-      removedHidden = true;
       continue;
     }
-    // The core flushed its work group at the agent message. Rejoin just that now-invisible boundary.
+    // The core flushed its work group at a hidden segment (agent message, hidden wakeup,
+    // or plan notice). Rejoin any now-adjacent step groups so collapsed summaries stay contiguous.
     const prev = visible.at(-1);
-    if (removedHidden && prev?.kind === "step_group" && seg.kind === "step_group") {
+    if (prev?.kind === "step_group" && seg.kind === "step_group") {
       const items = [...prev.items, ...seg.items];
       const thoughtMs = (prev.thought_duration_ms ?? 0) + (seg.thought_duration_ms ?? 0) || null;
       visible[visible.length - 1] = {
@@ -116,9 +136,120 @@ export function coalescePeerFinishes(
     } else {
       visible.push(seg);
     }
-    removedHidden = false;
   }
   return { segments: visible, finishStatuses };
+}
+
+export interface CompletedTurnWorkFoldPlan {
+  shouldWrap: boolean;
+  items: TimelineItemView[];
+  fallbackLabel: string;
+  unrecoveredFailureCount: number;
+  hasAnyFailureOrDenial: boolean;
+  sumWorkDurationMs: number;
+}
+
+const NO_TURN_WORK_FOLD: CompletedTurnWorkFoldPlan = {
+  shouldWrap: false,
+  items: [],
+  fallbackLabel: "",
+  unrecoveredFailureCount: 0,
+  hasAnyFailureOrDenial: false,
+  sumWorkDurationMs: 0,
+};
+
+/**
+ * Decides whether a settled turn's pre-final segments should collapse behind the
+ * top-level `TurnWorkedDisclosure` (`Worked for Xs`) above the final reply.
+ *
+ * Strictly wraps ONLY pure pre-final tool-bearing `step_group` segments (with no
+ * promoted timer/handoff milestones). Any earlier `assistant_message`, `notice`,
+ * `compaction`, `wakeup`, visible `agent_message`, or promoted milestone prevents
+ * wrapping so important intermediate replies, runtime warnings, and post-turn wakeup
+ * reports remain visible at top level while their surrounding tool groups collapse
+ * quietly on their own.
+ *
+ * Pure thinking-only pre-final groups (`action_steps === 0`) also skip wrapping so
+ * they keep their dedicated `[Brain] Thought about it` / `已思考` disclosure.
+ */
+export function resolveCompletedTurnWorkFold(params: {
+  segments: readonly TurnLiveSegmentView[];
+  isTurnActive: boolean;
+  turnHasUnrecoveredError: boolean;
+  locale?: OrbitLocale;
+  stepGroupSplits?: ReadonlyMap<string, StepGroupSplitResult>;
+}): CompletedTurnWorkFoldPlan {
+  const {
+    segments,
+    isTurnActive,
+    turnHasUnrecoveredError,
+    locale = DEFAULT_LOCALE,
+    stepGroupSplits,
+  } = params;
+  if (isTurnActive || segments.length < 2) return NO_TURN_WORK_FOLD;
+  const lastSeg = segments[segments.length - 1];
+  if (
+    !lastSeg ||
+    lastSeg.kind !== "assistant_message" ||
+    lastSeg.item.item_type !== "assistant_message" ||
+    lastSeg.item.streaming ||
+    !lastSeg.item.text.trim()
+  ) {
+    return NO_TURN_WORK_FOLD;
+  }
+
+  const preFinal = segments.slice(0, -1);
+  const items: TimelineItemView[] = [];
+  let totalActionSteps = 0;
+  let totalThoughtMs = 0;
+  let sumWorkDurationMs = 0;
+  let unrecoveredFailureCount = 0;
+  let hasAnyFailureOrDenial = false;
+
+  for (const seg of preFinal) {
+    if (seg.kind !== "step_group") {
+      return NO_TURN_WORK_FOLD;
+    }
+    const split = stepGroupSplits?.get(seg.key) ?? splitStepGroupChronologically(seg.items);
+    if (split.hasDelegations) {
+      return NO_TURN_WORK_FOLD;
+    }
+    items.push(...seg.items);
+    totalActionSteps += seg.summary.counts.action_steps ?? 0;
+    if (seg.thought_duration_ms) totalThoughtMs += seg.thought_duration_ms;
+    if (seg.work_duration_ms) sumWorkDurationMs += seg.work_duration_ms;
+    const unrecovered = seg.summary.counts.unrecovered_failure_count ?? 0;
+    if (turnHasUnrecoveredError) {
+      unrecoveredFailureCount += unrecovered;
+    }
+    if (
+      (seg.summary.counts.failed_count ?? 0) > 0 ||
+      (seg.summary.counts.denied_count ?? 0) > 0 ||
+      unrecovered > 0
+    ) {
+      hasAnyFailureOrDenial = true;
+    }
+  }
+
+  if (items.length === 0 || totalActionSteps <= 0) {
+    return NO_TURN_WORK_FOLD;
+  }
+
+  const singleGroup =
+    preFinal.length === 1 && preFinal[0]?.kind === "step_group" ? preFinal[0] : null;
+  const fallbackLabel =
+    singleGroup && locale === "en" && singleGroup.summary.label
+      ? singleGroup.summary.label
+      : summarizeWorkChunk(items, totalThoughtMs > 0 ? totalThoughtMs : null, locale).label;
+
+  return {
+    shouldWrap: true,
+    items,
+    fallbackLabel,
+    unrecoveredFailureCount,
+    hasAnyFailureOrDenial,
+    sumWorkDurationMs,
+  };
 }
 
 function milestoneArgs(raw: string): Record<string, unknown> | null {

@@ -190,14 +190,24 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
 };
 
 // Rust serializes AgentStatus on AgentCardView. Older desktop snapshots only have the flags/label.
-export function mapManagedStatus(agent: AgentCardView & { status?: { state: string } }): ResolvedSubagentStatus {
+export function mapManagedStatus(
+  agent: AgentCardView & { status?: { state: string; source?: string } },
+): ResolvedSubagentStatus {
   const state = agent.status?.state;
   if (agent.is_awaiting_permission || state === "awaiting_permission") return "awaiting_permission";
+  const isWakeupWaiting =
+    state === "autonomous_wakeup" &&
+    typeof agent.status?.source === "string" &&
+    agent.status.source.trim().startsWith("waiting:");
+  const isExplicitNonRunning =
+    state === "idle" || state === "closed" || state === "error" || isWakeupWaiting;
   if (
-    isAgentForegroundRunningLocal(agent) ||
-    state === "initializing" ||
-    state === "running" ||
-    (state === "autonomous_wakeup" && !agent.has_background_tasks)
+    !isExplicitNonRunning &&
+    !agent.has_background_tasks &&
+    (state === "initializing" ||
+      state === "running" ||
+      state === "autonomous_wakeup" ||
+      isAgentForegroundRunningLocal(agent))
   ) {
     return "running";
   }
@@ -590,12 +600,18 @@ export function resolveSessionSubagents(params: {
         nativeModel,
         null,
       );
+      // If the spawn tool call itself failed, a stale persisted `running` provider descriptor
+      // from an older daemon must not resurrect the failed launch back to `running`.
+      const resolvedStatus: ResolvedSubagentStatus =
+        sa.status === "failed" && providerSub.status === "running"
+          ? "failed"
+          : mapProviderSubagentStatus(providerSub.status);
       out.push({
         key: `provider:${providerSub.subagent_id}`,
         callId: sa.id,
         title: providerSub.title?.trim() || sa.role || "Subagent",
         promptPreview: sa.prompt_preview || providerSub.subtitle || "",
-        status: mapProviderSubagentStatus(providerSub.status),
+        status: resolvedStatus,
         isManaged: false,
         childHostId: insightHostId,
         remoteHostName: insightRemoteHost,
@@ -800,12 +816,16 @@ export function isSubagentActiveStatus(status: ResolvedSubagentStatus): boolean 
  * subagents visible regardless of `archivedSubagents` while hiding archived settled ones.
  */
 export function filterVisibleSubagents<
-  T extends Pick<ResolvedSubagentItem, "callId" | "providerSubagentId" | "childAgentId" | "status">,
+  T extends Pick<
+    ResolvedSubagentItem,
+    "callId" | "providerSubagentId" | "childAgentId" | "childHostId" | "status"
+  >,
 >(
   subagents: readonly T[],
   archivedSubagents: Readonly<Record<string, true>>,
   hostId: string | null,
   agentId: string | null,
+  archivedThreads?: Readonly<Record<string, unknown>>,
 ): T[] {
   if (!hostId || !agentId) return [];
   const prefix = `${hostId}::${agentId}::`;
@@ -816,6 +836,13 @@ export function filterVisibleSubagents<
       return false;
     }
     if (sa.childAgentId && archivedSubagents[`${prefix}${sa.childAgentId}`]) return false;
+    if (
+      archivedThreads &&
+      sa.childAgentId &&
+      archivedThreads[`${sa.childHostId}::${sa.childAgentId}`]
+    ) {
+      return false;
+    }
     return true;
   });
 }

@@ -26,6 +26,7 @@ import type {
   GitHubDeviceFlowStartView,
   GitReposInspectionView,
   GitReviewView,
+  GoalRunRecord,
   GuardianAuditEntry,
   GuardianPolicyConfig,
   PermissionRuleRecord,
@@ -318,6 +319,8 @@ export interface SidePanelTab {
   title: string;
   filePath?: string;
   hostId?: string;
+  parentHostId?: string;
+  agentId?: string | null;
   cwd?: string;
   focusLine?: number | null;
   focusEndLine?: number | null;
@@ -333,6 +336,20 @@ export interface SidePanelTab {
   peerAgentId?: string;
   artifactId?: string;
   sideQuestionEntryId?: string;
+}
+
+export type SidePanelScopeKey = string;
+export type SidePanelOpenSource = "user" | "auto";
+
+export interface SidePanelSnapshot {
+  open: boolean;
+  tabs: SidePanelTab[];
+  activeTabId: string | null;
+  split: SidePanelSplitState | null;
+  userDismissed: boolean;
+  closedTabs: SidePanelTab[];
+  unseenTabIds?: string[];
+  lastUsedAt: number;
 }
 
 export interface FileViewCacheEntry {
@@ -388,7 +405,13 @@ export type OverviewSectionId =
   | "tasks"
   | "artifacts"
   | "links"
-  | "touched_files";
+  | "touched_files"
+  | "briefing_needs_you"
+  | "briefing_in_progress"
+  | "briefing_waiting"
+  | "briefing_completed"
+  | "briefing_handled"
+  | "briefing_hosts";
 
 export type ReviewScope = "working_tree" | "session_turns";
 export type DiffLayoutMode = "unified" | "split";
@@ -402,11 +425,6 @@ export interface SidePanelSplitState {
   secondaryTabId: string;
   /** Fraction [0.25, 0.75] of side-panel width allocated to the left/primary pane. */
   ratio: number;
-}
-
-export interface OverviewPinnedLane {
-  hostId: string;
-  agentId: string;
 }
 export type TerminalCursorStyle = "bar" | "block" | "underline";
 export type TerminalThemeMode = "harmonized" | "high_contrast";
@@ -425,6 +443,19 @@ export interface PendingJumpTarget {
   agentId: string;
   seq: number;
   nonce: number;
+}
+
+export interface GoalEditDialogTarget {
+  hostId: string;
+  goal: GoalRunRecord;
+}
+
+export interface GoalReplaceConfirmTarget {
+  hostId: string;
+  agentId: string;
+  currentGoal: GoalRunRecord;
+  newObjective: string;
+  onConfirm: () => Promise<void>;
 }
 
 export interface WorktreeHandoffDialogTarget {
@@ -476,6 +507,7 @@ export interface OrbitUiState {
   fleetHydrated: boolean;
   bootstrapError: string | null;
   hostDetails: Record<string, HostDetailView>;
+  primaryRouterHostId: string | null;
   selectedHostId: string | null;
   instructionsTarget: InstructionsTarget | null;
   selectedAgentId: string | null;
@@ -523,6 +555,13 @@ export interface OrbitUiState {
   sidePanelTabs: SidePanelTab[];
   activeSidePanelTabId: string | null;
   sidePanelSplit: SidePanelSplitState | null;
+  sidePanelByScope: Record<SidePanelScopeKey, SidePanelSnapshot>;
+  sidePanelScopeKey: SidePanelScopeKey | null;
+  sidePanelUserDismissed: boolean;
+  sidePanelClosedTabs: SidePanelTab[];
+  sidePanelUnseenTabIds: string[];
+  sidePanelCollapsedByResize: boolean;
+  sidePanelScopeSwitchNonce: number;
   fileViewCache: Record<string, FileViewCacheEntry>;
   fileEditorDrafts: Record<string, FileEditorDraftState>;
   pendingUnsavedFileAction: PendingUnsavedFileAction | null;
@@ -575,7 +614,6 @@ export interface OrbitUiState {
   // Modals, Views & Overlays
   activeView: ActiveViewMode;
   workspacePanel: WorkspacePanelMode;
-  overviewPinnedLanes: OverviewPinnedLane[];
   settingsSection: SettingsSection;
   commandPaletteOpen: boolean;
   onboardingOpen: boolean;
@@ -583,6 +621,8 @@ export interface OrbitUiState {
   relayDialogOpen: boolean;
   remoteFolderPickerHostId: string | null;
   exportDialogTarget: { hostId: string; agentId: string } | null;
+  goalEditDialogTarget: GoalEditDialogTarget | null;
+  goalReplaceConfirmTarget: GoalReplaceConfirmTarget | null;
   copyCodeBlocksTarget: {
     hostId: string;
     agentId: string;
@@ -731,6 +771,15 @@ export interface OrbitUiState {
   terminalScrollback: number;
   terminalThemeMode: TerminalThemeMode;
   customKeybindings: Record<string, string>;
+  conversationFontSize: number;
+  codeFontSize: number;
+  uiFontId: string;
+  contentFontId: string;
+  codeFontId: string;
+  uiFontCustom: string | null;
+  contentFontCustom: string | null;
+  codeFontCustom: string | null;
+  uiZoomPercent: number;
 }
 
 export interface PersistedPrefs {
@@ -755,6 +804,14 @@ export interface PersistedPrefs {
   terminalCursorStyle?: TerminalCursorStyle;
   terminalScrollback?: number;
   terminalThemeMode?: TerminalThemeMode;
+  conversationFontSize?: number;
+  codeFontSize?: number;
+  uiFontId?: string;
+  contentFontId?: string;
+  codeFontId?: string;
+  uiFontCustom?: string | null;
+  contentFontCustom?: string | null;
+  codeFontCustom?: string | null;
   sidebarOpen?: boolean;
   sidebarWidth?: number;
   hiddenProjectKeys?: Record<string, boolean>;

@@ -3,6 +3,7 @@ import { CornerDownLeft } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { useI18n } from "@/lib/i18n";
+import { handleDesktopZoomKeyDown, noteExternalZoomEvent } from "@/lib/keybindings";
 import { isMacDesktop, isTauriRuntime, orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -65,9 +66,41 @@ export function DetachedTerminalWindow({
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  // Support Cmd/Ctrl+W to close floating window cleanly without killing the remote PTY shim
+  // Keep native window zoom CSS compensation synced with Rust (without showing the main-window HUD)
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void orbitIpc
+      .getUiZoom()
+      .then((state) => {
+        if (active) orbitActions.applyUiZoomState(state);
+      })
+      .catch(() => undefined);
+    void orbitIpc
+      .onUiZoomChanged((payload) => {
+        if (!active) return;
+        noteExternalZoomEvent(payload.source);
+        orbitActions.applyUiZoomState(payload);
+      })
+      .then((fn) => {
+        if (!active) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  // Support Cmd/Ctrl +/-/0 zoom and Cmd/Ctrl+W to close floating window cleanly without killing the remote PTY shim
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      if (handleDesktopZoomKeyDown(e)) return;
       const mod = isMac ? e.metaKey : e.ctrlKey;
       if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "w") {
         e.preventDefault();
@@ -92,8 +125,8 @@ export function DetachedTerminalWindow({
       <header
         data-tauri-drag-region
         className={cn(
-          "border-border-subtle bg-surface-base flex h-[36px] shrink-0 items-center justify-between gap-2 border-b pr-2.5",
-          isMac ? "pl-[78px]" : "pl-3",
+          "border-border-subtle bg-surface-base flex h-(--orbit-detached-titlebar-h) shrink-0 items-center justify-between gap-2 border-b pr-2.5",
+          isMac ? "pl-(--orbit-detached-pad)" : "pl-3",
         )}
       >
         <div

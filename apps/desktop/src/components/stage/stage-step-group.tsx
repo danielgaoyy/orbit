@@ -5,7 +5,6 @@ import {
   ArrowRight,
   ArrowUpRight,
   Blocks,
-  Brain,
   ChevronRight,
   ChevronsUpDown,
   FoldVertical,
@@ -60,6 +59,7 @@ import { StageCopyButton } from "./stage-prompt-controls";
 import {
   InlineLiveElapsed,
   StepItemRow,
+  ThinkingGlyph,
   resolveLiveToolCallIcon,
 } from "./stage-tool-renderers";
 
@@ -69,6 +69,87 @@ type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
 
 export const LONG_STEP_LIST_THRESHOLD = 12;
 export const RECENT_VISIBLE_STEP_COUNT = 8;
+
+export interface EarlierStepsRevealState {
+  scopeKey: string;
+  anchorSeq: number;
+}
+
+export interface StepTimelineRailVisibility {
+  hasOverflow: boolean;
+  hiddenCount: number;
+  visibleStartIndex: number;
+}
+
+export function buildStepRailScopeKey(
+  agentId: string,
+  turnIndex?: number,
+  workOrdinal?: number,
+): string {
+  return `${agentId}::t${turnIndex ?? "x"}::w${workOrdinal ?? "x"}`;
+}
+
+/**
+ * Matches an explicit user click on `Show N earlier steps` against the active rail scope.
+ * Preserves reveal across an optimistic turn (`anchorSeq === 0`) being confirmed (`> 0`),
+ * while resetting automatically if the rail is ever reused across a rewind, turn, or agent.
+ */
+export function isEarlierStepsRevealedForScope(
+  revealed: EarlierStepsRevealState | null,
+  scopeKey: string,
+  anchorSeq?: number,
+): boolean {
+  if (!revealed || revealed.scopeKey !== scopeKey) return false;
+  const nextAnchor = typeof anchorSeq === "number" ? anchorSeq : 0;
+  if (revealed.anchorSeq === nextAnchor) return true;
+  return revealed.anchorSeq === 0 && nextAnchor > 0;
+}
+
+/**
+ * Deterministic earlier-step folding rule: whenever `itemCount > LONG_STEP_LIST_THRESHOLD`,
+ * earlier steps remain folded behind `Show N earlier steps` unless the user explicitly clicked
+ * to reveal them. Never auto-expands on live->settled transitions, step count growth, or errors.
+ */
+export function resolveStepTimelineRailVisibility(
+  itemCount: number,
+  userRevealedEarlier: boolean,
+  threshold = LONG_STEP_LIST_THRESHOLD,
+  recentVisibleCount = RECENT_VISIBLE_STEP_COUNT,
+): StepTimelineRailVisibility {
+  const hasOverflow = itemCount > threshold;
+  const hiddenCount =
+    hasOverflow && !userRevealedEarlier
+      ? Math.max(0, itemCount - recentVisibleCount)
+      : 0;
+  return {
+    hasOverflow,
+    hiddenCount,
+    visibleStartIndex: hiddenCount,
+  };
+}
+
+/**
+ * Returns the first index of the trailing unrecovered failure streak in `items`, or
+ * `items.length` when every failed/denied tool call was recovered by a later completed call.
+ * Mirrors `unrecovered_failure_count` in `crates/orbit-client-core/src/stage.rs`.
+ */
+export function findTrailingUnrecoveredFailureStartIndex(
+  items: readonly TimelineItemView[],
+): number {
+  let trailingFailureStartIdx = items.length;
+  for (let i = 0; i < items.length; i += 1) {
+    const it = items[i];
+    if (it.item_type !== "tool_call") continue;
+    if (it.status === "failed" || it.status === "denied") {
+      if (trailingFailureStartIdx === items.length) {
+        trailingFailureStartIdx = i;
+      }
+    } else if (it.status === "completed") {
+      trailingFailureStartIdx = items.length;
+    }
+  }
+  return trailingFailureStartIdx;
+}
 
 /** Vertical step connector rail for expanded turn activity steps. */
 export const StepTimelineRail = memo(function StepTimelineRail({
@@ -80,6 +161,9 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   followBottomOnExpand = false,
   autoExpandErrors = false,
   agentId,
+  turnIndex,
+  turnAnchorSeq,
+  workOrdinal,
   thinkingSignature: _thinkingSignature,
   getThinkingDurationMs,
   sessionSubagents,
@@ -93,30 +177,36 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   followBottomOnExpand?: boolean;
   autoExpandErrors?: boolean;
   agentId: string;
+  turnIndex?: number;
+  turnAnchorSeq?: number;
+  workOrdinal?: number;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const { t } = useI18n();
-  const [showEarlier, setShowEarlier] = useState(false);
+  const scopeKey = buildStepRailScopeKey(agentId, turnIndex, workOrdinal);
+  const [revealedEarlier, setRevealedEarlier] = useState<EarlierStepsRevealState | null>(null);
   const showEarlierRef = useRef<HTMLButtonElement | null>(null);
 
   if (items.length === 0) return null;
 
-  const hasOverflow = items.length > LONG_STEP_LIST_THRESHOLD;
-  const candidateHiddenCount = hasOverflow ? items.length - RECENT_VISIBLE_STEP_COUNT : 0;
-  const hasHiddenError =
-    autoExpandErrors &&
-    candidateHiddenCount > 0 &&
-    items
-      .slice(0, candidateHiddenCount)
-      .some(
-        (it) =>
-          it.item_type === "tool_call" && (it.status === "failed" || it.status === "denied"),
-      );
-  const hiddenCount = hasOverflow && !showEarlier && !hasHiddenError ? candidateHiddenCount : 0;
+  const showEarlier = isEarlierStepsRevealedForScope(revealedEarlier, scopeKey, turnAnchorSeq);
+  if (
+    revealedEarlier &&
+    revealedEarlier.scopeKey === scopeKey &&
+    revealedEarlier.anchorSeq === 0 &&
+    typeof turnAnchorSeq === "number" &&
+    turnAnchorSeq > 0
+  ) {
+    setRevealedEarlier({ scopeKey, anchorSeq: turnAnchorSeq });
+  }
+  const { hiddenCount } = resolveStepTimelineRailVisibility(items.length, showEarlier);
   const visibleItems = hiddenCount > 0 ? items.slice(hiddenCount) : items;
+  const trailingFailureStartIdx = autoExpandErrors
+    ? findTrailingUnrecoveredFailureStartIndex(items)
+    : items.length;
   const lastSeq = items[items.length - 1]?.seq;
 
   return (
@@ -126,14 +216,19 @@ export const StepTimelineRail = memo(function StepTimelineRail({
           ref={showEarlierRef}
           type="button"
           onClick={() =>
-            holdViewport(showEarlierRef.current, () => setShowEarlier(true), "top", {
-              intent: "expand",
-            })
+            holdViewport(
+              showEarlierRef.current,
+              () => setRevealedEarlier({ scopeKey, anchorSeq: turnAnchorSeq ?? 0 }),
+              "top",
+              {
+                intent: "expand",
+              },
+            )
           }
           className="text-ink-muted hover:text-foreground flex min-h-[24px] w-fit cursor-pointer items-center gap-2 rounded-md text-left text-[13px] leading-[18px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-ring/45"
         >
           <TraceIcon>
-            <ChevronsUpDown className="size-3.5" />
+            <ChevronsUpDown className="size-[13px]" strokeWidth={1.75} />
           </TraceIcon>
           <span>
             {t(hiddenCount === 1 ? "stage.showEarlierStep" : "stage.showEarlierSteps", {
@@ -164,7 +259,7 @@ export const StepTimelineRail = memo(function StepTimelineRail({
               sub.item_type === "assistant_thinking" && isLastInLiveGroup
             }
             thoughtDurationMs={thoughtDurationMs}
-            autoExpandError={autoExpandErrors}
+            autoExpandError={autoExpandErrors && originalIndex >= trailingFailureStartIdx}
             sessionSubagents={sessionSubagents}
             onOpenSubagent={onOpenSubagent}
           />
@@ -611,7 +706,10 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
     [hasProjectedSummary, items, thoughtDurationMs, locale],
   );
   const activeLabel = localizedSummary?.live_label ?? liveLabel;
-  const thoughtOnly = summaryCounts.action_steps === 0 && summaryCounts.thought_count > 0;
+  const thoughtOnly =
+    summaryCounts.action_steps === 0 &&
+    (summaryCounts.thought_count > 0 ||
+      (items.length > 0 && items.every((it) => it.item_type === "assistant_thinking")));
   const finishedLabel = thoughtOnly
     ? formatThoughtSummaryLabel(thoughtDurationMs, summaryCounts.thought_count, locale)
     : localizedSummary?.label ?? settledLabel;
@@ -680,15 +778,19 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   const ActiveToolIcon = activeLiveTool ? resolveLiveToolCallIcon(activeLiveTool) : null;
   const line = (
     <TraceLine status={isWorkActive ? "running" : hasFailure ? "error" : undefined} className="text-[13px]">
-      {isWorkActive && (
+      {isWorkActive ? (
         <TraceIcon>
-          {ActiveToolIcon ? (
-            <ActiveToolIcon />
-          ) : (
-            <Brain className="size-3.5 animate-pulse motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]" strokeWidth={1.75} />
-          )}
+          {ActiveToolIcon ? <ActiveToolIcon /> : <ThinkingGlyph active />}
         </TraceIcon>
-      )}
+      ) : thoughtOnly ? (
+        <TraceIcon>
+          <ThinkingGlyph />
+        </TraceIcon>
+      ) : hasFailure ? (
+        <TraceIcon>
+          <AlertTriangle className="size-[13px]" strokeWidth={1.75} />
+        </TraceIcon>
+      ) : null}
       <TraceTitle>
         {isWorkActive ? activeLabel || t("stage.working") : finishedLabel}
       </TraceTitle>
@@ -726,10 +828,11 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
               holdViewport={holdViewport}
               isLiveActive={isWorkActive}
               followBottomOnExpand={isTrailingLatest}
-              autoExpandErrors={
-                !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
-              }
+              autoExpandErrors={!isWorkActive && summaryCounts.unrecovered_failure_count > 0}
               agentId={agentId}
+              turnIndex={turnIndex}
+              turnAnchorSeq={turnAnchorSeq}
+              workOrdinal={workOrdinal}
               thinkingSignature={thinkingSignature}
               getThinkingDurationMs={getThinkingDurationMs}
               sessionSubagents={sessionSubagents}
@@ -744,6 +847,7 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 
 export const TurnWorkedDisclosure = memo(function TurnWorkedDisclosure({
   durationMs,
+  fallbackLabel,
   unrecoveredFailureCount = 0,
   defaultCollapsed,
   autoOpenForError,
@@ -754,6 +858,7 @@ export const TurnWorkedDisclosure = memo(function TurnWorkedDisclosure({
   children,
 }: {
   durationMs: number | null;
+  fallbackLabel?: string;
   unrecoveredFailureCount?: number;
   defaultCollapsed: boolean;
   autoOpenForError: boolean;
@@ -807,7 +912,7 @@ export const TurnWorkedDisclosure = memo(function TurnWorkedDisclosure({
   const label =
     durationMs !== null && durationMs >= 1000
       ? t("stage.workedFor", { duration: formatDurationCompact(durationMs, locale) })
-      : t("stage.worked");
+      : fallbackLabel?.trim() || t("stage.worked");
   const showFailureBadge = unrecoveredFailureCount > 0;
 
   return (
@@ -815,6 +920,11 @@ export const TurnWorkedDisclosure = memo(function TurnWorkedDisclosure({
       <TraceCollapsible open={isExpanded} onOpenChange={handleOpenChange}>
         <TraceCollapsibleTrigger ref={foldBtnRef}>
           <TraceLine status={showFailureBadge ? "error" : undefined} className="text-[13px]">
+            {showFailureBadge && (
+              <TraceIcon>
+                <AlertTriangle className="size-[13px]" strokeWidth={1.75} />
+              </TraceIcon>
+            )}
             <TraceTitle>{label}</TraceTitle>
             {showFailureBadge && (
               <TraceDescription className="text-destructive">
@@ -824,11 +934,7 @@ export const TurnWorkedDisclosure = memo(function TurnWorkedDisclosure({
           </TraceLine>
         </TraceCollapsibleTrigger>
         <TraceCollapsibleContent>
-          {hasOpened ? (
-            <div className="min-w-0 space-y-3">
-              {typeof children === "function" ? children() : children}
-            </div>
-          ) : null}
+          {hasOpened ? (typeof children === "function" ? children() : children) : null}
         </TraceCollapsibleContent>
       </TraceCollapsible>
     </Trace>

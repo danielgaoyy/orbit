@@ -923,6 +923,65 @@ fn classify_generic_tool(
     let lower_tool = tool_name.trim().to_ascii_lowercase();
     let parsed: Option<serde_json::Value> = serde_json::from_str(arguments_json).ok();
 
+    // Pure read-only deferred tool discovery via `orbit_tool_search(action="search")` is Low risk.
+    // Side-effecting `action="call"` is intentionally excluded here so it undergoes full Guardian
+    // evaluation and permission checks.
+    if matches!(
+        lower_tool.as_str(),
+        "mcp__orbit__orbit_tool_search" | "orbit/orbit_tool_search"
+    ) && parsed
+        .as_ref()
+        .and_then(|v| v.get("action"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|a| a.trim().eq_ignore_ascii_case("search"))
+        && !contains_sensitive_secret_reference(arguments_json)
+    {
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Low,
+            GuardianDecision::AutoAllow,
+            0.98,
+            format!("Orbit read-only deferred tool search `{tool_name}`"),
+            vec!["orbit_mcp_readonly".into()],
+        );
+    }
+
+    // Safe session-goal bookkeeping actions (`get_goal`, `update_goal`, `pause_goal`,
+    // `complete_goal`) never spawn shell processes or external monitors and must not stall
+    // unattended Goal loops. `start_goal` / `start_monitor` / `stop_monitor` remain under full
+    // Guardian evaluation because they can configure shell verification commands or watchers.
+    if matches!(
+        lower_tool.as_str(),
+        "mcp__orbit__orbit_goal" | "orbit/orbit_goal"
+    ) && parsed
+        .as_ref()
+        .and_then(|v| v.get("action"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|a| {
+            matches!(
+                a.trim().to_ascii_lowercase().as_str(),
+                "get_goal"
+                    | "get"
+                    | "status"
+                    | "update_goal"
+                    | "update_goal_progress"
+                    | "update"
+                    | "pause_goal"
+                    | "pause"
+                    | "complete_goal"
+                    | "complete"
+            )
+        })
+        && !contains_sensitive_secret_reference(arguments_json)
+    {
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Low,
+            GuardianDecision::AutoAllow,
+            0.97,
+            format!("Orbit goal bookkeeping `{tool_name}`"),
+            vec!["orbit_goal_bookkeeping".into()],
+        );
+    }
+
     // Safe read-only & workspace coordination Orbit MCP tools are Low risk and AutoAllow cleanly.
     if matches!(
         lower_tool.as_str(),
@@ -3897,6 +3956,80 @@ mod tests {
         assert_eq!(r4.risk_level, GuardianRiskLevel::High);
         assert_eq!(r4.classifier_tier, "fail_closed");
         assert!(r4.signals.iter().any(|s| s == "classifier_panic"));
+    }
+
+    #[test]
+    fn guardian_allows_readonly_orbit_tool_search_but_never_auto_allows_call_action() {
+        let cfg = GuardianPolicyConfig::default();
+        let search_res = classify_generic_tool(
+            "mcp__orbit__orbit_tool_search",
+            r#"{"action":"search","query":"select:orbit_goal"}"#,
+            "/tmp",
+            &cfg,
+        );
+        match search_res.outcome {
+            Tier1Outcome::Final(assessment) => {
+                assert_eq!(assessment.risk_level, GuardianRiskLevel::Low);
+                assert_eq!(assessment.decision, GuardianDecision::AutoAllow);
+            }
+            Tier1Outcome::NeedsTier2 { reason, .. } => {
+                panic!("expected Final Low AutoAllow for search, got NeedsTier2({reason})")
+            }
+        }
+
+        let call_res = classify_generic_tool(
+            "mcp__orbit__orbit_tool_search",
+            r#"{"action":"call","tool":"orbit_browser","arguments":"{\"action\":\"open\"}"}"#,
+            "/tmp",
+            &cfg,
+        );
+        assert!(
+            !matches!(
+                call_res.outcome,
+                Tier1Outcome::Final(GuardianAssessment {
+                    decision: GuardianDecision::AutoAllow,
+                    ..
+                })
+            ),
+            "orbit_tool_search(action=\"call\") must never bypass Guardian as read-only"
+        );
+
+        for action in ["get_goal", "update_goal", "pause_goal", "complete_goal"] {
+            let goal_res = classify_generic_tool(
+                "mcp__orbit__orbit_goal",
+                &format!(r#"{{"action":"{action}","summary":"verified"}}"#),
+                "/tmp",
+                &cfg,
+            );
+            assert!(
+                matches!(
+                    goal_res.outcome,
+                    Tier1Outcome::Final(GuardianAssessment {
+                        risk_level: GuardianRiskLevel::Low,
+                        decision: GuardianDecision::AutoAllow,
+                        ..
+                    })
+                ),
+                "orbit_goal(action=\"{action}\") bookkeeping should AutoAllow"
+            );
+        }
+
+        let start_goal_res = classify_generic_tool(
+            "mcp__orbit__orbit_goal",
+            r#"{"action":"start_goal","objective":"run","verify_command":"rm -rf /tmp/x"}"#,
+            "/tmp",
+            &cfg,
+        );
+        assert!(
+            !matches!(
+                start_goal_res.outcome,
+                Tier1Outcome::Final(GuardianAssessment {
+                    decision: GuardianDecision::AutoAllow,
+                    ..
+                })
+            ),
+            "orbit_goal(action=\"start_goal\") with shell verify_command must never auto-allow"
+        );
     }
 
     #[tokio::test]

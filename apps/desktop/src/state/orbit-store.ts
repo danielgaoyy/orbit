@@ -23,6 +23,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
+import { applyTypography, resolveTypography } from "@/lib/typography";
 import {
   MAX_CACHED_STAGE_VIEWS,
   collectPinnedStageKeys,
@@ -39,6 +40,13 @@ import { createStageStreamSlice } from "./slices/stage-stream-slice";
 import { createTerminalSlice } from "./slices/terminal-slice";
 import { createUpdaterSlice } from "./slices/updater-slice";
 import { createWorkspaceSlice } from "./slices/workspace-slice";
+import {
+  SIDE_PANEL_STORAGE_KEY,
+  loadPersistedSidePanelSnapshots,
+  resolveSidePanelScopeKey,
+  savePersistedSidePanelSnapshots,
+  sidePanelTabScopeKey,
+} from "./side-panel-scope";
 import {
   MAX_NOTIFIED_TERMINAL_GOALS,
   PREFS_STORAGE_KEY,
@@ -90,12 +98,15 @@ import type {
 } from "./store-types";
 
 export {
+  SIDE_PANEL_STORAGE_KEY,
   STORE_TOPICS,
   TOPIC_BIT,
   composerScopeKey,
   fileCacheKey,
   isSubagentArchived,
   resolveFleetTargetVersion,
+  resolveSidePanelScopeKey,
+  sidePanelTabScopeKey,
   sideQuestionScopeKey,
   subagentArchiveKey,
   threadScopeKey,
@@ -131,6 +142,9 @@ export type {
   SettingsSection,
   SettingsSectionTarget,
   SettingsSubTabId,
+  SidePanelOpenSource,
+  SidePanelScopeKey,
+  SidePanelSnapshot,
   SidePanelTab,
   SidePanelTabKind,
   SideQuestionEntry,
@@ -164,6 +178,7 @@ const initialPrefs = loadPrefs();
 const initialTheme: ThemeMode = initialPrefs.theme ?? preferenceDefaults.theme;
 const initialResolvedTheme: ResolvedTheme = resolveTheme(initialTheme);
 applyDocumentTheme(initialResolvedTheme);
+applyTypography(resolveTypography(initialPrefs));
 if (typeof document !== "undefined") {
   if (isMacDesktop()) {
     document.documentElement.classList.add("orbit-mac");
@@ -192,11 +207,14 @@ if (hmrData?.draftUpdatedAtByScope) {
   draftPersistence.restoreUpdatedAtByScope(hmrData.draftUpdatedAtByScope);
 }
 
+const initialSidePanelByScope = loadPersistedSidePanelSnapshots();
+
 const defaultInitialState = createDefaultInitialState(
   initialPrefs,
   initialTheme,
   initialResolvedTheme,
   initialDrafts,
+  initialSidePanelByScope,
 );
 
 const initialState: OrbitUiState = hmrData?.state
@@ -267,6 +285,8 @@ let gitChangedDebounceTimer: number | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let savePrefsTimer: ReturnType<typeof setTimeout> | null = null;
 let savePrefsPending = false;
+let saveSidePanelTimer: ReturnType<typeof setTimeout> | null = null;
+let saveSidePanelPending = false;
 let lastTrayStatusKey: string | null = null;
 let trayStatusSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingDraftCreate: PendingDraftCreateState | null = null;
@@ -299,6 +319,44 @@ function scheduleSavePrefs(): void {
       writePrefsNow(kernel.getState());
     }
   }, 180);
+}
+
+function writeSidePanelNow(snap: OrbitUiState): void {
+  if (typeof window === "undefined") return;
+  saveSidePanelPending = false;
+  if (saveSidePanelTimer !== null) {
+    clearTimeout(saveSidePanelTimer);
+    saveSidePanelTimer = null;
+  }
+  savePersistedSidePanelSnapshots(snap);
+}
+
+function scheduleSaveSidePanel(): void {
+  if (typeof window === "undefined") return;
+  saveSidePanelPending = true;
+  if (saveSidePanelTimer !== null) return;
+  saveSidePanelTimer = setTimeout(() => {
+    saveSidePanelTimer = null;
+    if (disposed) return;
+    if (saveSidePanelPending) {
+      writeSidePanelNow(kernel.getState());
+    }
+  }, 220);
+}
+
+function hasSidePanelStateChanged(prev: OrbitUiState, next: OrbitUiState): boolean {
+  return (
+    prev.sidePanelOpen !== next.sidePanelOpen ||
+    prev.sidePanelTabs !== next.sidePanelTabs ||
+    prev.activeSidePanelTabId !== next.activeSidePanelTabId ||
+    prev.sidePanelSplit !== next.sidePanelSplit ||
+    prev.sidePanelByScope !== next.sidePanelByScope ||
+    prev.sidePanelScopeKey !== next.sidePanelScopeKey ||
+    prev.sidePanelUserDismissed !== next.sidePanelUserDismissed ||
+    prev.sidePanelClosedTabs !== next.sidePanelClosedTabs ||
+    prev.sidePanelUnseenTabIds !== next.sidePanelUnseenTabIds ||
+    prev.sidePanelCollapsedByResize !== next.sidePanelCollapsedByResize
+  );
 }
 
 function emitComposerDraftChange(): void {
@@ -376,6 +434,9 @@ function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false
   kernel.replaceStateSilent(next);
   if (persist) {
     scheduleSavePrefs();
+  }
+  if (hasSidePanelStateChanged(prev, next)) {
+    scheduleSaveSidePanel();
   }
   syncDraftMutations(prev, next);
   if (next.composerDrafts !== prev.composerDrafts) {
@@ -1004,6 +1065,9 @@ const beforeUnloadListener = (e: BeforeUnloadEvent) => {
   if (savePrefsPending) {
     writePrefsNow(snap);
   }
+  if (saveSidePanelPending) {
+    writeSidePanelNow(snap);
+  }
   if (Object.values(snap.fileEditorDrafts).some((d) => d.dirty)) {
     e.preventDefault();
     e.returnValue = "";
@@ -1112,6 +1176,12 @@ if (viteHot) {
     if (savePrefsTimer !== null) {
       clearTimeout(savePrefsTimer);
       savePrefsTimer = null;
+    }
+    if (saveSidePanelPending) {
+      writeSidePanelNow(kernel.getState());
+    } else if (saveSidePanelTimer !== null) {
+      clearTimeout(saveSidePanelTimer);
+      saveSidePanelTimer = null;
     }
     if (toastTimer) {
       clearTimeout(toastTimer);

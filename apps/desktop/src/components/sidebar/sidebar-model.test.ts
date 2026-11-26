@@ -9,6 +9,7 @@ import type {
   SidebarProjectGroupView,
 } from "../../lib/orbit-ipc.ts";
 import {
+  PINNED_MANUAL_ORDER_SCOPE,
   buildRunningParentThreadKeys,
   buildSidebarDisplayModel,
   collectVisibleSidebarThreads,
@@ -247,5 +248,200 @@ describe("sidebar-model pure derivation & invariants", () => {
     assert.equal(runningKeys.has("h1::parent_e"), true);
     assert.equal(runningKeys.has("h1::parent_timer"), false);
     assert.equal(runningKeys.has("h1::parent_legacy_timer"), false);
+  });
+
+  it("honors pinned manual order independently of sidebarProjectSort and appends newly pinned threads in default order", () => {
+    const a1 = makeAgent("p1", "Alpha");
+    const a2 = makeAgent("p2", "Beta");
+    const a3 = makeAgent("p3", "Gamma");
+    const a4 = makeAgent("p4", "Delta");
+    const a5 = makeAgent("p5", "Epsilon");
+
+    const c1 = makeConv(a1);
+    const c2 = makeConv(a2);
+    const c3 = makeConv(a3);
+    const c4 = makeConv(a4);
+    const c5 = makeConv(a5);
+
+    const sidebarView: FleetSidebarView = {
+      needs_attention: [],
+      pinned_conversations: [c1, c2, c3, c4, c5],
+      projects: [
+        {
+          id: "proj_1",
+          host_id: "h1",
+          name: "Orbit",
+          primary_cwd: "/repo/orbit",
+          directories: ["/repo/orbit"],
+          conversations: [c1, c2, c3, c4, c5],
+          unclassified_conversations: [c1, c2, c3, c4, c5],
+          workspaces: [],
+        },
+      ],
+    } as unknown as FleetSidebarView;
+
+    // Include a stale/unpinned key alongside explicit ordering for p3, p1, p2;
+    // newly pinned p4 & p5 must append in their original default order.
+    const manualPinned = ["h1::stale_removed", "h1::p3", "h1::p1", "h1::p2"];
+
+    for (const sortMode of ["recent", "alphabetical", "manual"] as const) {
+      const baseInput = {
+        hosts: [makeHost()],
+        sidebarView,
+        hostDetails: {},
+        archivedThreads: {},
+        hiddenProjectKeys: {},
+        threadCustomTitles: {},
+        collapsedProjectIds: {},
+        collapsedWorkspaceIds: {},
+        sidebarProjectSort: sortMode,
+        threadManualOrder: {
+          [PINNED_MANUAL_ORDER_SCOPE]: manualPinned,
+        },
+        workspacePanel: "conversation" as const,
+        isDraftNewSession: false,
+        selectedHostId: null,
+        selectedAgentId: null,
+        selectedWorkspaceCwd: null,
+      };
+
+      const model = buildSidebarDisplayModel({
+        ...baseInput,
+        expandedMoreProjects: {},
+        filterQuery: "",
+      });
+
+      assert.deepEqual(
+        model.filteredPinnedEntries.map((entry) => entry.conv.agent.agent_id),
+        ["p3", "p1", "p2", "p4", "p5"],
+        `pinned order should hold under sortMode=${sortMode}`,
+      );
+
+      // Cmd+1..9 visible sequence should stay aligned with pinned manual order
+      const visible = collectVisibleSidebarThreads(baseInput);
+      assert.deepEqual(
+        visible.map((v) => v.agentId),
+        ["p3", "p1", "p2", "p4", "p5"],
+        `Cmd+1..9 order should match pinned order under sortMode=${sortMode}`,
+      );
+    }
+  });
+
+  it("hides cross-host and orphaned subagents while keeping router-dispatched conversations visible", () => {
+    const crossHostSub = makeAgent("sub_cross", "Remote Helper", {
+      parent_agent_id: "conv_local",
+      parent_host_id: "h1",
+      labels: { "orbit.session_tier": "subagent" },
+    });
+    const orphanSub = makeAgent("sub_orphan", "Orphan Helper", {
+      parent_agent_id: "conv_archived",
+      labels: { "orbit.session_tier": "subagent" },
+    });
+    const routedConv = makeAgent("conv_routed", "Investigate Latency", {
+      parent_agent_id: null,
+      labels: {
+        "orbit.routed_by_agent": "ag_router",
+        "orbit.session_tier": "conversation",
+      },
+    });
+
+    const sidebarView: FleetSidebarView = {
+      revision: 1,
+      launchpad_projects: [],
+      needs_attention: [
+        {
+          host_id: "h2",
+          is_pinned: false,
+          is_unread: false,
+          seen_seq: 0,
+          is_worktree: false,
+          agent: crossHostSub,
+        },
+      ],
+      pinned_conversations: [
+        {
+          host_id: "h1",
+          is_pinned: true,
+          is_unread: false,
+          seen_seq: 0,
+          is_worktree: false,
+          agent: orphanSub,
+        },
+      ],
+      projects: [
+        {
+          id: "h2::/repo",
+          host_id: "h2",
+          name: "repo",
+          is_home_workspace: false,
+          primary_cwd: "/repo",
+          directories: ["/repo"],
+          git_branch: "main",
+          is_git_repo: true,
+          nested_git_repos: [],
+          pinned_project_id: null,
+          sort_weight_ms: 1000,
+          sort_order_key: "h2::/repo",
+          conversations: [
+            {
+              host_id: "h2",
+              is_pinned: false,
+              is_unread: false,
+              seen_seq: 0,
+              is_worktree: false,
+              agent: crossHostSub,
+            },
+            {
+              host_id: "h2",
+              is_pinned: false,
+              is_unread: false,
+              seen_seq: 0,
+              is_worktree: false,
+              agent: orphanSub,
+            },
+            {
+              host_id: "h2",
+              is_pinned: false,
+              is_unread: false,
+              seen_seq: 0,
+              is_worktree: false,
+              agent: routedConv,
+            },
+          ],
+          workspaces: [],
+          unclassified_conversations: [],
+        },
+      ],
+    };
+
+    const model = buildSidebarDisplayModel({
+      hosts: [
+        { host_id: "h1", display_name: "Mac" } as HostCardView,
+        { host_id: "h2", display_name: "Linux" } as HostCardView,
+      ],
+      sidebarView,
+      hostDetails: {},
+      archivedThreads: {},
+      hiddenProjectKeys: {},
+      threadCustomTitles: {},
+      collapsedProjectIds: {},
+      collapsedWorkspaceIds: {},
+      sidebarProjectSort: "recent",
+      threadManualOrder: {},
+      workspacePanel: "conversation",
+      isDraftNewSession: false,
+      selectedHostId: "h2",
+      selectedAgentId: "conv_routed",
+      selectedWorkspaceCwd: "/repo",
+      expandedMoreProjects: {},
+      filterQuery: "",
+    });
+
+    assert.equal(model.filteredAttentionItems.length, 0);
+    assert.equal(model.filteredPinnedEntries.length, 0);
+    assert.deepEqual(
+      model.projectRenderModels[0].visibleConversations.map((c) => c.agent.agent_id),
+      ["conv_routed"],
+    );
   });
 });

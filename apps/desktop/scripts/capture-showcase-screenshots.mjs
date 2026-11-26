@@ -4,7 +4,7 @@
  *
  * Uses zero external npm dependencies (built-in Node HTTP server + Chrome CDP,
  * matching `apps/desktop/scripts/smoke-render.mjs`) to render a realistic
- * multi-host Personal Agent + Subagent Crew + Plan Shelf + Review Diff scene
+ * multi-host Personal Agent + Briefing Rail + Subagent Crew + Plan Shelf scene
  * in both Dark ("Obsidian Graphite") and Light ("Alabaster Paper") themes.
  *
  * Outputs (1440x900 @ 2x DPR = 2880x1800 PNG):
@@ -397,7 +397,7 @@ export function buildShowcaseFixture(theme, opts = {}) {
     is_awaiting_permission: false,
     parent_agent_id: null,
     labels: {
-      "orbit.agent_role": "personal_router",
+      "orbit.role": "personal_router",
       "orbit.im_channel": "slack_socket",
     },
     latest_seq: 42,
@@ -1187,16 +1187,8 @@ export function buildShowcaseFixture(theme, opts = {}) {
         seen_seq: 10,
       },
     ],
-    pinned_conversations: [
-      {
-        host_id: "host_mac_studio",
-        agent: agentPersonal,
-        is_worktree: false,
-        is_pinned: true,
-        is_unread: false,
-        seen_seq: 42,
-      },
-    ],
+    // The Personal Agent has its own top-level sidebar entry and is never listed under Pinned/Projects.
+    pinned_conversations: [],
     projects: [
       {
         id: "proj_mac_orbit",
@@ -1604,6 +1596,11 @@ export function buildShowcaseFixture(theme, opts = {}) {
     const sidebarView = ${JSON.stringify(sidebarView)};
     const stageByAgent = ${JSON.stringify(stageByAgent)};
     const gitReview = ${JSON.stringify(gitReview)};
+    const agentPersonal = ${JSON.stringify(agentPersonal)};
+    const subBuildLinux = ${JSON.stringify(subBuildLinux)};
+    const subSecurityMac = ${JSON.stringify(subSecurityMac)};
+    const now = ${JSON.stringify(now)};
+    const isoAgo = (sec) => new Date(now - sec * 1000).toISOString();
 
     let revisionCounter = 5;
     let nextCallbackId = 1;
@@ -1681,6 +1678,125 @@ export function buildShowcaseFixture(theme, opts = {}) {
               host_id: "host_mac_studio",
               os_arch: "darwin / aarch64",
             };
+          case "get_primary_router_selection":
+            return {
+              host_id: "host_mac_studio",
+              agent_id: "ag_personal_chief",
+              updated_at_ms: now - 600_000,
+            };
+          case "get_personal_agent_briefing":
+            return {
+              personal_agent: {
+                host_id: "host_mac_studio",
+                host_name: "mac-studio",
+                agent_id: "ag_personal_chief",
+                title: agentPersonal.title,
+                provider: agentPersonal.provider,
+                status_label: agentPersonal.status_label,
+                is_busy: true,
+                is_awaiting: false,
+              },
+              needs_you: stageByAgent.ag_linux_deploy.pending_permissions.map((perm) => ({
+                key: "perm:host_linux_build:ag_linux_deploy:" + perm.request_id,
+                kind: "permission",
+                host_id: "host_linux_build",
+                host_name: "linux-build-01",
+                agent_id: "ag_linux_deploy",
+                agent_title: perm.agent_title,
+                request_id: perm.request_id,
+                summary: perm.title,
+                risk_level: "high",
+                human_only: true,
+                batch_eligible: false,
+                router_recommendation: {
+                  decision: "allow",
+                  reason: "All 1,061 tests passed and Curve25519 audit is clean.",
+                  created_at: isoAgo(90),
+                },
+                dispatched_by_personal_agent: true,
+                updated_at_ms: now - 120_000,
+              })),
+              missions: [
+                {
+                  key: "mission:ag_sub_build_linux",
+                  root: {
+                    host_id: "host_linux_build",
+                    host_name: "linux-build-01",
+                    agent_id: "ag_sub_build_linux",
+                    title: subBuildLinux.title,
+                    provider: subBuildLinux.provider,
+                    state: "running",
+                    step_preview: "Running cargo test --workspace across e2ee worktree",
+                    worktree_branch: subBuildLinux.worktree_branch,
+                    updated_at_ms: now - 4_000,
+                  },
+                  workers: [
+                    {
+                      host_id: "host_mac_studio",
+                      host_name: "mac-studio",
+                      agent_id: "ag_sub_sec_mac",
+                      title: subSecurityMac.title,
+                      provider: subSecurityMac.provider,
+                      state: "done",
+                      step_preview: "Curve25519 audit signed off",
+                      worktree_branch: null,
+                      updated_at_ms: now - 48_000,
+                    },
+                  ],
+                  host_names: ["linux-build-01", "mac-studio"],
+                  done: 1,
+                  total: 2,
+                  state: "running",
+                  updated_at_ms: now - 4_000,
+                },
+              ],
+              other_active: [],
+              waiting: [
+                {
+                  key: "timer:ci_watch",
+                  kind: "timer",
+                  host_id: "host_linux_build",
+                  agent_id: "ag_linux_ci_watch",
+                  title: "Watch PR #68 CI checks",
+                  detail: "Wake when CI finishes",
+                  due_at_ms: now + 180_000,
+                },
+              ],
+              hosts: fleetHosts.map((h) => ({
+                host_id: h.host_id,
+                name: h.display_name,
+                online:
+                  h.connection_state === "online_direct" || h.connection_state === "online_relay",
+                is_personal_agent_host: h.host_id === "host_mac_studio",
+              })),
+              counts: {
+                needs_you: stageByAgent.ag_linux_deploy.pending_permissions.length,
+                running: 1,
+                done_recent: 1,
+                hosts_online: fleetHosts.length,
+                hosts_total: fleetHosts.length,
+              },
+              since_last_visit: {
+                completed: 0,
+                auto_handled: 0,
+              },
+            };
+          case "list_personal_agent_activity":
+            return [
+              {
+                seq: 101,
+                timestamp_ms: now - 240_000,
+                actor: "guardian_tier1",
+                decision: "allow",
+                host_id: "host_linux_build",
+                agent_id: "ag_sub_build_linux",
+                agent_title: subBuildLinux.title,
+                summary: "cargo test -p orbit-protocol",
+                risk_level: "low",
+                reason: "Workspace test command auto-allowed by Guardian Tier-1.",
+                request_id: "perm_auto_101",
+              },
+            ];
           case "get_fleet_overview":
             return {
               revision: revisionCounter,
@@ -2278,7 +2394,7 @@ async function captureTheme({ port, serverUrl, theme, outputPaths }) {
     await cdp.send("Page.navigate", { url: serverUrl });
     await loadedPromise;
 
-    // Wait for initial fleet hydration, open the Review Diff tab via Cmd/Ctrl+D,
+    // Wait for initial fleet hydration, open the Personal Agent Briefing Rail,
     // and add authentic subtle macOS window traffic lights in the reserved 80px titlebar slot.
     const stateRes = await cdp.send("Runtime.evaluate", {
       awaitPromise: true,
@@ -2287,16 +2403,12 @@ async function captureTheme({ port, serverUrl, theme, outputPaths }) {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         await sleep(950);
 
-        // Open Review Diff side panel cleanly using the app's native Cmd/Ctrl+D binding
+        // Reveal the docked Personal Agent Briefing Rail via its top-bar trigger (if not already open).
         const isMac = /Mac/.test(navigator.platform || navigator.userAgent);
-        window.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "d",
-          code: "KeyD",
-          metaKey: isMac,
-          ctrlKey: !isMac,
-          bubbles: true,
-          cancelable: true,
-        }));
+        if (!document.querySelector('[aria-label="Personal Agent briefing"]')) {
+          const trigger = Array.from(document.querySelectorAll("[data-overview-trigger]")).pop();
+          if (trigger) trigger.click();
+        }
 
         await sleep(850);
 
@@ -2325,7 +2437,7 @@ async function captureTheme({ port, serverUrl, theme, outputPaths }) {
           hasErrorBoundary: bodyText.includes("Orbit UI Render Error"),
           isDark: document.documentElement.classList.contains("dark"),
           hasPersonalAgent: bodyText.includes("Personal Agent"),
-          hasDiff: bodyText.includes("noise.rs"),
+          hasBriefing: bodyText.includes("Needs you") || bodyText.includes("NEEDS YOU"),
           hasPlan: bodyText.includes("Noise_NKpsk0"),
           len: document.getElementById("root")?.innerHTML?.length || 0,
           snippet: bodyText.includes("Orbit UI Render Error") ? bodyText.slice(0, 400) : undefined,

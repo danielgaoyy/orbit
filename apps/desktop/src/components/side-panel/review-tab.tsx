@@ -69,7 +69,7 @@ import {
 import { normalizeProjectPath } from "@/lib/projects";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 const EMPTY_DIFFS: DiffFileView[] = [];
 const EMPTY_STATUS_FILES: GitFileEntry[] = [];
@@ -107,9 +107,11 @@ function pathsMatch(a: string, b: string, cwd: string): boolean {
 }
 
 export const ReviewTab = memo(function ReviewTab({
-  selectedHostId,
+  tab,
+  selectedHostId: propHostId,
   visible = true,
 }: {
+  tab?: SidePanelTab;
   selectedHostId: string;
   visible?: boolean;
 }) {
@@ -118,7 +120,9 @@ export const ReviewTab = memo(function ReviewTab({
   const diffStaged = useOrbitSelector((s) => s.diffStaged);
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
   const selectedDiffPath = useOrbitSelector((s) => s.selectedDiffPath);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const selectedHostId = tab?.hostId ?? propHostId;
+  const tabAgentId = tab?.agentId ?? null;
+  const selectedCwd = tab?.cwd ?? "";
 
   const activeWorkspaceKey = useOrbitSelector((s) => {
     if (!visible) return "";
@@ -126,8 +130,8 @@ export const ReviewTab = memo(function ReviewTab({
     if (!detail) return "";
     const normCwd = selectedCwd ? normalizeProjectPath(selectedCwd) : "";
     let ws = null;
-    if (s.selectedAgentId) {
-      const ag = detail.agents.find((a) => a.agent_id === s.selectedAgentId);
+    if (tabAgentId) {
+      const ag = detail.agents.find((a) => a.agent_id === tabAgentId);
       if (ag) {
         const candidate = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
         if (candidate && (!normCwd || normalizeProjectPath(candidate.cwd) === normCwd)) {
@@ -152,8 +156,8 @@ export const ReviewTab = memo(function ReviewTab({
   }, [activeWorkspaceKey]);
 
   const gitReview = useOrbitSelector((s) =>
-    s.selectedHostId && s.selectedWorkspaceCwd
-      ? (s.gitReviews[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`] ?? null)
+    selectedHostId && selectedCwd
+      ? (s.gitReviews[`${selectedHostId}::${selectedCwd}`] ?? null)
       : null,
   );
   const isHostOnline = useOrbitSelector((s) => {
@@ -165,8 +169,8 @@ export const ReviewTab = memo(function ReviewTab({
 
   // Only read session_turn_diffs reference; never trigger working_tree re-renders on unrelated streaming deltas.
   const sessionTurnDiffs = useOrbitSelector((s) => {
-    if (!s.selectedHostId || !s.selectedAgentId) return EMPTY_DIFFS;
-    return s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.session_turn_diffs ?? EMPTY_DIFFS;
+    if (!selectedHostId || !tabAgentId) return EMPTY_DIFFS;
+    return s.stages[`${selectedHostId}::${tabAgentId}`]?.session_turn_diffs ?? EMPTY_DIFFS;
   });
 
   const [wrapLines, setWrapLines] = useState(false);
@@ -1027,7 +1031,7 @@ export const ReviewTab = memo(function ReviewTab({
       const match = findMatchingDiffLine(scopeDiffs, finding, selectedCwd);
       if (match && match.exactLine) {
         if (selectedDiffPath && !pathsMatch(selectedDiffPath, match.filePath, selectedCwd)) {
-          orbitActions.selectDiffFile(null);
+          orbitActions.selectDiffFile(null, { hostId: selectedHostId, cwd: selectedCwd });
         }
         if (fileQuery.trim() && !match.filePath.toLowerCase().includes(fileQuery.trim().toLowerCase())) {
           setFileQuery("");
@@ -1043,7 +1047,7 @@ export const ReviewTab = memo(function ReviewTab({
       }
       handleOpenFile(finding.file_path, finding.start_line);
     },
-    [reviewScope, sessionTurnDiffs, gitReview, selectedCwd, selectedDiffPath, fileQuery, handleOpenFile],
+    [reviewScope, sessionTurnDiffs, gitReview, selectedHostId, selectedCwd, selectedDiffPath, fileQuery, handleOpenFile],
   );
 
   const handleOpenPatrolFindingInEditor = useCallback(
@@ -1113,7 +1117,12 @@ export const ReviewTab = memo(function ReviewTab({
         <div className="bg-muted inline-flex h-[26px] items-center rounded-lg p-0.5 text-[11.5px]">
           <button
             type="button"
-            onClick={() => orbitActions.setReviewScope("working_tree")}
+            onClick={() =>
+              orbitActions.setReviewScope("working_tree", {
+                hostId: selectedHostId,
+                cwd: selectedCwd,
+              })
+            }
             className={cn(
               "inline-flex h-[22px] cursor-pointer items-center rounded-md px-2 font-medium transition-colors",
               reviewScope === "working_tree"
@@ -1125,7 +1134,12 @@ export const ReviewTab = memo(function ReviewTab({
           </button>
           <button
             type="button"
-            onClick={() => orbitActions.setReviewScope("session_turns")}
+            onClick={() =>
+              orbitActions.setReviewScope("session_turns", {
+                hostId: selectedHostId,
+                cwd: selectedCwd,
+              })
+            }
             className={cn(
               "inline-flex h-[22px] cursor-pointer items-center rounded-md px-2 font-medium transition-colors",
               reviewScope === "session_turns"
@@ -1320,7 +1334,12 @@ export const ReviewTab = memo(function ReviewTab({
 
                 <button
                   type="button"
-                  onClick={() => orbitActions.setDiffStaged(false)}
+                  onClick={() =>
+                    orbitActions.setDiffStaged(false, {
+                      hostId: selectedHostId,
+                      cwd: selectedCwd,
+                    })
+                  }
                   className={cn(
                     "inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors",
                     !diffStaged
@@ -1335,7 +1354,12 @@ export const ReviewTab = memo(function ReviewTab({
                 </button>
                 <button
                   type="button"
-                  onClick={() => orbitActions.setDiffStaged(true)}
+                  onClick={() =>
+                    orbitActions.setDiffStaged(true, {
+                      hostId: selectedHostId,
+                      cwd: selectedCwd,
+                    })
+                  }
                   className={cn(
                     "inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors",
                     diffStaged
@@ -1370,7 +1394,12 @@ export const ReviewTab = memo(function ReviewTab({
               <div className="flex w-max items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => orbitActions.selectDiffFile(null)}
+                  onClick={() =>
+                    orbitActions.selectDiffFile(null, {
+                      hostId: selectedHostId,
+                      cwd: selectedCwd,
+                    })
+                  }
                   className={cn(
                     "shrink-0 cursor-pointer rounded-md border px-2 py-0.5 text-[11.5px] font-medium transition-colors",
                     selectedDiffPath === null
@@ -1401,7 +1430,12 @@ export const ReviewTab = memo(function ReviewTab({
                       <button
                         type="button"
                         title={f.path}
-                        onClick={() => orbitActions.selectDiffFile(f.path)}
+                        onClick={() =>
+                          orbitActions.selectDiffFile(f.path, {
+                            hostId: selectedHostId,
+                            cwd: selectedCwd,
+                          })
+                        }
                         className="inline-flex cursor-pointer items-center gap-1.5 px-2 py-0.5"
                       >
                         {isViewed && (

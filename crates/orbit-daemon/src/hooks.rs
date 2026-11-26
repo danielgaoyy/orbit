@@ -3658,6 +3658,7 @@ mod tests {
                 workspace_id: None,
                 parent_agent_id: None,
                 parent_host_id: None,
+                initial_prompt_source: None,
                 profile_id: None,
                 background: false,
                 auto_archive: false,

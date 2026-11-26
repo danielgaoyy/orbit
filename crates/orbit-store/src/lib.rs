@@ -37,7 +37,11 @@ pub use triggers::{
 pub use usage::{
     AgentContextTelemetry, QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS,
 };
-pub use workspace_sync::{AgentContextSnippet, LABEL_HANDLE_ALIASES, SemanticIdentityOptions};
+pub use workspace_sync::{
+    AgentContextSnippet, DEFAULT_BOARD_GOAL_PLACEHOLDER, LABEL_HANDLE_ALIASES,
+    ResetWorkspaceBoardOutcome, SemanticIdentityOptions, board_has_substantive_content,
+    build_clean_board_markdown, extract_goal_section_from_board, upsert_board_markdown_section,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -2693,7 +2697,7 @@ impl OrbitStore {
         )
     }
 
-    /// Read user-prompt anchors in chronological order using the agent/type/sequence index.
+    /// Read user-prompt and visible direct-agent-dispatch anchors in chronological order.
     pub fn fetch_timeline_outline_prompts(
         &self,
         agent_id: &str,
@@ -2701,7 +2705,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, payload_json FROM timeline_events
-             WHERE agent_id = ?1 AND event_type = 'user_prompt' ORDER BY seq ASC",
+             WHERE agent_id = ?1 AND event_type IN ('user_prompt', 'agent_message') ORDER BY seq ASC",
         )?;
         Self::collect_outline_prompts(&mut stmt, agent_id)
     }
@@ -2712,8 +2716,8 @@ impl OrbitStore {
             [agent_id], |row| row.get(0))?)
     }
 
-    /// Read user-prompt anchors from the local client replica in chronological order using
-    /// `idx_replica_agent_type_seq` so tail-hydrated stages retain pre-tail outline anchors.
+    /// Read user-prompt and visible direct-agent-dispatch anchors from the local client replica
+    /// in chronological order so tail-hydrated stages retain pre-tail outline anchors.
     pub fn fetch_replica_outline_prompts(
         &self,
         agent_id: &str,
@@ -2721,7 +2725,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, payload_json FROM client_replica_events
-             WHERE agent_id = ?1 AND event_type = 'user_prompt' ORDER BY seq ASC",
+             WHERE agent_id = ?1 AND event_type IN ('user_prompt', 'agent_message') ORDER BY seq ASC",
         )?;
         Self::collect_outline_prompts(&mut stmt, agent_id)
     }
@@ -2738,9 +2742,24 @@ impl OrbitStore {
                 continue;
             }
             let json = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
-            if let Ok(TimelinePayload::UserPrompt { text, badges, .. }) = serde_json::from_str(json)
-                && let Some(prompt) = TimelineOutlinePrompt::from_user_prompt(seq, &text, &badges)
-            {
+            let maybe_prompt = match serde_json::from_str::<TimelinePayload>(json) {
+                Ok(TimelinePayload::UserPrompt { text, badges, .. }) => {
+                    TimelineOutlinePrompt::from_user_prompt(seq, &text, &badges)
+                }
+                Ok(TimelinePayload::AgentMessage {
+                    kind,
+                    text,
+                    permission_context,
+                    ..
+                }) => TimelineOutlinePrompt::from_agent_message(
+                    seq,
+                    kind,
+                    &text,
+                    permission_context.is_some(),
+                ),
+                _ => None,
+            };
+            if let Some(prompt) = maybe_prompt {
                 prompts.push(prompt);
             }
         }

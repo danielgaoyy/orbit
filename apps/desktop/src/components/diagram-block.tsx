@@ -1,5 +1,4 @@
 import {
-  type PointerEvent as ReactPointerEvent,
   memo,
   useCallback,
   useEffect,
@@ -25,6 +24,7 @@ import {
 import { HighlightedCodeBlock } from "@/components/markdown-blocks";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { usePanZoom } from "@/lib/drag/use-pan-zoom";
 import {
   type DiagramKind,
   type DiagramTheme,
@@ -39,10 +39,6 @@ const diagramViewCache = new Map<string, RenderDiagramView>();
 
 const MIN_LIGHTBOX_ZOOM = 0.25;
 const MAX_LIGHTBOX_ZOOM = 5.0;
-
-function clampZoom(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
 
 function diagramCacheKey(kind: DiagramKind, theme: DiagramTheme, source: string): string {
   return `${kind}::${theme}::${source}`;
@@ -108,13 +104,31 @@ const DiagramLightbox = memo(function DiagramLightbox({
   kind: DiagramKind;
   onClose: () => void;
 }) {
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [copiedMode, setCopiedMode] = useState<"none" | "svg" | "source">("none");
   const copyTimerRef = useRef<number | null>(null);
   const [viewportEl, setViewportEl] = useState<HTMLDivElement | null>(null);
-  const zoomRef = useRef(zoom);
-  zoomRef.current = zoom;
+  const diagramCardRef = useRef<HTMLDivElement | null>(null);
+
+  const {
+    zoom,
+    pan,
+    isDragging,
+    setZoom,
+    zoomIn,
+    zoomOut,
+    resetTransform,
+    transformStyle,
+    pointerHandlers,
+  } = usePanZoom({
+    open,
+    minZoom: MIN_LIGHTBOX_ZOOM,
+    maxZoom: MAX_LIGHTBOX_ZOOM,
+    allowPanAtBaseZoom: true,
+    zoomStep: 1.18,
+    wheelMode: "always",
+    contentRef: diagramCardRef,
+    viewportEl,
+  });
 
   useEffect(() => {
     return () => {
@@ -125,128 +139,29 @@ const DiagramLightbox = memo(function DiagramLightbox({
     };
   }, []);
 
-  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
-  const pinchStartRef = useRef<{ distance: number; zoom: number } | null>(null);
-  const dragRef = useRef<{
-    active: boolean;
-    pointerId: number;
-    startX: number;
-    startY: number;
-    origX: number;
-    origY: number;
-    moved: boolean;
-  }>({
-    active: false,
-    pointerId: -1,
-    startX: 0,
-    startY: 0,
-    origX: 0,
-    origY: 0,
-    moved: false,
-  });
-
-  const resetView = useCallback(() => {
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-  }, []);
-
   useEffect(() => {
     if (!open) return;
-    resetView();
-  }, [open, resetView]);
+    resetTransform();
+  }, [open, resetTransform]);
 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === "+" || ev.key === "=") {
         ev.preventDefault();
-        setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
+        zoomIn();
       } else if (ev.key === "-") {
         ev.preventDefault();
-        setZoom((z) => clampZoom(z / 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
+        zoomOut();
       } else if (ev.key === "0") {
         ev.preventDefault();
-        resetView();
+        resetTransform();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, resetView]);
-
-  // Native non-passive wheel listener for smooth multiplicative trackpad pinch & wheel zoom
-  useEffect(() => {
-    if (!viewportEl) return;
-    const onWheel = (ev: WheelEvent) => {
-      ev.preventDefault();
-      // Trackpad pinch (`ctrlKey`) uses finer sensitivity than standard mouse wheel ticks
-      const sensitivity = ev.ctrlKey || ev.metaKey ? 0.0085 : 0.0022;
-      const factor = Math.exp(-ev.deltaY * sensitivity);
-      setZoom((z) => clampZoom(z * factor, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
-    };
-    viewportEl.addEventListener("wheel", onWheel, { passive: false });
-    return () => viewportEl.removeEventListener("wheel", onWheel);
-  }, [viewportEl]);
-
-  const handlePointerDown = useCallback(
-    (ev: ReactPointerEvent<HTMLDivElement>) => {
-      if (ev.button !== 0 && ev.pointerType === "mouse") return;
-      ev.currentTarget.setPointerCapture(ev.pointerId);
-      activePointersRef.current.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
-
-      if (activePointersRef.current.size === 2) {
-        const pts = Array.from(activePointersRef.current.values());
-        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
-        pinchStartRef.current = { distance: Math.max(dist, 1), zoom: zoomRef.current };
-        dragRef.current.active = false;
-        dragRef.current.moved = true;
-        return;
-      }
-
-      dragRef.current = {
-        active: true,
-        pointerId: ev.pointerId,
-        startX: ev.clientX,
-        startY: ev.clientY,
-        origX: pan.x,
-        origY: pan.y,
-        moved: false,
-      };
-    },
-    [pan],
-  );
-
-  const handlePointerMove = useCallback((ev: ReactPointerEvent<HTMLDivElement>) => {
-    if (activePointersRef.current.has(ev.pointerId)) {
-      activePointersRef.current.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
-    }
-
-    if (activePointersRef.current.size === 2 && pinchStartRef.current) {
-      const pts = Array.from(activePointersRef.current.values());
-      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
-      const ratio = dist / pinchStartRef.current.distance;
-      setZoom(clampZoom(pinchStartRef.current.zoom * ratio, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
-      return;
-    }
-
-    const d = dragRef.current;
-    if (!d.active || d.pointerId !== ev.pointerId) return;
-    const dx = ev.clientX - d.startX;
-    const dy = ev.clientY - d.startY;
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-      d.moved = true;
-    }
-    setPan({ x: d.origX + dx, y: d.origY + dy });
-  }, []);
-
-  const handlePointerUp = useCallback((ev: ReactPointerEvent<HTMLDivElement>) => {
-    activePointersRef.current.delete(ev.pointerId);
-    if (activePointersRef.current.size < 2) {
-      pinchStartRef.current = null;
-    }
-    if (dragRef.current.pointerId === ev.pointerId) {
-      dragRef.current.active = false;
-    }
-  }, []);
+  }, [open, zoomIn, zoomOut, resetTransform]);
 
   const handleDownloadSvg = useCallback(() => {
     const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
@@ -296,9 +211,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
           <div className="flex items-center gap-1">
             <button
               type="button"
-              onClick={() =>
-                setZoom((z) => clampZoom(z / 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
-              }
+              onClick={zoomOut}
               className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
               title="Zoom out (-)"
             >
@@ -306,7 +219,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
             </button>
             <button
               type="button"
-              onClick={resetView}
+              onClick={resetTransform}
               title="Reset zoom (0)"
               className="tabular-nums orbit-press text-ink-secondary hover:bg-accent hover:text-ink-primary min-w-[44px] cursor-pointer rounded-md px-1.5 py-1 text-center font-mono text-[11px]"
             >
@@ -314,9 +227,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
             </button>
             <button
               type="button"
-              onClick={() =>
-                setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
-              }
+              onClick={zoomIn}
               className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
               title="Zoom in (+)"
             >
@@ -324,7 +235,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
             </button>
             <button
               type="button"
-              onClick={resetView}
+              onClick={resetTransform}
               className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
               title="Reset view (0)"
             >
@@ -378,24 +289,25 @@ const DiagramLightbox = memo(function DiagramLightbox({
 
         <div
           ref={setViewportEl}
-          className="bg-surface-recessed/45 flex min-h-0 flex-1 cursor-grab touch-none items-center justify-center overflow-hidden p-8 active:cursor-grabbing"
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerUp}
+          className={cn(
+            "bg-surface-recessed/45 flex min-h-0 flex-1 touch-none items-center justify-center overflow-hidden p-8",
+            isDragging ? "cursor-grabbing" : "cursor-grab",
+          )}
+          {...pointerHandlers}
           onDoubleClick={() => {
             if (zoom !== 1 || pan.x !== 0 || pan.y !== 0) {
-              resetView();
+              resetTransform();
             } else {
               setZoom(1.6);
             }
           }}
         >
           <div
+            ref={diagramCardRef}
             className="border-border-subtle bg-surface-raised rounded-2xl border p-6 shadow-md select-none [&>svg]:block [&>svg]:h-auto [&>svg]:max-w-none"
             style={{
               minWidth: Math.min(Math.max(naturalWidth, 320), 960),
-              transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+              ...transformStyle,
               transformOrigin: "center center",
               willChange: "transform",
             }}

@@ -3,9 +3,19 @@ title: Personal Agent 与全局调度
 description: 通过唯一常驻的 Personal Agent 跨主机调度 Claude Code、Codex、Antigravity 与 ACP 子代理，并经零公网 Webhook 长连接直连 Slack、Discord 与飞书 / Lark。
 ---
 
-Orbit 最核心的架构设计是 **Personal Router（`AgentRole::PersonalRouter`）**——一个跨越全部机器、全天候在线的 **Personal Agent**，作为你多主机编码舰队的统一协调入口。
+Orbit 最核心的架构设计是 **Personal Agent**（内部角色 `AgentRole::PersonalRouter`）——一个跨越全部机器、全天候在线的全局协调入口。
 
 与其在本地终端、SSH 窗口和浏览器之间充当「人工剪贴板」，你只需与这**一个常驻协调者**对话：它能直接看到全部在线主机上的项目与子代理状态，自动按专长并行或接力派发任务、挂起条件唤醒定时器，并且只在需要人工拍板的高风险节点推送决策。
+
+## Personal Agent 主页与简报栏（Briefing Rail）
+
+在桌面端侧栏点击 **Personal Agent**（或按快捷键 `⌘⇧O` / `Ctrl+Shift+O`）即可直达统一的 Personal Agent 主页：中间为 `740px` 真实对话与完整输入框，右侧为 `304px` 常驻**简报栏**（空分区自动隐藏为 0 高度）：
+
+- **需要你**：汇总 Tier-3 / `human_only` 审批、方案审查与出错 Worker，支持单条一键允许/拒绝/查看、多条低风险批量放行，并内联展示 **PA 建议**（`recommend_permission` 给出的允许/拒绝建议及理由）。
+- **进行中**：按 Personal Agent 跨主机派发的任务分组展示涉及主机、`done/total` 进度、实时 diff 统计与最近步骤；点击任意 Worker 即在右侧 Side Panel 打开实时预览而无需离开 PA 对话（按住 `⌘/Ctrl` 点击可跳转至该会话）。
+- **已替你处理**：记录由 Personal Agent、Guardian Tier-1 或权限规则自动放行/拒绝的审计日志（含时间、Worker、摘要、风险、决策者与理由），支持一键打开对应会话复核。
+- **等待中与主机**：集中展示条件唤醒定时器、进行中的 Goal、后台任务，以及 `在线/总数` 主机状态条（标注 Personal Agent 托管主机）。
+- **离开期间摘要与窄窗口适配**：返回时若期间有新完成的任务或自动决策，对话顶部显示一行可关闭的“你离开期间”摘要；窄窗口下简报栏自动收起为 TopBar 胶囊（如 `2 需要你 · 3 进行中`）并可展开为 Popover；未配置 Personal Agent 时居中展示推荐主机卡片，支持一键启用或跳转自定义设置。
 
 ## 全局主主机选举与跨机上下文注入
 

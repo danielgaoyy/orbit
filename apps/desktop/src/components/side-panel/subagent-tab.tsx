@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
-import { ChevronRight, GitBranch } from "lucide-react";
+import { ArrowUpRight, ChevronRight, GitBranch } from "lucide-react";
 import {
   ConversationViewport,
   useViewportAnchorHold,
@@ -23,9 +23,15 @@ import {
 } from "@/components/stage/stage-helpers";
 import { Button } from "@/components/ui/button";
 import { ContextBanner } from "@/components/ui/context-banner";
+import { IconButton } from "@/components/ui/icon-button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import {
+  type AgentListItemStatus,
+  formatAgentListItemStatusLabel,
+  mapAgentCardToItemStatus,
+} from "@/lib/agent-list-item";
 import { cn } from "@/lib/utils";
 import {
   type AgentCardView,
@@ -126,21 +132,20 @@ function hasProviderContent(turns: StageTurnView[]): boolean {
 
 export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTab }) {
   const { t } = useI18n();
-  const hostId = useOrbitSelector((s) => tab.hostId ?? s.selectedHostId);
+  const hostId = tab.hostId ?? null;
   const isManaged = Boolean(hostId && tab.childAgentId);
-  const parentHostId = useOrbitSelector((s) => isManaged ? (s.selectedHostId ?? hostId) : hostId);
+  const parentHostId = tab.parentHostId ?? hostId;
   const providerId = isManaged ? null : tab.providerSubagentId;
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
   const remoteHostName = useOrbitSelector((s) => {
-    if (!tab.hostId || !s.selectedHostId || tab.hostId === s.selectedHostId) return null;
+    if (!hostId || !parentHostId || hostId === parentHostId) return null;
     return (
-      s.fleet.hosts.find((h) => h.host_id === tab.hostId)?.display_name ??
-      s.hostDetails[tab.hostId]?.host.display_name ??
-      tab.hostId
+      s.fleet.hosts.find((h) => h.host_id === hostId)?.display_name ??
+      s.hostDetails[hostId]?.host.display_name ??
+      hostId
     );
   });
-  const cwd = useOrbitSelector((s) => tab.cwd ?? s.selectedWorkspaceCwd);
-  const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
+  const parentAgentId = tab.parentAgentId ?? tab.agentId ?? null;
   const parentHostRevision = useOrbitSelector((s) =>
     providerId && parentHostId ? (s.hostDetails[parentHostId]?.revision ?? 0) : 0,
   );
@@ -156,6 +161,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tab.childAgentId) ?? null)
       : null,
   );
+  const cwd = tab.cwd || childAgent?.cwd || "~";
   const childStage = useOrbitSelector((s) =>
     hostId && tab.childAgentId
       ? (s.stages[`${hostId}::${tab.childAgentId}`] ?? null)
@@ -177,8 +183,12 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
 
-  const status: "awaiting_permission" | "running" | "completed" | "canceled" | "failed" = childAgent
-    ? mapManagedStatus(childAgent)
+  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const status: AgentListItemStatus = childAgent
+    ? childAgent.parent_agent_id
+      ? mapManagedStatus(childAgent)
+      : mapAgentCardToItemStatus(childAgent)
     : providerSubagent
       ? providerSubagent.status === "running"
         ? "running"
@@ -586,16 +596,17 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   // For multi-level subagent trees (depth >= 2), expose clickable parent crumbs without repeating
   // the current subagent's own title (already shown in the tab strip directly above).
   const ancestorCrumbs = ancestorLineage.length > 2 ? ancestorLineage.slice(0, -1) : [];
-  const statusLabelText =
-    status === "awaiting_permission"
-      ? t("overview.subagentApprovalRequired")
-      : status === "running"
-        ? t("overview.subagentWorking")
-        : status === "failed"
-          ? t("overview.subagentFailed")
-          : status === "canceled"
-            ? t("overview.subagentStopped")
-            : t("overview.subagentFinished");
+  const statusLabelText = formatAgentListItemStatusLabel(status, t);
+  // Top-level standalone/root workers opened from Personal Agent Briefing can be focused in
+  // the main stage, whereas child subagents live exclusively in the Right Side Panel.
+  const canFocusInMainStage = Boolean(
+    isManaged &&
+      hostId &&
+      tab.childAgentId &&
+      childAgent &&
+      !childAgent.parent_agent_id &&
+      !(selectedHostId === hostId && selectedAgentId === tab.childAgentId),
+  );
 
   // Show an actionable fallback banner ONLY when awaiting approval without a live DecisionDock payload
   // (e.g. cold hydration or provider-only subagent whose gate lives on the parent).
@@ -710,32 +721,45 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           )}
         </div>
 
-        <span
-          className={cn(
-            "inline-flex shrink-0 items-center gap-1.5",
-            status === "awaiting_permission"
-              ? "text-signal-warning font-medium"
-              : status === "failed"
-                ? "text-signal-danger"
-                : status === "running"
-                  ? "text-ink-secondary"
-                  : "text-ink-tertiary",
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span
+            className={cn(
+              "inline-flex shrink-0 items-center gap-1.5",
+              status === "awaiting_permission"
+                ? "text-signal-warning font-medium"
+                : status === "failed"
+                  ? "text-signal-danger"
+                  : status === "running"
+                    ? "text-ink-secondary"
+                    : "text-ink-tertiary",
+            )}
+          >
+            {status === "running" && (
+              <span
+                aria-hidden="true"
+                className="bg-signal-success size-[6px] shrink-0 animate-pulse rounded-full motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]"
+              />
+            )}
+            {status === "awaiting_permission" && (
+              <span aria-hidden="true" className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
+            )}
+            {status === "failed" && (
+              <span aria-hidden="true" className="bg-signal-danger size-[6px] shrink-0 rounded-full" />
+            )}
+            <span>{statusLabelText}</span>
+          </span>
+          {canFocusInMainStage && hostId && tab.childAgentId && (
+            <IconButton
+              size="xs"
+              tooltip={t("overview.focusSession")}
+              aria-label={t("overview.focusSession")}
+              onClick={() => orbitActions.selectAgent(hostId, tab.childAgentId!)}
+              className="text-ink-muted hover:text-ink-primary"
+            >
+              <ArrowUpRight className="size-3" />
+            </IconButton>
           )}
-        >
-          {status === "running" && (
-            <span
-              aria-hidden="true"
-              className="bg-signal-success size-[6px] shrink-0 animate-pulse rounded-full motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]"
-            />
-          )}
-          {status === "awaiting_permission" && (
-            <span aria-hidden="true" className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
-          )}
-          {status === "failed" && (
-            <span aria-hidden="true" className="bg-signal-danger size-[6px] shrink-0 rounded-full" />
-          )}
-          <span>{statusLabelText}</span>
-        </span>
+        </div>
       </div>
       {showInlineContextBar && (
         <ContextBanner
@@ -789,7 +813,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                   isManaged
                     ? (childAgent?.status_label ?? null)
                     : status === "running"
-                      ? "Working..."
+                      ? t("stage.working")
                       : null
                 }
                 hasLiveBackgroundTasks={runningBackgroundTasks.length > 0}
@@ -826,7 +850,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
               {t("common.syncing")}
             </div>
           ) : emptyPrompt.trim() ? (
-            <p className="selectable-text text-ink-secondary text-[13px] leading-[1.55] whitespace-pre-wrap break-words">{emptyPrompt}</p>
+            <p className="selectable-text text-ink-secondary font-(family-name:--orbit-font-content) text-(length:--orbit-read-compact) leading-(--orbit-read-compact-leading) whitespace-pre-wrap break-words">{emptyPrompt}</p>
           ) : (
             <div className="text-muted-foreground flex flex-col items-center justify-center gap-2.5 py-20 text-center text-[13px]">
               {status === "running" && <OrbitSpinner size={16} className="text-foreground/65" />}
@@ -835,7 +859,9 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                   ? "Running in an isolated context…"
                   : status === "canceled"
                     ? "Subagent run was canceled."
-                    : "Subagent outputs were folded into the main conversation."}
+                    : status === "idle"
+                      ? t("overview.noTurnsYet")
+                      : "Subagent outputs were folded into the main conversation."}
               </span>
             </div>
           )}

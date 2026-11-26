@@ -32,7 +32,35 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
   } catch {}
 
   let nextCallbackId = 1;
+  let nextEventId = 1;
   const callbacks = new Map();
+  const eventListeners = new Map();
+  let mockZoomPercent = 100;
+  window.smokeZoomCalls = [];
+
+  const buildZoomState = (percent) => ({
+    zoom_percent: percent,
+    min_percent: 80,
+    max_percent: 150,
+    step_percent: 10,
+  });
+
+  const emitMockEvent = (eventName, payload) => {
+    const listeners = eventListeners.get(eventName);
+    if (!listeners) return;
+    for (const [eventId, handlerId] of listeners.entries()) {
+      const entry = callbacks.get(handlerId);
+      if (!entry) continue;
+      if (entry.once) callbacks.delete(handlerId);
+      entry.cb({ event: eventName, id: eventId, payload });
+    }
+  };
+
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener(eventName, eventId) {
+      eventListeners.get(eventName)?.delete(eventId);
+    },
+  };
 
   const mockHost = {
     host_id: "host_smoke_1",
@@ -46,7 +74,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     custom_direct_endpoint: null,
     via_ssh_tunnel: false,
     last_ping_ms: 1,
-    daemon_version: "0.11.6",
+    daemon_version: "0.11.9",
     os_arch: "darwin/aarch64",
     daemon_pubkey_b64: "",
     direct_endpoints: ["127.0.0.1:6868"],
@@ -137,12 +165,45 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     },
     async invoke(cmd, args = {}) {
       switch (cmd) {
+        case "plugin:event|listen": {
+          const eventName = String(args.event ?? "");
+          const id = nextEventId++;
+          if (!eventListeners.has(eventName)) eventListeners.set(eventName, new Map());
+          eventListeners.get(eventName).set(id, args.handler);
+          return id;
+        }
+        case "plugin:event|unlisten": {
+          eventListeners.get(String(args.event ?? ""))?.delete(args.eventId);
+          return null;
+        }
+        case "get_ui_zoom": {
+          window.smokeZoomCalls.push({ cmd, args });
+          return buildZoomState(mockZoomPercent);
+        }
+        case "step_ui_zoom": {
+          window.smokeZoomCalls.push({ cmd, args });
+          const delta = args.delta === 1 ? 1 : args.delta === -1 ? -1 : 0;
+          if (!delta) throw new Error("Invalid zoom step delta");
+          mockZoomPercent = Math.max(80, Math.min(150, mockZoomPercent + delta * 10));
+          const state = buildZoomState(mockZoomPercent);
+          emitMockEvent("orbit://zoom-changed", { ...state, source: args.source || "settings" });
+          return state;
+        }
+        case "set_ui_zoom": {
+          window.smokeZoomCalls.push({ cmd, args });
+          const raw = Number(args.zoomPercent ?? 100);
+          const snapped = Math.round(raw / 10) * 10;
+          mockZoomPercent = Math.max(80, Math.min(150, snapped));
+          const state = buildZoomState(mockZoomPercent);
+          emitMockEvent("orbit://zoom-changed", { ...state, source: args.source || "settings" });
+          return state;
+        }
         case "subscribe_core_events":
           return null;
         case "get_bridge_info":
-          return { protocol_version: 2, core_version: "0.11.6", capabilities: [] };
+          return { protocol_version: 2, core_version: "0.11.9", capabilities: [] };
         case "get_app_version":
-          return "0.11.6";
+          return "0.11.9";
         case "export_host_pairing_uri":
           return "orbit://pair/smoke-fixture";
         case "render_qr_svg":
@@ -198,6 +259,35 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return null;
         case "discover_fleet_router_hosts":
           return [routerHost];
+        case "get_personal_agent_briefing":
+          return {
+            personal_agent: null,
+            needs_you: [],
+            missions: [],
+            other_active: [],
+            waiting: [],
+            hosts: [
+              {
+                host_id: mockHost.host_id,
+                name: mockHost.display_name,
+                online: true,
+                is_personal_agent_host: false,
+              },
+            ],
+            counts: {
+              needs_you: 0,
+              running: 0,
+              done_recent: 0,
+              hosts_online: 1,
+              hosts_total: 1,
+            },
+            since_last_visit: {
+              completed: 0,
+              auto_handled: 0,
+            },
+          };
+        case "list_personal_agent_activity":
+          return [];
         case "get_personal_router_status":
           return {
             config: { enabled: false, provider: "codex", scope: "global_fleet",
@@ -308,6 +398,8 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           };
         case "get_agent_stage_turns_slice":
           return [];
+        case "harvest_conversation":
+        case "reset_workspace_board":
         case "resolve_plan_approval":
           return null;
         case "list_permission_rules":
@@ -711,13 +803,35 @@ function paginatedSessionScript({ longReplies = false } = {}) {
     const replyText = longReplies
       ? `Paginated response ${idx}. `.repeat(200)
       : `Paginated response ${idx}`;
+    const replyBlocks = makeParagraph(replyText);
+    if (longReplies && idx === 119) {
+      replyBlocks.push({
+        kind: "code_block",
+        language: "ts",
+        raw_code: "const orbitZoom = 100;\nconst orbitTextSize = 15;",
+        lines: [
+          {
+            line_number: 1,
+            tokens: [
+              { text: "const orbitZoom = 100;", fg_hex: "#d4d4d8", light_fg_hex: "#27272a", bold: false, italic: false },
+            ],
+          },
+          {
+            line_number: 2,
+            tokens: [
+              { text: "const orbitTextSize = 15;", fg_hex: "#d4d4d8", light_fg_hex: "#27272a", bold: false, italic: false },
+            ],
+          },
+        ],
+      });
+    }
     const replyItem = {
       item_type: "assistant_message",
       seq: replySeq,
       item_id: `m_pag_${idx}`,
       text: replyText,
       streaming: false,
-      blocks: makeParagraph(replyText),
+      blocks: replyBlocks,
       timestamp_ms: 1732360001000 + idx * 1000,
     };
     return {

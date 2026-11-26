@@ -514,6 +514,8 @@ pub struct StartGoalRunRequest {
     pub verify_command: Option<String>,
     pub max_iterations: Option<u32>,
     pub max_duration_secs: Option<u64>,
+    pub replace_existing: bool,
+    pub dispatch_initial_prompt: Option<bool>,
 }
 use orbit_client_core::contract::StartMonitorWatchRequest;
 #[uniffi::remote(Record)]

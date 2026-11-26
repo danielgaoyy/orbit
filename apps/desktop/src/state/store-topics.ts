@@ -20,6 +20,7 @@ export const STORE_TOPICS = [
   "automations",
   "cloud",
   "ui",
+  "zoom",
 ] as const;
 
 export type StoreTopic = (typeof STORE_TOPICS)[number];
@@ -36,6 +37,7 @@ export const TOPIC_BIT: Readonly<Record<StoreTopic, number>> = {
   automations: 1 << 8,
   cloud: 1 << 9,
   ui: 1 << 10,
+  zoom: 1 << 11,
 };
 
 export const ALL_TOPICS_MASK: number = (1 << STORE_TOPICS.length) - 1;
@@ -50,6 +52,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   fleetHydrated: "fleet",
   bootstrapError: "fleet",
   hostDetails: "fleet",
+  primaryRouterHostId: "fleet",
   selectedHostId: "fleet",
   selectedAgentId: "fleet",
   selectedWorkspaceCwd: "fleet",
@@ -96,6 +99,13 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   sidePanelTabs: "workspace",
   activeSidePanelTabId: "workspace",
   sidePanelSplit: "workspace",
+  sidePanelByScope: "workspace",
+  sidePanelScopeKey: "workspace",
+  sidePanelUserDismissed: "workspace",
+  sidePanelClosedTabs: "workspace",
+  sidePanelUnseenTabIds: "workspace",
+  sidePanelCollapsedByResize: "workspace",
+  sidePanelScopeSwitchNonce: "workspace",
   fileViewCache: "workspace",
   fileEditorDrafts: "workspace",
   pendingUnsavedFileAction: "workspace",
@@ -167,6 +177,17 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   terminalScrollback: "preferences",
   terminalThemeMode: "preferences",
   customKeybindings: "preferences",
+  conversationFontSize: "preferences",
+  codeFontSize: "preferences",
+  uiFontId: "preferences",
+  contentFontId: "preferences",
+  codeFontId: "preferences",
+  uiFontCustom: "preferences",
+  contentFontCustom: "preferences",
+  codeFontCustom: "preferences",
+
+  // zoom
+  uiZoomPercent: "zoom",
 
   // updater
   appVersion: "updater",
@@ -199,7 +220,6 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   // ui
   activeView: "ui",
   workspacePanel: "ui",
-  overviewPinnedLanes: "ui",
   settingsSection: "ui",
   instructionsTarget: "ui",
   commandPaletteOpen: "ui",
@@ -208,6 +228,8 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   relayDialogOpen: "ui",
   remoteFolderPickerHostId: "ui",
   exportDialogTarget: "ui",
+  goalEditDialogTarget: "ui",
+  goalReplaceConfirmTarget: "ui",
   copyCodeBlocksTarget: "ui",
   handoffDialogTarget: "ui",
   mediaPreviewTarget: "ui",

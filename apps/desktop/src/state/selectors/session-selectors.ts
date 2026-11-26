@@ -71,7 +71,7 @@ const EMPTY_INSIGHT_SUBAGENTS: readonly SessionSubagentEntryView[] = Object.free
  */
 export function selectSessionSubagents(
   state: Pick<OrbitUiState, "hostDetails" | "fleet" | "archivedSubagents"> &
-    Partial<Pick<OrbitUiState, "stages">>,
+    Partial<Pick<OrbitUiState, "stages" | "archivedThreads">>,
   hostId: string | null,
   agentId: string | null,
   insightsSubagentsOverride?: readonly SessionSubagentEntryView[],
@@ -103,7 +103,13 @@ export function selectSessionSubagents(
     character: characterByKey.get(sa.key)!,
   }));
 
-  const visible = filterVisibleSubagents(all, state.archivedSubagents, hostId, agentId);
+  const visible = filterVisibleSubagents(
+    all,
+    state.archivedSubagents,
+    hostId,
+    agentId,
+    state.archivedThreads,
+  );
 
   let activeCount = 0;
   let awaitingCount = 0;
@@ -434,6 +440,33 @@ export function selectActiveGoalForAgent(
     }
   }
   return null;
+}
+
+/**
+ * Finds the active goal for `agentId`, or falls back to the latest succeeded goal on that session
+ * so the Composer Goal Dock can briefly surface completion before dismissal.
+ */
+export function selectDockGoalForAgent(
+  hostDetail: HostDetailView | null | undefined,
+  agentId: string | null,
+): GoalRunRecord | null {
+  if (!hostDetail || !agentId) return null;
+  const goals = hostDetail.goal_runs;
+  if (!goals || goals.length === 0) return null;
+  let latestSucceeded: GoalRunRecord | null = null;
+  for (const g of goals) {
+    if (g.agent_id !== agentId) continue;
+    if (ACTIVE_GOAL_STATUSES_LOOKUP.has(g.status)) {
+      return g;
+    }
+    if (
+      g.status === "succeeded" &&
+      (!latestSucceeded || (g.finished_at_ms ?? g.updated_at_ms) > (latestSucceeded.finished_at_ms ?? latestSucceeded.updated_at_ms))
+    ) {
+      latestSucceeded = g;
+    }
+  }
+  return latestSucceeded;
 }
 
 /**

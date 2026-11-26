@@ -1,10 +1,8 @@
-import { memo, useState, type ReactNode } from "react";
+import { memo, useState, type MouseEvent, type ReactNode } from "react";
 import {
-  AlarmClock,
   ArrowUpRight,
   Blocks,
   CheckCircle2,
-  ChevronRight,
   Clock,
   Code2,
   ExternalLink,
@@ -14,20 +12,20 @@ import {
   Link2,
   MessageCircleQuestion,
   Pause,
+  Pencil,
   Play,
   Square,
   Target,
   Timer,
   X,
 } from "lucide-react";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import {
+  StageRailExpandFooter,
+  StageRailSection,
+} from "@/components/ui/stage-rail-primitives";
 import { useI18n } from "@/lib/i18n";
 import { useLiveSecondClock } from "@/lib/live-clock";
 import {
@@ -42,6 +40,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
+import { computeGoalElapsedSecs, countGoalCriteria, formatGoalDuration } from "@/lib/goal-format";
 import type { OverviewLinkItem } from "@/state/selectors/session-selectors";
 import {
   type OverviewSectionId,
@@ -107,14 +106,24 @@ const TimerCountdownLabel = memo(function TimerCountdownLabel({
 export const OverviewGoalRow = memo(function OverviewGoalRow({
   hostId,
   goal,
+  contextLabel,
+  onSelect,
 }: {
   hostId: string;
   goal: GoalRunRecord;
+  /** Optional owner/host context appended in the metadata line (e.g. in cross-host Briefing Rail). */
+  contextLabel?: string | null;
+  /** Optional primary click handler (kept independent from hover action IconButtons). */
+  onSelect?: (e: MouseEvent<HTMLButtonElement>) => void;
 }) {
   const { t } = useI18n();
   const [busyAction, setBusyAction] = useState<GoalControlAction | null>(null);
   const isPaused = goal.status === "paused";
   const isVerifying = goal.status === "verifying";
+  const isLive = goal.status === "running" || isVerifying;
+  const nowMs = useLiveSecondClock(isLive);
+  const elapsedLabel = formatGoalDuration(computeGoalElapsedSecs(goal, isLive ? nowMs : Date.now()));
+  const { passed, total } = countGoalCriteria(goal);
 
   const handleControl = async (action: GoalControlAction) => {
     setBusyAction(action);
@@ -125,54 +134,85 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
     }
   };
 
+  const tooltip = goal.pause_reason
+    ? `${goal.objective}\n${goal.pause_reason}`
+    : goal.verify_command
+      ? `${goal.objective}\n${t("overview.goalVerifyPrefix", { command: goal.verify_command })}`
+      : goal.objective;
+
+  const content = (
+    <>
+      <span className="mt-[4px] flex size-[14px] shrink-0 items-center justify-center">
+        <span
+          className={cn(
+            "size-[6px] rounded-full",
+            isVerifying
+              ? "bg-signal-info animate-pulse"
+              : isPaused
+                ? "bg-signal-warning"
+                : "bg-signal-success animate-pulse",
+          )}
+        />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="text-ink-primary truncate text-[13px] leading-[18px] font-medium">
+          {goal.objective}
+        </div>
+        <div className="text-ink-tertiary flex min-w-0 items-center gap-1.5 text-[11px] leading-[15px]">
+          <Target className="size-[11px] shrink-0 opacity-75" />
+          <span className="shrink-0">
+            {isVerifying
+              ? t("overview.goalStatusVerifying")
+              : isPaused
+                ? t("overview.goalStatusPaused")
+                : t("overview.goalStatusRunning")}
+          </span>
+          {total > 0 && (
+            <>
+              <span className="shrink-0 opacity-45">·</span>
+              <span className="shrink-0 font-mono tabular-nums">
+                {passed}/{total}
+              </span>
+            </>
+          )}
+          <span className="shrink-0 opacity-45">·</span>
+          <span className="shrink-0 font-mono tabular-nums">{elapsedLabel}</span>
+          {contextLabel && (
+            <>
+              <span className="shrink-0 opacity-45">·</span>
+              <span className="min-w-0 truncate">{contextLabel}</span>
+            </>
+          )}
+        </div>
+        {isPaused && goal.pause_reason && (
+          <div className="text-signal-warning mt-0.5 truncate text-[11px] leading-[14px]">
+            {goal.pause_reason}
+          </div>
+        )}
+      </div>
+    </>
+  );
+
   return (
     <div
-      title={
-        goal.verify_command
-          ? `${goal.objective}\n${t("overview.goalVerifyPrefix", { command: goal.verify_command })}`
-          : goal.objective
-      }
+      title={onSelect ? undefined : tooltip}
       className="group/goalrow hover:bg-accent/70 relative flex min-h-[38px] w-full items-center gap-2 rounded-[8px] px-2 py-1.5 transition-colors"
     >
-      <div className="flex min-w-0 flex-1 items-start gap-2">
-        <span className="mt-[4px] flex size-[14px] shrink-0 items-center justify-center">
-          <span
-            className={cn(
-              "size-[6px] rounded-full",
-              isVerifying
-                ? "bg-signal-info animate-pulse"
-                : isPaused
-                  ? "bg-signal-warning"
-                  : "bg-signal-success animate-pulse",
-            )}
-          />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-ink-primary truncate text-[13px] leading-[18px] font-medium">
-            {goal.objective}
-          </div>
-          <div className="text-ink-tertiary flex items-center gap-1.5 text-[11px] leading-[15px]">
-            <Target className="size-[11px] shrink-0 opacity-75" />
-            <span>
-              {isVerifying
-                ? t("overview.goalStatusVerifying")
-                : isPaused
-                  ? t("overview.goalStatusPaused")
-                  : t("overview.goalStatusRunning")}
-            </span>
-            <span className="opacity-45">·</span>
-            <span className="font-mono tabular-nums">
-              {t("overview.goalIteration", {
-                current: goal.current_iteration,
-                max: goal.max_iterations,
-              })}
-            </span>
-          </div>
-        </div>
-      </div>
+      {onSelect ? (
+        <button
+          type="button"
+          title={tooltip}
+          onClick={onSelect}
+          className="focus-visible:ring-ring/50 flex min-w-0 flex-1 cursor-pointer items-start gap-2 rounded-[6px] text-left outline-none focus-visible:ring-2"
+        >
+          {content}
+        </button>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-start gap-2">{content}</div>
+      )}
 
       <div className="bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs transition-opacity duration-150 motion-reduce:transition-none group-focus-within/goalrow:pointer-events-auto group-focus-within/goalrow:opacity-100 group-hover/goalrow:pointer-events-auto group-hover/goalrow:opacity-100">
-        {!isVerifying && (
+        {!isVerifying && goal.verify_command && (
           <IconButton
             size="xs"
             tooltip={t("overview.verifyNow")}
@@ -192,6 +232,14 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
         </IconButton>
         <IconButton
           size="xs"
+          tooltip={t("goal.editAction")}
+          disabled={busyAction !== null}
+          onClick={() => orbitActions.openGoalEditDialog(hostId, goal)}
+        >
+          <Pencil className="size-3" />
+        </IconButton>
+        <IconButton
+          size="xs"
           tone="danger"
           tooltip={t("overview.stopGoal")}
           disabled={busyAction !== null}
@@ -207,25 +255,48 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
 export const ArmedTimerRow = memo(function ArmedTimerRow({
   hostId,
   timer,
+  contextLabel,
+  onSelect,
 }: {
   hostId: string;
   timer: ConditionalTimerRecord;
+  /** Optional target agent/host label shown alongside the timer condition in Briefing Rail. */
+  contextLabel?: string | null;
+  /** Optional primary click handler (kept independent from hover Run/Cancel IconButtons). */
+  onSelect?: (e: MouseEvent<HTMLButtonElement>) => void;
 }) {
   const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   const conditionLabel = formatTimerConditionLabel(timer.condition);
+  const detailText = contextLabel ? `${contextLabel} · ${conditionLabel}` : conditionLabel;
+  const tooltip = contextLabel ? `${contextLabel}\n${timer.prompt}` : timer.prompt;
+
+  const content = (
+    <>
+      <Timer className="text-signal-info size-[13px] shrink-0 stroke-[1.8]" />
+      <TimerCountdownLabel fireAtMs={timer.fire_at_ms} />
+      <span className="text-ink-muted shrink-0">·</span>
+      <span className="text-ink-tertiary min-w-0 truncate text-[11px]">{detailText}</span>
+    </>
+  );
 
   return (
     <div
-      title={timer.prompt}
+      title={onSelect ? undefined : tooltip}
       className="group/timerrow hover:bg-accent/70 relative flex h-[30px] w-full items-center gap-1.5 rounded-[8px] px-2 transition-colors"
     >
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px]">
-        <Timer className="text-signal-info size-[13px] shrink-0 stroke-[1.8]" />
-        <TimerCountdownLabel fireAtMs={timer.fire_at_ms} />
-        <span className="text-ink-muted shrink-0">·</span>
-        <span className="text-ink-tertiary truncate text-[11px]">{conditionLabel}</span>
-      </div>
+      {onSelect ? (
+        <button
+          type="button"
+          title={tooltip}
+          onClick={onSelect}
+          className="focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-[6px] text-left text-[13px] outline-none focus-visible:ring-2"
+        >
+          {content}
+        </button>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px]">{content}</div>
+      )}
       <div className="bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs transition-opacity duration-150 motion-reduce:transition-none group-focus-within/timerrow:pointer-events-auto group-focus-within/timerrow:opacity-100 group-hover/timerrow:pointer-events-auto group-hover/timerrow:opacity-100">
         <IconButton
           size="xs"
@@ -400,6 +471,7 @@ export const OverviewSection = memo(function OverviewSection({
   label,
   count,
   collapsed,
+  tone = "default",
   isRunning = false,
   hasAlert = false,
   runningTone = "spinner",
@@ -413,6 +485,7 @@ export const OverviewSection = memo(function OverviewSection({
   label: string;
   count?: number;
   collapsed: boolean;
+  tone?: "default" | "warning";
   isRunning?: boolean;
   hasAlert?: boolean;
   runningTone?: "spinner" | "emerald" | "info" | "timer";
@@ -422,123 +495,27 @@ export const OverviewSection = memo(function OverviewSection({
   footer?: ReactNode;
   children: ReactNode;
 }) {
-  const { t } = useI18n();
-  const hoverReplacesMeta = Boolean(headerAction && headerActionVisibility === "hover");
-
   return (
-    <Collapsible
-      open={!collapsed}
+    <StageRailSection
+      label={label}
+      count={count}
+      collapsed={collapsed}
       onOpenChange={() => orbitActions.toggleOverviewSection(id)}
-      className={cn(
-        "border-border-subtle border-t px-2 pt-1.5 first:border-t-0",
-        !collapsed && footer ? "pb-0" : "pb-1.5",
-      )}
+      tone={tone}
+      isRunning={isRunning}
+      hasAlert={hasAlert}
+      runningTone={runningTone}
+      trailingMeta={trailingMeta}
+      headerAction={headerAction}
+      headerActionVisibility={headerActionVisibility}
+      footer={footer}
     >
-      <div className="group/sechead hover:bg-accent/65 flex h-[28px] w-full items-center rounded-[8px] pr-1 transition-colors">
-        <CollapsibleTrigger className="group/trigger focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-[8px] pr-1 pl-2 text-left outline-none focus-visible:ring-2">
-          <span className="text-ink-tertiary group-hover/sechead:text-ink-primary truncate text-[11px] font-medium tracking-[0.03em] uppercase transition-colors">
-            {label}
-          </span>
-          {typeof count === "number" && (
-            <span className="text-ink-muted font-mono text-[11px] tabular-nums">
-              {count}
-            </span>
-          )}
-        </CollapsibleTrigger>
-
-        <div className="flex shrink-0 items-center gap-1">
-          {hoverReplacesMeta ? (
-            <div className="grid items-center justify-items-end">
-              {(trailingMeta || (collapsed && (hasAlert || isRunning))) && (
-                <div className="col-start-1 row-start-1 flex items-center gap-1 transition-opacity duration-150 motion-reduce:transition-none group-focus-within/sechead:pointer-events-none group-focus-within/sechead:opacity-0 group-hover/sechead:pointer-events-none group-hover/sechead:opacity-0 [@media(hover:none)]:pointer-events-none [@media(hover:none)]:opacity-0">
-                  {trailingMeta && <span className="flex items-center">{trailingMeta}</span>}
-                  {collapsed && (hasAlert || isRunning) && (
-                    <span className="flex items-center">
-                      {hasAlert ? (
-                        <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
-                      ) : runningTone === "emerald" ? (
-                        <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
-                      ) : runningTone === "info" ? (
-                        <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />
-                      ) : runningTone === "timer" ? (
-                        <AlarmClock className="text-ink-faint size-[11.5px] shrink-0 stroke-[1.7]" />
-                      ) : (
-                        <OrbitSpinner size={12} className="text-ink-secondary" />
-                      )}
-                    </span>
-                  )}
-                </div>
-              )}
-              <div className="pointer-events-none col-start-1 row-start-1 flex items-center opacity-0 transition-opacity duration-150 motion-reduce:transition-none group-focus-within/sechead:pointer-events-auto group-focus-within/sechead:opacity-100 group-hover/sechead:pointer-events-auto group-hover/sechead:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
-                {headerAction}
-              </div>
-            </div>
-          ) : (
-            <>
-              {headerAction && <div className="flex items-center">{headerAction}</div>}
-              {trailingMeta && <span className="flex items-center">{trailingMeta}</span>}
-              {collapsed && (hasAlert || isRunning) && (
-                <span className="flex items-center">
-                  {hasAlert ? (
-                    <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
-                  ) : runningTone === "emerald" ? (
-                    <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
-                  ) : runningTone === "info" ? (
-                    <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />
-                  ) : runningTone === "timer" ? (
-                    <AlarmClock className="text-ink-faint size-[11.5px] shrink-0 stroke-[1.7]" />
-                  ) : (
-                    <OrbitSpinner size={12} className="text-ink-secondary" />
-                  )}
-                </span>
-              )}
-            </>
-          )}
-          <CollapsibleTrigger
-            aria-label={t("overview.toggleSection", { label })}
-            className="group/trigger text-ink-muted inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[6px] outline-none"
-          >
-            <ChevronRight className="size-3 shrink-0 transition-transform duration-[180ms] ease-[var(--ease-panel)] motion-reduce:transition-none group-data-[panel-open]/trigger:rotate-90" />
-          </CollapsibleTrigger>
-        </div>
-      </div>
-
-      <CollapsibleContent>
-        <div className="pt-1">{children}</div>
-        {footer}
-      </CollapsibleContent>
-    </Collapsible>
+      {children}
+    </StageRailSection>
   );
 });
 
-export const OverviewExpandFooter = memo(function OverviewExpandFooter({
-  expanded,
-  hiddenCount,
-  onToggle,
-}: {
-  expanded: boolean;
-  hiddenCount: number;
-  onToggle: () => void;
-}) {
-  const { t } = useI18n();
-  return (
-    <div
-      className={cn(
-        expanded
-          ? "bg-[var(--overview-surface,var(--surface-raised))] sticky bottom-0 z-[2] px-2 pt-1 pb-1.5"
-          : "px-2 pt-0.5 pb-1.5",
-      )}
-    >
-      <button
-        type="button"
-        onClick={onToggle}
-        className="text-ink-tertiary hover:text-ink-primary inline-flex cursor-pointer items-center py-0.5 text-[11px] font-medium transition-colors"
-      >
-        {expanded ? t("overview.showLess") : t("overview.showMore", { count: hiddenCount })}
-      </button>
-    </div>
-  );
-});
+export const OverviewExpandFooter = StageRailExpandFooter;
 
 export const OverviewPullRequestRow = memo(function OverviewPullRequestRow({
   pr,

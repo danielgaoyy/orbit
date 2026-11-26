@@ -1,4 +1,5 @@
 ---
+import OrbitMark from "./OrbitMark.astro";
 import { getLandingCopy, type LandingLang } from "../data/landing-copy";
 import OrbitCommunityIcon from "./OrbitCommunityIcon.astro";
 
@@ -24,20 +25,7 @@ const repoUrl = "https://github.com/danielgaoyy/orbit";
 <nav class="orbit-nav" aria-label="Primary" data-orbit-nav>
   <div class="orbit-nav-inner">
     <a class="orbit-brand" href={`${prefix}/`}>
-      <svg class="orbit-brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-        <circle cx="14" cy="14" r="10.5" stroke="currentColor" stroke-width="1.5" stroke-opacity="0.35" />
-        <ellipse
-          cx="14"
-          cy="14"
-          rx="11.5"
-          ry="4.8"
-          transform="rotate(-24 14 14)"
-          stroke="currentColor"
-          stroke-width="1.6"
-        />
-        <circle cx="14" cy="14" r="3.2" fill="currentColor" />
-        <circle cx="23.2" cy="9.8" r="2.1" fill="var(--orbit-accent-cyan)" />
-      </svg>
+      <OrbitMark class="orbit-brand-mark" />
       <span>Orbit</span>
     </a>
 

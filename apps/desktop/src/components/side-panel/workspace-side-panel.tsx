@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Blocks,
   Columns2,
@@ -27,16 +27,20 @@ import { WorkspaceBoardTab } from "@/components/side-panel/workspace-board-tab";
 import { SidePanelLaunchpad } from "@/components/side-panel/side-panel-launchpad";
 import { WorkspacePluginsPopover } from "@/components/side-panel/workspace-plugins-popover";
 import { WorkspaceScriptsPopover } from "@/components/side-panel/scripts-panel";
+import { DragShield } from "@/components/ui/drag-feedback";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
-import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import { ResizeSash } from "@/components/ui/resize-sash";
+import { SubagentAvatar, type SubagentAvatarStatus } from "@/components/ui/subagent-avatar";
+import { mapAgentCardToItemStatus } from "@/lib/agent-list-item";
+import { useInlineSortable } from "@/lib/drag/use-inline-sortable";
 import type {
   HostCardView,
   HostDetailView,
   SessionSubagentEntryView,
 } from "@/lib/orbit-ipc";
 import { getSubagentCharacterById } from "@/lib/subagent-avatar";
-import type { ResolvedSubagentStatus } from "@/lib/subagents";
+import { mapManagedStatus } from "@/lib/subagents";
 import {
   hasCrossHostChildAgents,
   selectSessionSubagents,
@@ -47,15 +51,10 @@ import {
   type SidePanelTab,
   fileCacheKey,
   orbitActions,
-  sideQuestionScopeKey,
+  sidePanelTabScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
-
-interface TabDropIndicator {
-  targetTabId: string;
-  position: "before" | "after";
-}
 
 const EMPTY_INSIGHT_SUBAGENTS: readonly SessionSubagentEntryView[] = [];
 const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = {};
@@ -88,8 +87,8 @@ const SubagentSidePanelTabAvatar = memo(function SubagentSidePanelTabAvatar({
 }: {
   tab: SidePanelTab;
 }) {
-  const hostId = useOrbitSelector((s) => s.selectedHostId);
-  const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
+  const hostId = tab.parentHostId ?? tab.hostId ?? null;
+  const parentAgentId = tab.parentAgentId ?? tab.agentId ?? null;
   const insightSubagents = useOrbitSelector((s) =>
     hostId && parentAgentId
       ? (s.stages[`${hostId}::${parentAgentId}`]?.insights?.subagents ?? EMPTY_INSIGHT_SUBAGENTS)
@@ -130,14 +129,27 @@ const SubagentSidePanelTabAvatar = memo(function SubagentSidePanelTabAvatar({
         (tab.providerSubagentId && sa.providerSubagentId === tab.providerSubagentId) ||
         (tab.subagentCallId && sa.callId === tab.subagentCallId),
     );
-    if (!matched) return "";
-    return `${matched.character.id}\0${matched.status}`;
+    if (matched) {
+      return `${matched.character.id}\0${matched.status}`;
+    }
+    if (tab.hostId && tab.childAgentId) {
+      const directAgent = s.hostDetails[tab.hostId]?.agents.find(
+        (a) => a.agent_id === tab.childAgentId,
+      );
+      if (directAgent) {
+        const directStatus = directAgent.parent_agent_id
+          ? mapManagedStatus(directAgent)
+          : mapAgentCardToItemStatus(directAgent);
+        return `\0${directStatus}`;
+      }
+    }
+    return "";
   });
 
   const sepIdx = avatarKey.indexOf("\0");
   const character =
     sepIdx > 0 ? (getSubagentCharacterById(avatarKey.slice(0, sepIdx)) ?? undefined) : undefined;
-  const status = (sepIdx >= 0 ? avatarKey.slice(sepIdx + 1) : "completed") as ResolvedSubagentStatus;
+  const status = (sepIdx >= 0 ? avatarKey.slice(sepIdx + 1) : "completed") as SubagentAvatarStatus;
 
   const fallbackSeed =
     tab.childAgentId || tab.providerSubagentId || tab.subagentCallId || tab.title;
@@ -203,33 +215,33 @@ function resolveSidePanelTabTitle(
 
 function renderTransientTabBody(
   tab: SidePanelTab,
-  selectedHostId: string,
-  selectedWorkspaceCwd: string,
+  scopeResetPrefix: string,
   paneStyle: CSSProperties | undefined,
   paneClassName: string,
 ) {
   switch (tab.kind) {
     case "files":
       return (
-        <div key={tab.id} style={paneStyle} className={paneClassName}>
+        <div key={`${scopeResetPrefix}:${tab.id}`} style={paneStyle} className={paneClassName}>
           <PanelErrorBoundary
             panelName="Files"
-            resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+            resetKey={`${scopeResetPrefix}:${tab.hostId ?? ""}:${tab.cwd ?? ""}`}
           >
-            <FilesExplorerTab />
+            <FilesExplorerTab tab={tab} />
           </PanelErrorBoundary>
         </div>
       );
     case "file":
       return (
         <div
-          key={`${tab.id}:${tab.filePath ?? ""}`}
+          key={`${scopeResetPrefix}:${tab.id}:${tab.filePath ?? ""}`}
           style={paneStyle}
           className={paneClassName}
         >
           <PanelErrorBoundary
-            key={`${tab.id}:${tab.filePath ?? ""}`}
+            key={`${scopeResetPrefix}:${tab.id}:${tab.filePath ?? ""}`}
             panelName="File Viewer"
+            resetKey={`${scopeResetPrefix}:${tab.id}:${tab.filePath ?? ""}`}
           >
             <FileViewerTab tab={tab} />
           </PanelErrorBoundary>
@@ -240,16 +252,20 @@ function renderTransientTabBody(
         <div key={tab.id} style={paneStyle} className={paneClassName}>
           <PanelErrorBoundary
             panelName="Side Question"
-            resetKey={`${selectedHostId}:${tab.id}`}
+            resetKey={`${scopeResetPrefix}:${tab.id}`}
           >
-            <SideQuestionTab />
+            <SideQuestionTab tab={tab} />
           </PanelErrorBoundary>
         </div>
       );
     case "subagent":
       return (
         <div key={tab.id} style={paneStyle} className={paneClassName}>
-          <PanelErrorBoundary key={tab.id} panelName="Subagent">
+          <PanelErrorBoundary
+            key={`${scopeResetPrefix}:${tab.id}`}
+            panelName="Subagent"
+            resetKey={`${scopeResetPrefix}:${tab.id}`}
+          >
             <SubagentTab tab={tab} />
           </PanelErrorBoundary>
         </div>
@@ -257,7 +273,11 @@ function renderTransientTabBody(
     case "peer":
       return (
         <div key={tab.id} style={paneStyle} className={paneClassName}>
-          <PanelErrorBoundary key={tab.id} panelName="Peer Split">
+          <PanelErrorBoundary
+            key={`${scopeResetPrefix}:${tab.id}`}
+            panelName="Peer Split"
+            resetKey={`${scopeResetPrefix}:${tab.id}`}
+          >
             <PeerSplitTab tab={tab} />
           </PanelErrorBoundary>
         </div>
@@ -265,7 +285,11 @@ function renderTransientTabBody(
     case "artifacts":
       return (
         <div key={tab.id} style={paneStyle} className={paneClassName}>
-          <PanelErrorBoundary key={tab.id} panelName="Artifacts">
+          <PanelErrorBoundary
+            key={`${scopeResetPrefix}:${tab.id}`}
+            panelName="Artifacts"
+            resetKey={`${scopeResetPrefix}:${tab.id}`}
+          >
             <ArtifactsTab tab={tab} />
           </PanelErrorBoundary>
         </div>
@@ -318,7 +342,8 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   } = useWorkspaceMotion();
 
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
-  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const sidePanelScopeKey = useOrbitSelector((s) => s.sidePanelScopeKey);
+  const scopeResetPrefix = sidePanelScopeKey ?? "";
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
   const sidePanelSplit = useOrbitSelector((s) => s.sidePanelSplit);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
@@ -327,48 +352,63 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   const panelElRef = useRef<HTMLElement | null>(null);
   const bodyElRef = useRef<HTMLDivElement | null>(null);
   const tabStripRef = useRef<HTMLDivElement | null>(null);
-  const tabElRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const suppressNextTabClickRef = useRef(false);
-  const tabDragCleanupRef = useRef<(() => void) | null>(null);
-  const splitResizeCleanupRef = useRef<(() => void) | null>(null);
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
 
-  const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
-  const [tabDropIndicator, setTabDropIndicator] = useState<TabDropIndicator | null>(null);
   const [isResizingSplit, setIsResizingSplit] = useState(false);
 
+  const tabIds = useMemo(() => tabs.map((tab) => tab.id), [tabs]);
+  const tabSortable = useInlineSortable({
+    axis: "x",
+    itemIds: tabIds,
+    scrollViewportRef: tabStripRef,
+    ignoreSelector: "button",
+    onCommit: (fromIndex, toIndex) => {
+      const currentTabs = tabsRef.current;
+      const src = currentTabs[fromIndex];
+      const dst = currentTabs[toIndex];
+      if (src && dst) {
+        orbitActions.reorderSidePanelTabs(
+          src.id,
+          dst.id,
+          toIndex > fromIndex ? "after" : "before",
+        );
+      }
+    },
+  });
+
+  const sideQuestionTab = tabs.find((t) => t.kind === "side_question") ?? null;
+  const sideQuestionTabScope = sideQuestionTab ? sidePanelTabScopeKey(sideQuestionTab) : null;
+  const terminalTab = tabs.find((t) => t.kind === "terminal") ?? null;
+  const terminalHostId = terminalTab?.hostId ?? selectedHostId;
+  const artifactsTab = tabs.find((t) => t.kind === "artifacts") ?? null;
+  const artifactsHostId = artifactsTab?.hostId ?? selectedHostId;
+  const artifactsAgentId = artifactsTab?.agentId ?? null;
+  const artifactsWorkspaceId = artifactsTab?.workspaceId ?? "";
+
   const hasStreamingSideQuestion = useOrbitSelector((s) => {
-    const scope = sideQuestionScopeKey(s);
-    const list = s.sideQuestionsByScope[scope];
+    if (!sideQuestionTabScope) return false;
+    const list = s.sideQuestionsByScope[sideQuestionTabScope];
     return Boolean(list?.some((e) => e.status === "streaming"));
   });
   const activeTerminalCount = useOrbitSelector(
-    (s) => s.terminalTabs.filter((t) => t.hostId === selectedHostId).length,
+    (s) => s.terminalTabs.filter((t) => t.hostId === terminalHostId).length,
   );
   const totalTerminalCount = useOrbitSelector((s) => s.terminalTabs.length);
   const artifactCount = useOrbitSelector((s) => {
-    const detail = s.hostDetails[selectedHostId];
+    const detail = s.hostDetails[artifactsHostId];
     const all = detail?.artifacts ?? [];
     if (all.length === 0) return 0;
-    const activeAg =
-      !s.isDraftNewSession && s.selectedAgentId
-        ? detail?.agents.find((a) => a.agent_id === s.selectedAgentId)
-        : null;
-    if (activeAg?.workspace_id) {
-      const wsCount = all.filter((a) => a.workspace_id === activeAg.workspace_id).length;
+    const boundAg = artifactsAgentId
+      ? detail?.agents.find((a) => a.agent_id === artifactsAgentId)
+      : null;
+    const wsId = artifactsWorkspaceId || boundAg?.workspace_id || "";
+    if (wsId) {
+      const wsCount = all.filter((a) => a.workspace_id === wsId).length;
       if (wsCount > 0) return wsCount;
     }
     return all.length;
   });
-
-  const resizeCleanupRef = useRef<(() => void) | null>(null);
-
-  useEffect(() => {
-    return () => {
-      resizeCleanupRef.current?.();
-      tabDragCleanupRef.current?.();
-      splitResizeCleanupRef.current?.();
-    };
-  }, []);
 
   // Keep the active side-panel tab scrolled into view when multiple tabs overflow horizontally
   useEffect(() => {
@@ -406,9 +446,8 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     return null;
   };
 
-  const hasTerminalTabInBar = tabs.some((t) => t.kind === "terminal");
+  const hasTerminalTabInBar = terminalTab !== null;
   const hasAnyPtySession = totalTerminalCount > 0;
-  const terminalTab = tabs.find((t) => t.kind === "terminal") ?? null;
   const terminalSlot = terminalTab ? paneSlotForTab(terminalTab.id) : null;
   const isTerminalVisible = terminalSlot !== null;
 
@@ -419,194 +458,61 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
 
   const boardTabs = tabs.filter((t) => t.kind === "board");
 
-  // Pointer-driven zero-rerender horizontal tab drag-reordering (works cleanly in macOS WKWebView)
-  const startTabDrag = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>, sourceTabId: string) => {
-      if (e.button !== 0 || tabs.length < 2) return;
-      if ((e.target as HTMLElement | null)?.closest("button")) return;
+  const splitRatioRef = useRef(splitRatio);
+  splitRatioRef.current = splitRatio;
 
-      tabDragCleanupRef.current?.();
-      const startX = e.clientX;
-      let hasMoved = false;
-      let latestIndicator: TabDropIndicator | null = null;
-
-      const resolveDropTarget = (clientX: number): TabDropIndicator | null => {
-        let best: { id: string; pos: "before" | "after"; dist: number } | null = null;
-        for (const [id, el] of tabElRefs.current.entries()) {
-          if (id === sourceTabId || !el.isConnected) continue;
-          const rect = el.getBoundingClientRect();
-          const mid = rect.left + rect.width * 0.5;
-          const dist = Math.abs(clientX - mid);
-          if (best === null || dist < best.dist) {
-            best = { id, pos: clientX < mid ? "before" : "after", dist };
-          }
-        }
-        return best ? { targetTabId: best.id, position: best.pos } : null;
-      };
-
-      const onMove = (ev: PointerEvent) => {
-        if (!hasMoved) {
-          if (Math.abs(ev.clientX - startX) < 5) return;
-          hasMoved = true;
-          setDraggingTabId(sourceTabId);
-          document.body.style.cursor = "grabbing";
-        }
-        const next = resolveDropTarget(ev.clientX);
-        if (
-          next?.targetTabId !== latestIndicator?.targetTabId ||
-          next?.position !== latestIndicator?.position
-        ) {
-          latestIndicator = next;
-          setTabDropIndicator(next);
-        }
-      };
-
-      const cleanup = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        window.removeEventListener("pointercancel", onCancel);
-        window.removeEventListener("blur", onCancel);
-        document.body.style.cursor = "";
-        setDraggingTabId(null);
-        setTabDropIndicator(null);
-        if (tabDragCleanupRef.current === cleanup) {
-          tabDragCleanupRef.current = null;
-        }
-      };
-
-      const onUp = () => {
-        if (hasMoved) {
-          suppressNextTabClickRef.current = true;
-          if (latestIndicator) {
-            orbitActions.reorderSidePanelTabs(
-              sourceTabId,
-              latestIndicator.targetTabId,
-              latestIndicator.position,
-            );
-          }
-          window.requestAnimationFrame(() => {
-            suppressNextTabClickRef.current = false;
-          });
-        }
-        cleanup();
-      };
-
-      const onCancel = () => {
-        cleanup();
-      };
-
-      tabDragCleanupRef.current = cleanup;
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
-      window.addEventListener("pointercancel", onCancel);
-      window.addEventListener("blur", onCancel);
-    },
-    [tabs.length],
+  const handlePanelDragStart = useCallback(
+    () => Math.round(panelElRef.current?.getBoundingClientRect().width ?? 480),
+    [],
   );
 
-  const startSplitResize = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.button !== 0 || !bodyElRef.current) return;
-    e.preventDefault();
-    splitResizeCleanupRef.current?.();
-    const rect = bodyElRef.current.getBoundingClientRect();
-    if (rect.width <= 0) return;
+  const handlePanelDragMove = useCallback((delta: number, startW: number) => {
+    orbitActions.setSidePanelWidth(startW - delta, false);
+  }, []);
 
-    setIsResizingSplit(true);
-    document.body.style.cursor = "col-resize";
+  const handlePanelDragCommit = useCallback((delta: number, startW: number) => {
+    orbitActions.setSidePanelWidth(startW - delta, true);
+  }, []);
 
-    let rafId: number | null = null;
-    let latestRatio = splitRatio;
+  const handlePanelDragCancel = useCallback((startW: number) => {
+    orbitActions.setSidePanelWidth(startW, false);
+  }, []);
 
-    const onMove = (ev: MouseEvent) => {
-      latestRatio = (ev.clientX - rect.left) / rect.width;
-      if (rafId === null) {
-        rafId = window.requestAnimationFrame(() => {
-          rafId = null;
-          orbitActions.setSidePanelSplitRatio(latestRatio);
-        });
-      }
-    };
+  const handlePanelKeyboardStep = useCallback((mult: number) => {
+    const cur = Math.round(panelElRef.current?.getBoundingClientRect().width ?? 480);
+    orbitActions.setSidePanelWidth(cur - mult * 16, true);
+  }, []);
 
-    const cleanup = () => {
-      if (rafId !== null) {
-        window.cancelAnimationFrame(rafId);
-        rafId = null;
-      }
-      setIsResizingSplit(false);
-      document.body.style.cursor = "";
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", cleanup);
-      window.removeEventListener("blur", cleanup);
-      if (splitResizeCleanupRef.current === cleanup) {
-        splitResizeCleanupRef.current = null;
-      }
-    };
-
-    splitResizeCleanupRef.current = cleanup;
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", cleanup);
-    window.addEventListener("blur", cleanup);
-  };
-
-  const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    if (e.detail >= 2) {
-      e.preventDefault();
-      return;
-    }
-    e.preventDefault();
-    resizeCleanupRef.current?.();
-    const startX = e.clientX;
-    const startW = Math.round(panelElRef.current?.getBoundingClientRect().width ?? 480);
-    let latestW = startW;
-    let hasMoved = false;
-    let rafId: number | null = null;
-
-    const onMove = (ev: MouseEvent) => {
-      const delta = startX - ev.clientX;
-      if (!hasMoved) {
-        if (Math.abs(delta) < 2) return;
-        hasMoved = true;
-        setIsResizingRight(true);
-        document.body.style.cursor = "col-resize";
-      }
-      latestW = startW + delta;
-      if (rafId === null) {
-        rafId = window.requestAnimationFrame(() => {
-          rafId = null;
-          orbitActions.setSidePanelWidth(latestW, false);
-        });
-      }
-    };
-    const cleanup = () => {
-      if (rafId !== null) {
-        window.cancelAnimationFrame(rafId);
-        rafId = null;
-      }
-      if (hasMoved) {
-        orbitActions.setSidePanelWidth(latestW, true);
-        setIsResizingRight(false);
-        document.body.style.cursor = "";
-      }
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", cleanup);
-      window.removeEventListener("blur", cleanup);
-      if (resizeCleanupRef.current === cleanup) {
-        resizeCleanupRef.current = null;
-      }
-    };
-    resizeCleanupRef.current = cleanup;
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", cleanup);
-    window.addEventListener("blur", cleanup);
-  };
-
-  const handleEqualizeSidePanel = (e: React.MouseEvent<HTMLDivElement>) => {
-    e.preventDefault();
+  const handleEqualizeSidePanel = useCallback(() => {
     const leftEl = sidebarOpen ? document.querySelector<HTMLElement>(".orbit-panel-left") : null;
     const activeLeft = leftEl ? Math.round(leftEl.getBoundingClientRect().width) : 0;
     orbitActions.equalizeSidePanel(window.innerWidth, activeLeft);
-  };
+  }, [sidebarOpen]);
+
+  const handleSplitDragStart = useCallback(() => {
+    const rect = bodyElRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return null;
+    return { width: rect.width, startRatio: splitRatioRef.current };
+  }, []);
+
+  const handleSplitDragMove = useCallback(
+    (delta: number, snap: { width: number; startRatio: number }) => {
+      orbitActions.setSidePanelSplitRatio(snap.startRatio + delta / snap.width);
+    },
+    [],
+  );
+
+  const handleSplitDragCancel = useCallback((snap: { width: number; startRatio: number }) => {
+    orbitActions.setSidePanelSplitRatio(snap.startRatio);
+  }, []);
+
+  const handleSplitReset = useCallback(() => {
+    orbitActions.setSidePanelSplitRatio(0.5);
+  }, []);
+
+  const handleSplitKeyboardStep = useCallback((mult: number) => {
+    orbitActions.setSidePanelSplitRatio(splitRatioRef.current + mult * 0.04);
+  }, []);
 
   const styleForSlot = (slot: "primary" | "secondary" | null): CSSProperties | undefined => {
     if (!isSplitActive || !slot) return undefined;
@@ -638,28 +544,28 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     >
       {/* Left Resize Drag Handle (double-click to split 50/50 with main stage) */}
       {shouldOpen && (
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label={t("sidePanel.resizeAria")}
-          onMouseDown={startResize}
-          onDoubleClick={handleEqualizeSidePanel}
-          className="group/sash absolute top-0 left-0 z-20 flex h-full w-[6px] cursor-col-resize justify-start"
-        >
-          <div className="group-hover/sash:bg-border-strong group-active/sash:bg-ink-muted h-full w-[1.5px] transition-colors duration-150" />
-        </div>
+        <ResizeSash
+          orientation="vertical"
+          variant="edge-start"
+          ariaLabel={t("sidePanel.resizeAria")}
+          title={t("sidePanel.resizeHint")}
+          onDragStart={handlePanelDragStart}
+          onDragMove={handlePanelDragMove}
+          onDragCommit={handlePanelDragCommit}
+          onDragCancel={handlePanelDragCancel}
+          onDraggingChange={setIsResizingRight}
+          onReset={handleEqualizeSidePanel}
+          onKeyboardStep={handlePanelKeyboardStep}
+        />
       )}
 
-      {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow resize events */}
-      {(isResizingRight || isResizingSplit) && (
-        <div className="fixed inset-0 z-50 cursor-col-resize select-none" />
-      )}
+      <DragShield active={tabSortable.isDragging} cursor="grabbing" />
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {shouldRenderBody && (
           <>
             {/* Flush 40px Two-State Side Panel Header Bar (No-Tab vs With-Tab) */}
-            <div className="@container border-border-subtle flex h-[40px] min-w-0 shrink-0 items-center gap-1 border-b pr-[44px] pl-2">
+            <div className="@container border-border-subtle flex h-(--orbit-titlebar-h) min-w-0 shrink-0 items-center gap-1 border-b pr-[44px] pl-2">
               {tabs.length > 0 ? (
                 <>
                   <div
@@ -674,7 +580,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                     }}
                     className="flex h-full min-w-0 items-center gap-0.5 overflow-x-auto pr-2.5 [mask-image:linear-gradient(to_right,black_calc(100%-10px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
                   >
-                    {tabs.map((tab) => {
+                    {tabs.map((tab, idx) => {
                       const isPrimary = tab.id === activeTab?.id;
                       const isSecondary = tab.id === secondaryTab?.id;
                       const isActive = isPrimary || isSecondary;
@@ -683,22 +589,24 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                         (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
 
                       const displayTitle = resolveSidePanelTabTitle(tab, t);
-                      const dropSide =
-                        tabDropIndicator?.targetTabId === tab.id ? tabDropIndicator.position : null;
+                      const isDragged = tabSortable.sortState?.fromIndex === idx;
+                      const isSettling = isDragged && tabSortable.sortState?.phase === "settling";
 
                       return (
                         <div
                           key={tab.id}
-                          ref={(el) => {
-                            if (el) tabElRefs.current.set(tab.id, el);
-                            else tabElRefs.current.delete(tab.id);
-                          }}
+                          ref={(el) => tabSortable.registerItem(tab.id, el)}
                           role="tab"
                           aria-selected={isPrimary}
                           title={tab.filePath || tab.url || displayTitle}
-                          onPointerDown={(e) => startTabDrag(e, tab.id)}
+                          onPointerDown={
+                            tabs.length > 1
+                              ? (e) => tabSortable.handlePointerDown(e, idx)
+                              : undefined
+                          }
+                          onDragStart={(e) => e.preventDefault()}
                           onClick={(e) => {
-                            if (suppressNextTabClickRef.current) return;
+                            if (tabSortable.shouldSuppressClick()) return;
                             if (e.altKey && tabs.length >= 2) {
                               orbitActions.setSidePanelSecondaryTab(tab.id);
                             } else {
@@ -711,28 +619,33 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                               orbitActions.closeSidePanelTab(tab.id);
                             }
                           }}
+                          style={tabSortable.getNeighborStyle(idx)}
                           className={cn(
-                            "group/stab relative inline-flex h-[28px] max-w-[116px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors @[380px]:max-w-[144px] @[480px]:max-w-[168px]",
-                            draggingTabId === tab.id && "opacity-45",
-                            isPrimary
-                              ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
-                              : isSecondary
-                                ? "border-border-default bg-surface-recessed text-ink-primary border font-medium"
-                                : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
+                            "group/stab relative inline-flex h-[28px] max-w-[116px] shrink-0 touch-none cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[12px] [-webkit-user-drag:none] @[380px]:max-w-[144px] @[480px]:max-w-[168px]",
+                            isDragged
+                              ? cn(
+                                  "drag-lifted-surface border-transparent text-ink-primary z-10",
+                                  (isPrimary || isSecondary) && "font-medium",
+                                  !isSettling && "cursor-grabbing",
+                                )
+                              : cn(
+                                  tabSortable.isActive
+                                    ? "transition-transform duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none"
+                                    : "transition-colors",
+                                  isPrimary
+                                    ? "border-transparent bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
+                                    : isSecondary
+                                      ? "border-border-default bg-surface-recessed text-ink-primary font-medium"
+                                      : "text-muted-foreground border-transparent hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
+                                ),
                           )}
                         >
-                          {dropSide === "before" && (
-                            <span className="bg-signal-info pointer-events-none absolute top-1 bottom-1 -left-[1px] z-20 w-[2px] rounded-full" />
-                          )}
-                          {dropSide === "after" && (
-                            <span className="bg-signal-info pointer-events-none absolute top-1 -right-[1px] bottom-1 z-20 w-[2px] rounded-full" />
-                          )}
                           <SidePanelTabIcon tab={tab} />
                           <span className="min-w-0 truncate">{displayTitle}</span>
                           {tab.kind === "file" && tab.filePath && (
                             <FileTabDirtyIndicator
-                              hostId={tab.hostId ?? selectedHostId}
-                              cwd={tab.cwd ?? selectedWorkspaceCwd ?? "~"}
+                              hostId={tab.hostId ?? ""}
+                              cwd={tab.cwd ?? "~"}
                               filePath={tab.filePath}
                               title={t("sidePanel.unsavedChanges")}
                             />
@@ -766,6 +679,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                               isActive
                                 ? "opacity-65 hover:opacity-100"
                                 : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
+                              tabSortable.isActive && "pointer-events-none",
                             )}
                           >
                             <X className="h-[11px] w-[11px]" />
@@ -846,8 +760,15 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                     isTerminalVisible ? "flex flex-1" : "hidden",
                   )}
                 >
-                  <PanelErrorBoundary panelName="Terminal" resetKey={selectedHostId}>
-                    <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
+                  <PanelErrorBoundary
+                    panelName="Terminal"
+                    resetKey={`${scopeResetPrefix}:${terminalHostId}`}
+                  >
+                    <TerminalTab
+                      tab={terminalTab ?? undefined}
+                      selectedHostId={terminalHostId}
+                      visible={isTerminalVisible}
+                    />
                   </PanelErrorBoundary>
                 </div>
               )}
@@ -860,7 +781,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                   const browserVisible = slot !== null;
                   return (
                     <div
-                      key={browserTab.id}
+                      key={`${scopeResetPrefix}:${browserTab.id}`}
                       style={styleForSlot(slot)}
                       className={cn(
                         "min-h-0 min-w-0 flex-col overflow-hidden",
@@ -869,7 +790,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                     >
                       <PanelErrorBoundary
                         panelName="Browser"
-                        resetKey={browserTab.url ?? ""}
+                        resetKey={`${scopeResetPrefix}:${browserTab.url ?? ""}`}
                       >
                         <BrowserTab tab={browserTab} visible={browserVisible} />
                       </PanelErrorBoundary>
@@ -878,7 +799,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 })}
 
               {/* Persistent Review Pool */}
-              {hasReviewTab && (
+              {hasReviewTab && reviewTab && (
                 <div
                   style={styleForSlot(reviewSlot)}
                   className={cn(
@@ -888,11 +809,12 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 >
                   <PanelErrorBoundary
                     panelName="Review"
-                    resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+                    resetKey={`${scopeResetPrefix}:${reviewTab.hostId ?? selectedHostId}:${reviewTab.cwd ?? ""}`}
                   >
                     <ReviewTab
-                      key={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
-                      selectedHostId={selectedHostId}
+                      key={`${scopeResetPrefix}:${reviewTab.hostId ?? selectedHostId}:${reviewTab.cwd ?? ""}`}
+                      tab={reviewTab}
+                      selectedHostId={reviewTab.hostId ?? selectedHostId}
                       visible={isReviewVisible}
                     />
                   </PanelErrorBoundary>
@@ -912,7 +834,10 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                       isBoardVisible ? "flex flex-1" : "hidden",
                     )}
                   >
-                    <PanelErrorBoundary panelName="Workspace Notes">
+                    <PanelErrorBoundary
+                      panelName="Workspace Notes"
+                      resetKey={`${scopeResetPrefix}:${boardTab.id}`}
+                    >
                       <WorkspaceBoardTab tab={boardTab} visible={isBoardVisible} />
                     </PanelErrorBoundary>
                   </div>
@@ -921,25 +846,26 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
 
               {/* Resizable Dual-Split Center Divider (order: 2 between Primary=1 and Secondary=3) */}
               {isSplitActive && (
-                <div
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label={t("sidePanel.resizeSplitAria")}
-                  onMouseDown={startSplitResize}
-                  onDoubleClick={() => orbitActions.setSidePanelSplitRatio(0.5)}
+                <ResizeSash
+                  orientation="vertical"
+                  variant="split"
                   style={{ order: 2 }}
-                  className="group/split-sash border-border-subtle relative flex w-[5px] shrink-0 cursor-col-resize items-center justify-center border-x bg-transparent transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
-                >
-                  <div className="bg-border-default group-hover/split-sash:bg-border-strong h-8 w-[1.5px] rounded-full transition-colors" />
-                </div>
+                  ariaLabel={t("sidePanel.resizeSplitAria")}
+                  title={t("sidePanel.resizeSplitHint")}
+                  onDragStart={handleSplitDragStart}
+                  onDragMove={handleSplitDragMove}
+                  onDragCancel={handleSplitDragCancel}
+                  onDraggingChange={setIsResizingSplit}
+                  onReset={handleSplitReset}
+                  onKeyboardStep={handleSplitKeyboardStep}
+                />
               )}
 
               {/* Transient Primary Tab Body */}
               {activeTab &&
                 renderTransientTabBody(
                   activeTab,
-                  selectedHostId,
-                  selectedWorkspaceCwd,
+                  scopeResetPrefix,
                   primaryPaneStyle,
                   transientClass,
                 )}
@@ -948,14 +874,16 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
               {secondaryTab &&
                 renderTransientTabBody(
                   secondaryTab,
-                  selectedHostId,
-                  selectedWorkspaceCwd,
+                  scopeResetPrefix,
                   secondaryPaneStyle,
                   transientClass,
                 )}
 
               {!activeTab && (
-                <PanelErrorBoundary panelName="Side Panel" resetKey={selectedHostId}>
+                <PanelErrorBoundary
+                  panelName="Side Panel"
+                  resetKey={`${scopeResetPrefix}:${selectedHostId}`}
+                >
                   <SidePanelLaunchpad
                     selectedHostId={selectedHostId}
                     isPanelOpen={shouldOpen}

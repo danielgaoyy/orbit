@@ -197,28 +197,28 @@ export const BrowserTab = memo(function BrowserTab({
   overlayState?: BrowserTabOverlayState;
 }) {
   const { t } = useI18n();
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const selectedHostId = tab.hostId ?? null;
+  const selectedAgentId = tab.agentId ?? null;
+  const selectedWorkspaceCwd = tab.cwd ?? "~";
   const detectedUrls = useOrbitSelector((s) =>
-    s.selectedHostId && s.selectedAgentId
-      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights.detected_local_urls ??
+    selectedHostId && selectedAgentId
+      ? (s.stages[`${selectedHostId}::${selectedAgentId}`]?.insights.detected_local_urls ??
         EMPTY_LOCAL_URLS)
       : EMPTY_LOCAL_URLS,
   );
   const hostCard = useOrbitSelector((s) =>
-    s.selectedHostId
-      ? (s.fleet.hosts.find((h) => h.host_id === s.selectedHostId) ?? null)
+    selectedHostId
+      ? (s.fleet.hosts.find((h) => h.host_id === selectedHostId) ?? null)
       : null,
   );
   const hostBrowser = useOrbitSelector((s) =>
-    s.selectedHostId ? (s.browserByHost[s.selectedHostId] ?? null) : null,
+    selectedHostId ? (s.browserByHost[selectedHostId] ?? null) : null,
   );
   const hostScriptsByWorkspace = useOrbitSelector((s) =>
-    s.selectedHostId
-      ? (s.hostDetails[s.selectedHostId]?.workspace_scripts ?? EMPTY_SCRIPTS_MAP)
+    selectedHostId
+      ? (s.hostDetails[selectedHostId]?.workspace_scripts ?? EMPTY_SCRIPTS_MAP)
       : EMPTY_SCRIPTS_MAP,
   );
-  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
 
   const initialUrl = sanitizeHttpUrl(tab.url ?? "");
   const [mode, setMode] = useState<BrowserPanelMode>("preview");

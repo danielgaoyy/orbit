@@ -85,7 +85,13 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 **硬性禁止**在未同步更新 GitHub Branch Ruleset 的情况下修改或删除 `ci.yml` 中的任何必填 Check 名称！
 若需增删或重命名 `rust-quality-and-unit`、`e2e-regression-matrix` 标签或 `desktop-frontend-build`，**必须在同一 PR 合入前后同步调整 GitHub Ruleset `protect-main-and-master`（ID `27444583`）的 `required_status_checks`**，否则所有 PR 将被永久挂起。
 
-The Rust quality job runs `bash scripts/check-ohos-dts-sync.sh` to verify every N-API method against the checked-in ArkTS declarations, including factories, optional arguments and promise results. After changing the Rust exports, run the script with `--write` to regenerate `index.d.ts`.
+### HarmonyOS PR 验证
+
+Rust 质量任务通过 `bash scripts/check-ohos-dts-sync.sh --print-count` 核对 N-API 声明。脚本先读 crate 根文件，再按路径字典序读取 `src/napi/**/*.rs`。同一类重名或签名漂移会导致失败。修改导出后使用 `--write` 重新生成声明。
+
+[HarmonyOS PR Build](../../.github/workflows/harmony-ci.yml) 在鸿蒙相关 PR 上检查 Rust fixture 可再生性、ArkTS DTO 顶层字段与 d.ts，在宿主验证 500 帧回放后，交叉编译 x86_64 并组装 unsigned debug HAP。工具链沿用 Release 的 Temurin 17 与 API 26（26.0.0.821），关闭 SDK 缓存。该任务独立显示结果，稳定运行两周后再评估纳入 Ruleset。
+
+本机双 ABI 构建使用 `bash apps/harmony/scripts/build-rust-ohos.sh`。该脚本与 Swift/Kotlin 绑定检查 `bash scripts/sync-bindings.sh --check` 均支持 `CARGO_TARGET_DIR`。绑定检查生成到临时目录并比较两端生成树。
 
 [Orbit Patrol’s opt-in workflow](../../.github/workflows/orbit-pr-review.yml.example) runs on read-only pull request events. It builds the reviewer at the trusted base SHA and reads the fork head as Git objects. Download the JSON report from the run artifacts.
 

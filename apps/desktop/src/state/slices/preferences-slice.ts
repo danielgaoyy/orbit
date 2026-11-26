@@ -6,8 +6,20 @@ import {
 import {
   type CloudSyncStatusView,
   type ExternalEditorKind,
+  type UiZoomState,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import {
+  type FontSlot,
+  applyTypography,
+  applyZoomCssVar,
+  normalizeCodeFontSize,
+  normalizeConversationFontSize,
+  normalizeFontId,
+  normalizeZoomPercent,
+  resolveTypography,
+  sanitizeFontName,
+} from "@/lib/typography";
 import {
   type ShortcutActionId,
   SHORTCUT_ACTION_MAP,
@@ -67,17 +79,58 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
      */
     syncAppearanceFromStorage(): void {
       const fresh = loadPrefs();
-      const nextLocale = fresh.locale ? resolveLocale(fresh.locale) : getState().locale;
-      if (nextLocale !== getState().locale) {
+      const cur = getState();
+      const nextLocale = fresh.locale ? resolveLocale(fresh.locale) : cur.locale;
+      if (nextLocale !== cur.locale) {
         setI18nLocale(nextLocale);
       }
-      const nextTheme: ThemeMode = fresh.theme ?? getState().theme;
+      const nextTheme: ThemeMode = fresh.theme ?? cur.theme;
       const nextResolved = resolveTheme(nextTheme);
       applyDocumentTheme(nextResolved);
+
+      const nextConversationFontSize = normalizeConversationFontSize(
+        fresh.conversationFontSize ?? cur.conversationFontSize,
+      );
+      const nextCodeFontSize = normalizeCodeFontSize(fresh.codeFontSize ?? cur.codeFontSize);
+      const nextUiFontId = normalizeFontId("ui", fresh.uiFontId ?? cur.uiFontId);
+      const nextContentFontId = normalizeFontId("content", fresh.contentFontId ?? cur.contentFontId);
+      const nextCodeFontId = normalizeFontId("code", fresh.codeFontId ?? cur.codeFontId);
+      const nextUiFontCustom =
+        fresh.uiFontCustom !== undefined ? sanitizeFontName(fresh.uiFontCustom) : cur.uiFontCustom;
+      const nextContentFontCustom =
+        fresh.contentFontCustom !== undefined
+          ? sanitizeFontName(fresh.contentFontCustom)
+          : cur.contentFontCustom;
+      const nextCodeFontCustom =
+        fresh.codeFontCustom !== undefined
+          ? sanitizeFontName(fresh.codeFontCustom)
+          : cur.codeFontCustom;
+
+      applyTypography(
+        resolveTypography({
+          conversationFontSize: nextConversationFontSize,
+          codeFontSize: nextCodeFontSize,
+          uiFontId: nextUiFontId,
+          contentFontId: nextContentFontId,
+          codeFontId: nextCodeFontId,
+          uiFontCustom: nextUiFontCustom,
+          contentFontCustom: nextContentFontCustom,
+          codeFontCustom: nextCodeFontCustom,
+        }),
+      );
+
       if (
-        nextLocale === getState().locale &&
-        nextTheme === getState().theme &&
-        nextResolved === getState().resolvedTheme
+        nextLocale === cur.locale &&
+        nextTheme === cur.theme &&
+        nextResolved === cur.resolvedTheme &&
+        nextConversationFontSize === cur.conversationFontSize &&
+        nextCodeFontSize === cur.codeFontSize &&
+        nextUiFontId === cur.uiFontId &&
+        nextContentFontId === cur.contentFontId &&
+        nextCodeFontId === cur.codeFontId &&
+        nextUiFontCustom === cur.uiFontCustom &&
+        nextContentFontCustom === cur.contentFontCustom &&
+        nextCodeFontCustom === cur.codeFontCustom
       ) {
         return;
       }
@@ -86,6 +139,14 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
         locale: nextLocale,
         theme: nextTheme,
         resolvedTheme: nextResolved,
+        conversationFontSize: nextConversationFontSize,
+        codeFontSize: nextCodeFontSize,
+        uiFontId: nextUiFontId,
+        contentFontId: nextContentFontId,
+        codeFontId: nextCodeFontId,
+        uiFontCustom: nextUiFontCustom,
+        contentFontCustom: nextContentFontCustom,
+        codeFontCustom: nextCodeFontCustom,
       }));
     },
 
@@ -202,6 +263,53 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
       const order: ThemeMode[] = ["system", "light", "dark"];
       const next = order[(order.indexOf(getState().theme) + 1) % order.length];
       ctx.actions.setTheme(next);
+    },
+
+
+    setConversationFontSize(size: number): void {
+      const normalized = normalizeConversationFontSize(size);
+      const cur = getState();
+      if (cur.conversationFontSize === normalized) return;
+      applyTypography(resolveTypography({ ...cur, conversationFontSize: normalized }));
+      setState((s) => ({ ...s, conversationFontSize: normalized }), true);
+    },
+
+
+    setCodeFontSize(size: number): void {
+      const normalized = normalizeCodeFontSize(size);
+      const cur = getState();
+      if (cur.codeFontSize === normalized) return;
+      applyTypography(resolveTypography({ ...cur, codeFontSize: normalized }));
+      setState((s) => ({ ...s, codeFontSize: normalized }), true);
+    },
+
+
+    setFontChoice(slot: FontSlot, id: string, custom?: string | null): void {
+      const normalizedId = normalizeFontId(slot, id);
+      const cur = getState();
+      const nextCustom =
+        custom !== undefined
+          ? sanitizeFontName(custom)
+          : slot === "ui"
+            ? cur.uiFontCustom
+            : slot === "content"
+              ? cur.contentFontCustom
+              : cur.codeFontCustom;
+      const patch =
+        slot === "ui"
+          ? { uiFontId: normalizedId, uiFontCustom: nextCustom }
+          : slot === "content"
+            ? { contentFontId: normalizedId, contentFontCustom: nextCustom }
+            : { codeFontId: normalizedId, codeFontCustom: nextCustom };
+      applyTypography(resolveTypography({ ...cur, ...patch }));
+      setState((s) => ({ ...s, ...patch }), true);
+    },
+
+
+    applyUiZoomState(zoom: Pick<UiZoomState, "zoom_percent">): void {
+      const normalized = normalizeZoomPercent(zoom.zoom_percent);
+      applyZoomCssVar(normalized);
+      setState((s) => (s.uiZoomPercent === normalized ? s : { ...s, uiZoomPercent: normalized }));
     },
 
 

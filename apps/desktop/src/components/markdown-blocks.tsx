@@ -26,7 +26,7 @@ import {
   groupMarkdownBlocks,
 } from "@/lib/markdown-helpers";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { orbitActions } from "@/state/orbit-store";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   type InlineSpanView,
   type RichBlockView,
@@ -486,11 +486,13 @@ export const HighlightedCodeBlock = memo(
       runTimerRef.current = window.setTimeout(() => setJustRan(false), 1500);
     }, [shellMeta, linkCtx.hostId, linkCtx.cwd]);
 
+    const codeFontSize = useOrbitSelector((s) => s.codeFontSize);
+    const codeLinePx = Math.round(20 * (codeFontSize / 13));
     const showLineNumbers = lines.length > 2;
     const codeBody = (
       <ScrollArea
         orientation="horizontal"
-        viewportClassName="px-3.5 py-3 font-mono text-[13px] leading-[1.6]"
+        viewportClassName="px-3.5 py-3 font-(family-name:--orbit-font-code-surface) text-(length:--orbit-code-size) leading-(--orbit-code-block-leading)"
       >
         {lines.map((line) => (
           <HighlightedCodeLine
@@ -507,7 +509,7 @@ export const HighlightedCodeBlock = memo(
       return codeBody;
     }
 
-    const intrinsicHeight = collapsed ? 40 : Math.max(84, lines.length * 21 + 52);
+    const intrinsicHeight = collapsed ? 40 : Math.max(84, lines.length * (codeLinePx + 1) + 52);
 
     return (
       <div
@@ -663,7 +665,9 @@ const MarkdownTableBlock = memo(
       }
     }, [alignments, headers, rows]);
 
-    const intrinsicHeight = Math.max(96, (rows.length + 1) * 38 + 20);
+    const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+    const readScale = conversationFontSize / 15;
+    const intrinsicHeight = Math.max(96, (rows.length + 1) * Math.round(38 * readScale) + 20);
 
     return (
       <div
@@ -682,14 +686,14 @@ const MarkdownTableBlock = memo(
           }}
           className="orbit-native-scroll w-full overflow-x-auto overflow-y-hidden overscroll-x-contain"
         >
-          <table className="w-full border-collapse text-[13px] leading-[1.55]">
+          <table className="w-full border-collapse text-(length:--orbit-read-table) leading-(--orbit-read-compact-leading)">
             {headers.length > 0 && (
               <thead className="border-border-subtle bg-surface-recessed/65 border-b">
                 <tr>
                   {colIndices.map((colIdx) => (
                     <th
                       key={colIdx}
-                      className={`text-ink-secondary px-3.5 py-2 text-[12px] leading-[1.45] font-medium whitespace-pre-wrap ${tableAlignClass(
+                      className={`text-ink-secondary px-3.5 py-2 text-(length:--orbit-read-th) leading-[1.45] font-medium whitespace-pre-wrap ${tableAlignClass(
                         alignments[colIdx],
                       )}`}
                     >
@@ -982,10 +986,10 @@ function renderGroupedNodeContent(
     case "heading": {
       const sizeClass =
         block.level === 1
-          ? "text-[20px] leading-[1.3] font-semibold tracking-[-0.02em] text-foreground mt-4 first:mt-0"
+          ? "text-(length:--orbit-read-h1) leading-[1.3] font-semibold tracking-[-0.02em] text-foreground mt-4 first:mt-0"
           : block.level === 2
-            ? "text-[17px] leading-[1.35] font-semibold tracking-[-0.015em] text-foreground mt-3.5 first:mt-0"
-            : "text-[15px] leading-[1.45] font-semibold text-foreground mt-3 first:mt-0";
+            ? "text-(length:--orbit-read-h2) leading-[1.35] font-semibold tracking-[-0.015em] text-foreground mt-3.5 first:mt-0"
+            : "text-(length:--orbit-read-h3) leading-[1.45] font-semibold text-foreground mt-3 first:mt-0";
       return (
         <div className={sizeClass}>
           <InlineSpans spans={block.spans} />
@@ -1113,10 +1117,10 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
   const groupedNodes = useMemo(() => groupMarkdownBlocks(blocks), [blocks]);
 
   const containerClass = compact
-    ? "selectable-text text-foreground/82 min-w-0 space-y-1 text-[13px] leading-[1.55] break-words"
+    ? "selectable-text text-foreground/82 min-w-0 space-y-1 font-(family-name:--orbit-font-content) text-(length:--orbit-read-compact) leading-(--orbit-read-compact-leading) break-words"
     : bubble
-      ? "selectable-text text-foreground/92 min-w-0 space-y-2 text-[15px] leading-[1.65] break-words"
-      : "selectable-text text-foreground/88 min-w-0 space-y-3 text-[15px] leading-[1.65] break-words";
+      ? "selectable-text text-foreground/92 min-w-0 space-y-2 font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading) break-words"
+      : "selectable-text text-foreground/88 min-w-0 space-y-3 font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading) break-words";
   const listSpacingClass = compact || bubble ? "space-y-0.5" : "space-y-1";
 
   return (

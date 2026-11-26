@@ -477,6 +477,22 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
 
         let path = OrbitComposerLogic.findActiveTrigger(in: "/Users/murphy", cursorUtf16Offset: 13)
         try checkNil(path)
+
+        let leadingWhitespaceSlash = OrbitComposerLogic.findActiveTrigger(in: "  /goal", cursorUtf16Offset: 7)
+        try checkEqual(leadingWhitespaceSlash?.kind, .slash)
+        try checkEqual(leadingWhitespaceSlash?.query, "goal")
+
+        let midSentenceSlash = OrbitComposerLogic.findActiveTrigger(in: "compare /goal", cursorUtf16Offset: 13)
+        try checkNil(midSentenceSlash)
+
+        let escapedSlash = OrbitComposerLogic.findActiveTrigger(in: "\\/goal", cursorUtf16Offset: 6)
+        try checkNil(escapedSlash)
+
+        try checkTrue(OrbitComposerLogic.matchesLeadingSlashCommand("/review", command: "/review"))
+        try checkTrue(OrbitComposerLogic.matchesLeadingSlashCommand("  /REVIEW check diff", command: "/review"))
+        try checkFalse(OrbitComposerLogic.matchesLeadingSlashCommand("/reviewers list", command: "/review"))
+        try checkFalse(OrbitComposerLogic.matchesLeadingSlashCommand("\\/review check diff", command: "/review"))
+        try checkFalse(OrbitComposerLogic.matchesLeadingSlashCommand("run /review now", command: "/review"))
     }
 
     func testComposerAutocompleteInsertionEmojiAndCrlfOffsets() throws {

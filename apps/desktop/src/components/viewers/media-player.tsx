@@ -82,6 +82,7 @@ export const MediaPlayer = memo(function MediaPlayer({
   const [muted, setMuted] = useState(false);
   const [justCited, setJustCited] = useState(false);
   const [scrubbing, setScrubbing] = useState(false);
+  const [volumeScrubbing, setVolumeScrubbing] = useState(false);
 
   const displayName = basenameOfPath(filename || path || (kind === "video" ? "video" : "audio"));
   const effectiveMime = mimeType || defaultMimeForMedia(displayName, kind);
@@ -92,6 +93,7 @@ export const MediaPlayer = memo(function MediaPlayer({
     setDuration(0);
     setMediaError(null);
     setScrubbing(false);
+    setVolumeScrubbing(false);
 
     if (sourceUrl || !base64Content || truncated) {
       setOwnedBlobUrl(null);
@@ -166,15 +168,20 @@ export const MediaPlayer = memo(function MediaPlayer({
   }, []);
 
   useEffect(() => {
-    if (!scrubbing) return;
-    const stopScrubbing = () => setScrubbing(false);
+    if (!scrubbing && !volumeScrubbing) return;
+    const stopScrubbing = () => {
+      setScrubbing(false);
+      setVolumeScrubbing(false);
+    };
     window.addEventListener("pointerup", stopScrubbing);
     window.addEventListener("pointercancel", stopScrubbing);
+    window.addEventListener("blur", stopScrubbing);
     return () => {
       window.removeEventListener("pointerup", stopScrubbing);
       window.removeEventListener("pointercancel", stopScrubbing);
+      window.removeEventListener("blur", stopScrubbing);
     };
-  }, [scrubbing]);
+  }, [scrubbing, volumeScrubbing]);
 
   const handleCite = () => {
     const citation = formatTimestampCitation(displayName, currentTime);
@@ -208,6 +215,8 @@ export const MediaPlayer = memo(function MediaPlayer({
   };
 
   const progressRatio = duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
+  const effectiveVolume = muted ? 0 : volume;
+  const volumeRatio = Math.min(1, Math.max(0, effectiveVolume));
   const KindIcon = kind === "video" ? Film : Music;
 
   return (
@@ -414,18 +423,28 @@ export const MediaPlayer = memo(function MediaPlayer({
               <span className="text-foreground/80 tabular-nums w-11 shrink-0 font-mono text-[11px]">
                 {formatMediaDuration(currentTime)}
               </span>
-              <div className="focus-within:ring-foreground/30 relative flex flex-1 items-center rounded-full focus-within:ring-2">
-                <div className="bg-muted h-1.5 w-full overflow-hidden rounded-full">
+              <div className="group/seek relative -my-2 flex flex-1 items-center py-2">
+                <div className="bg-muted group-has-[:focus-visible]/seek:ring-ink-primary/30 h-1.5 w-full overflow-hidden rounded-full group-has-[:focus-visible]/seek:ring-2">
                   <div
                     className={cn(
-                      "bg-foreground/75 h-full w-full origin-left rounded-full",
+                      "h-full w-full origin-left rounded-full motion-reduce:transition-none",
                       scrubbing
-                        ? "transition-none"
-                        : "transition-transform duration-75 ease-linear",
+                        ? "bg-ink-primary transition-none"
+                        : "bg-ink-primary/75 group-hover/seek:bg-ink-primary transition-[transform,background-color] duration-75 ease-linear",
                     )}
                     style={{ transform: `scaleX(${progressRatio})` }}
                   />
                 </div>
+                <div
+                  aria-hidden="true"
+                  className={cn(
+                    "bg-ink-primary pointer-events-none absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full shadow-xs transition-[opacity,scale] duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none",
+                    scrubbing
+                      ? "scale-110 opacity-100"
+                      : "scale-75 opacity-0 group-focus-within/seek:scale-100 group-focus-within/seek:opacity-100 group-hover/seek:scale-100 group-hover/seek:opacity-100",
+                  )}
+                  style={{ left: `${progressRatio * 100}%` }}
+                />
                 <input
                   type="range"
                   aria-label="Seek timeline"
@@ -438,7 +457,10 @@ export const MediaPlayer = memo(function MediaPlayer({
                   onPointerCancel={() => setScrubbing(false)}
                   onBlur={() => setScrubbing(false)}
                   onChange={handleSeek}
-                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                  className={cn(
+                    "absolute inset-0 h-full w-full opacity-0",
+                    scrubbing ? "cursor-grabbing" : "cursor-pointer",
+                  )}
                 />
               </div>
               <span className="text-muted-foreground tabular-nums w-11 shrink-0 text-right font-mono text-[11px]">
@@ -484,20 +506,50 @@ export const MediaPlayer = memo(function MediaPlayer({
                       <Volume2 className="size-3.5 stroke-[1.75]" />
                     )}
                   </button>
-                  <input
-                    type="range"
-                    aria-label="Volume"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={muted ? 0 : volume}
-                    onChange={(e) => {
-                      const next = Number(e.target.value);
-                      setVolume(next);
-                      if (next > 0 && muted) setMuted(false);
-                    }}
-                    className="accent-foreground/75 h-1 w-16 cursor-pointer"
-                  />
+                  <div className="group/vol relative -my-2 flex w-16 items-center py-2">
+                    <div className="bg-muted group-has-[:focus-visible]/vol:ring-ink-primary/30 h-1.5 w-full overflow-hidden rounded-full group-has-[:focus-visible]/vol:ring-2">
+                      <div
+                        className={cn(
+                          "h-full w-full origin-left rounded-full motion-reduce:transition-none",
+                          volumeScrubbing
+                            ? "bg-ink-primary transition-none"
+                            : "bg-ink-primary/75 group-hover/vol:bg-ink-primary transition-[transform,background-color] duration-75 ease-linear",
+                        )}
+                        style={{ transform: `scaleX(${volumeRatio})` }}
+                      />
+                    </div>
+                    <div
+                      aria-hidden="true"
+                      className={cn(
+                        "bg-ink-primary pointer-events-none absolute top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full shadow-xs transition-[opacity,scale] duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none",
+                        volumeScrubbing
+                          ? "scale-110 opacity-100"
+                          : "scale-75 opacity-0 group-focus-within/vol:scale-100 group-focus-within/vol:opacity-100 group-hover/vol:scale-100 group-hover/vol:opacity-100",
+                      )}
+                      style={{ left: `${volumeRatio * 100}%` }}
+                    />
+                    <input
+                      type="range"
+                      aria-label="Volume"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={effectiveVolume}
+                      onPointerDown={() => setVolumeScrubbing(true)}
+                      onPointerUp={() => setVolumeScrubbing(false)}
+                      onPointerCancel={() => setVolumeScrubbing(false)}
+                      onBlur={() => setVolumeScrubbing(false)}
+                      onChange={(e) => {
+                        const next = Number(e.target.value);
+                        setVolume(next);
+                        if (next > 0 && muted) setMuted(false);
+                      }}
+                      className={cn(
+                        "absolute inset-0 h-full w-full opacity-0",
+                        volumeScrubbing ? "cursor-grabbing" : "cursor-pointer",
+                      )}
+                    />
+                  </div>
                 </div>
               </div>
 

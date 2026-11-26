@@ -35,9 +35,11 @@ import type {
   ActiveWorkspaceMenuState,
   MenuAnchorBox,
 } from "@/components/sidebar/sidebar-menus";
-import type {
-  ThreadDragSource,
-  ThreadDropIndicator,
+import {
+  type ThreadDragSource,
+  type ThreadDropIndicator,
+  type ThreadInlineSortState,
+  getInlineSortNeighborOffset,
 } from "@/components/sidebar/use-sidebar-drag";
 import { IconButton } from "@/components/ui/icon-button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -72,6 +74,7 @@ interface SidebarWorkspaceGroupProps {
   wsMenuOpen: boolean;
   dragOverDropId: string | null;
   draggingThread: ThreadDragSource | null;
+  threadInlineSort: ThreadInlineSortState | null;
   threadDropIndicator: ThreadDropIndicator | null;
   onOpenConvMenu: (
     threadKey: string,
@@ -124,6 +127,7 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
   wsMenuOpen,
   dragOverDropId,
   draggingThread,
+  threadInlineSort,
   threadDropIndicator,
   onOpenConvMenu,
   onOpenWsMenu,
@@ -200,7 +204,7 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
     <div
       className={cn(
         "space-y-0.5 rounded-[8px] transition-colors",
-        isDropHover && "bg-accent/55 ring-border-strong ring-1",
+        isDropHover && "bg-signal-info-bg/70 ring-signal-info-border ring-1",
       )}
     >
       <div
@@ -373,6 +377,13 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
                   });
                   const effectiveTitle = threadCustomTitles[tKey] || ag.title;
 
+                  const isDraggingThisRow =
+                    draggingThread?.hostId === proj.host_id &&
+                    draggingThread?.agentId === ag.agent_id;
+                  const wsInlineSort =
+                    threadInlineSort?.scopeKey === ws.threadScopeKey ? threadInlineSort : null;
+                  const rowDragOffsetY = getInlineSortNeighborOffset(wsInlineSort, ag.agent_id);
+
                   return (
                     <SidebarConversationRow
                       key={ag.agent_id}
@@ -399,10 +410,10 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
                       dragProjectId={proj.id}
                       dragScopeKey={ws.threadScopeKey}
                       dragWorkspaceId={ws.workspace_id}
-                      isDragging={
-                        draggingThread?.hostId === proj.host_id &&
-                        draggingThread?.agentId === ag.agent_id
-                      }
+                      isDragging={isDraggingThisRow}
+                      isDragPlaceholder={isDraggingThisRow}
+                      isDragSorting={Boolean(wsInlineSort)}
+                      dragOffsetY={rowDragOffsetY}
                       dropIndicator={
                         threadDropIndicator?.scopeKey === ws.threadScopeKey &&
                         threadDropIndicator.targetAgentId === ag.agent_id
@@ -466,8 +477,11 @@ export interface SidebarProjectSectionProps {
   onStartRenameThread: (threadKey: string) => void;
   onFinishRenameThread: () => void;
   isDraggingProject: boolean;
-  projectDropPosition: "before" | "after" | null;
+  isProjectDragSettling: boolean;
+  isProjectDragSorting: boolean;
+  projectDragOffsetY: number;
   draggingThread: ThreadDragSource | null;
+  threadInlineSort: ThreadInlineSortState | null;
   threadDropIndicator: ThreadDropIndicator | null;
   dragOverDropId: string | null;
   onRegisterProjectRow: (projectId: string, el: HTMLDivElement | null) => void;
@@ -531,8 +545,11 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
   onStartRenameThread,
   onFinishRenameThread,
   isDraggingProject,
-  projectDropPosition,
+  isProjectDragSettling,
+  isProjectDragSorting,
+  projectDragOffsetY,
   draggingThread,
+  threadInlineSort,
   threadDropIndicator,
   dragOverDropId,
   onRegisterProjectRow,
@@ -644,8 +661,6 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
   };
 
   const isDraggingThis = isDraggingProject;
-  const showDropBefore = projectDropPosition === "before";
-  const showDropAfter = projectDropPosition === "after";
 
   const hasCollapsedApproval =
     collapsed && visibleConversations.some((c) => c.agent.is_awaiting_permission);
@@ -718,6 +733,12 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
     });
     const effectiveTitle = threadCustomTitles[tKey] || ag.title;
 
+    const isDraggingThisRow =
+      draggingThread?.hostId === proj.host_id && draggingThread?.agentId === ag.agent_id;
+    const projInlineSort =
+      threadInlineSort?.scopeKey === projThreadScopeKey ? threadInlineSort : null;
+    const rowDragOffsetY = getInlineSortNeighborOffset(projInlineSort, ag.agent_id);
+
     return (
       <SidebarConversationRow
         key={ag.agent_id}
@@ -742,9 +763,10 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
         dragProjectId={proj.id}
         dragScopeKey={projThreadScopeKey}
         dragWorkspaceId={null}
-        isDragging={
-          draggingThread?.hostId === proj.host_id && draggingThread?.agentId === ag.agent_id
-        }
+        isDragging={isDraggingThisRow}
+        isDragPlaceholder={isDraggingThisRow}
+        isDragSorting={Boolean(projInlineSort)}
+        dragOffsetY={rowDragOffsetY}
         dropIndicator={
           threadDropIndicator?.scopeKey === projThreadScopeKey &&
           threadDropIndicator.targetAgentId === ag.agent_id
@@ -776,21 +798,31 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
     [onRegisterInboxArea, proj.id, proj.host_id, projThreadScopeKey],
   );
 
+  const projectNeighborStyle =
+    !isDraggingThis && isProjectDragSorting
+      ? { transform: `translate3d(0, ${projectDragOffsetY}px, 0)` }
+      : undefined;
+
   return (
     <div
       ref={setProjectRowRef}
+      style={projectNeighborStyle}
       className={cn(
-        "relative space-y-0.5 transition-opacity duration-150",
-        isDraggingThis && "opacity-45",
+        "relative space-y-0.5 rounded-[10px]",
+        isDraggingThis
+          ? cn("drag-lifted-surface z-20", !isProjectDragSettling && "cursor-grabbing")
+          : isProjectDragSorting &&
+              "transition-transform duration-150 ease-[var(--ease-out-expo)] motion-reduce:transition-none",
       )}
     >
-      {showDropBefore && (
-        <div className="bg-signal-info pointer-events-none absolute -top-1 right-1 left-1 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
-      )}
-
       {/* Project Header Row (`30px`, pointer-draggable to reorder) */}
       <div
-        onPointerDown={isRenamingProject ? undefined : (e) => onStartProjectDrag(e, proj.id)}
+        onPointerDown={
+          isRenamingProject || totalProjectCount <= 1
+            ? undefined
+            : (e) => onStartProjectDrag(e, proj.id)
+        }
+        onDragStart={(e) => e.preventDefault()}
         onContextMenu={(e) => {
           if (isRenamingProject) return;
           e.preventDefault();
@@ -805,7 +837,10 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
             },
           });
         }}
-        className="group/proj text-ink-primary hover:bg-accent/55 flex h-[30px] items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors"
+        className={cn(
+          "group/proj text-ink-primary hover:bg-accent/55 flex h-[30px] items-center justify-between gap-1.5 rounded-[8px] px-2 transition-colors [-webkit-user-drag:none]",
+          totalProjectCount > 1 && !isRenamingProject && "cursor-pointer",
+        )}
       >
         {isRenamingProject ? (
           <div className="flex min-w-0 flex-1 items-center gap-2.5">
@@ -1066,6 +1101,7 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
                   wsMenuOpen={openWsMenuId === ws.workspace_id}
                   dragOverDropId={dragOverDropId}
                   draggingThread={draggingThread}
+                  threadInlineSort={threadInlineSort}
                   threadDropIndicator={threadDropIndicator}
                   onOpenConvMenu={onOpenConvMenu}
                   onOpenWsMenu={onOpenWsMenu}
@@ -1088,11 +1124,18 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
                     "space-y-0.5 rounded-[8px] transition-colors",
                     curatedWorkspaces.length > 0 && "pt-0.5",
                     dragOverDropId === `inbox:${proj.id}` &&
-                      "bg-accent/55 ring-border-strong ring-1",
+                      "bg-signal-info-bg/70 ring-signal-info-border ring-1",
                   )}
                 >
                   {showEmptyInboxDropZone ? (
-                    <div className="border-border-default text-ink-muted flex h-[28px] items-center justify-center rounded-[7px] border border-dashed px-2 text-[11.5px]">
+                    <div
+                      className={cn(
+                        "flex h-[28px] items-center justify-center rounded-[7px] border border-dashed px-2 text-[11.5px] transition-colors",
+                        dragOverDropId === `inbox:${proj.id}`
+                          ? "border-transparent text-signal-info"
+                          : "border-border-default text-ink-muted",
+                      )}
+                    >
                       {t("sidebar.dropToUngroup")}
                     </div>
                   ) : (
@@ -1131,10 +1174,6 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
           )}
         </div>
       </div>
-
-      {showDropAfter && (
-        <div className="bg-signal-info pointer-events-none absolute right-1 -bottom-1 left-1 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
-      )}
     </div>
   );
 });

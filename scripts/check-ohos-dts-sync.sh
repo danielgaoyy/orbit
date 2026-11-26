@@ -8,7 +8,9 @@ import re
 import sys
 
 root = Path(sys.argv[1]).resolve().parent.parent
-source = (root / "crates/orbit-ffi-ohos/src/lib.rs").read_text()
+src = root / "crates/orbit-ffi-ohos/src"
+paths = [src / "lib.rs", *sorted((src / "napi").rglob("*.rs"))]
+source = "\n".join(path.read_text() for path in paths)
 dest = root / "apps/harmony/entry/src/main/cpp/types/liborbit_ohos/index.d.ts"
 # Keep quoted URLs and braces in Rust strings intact while dropping comments.
 tokens = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', re.S)
@@ -16,7 +18,9 @@ source = tokens.sub(lambda m: m[0] if m[0].startswith('"') else "", source)
 exports = re.compile(r"#\[napi(?:\(([^)]*)\))?\]\s*(?:#\[[^\]]*\]\s*)*")
 tasks = dict(re.findall(r"impl Task for (\w+)\s*\{.*?type JsValue\s*=\s*(\w+|\(\))\s*;", source, re.S))
 scopes = {}
-classes = {}
+# An impl can precede its class definition in lexical path order.
+classes = {name: [] for name in re.findall(r"#\[napi\]\s*pub struct (\w+)\s*\{", source)}
+defined_classes = set()
 functions = []
 aliases = []
 
@@ -72,7 +76,10 @@ for attr in exports.finditer(source):
         continue
     obj = re.match(r"pub struct (\w+)\s*\{", item)
     if obj:
-        classes[obj[1]] = []
+        if obj[1] in defined_classes:
+            sys.exit(f"Duplicate N-API class {obj[1]}")
+        defined_classes.add(obj[1])
+        classes.setdefault(obj[1], [])
         continue
     impl = re.match(r"impl (\w+)\s*\{", item)
     if impl:
@@ -112,7 +119,68 @@ for attr in exports.finditer(source):
 if not classes or not scopes:
     sys.exit("No exported N-API class found")
 lines = ["// Generated from orbit-ffi-ohos. Run scripts/check-ohos-dts-sync.sh --write."]
+# Published declaration order before the domain split. Signatures always come
+# from Rust. New methods follow the stable source traversal after these names.
+legacy_core_order = """
+constructor openWithOptions subscribeEvents discoverLocalDaemonUri fleetOverviewJson
+bridgeInfoJson searchMessagesJson exportAgentTranscriptJson listAgentCodeBlocksJson
+fleetSidebarByRequestJson agentStageDeltaByRequestJson createSessionJson sendPromptJson
+updateHostConfigRequestJson resolveModelSelectionJson slashCommandsJson composePromptJson
+rankMentionCandidatesJson hostDetailJson agentStageJson agentStageDeltaJson fleetSidebarJson
+markAgentSeen markAgentUnread setAgentPinned togglePinAgent seedThreadPrefsJson
+fallbackProviderCatalogJson fallbackProviderCatalogsJson formatCatalogModelLabel
+formatEffortLabel defaultEffortDescription resolveSupportedEffortForModel agentTimelineJson
+agentTimelineDeltaJson describeToolItemJson gitReviewJson terminalScreenJson
+terminalScreenSlotJson pairHostJson removeHost updateHostRelay applyRelayToFleet
+updateHostConfigJson upsertProjectJson removeProject listDirectory connectAllHosts connectHost
+refreshHost refreshQuotas refreshProviderModels createAgent createAgentFull openAgentTimeline
+loadOlderAgentTimeline sendPrompt sendPromptWithMeta enqueuePrompt removeQueuedPrompt
+flushQueuedPromptNow reorderQueuedPrompts interruptAgent interruptAgentAndContinue
+setSessionMode setAgentConfig setAgentFastMode switchAgentProvider archiveAgent unarchiveAgent
+deleteAgent resolvePermission answerQuestion fetchGitStatus fetchGitDiff fetchWorkspaceFiles
+workspaceFilesJson stageAttachmentJson startTerminal attachTerminal killTerminal
+sendTerminalKeys sendTerminalKeysSlot resizeTerminal resizeTerminalSlot rewindAgentJson
+forkAgentJson previewWorktreeHandoffJson executeWorktreeHandoffJson readWorkspaceFileJson
+writeWorkspaceFileJson createWorkspaceEntryJson renameWorkspaceEntryJson
+deleteWorkspaceEntryJson buildSideQuestionContext askSideQuestion onAppForeground
+onAppBackground onNetworkChanged detectDiagramKind renderDiagramJson cloudSyncStatusJson
+cloudSyncGeneratePassphrase cloudSyncSetGithubClientIdJson cloudSyncSetAutoSyncJson
+cloudSyncStartGithubDeviceFlowJson cloudSyncPollGithubDeviceFlowJson
+cloudSyncLoginWithTokenJson cloudSyncUnlockWithPassphraseJson cloudSyncNowJson
+cloudSyncExportDeviceLinkUri cloudSyncImportDeviceLinkUriJson
+cloudSyncEnableManualPassphraseJson cloudSyncSetManualPassphraseModeJson cloudSyncLogoutJson
+cloudSyncGetPreferencesJson cloudSyncUpdatePreferencesJson listArtifactsJson getArtifactJson
+upsertArtifactJson deleteArtifact fetchWorkspaceBoard workspaceBoardJson updateWorkspaceBoard
+fetchWorkspaceEvents workspaceEventsJson spawnWorkspacePeerJson createScheduleJson
+updateScheduleJson pauseSchedule resumeSchedule runScheduleOnce deleteSchedule
+fetchScheduleRuns scheduleRunsJson listConditionalTimersJson cancelConditionalTimerJson
+fireConditionalTimerNowJson listGoalRunsJson controlGoalRunJson updateGoalRunJson
+listMonitorWatchesJson stopMonitorWatchJson listWorkflowRunsJson cancelWorkflowRunJson
+registerPushDeviceJson unregisterPushDeviceJson listPushDevicesJson parseMarkdownPreviewJson
+archiveWorkspace cancelTimerJson createMissionWorkspace createMonitorJson createTimerJson
+deleteCustomAcpAgentJson deletePermissionRuleJson detachAgent discoverFleetRouterHostsJson
+dismissClusterSuggestion getFleetMeshSnapshotJson getGuardianConfigJson getRouterConfigJson
+getSessionUsageJson getToolCallDiffJson gitCommitJson gitConflictsJson gitCreatePrJson
+gitGenerateCommitMessageJson gitPrStatusJson gitRebaseAbortJson gitRebaseContinueJson
+gitRebaseSkipJson gitRebaseStartJson gitRebaseStatusJson gitReposInspectionJson
+gitResolveConflictJson gitStagePathsJson gitStashApplyJson gitStashDropJson gitStashListJson
+gitStashPopJson gitStashSaveJson gitUnstagePathsJson listAcpAgentsJson listPermissionRulesJson
+listProviderSubagents mergeWorkspaces moveAgentToWorkspace moveAgentToWorkspaceV2
+openProviderSubagentTimeline organizeProjectWorkspaces projectOrderJson
+providerSubagentTimelineJson pushRegistrationStatusJson readWorkspaceFileRequestJson
+refreshAcpAgents refreshAcpRegistryJson registerLiveActivityTokenJson registerPushTokenJson
+renameWorkspace reorderProjectsJson requestGitReposInspection resolvePermissionsBatchJson
+resolvePlanApprovalJson rewindAgentRequestJson searchMessagesRemoteJson sendTerminalBytes
+startGoalJson startWorkflowJson summarizeAgent testAcpAgentJson testPushNotificationJson
+unregisterPushToken updateAgentIdentity updateGuardianConfigJson updateMeshPeerJson
+updatePushPreferencesJson updateRouterConfigJson updateWorkspaceGoal upgradeHostDaemonOverWire
+upsertCustomAcpAgentJson upsertPermissionRuleJson newWithMasterKey open openInMemory subscribe
+subscribeCoalesced
+""".split()
+legacy_rank = {name: i for i, name in enumerate(legacy_core_order)}
 for owner, entries in classes.items():
+    if owner == "OrbitHarmonyCore":
+        entries.sort(key=lambda entry: legacy_rank.get(entry[0], len(legacy_rank)))
     lines.append(f"export class {owner} {{")
     lines.extend("  " + decl for _, decl in entries)
     lines.append("}")
@@ -123,11 +191,11 @@ for original, alias in aliases:
     lines.append(f"export {{ {original} as {alias} }};")
 expected = "\n".join(lines) + "\n"
 if sys.argv[2:] == ["--write"]:
-    dest.write_text(expected)
-elif sys.argv[2:]:
-    sys.exit("Usage: check-ohos-dts-sync.sh [--write]")
-elif expected != dest.read_text():
-    sys.stderr.writelines(difflib.unified_diff(dest.read_text().splitlines(True), expected.splitlines(True), fromfile="checked-in", tofile="Rust N-API"))
+    dest.write_bytes(expected.encode("utf-8"))
+elif sys.argv[2:] not in ([], ["--print-count"]):
+    sys.exit("Usage: check-ohos-dts-sync.sh [--write | --print-count]")
+elif expected.encode("utf-8") != dest.read_bytes():
+    sys.stderr.writelines(difflib.unified_diff(dest.read_bytes().decode("utf-8").splitlines(True), expected.splitlines(True), fromfile="checked-in", tofile="Rust N-API"))
     sys.exit("Run scripts/check-ohos-dts-sync.sh --write to synchronize the declarations.")
 print(f"Verified {sum(map(len, classes.values())) + len(functions)} HarmonyOS N-API exports.")
 PY

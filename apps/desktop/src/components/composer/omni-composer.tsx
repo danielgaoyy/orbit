@@ -54,6 +54,7 @@ import {
   detectActiveTriggerKind,
   resolveComposerActionMode,
 } from "@/lib/composer-input";
+import { useFileDrop } from "@/lib/drag/use-file-drop";
 import { translate, useI18n, useLocale } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -110,6 +111,7 @@ import {
   useComposerDraft,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { resolveTypography } from "@/lib/typography";
 import { cn } from "@/lib/utils";
 
 // Module-level frozen empty arrays for React 19 `useSyncExternalStore` snapshot stability
@@ -331,12 +333,16 @@ export interface OmniComposerProps {
   variant?: "hero" | "docked";
   occluding?: boolean;
   hasPendingDecisions?: boolean;
+  stageDraggingFiles?: boolean;
+  externalDropSurface?: boolean;
 }
 
 export const OmniComposer = memo(function OmniComposer({
   variant = "docked",
   occluding = false,
   hasPendingDecisions = false,
+  stageDraggingFiles = false,
+  externalDropSurface = false,
 }: OmniComposerProps) {
   const locale = useLocale();
   const t = useMemo(() => translate.bind(null, locale), [locale]);
@@ -570,13 +576,29 @@ export const OmniComposer = memo(function OmniComposer({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [menuHighlightIdx, setMenuHighlightIdx] = useState<number>(0);
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
-  const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [rankedMentions, setRankedMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
   const [symbolMentions, setSymbolMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
   const [isSearchingSymbols, setIsSearchingSymbols] = useState<boolean>(false);
   const mentionReqSeqRef = useRef<number>(0);
   const symbolReqSeqRef = useRef<number>(0);
+
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const uiFontId = useOrbitSelector((s) => s.uiFontId);
+  const contentFontId = useOrbitSelector((s) => s.contentFontId);
+  const uiFontCustom = useOrbitSelector((s) => s.uiFontCustom);
+  const contentFontCustom = useOrbitSelector((s) => s.contentFontCustom);
+  const { typographyKey, readScale } = useMemo(
+    () =>
+      resolveTypography({
+        conversationFontSize,
+        uiFontId,
+        contentFontId,
+        uiFontCustom,
+        contentFontCustom,
+      }),
+    [conversationFontSize, uiFontId, contentFontId, uiFontCustom, contentFontCustom],
+  );
 
   useLayoutEffect(() => {
     const overlay = tokenOverlayRef.current;
@@ -597,7 +619,7 @@ export const OmniComposer = memo(function OmniComposer({
       if (rafId !== null) window.cancelAnimationFrame(rafId);
       observer.disconnect();
     };
-  }, [slashDirective, selectedHostId]);
+  }, [slashDirective, selectedHostId, typographyKey]);
 
   const activeMode: SessionMode = normalizePermissionMode(
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
@@ -613,8 +635,8 @@ export const OmniComposer = memo(function OmniComposer({
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
-  const minTextareaHeight = 40;
-  const maxTextareaHeight = 200;
+  const minTextareaHeight = Math.max(40, Math.round(22 * readScale) + 18);
+  const maxTextareaHeight = Math.round(200 * readScale);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -679,7 +701,17 @@ export const OmniComposer = memo(function OmniComposer({
     ) {
       scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
     }
-  }, [draftText, scopeKey, composerWidthPx, indent, slashDirective, selectedHostId]);
+  }, [
+    draftText,
+    scopeKey,
+    composerWidthPx,
+    indent,
+    slashDirective,
+    selectedHostId,
+    typographyKey,
+    minTextareaHeight,
+    maxTextareaHeight,
+  ]);
 
   useEffect(() => {
     return orbitActions.onComposerFocusRequest((opts) => {
@@ -718,7 +750,7 @@ export const OmniComposer = memo(function OmniComposer({
   const cursorOffset = cursor.text === draftText ? cursor.offset : 0;
   const triggerKind = useMemo(() => detectActiveTriggerKind(draftText, cursorOffset), [draftText, cursorOffset]);
   const slashTrigger = useMemo(() => {
-    if (triggerKind !== "slash") return null;
+    if (slashDirective || triggerKind !== "slash") return null;
     const slashIndex = draftText.lastIndexOf("/", cursorOffset - 1);
     const query = draftText.slice(slashIndex + 1, cursorOffset);
     const tokenKey = `slash:${slashIndex}:${query}`;
@@ -728,7 +760,7 @@ export const OmniComposer = memo(function OmniComposer({
     const items = filterSlashCommands(commands, query, t);
     if (items.length === 0) return null;
     return { slashIndex, endIndex: cursorOffset, query, tokenKey, items };
-  }, [triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
+  }, [slashDirective, triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
 
   const mentionTrigger = useMemo(() => {
     if (triggerKind !== "mention") return null;
@@ -964,12 +996,6 @@ export const OmniComposer = memo(function OmniComposer({
         }
         break;
       case "goal":
-        if (isDraft || !hasCurrentAgent) {
-          orbitActions.showToast(t("composer.toastSessionRequiredGoal"));
-          break;
-        }
-        orbitActions.setSlashDirective(cmd.id);
-        break;
       case "btw":
       case "plan":
       case "review":
@@ -1403,15 +1429,14 @@ export const OmniComposer = memo(function OmniComposer({
     }
   };
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDraggingOver(false);
-    const files = Array.from(e.dataTransfer.files ?? []);
-    for (const file of files) {
-      void orbitActions.stageAndAttachFile(file);
-    }
-    textareaRef.current?.focus();
-  };
+  const { isDraggingFiles: isDraggingOver, dropHandlers: fileDropHandlers } = useFileDrop({
+    onDropFiles: (files) => {
+      for (const file of files) {
+        void orbitActions.stageAndAttachFile(file);
+      }
+      textareaRef.current?.focus();
+    },
+  });
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (ime.shouldIgnoreKeyDown(e)) {
@@ -1454,7 +1479,11 @@ export const OmniComposer = memo(function OmniComposer({
         executeSlashCommand(slashTrigger.items[safeIdx]);
         return;
       }
-      if (e.key === " ") {
+      if (
+        e.key === " " &&
+        !slashDirective &&
+        !/\S/.test(draftText.slice(0, slashTrigger.slashIndex))
+      ) {
         const exactCmd = slashTrigger.items.find(
           (c) =>
             isComposerInlineDirective(c.id) &&
@@ -2165,19 +2194,7 @@ export const OmniComposer = memo(function OmniComposer({
         <ComposerQueueStrip />
 
         {/* Relative Anchor for Floating `/` & `@` Menus + Single-Rim Tactile Composer Card */}
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            if (!isDraggingOver) setIsDraggingOver(true);
-          }}
-          onDragLeave={(e) => {
-            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-              setIsDraggingOver(false);
-            }
-          }}
-          onDrop={handleDrop}
-          className="relative"
-        >
+        <div {...fileDropHandlers} className="relative">
           {slashTrigger && (
             <SlashCommandMenu
               items={slashTrigger.items}
@@ -2209,18 +2226,22 @@ export const OmniComposer = memo(function OmniComposer({
             data-dock-active={hasPendingDecisions ? "true" : undefined}
             className={cn(
               "composer-surface relative rounded-[20px]",
-              isDraggingOver && "ring-signal-info/25 border-signal-info ring-2",
+              isDraggingOver
+                ? "ring-signal-info/25 border-signal-info ring-2"
+                : stageDraggingFiles && "ring-signal-info/18 border-signal-info/70 ring-1",
             )}
           >
-            <div
-              aria-hidden={!isDraggingOver}
-              className={cn(
-                "bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px] transition-opacity duration-[140ms] ease-[var(--ease-out-quart)] select-none",
-                isDraggingOver ? "opacity-100" : "opacity-0",
-              )}
-            >
-              {t("composer.dropToAttach")}
-            </div>
+            {!externalDropSurface && (
+              <div
+                aria-hidden={!isDraggingOver}
+                className={cn(
+                  "bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px] transition-opacity duration-[140ms] ease-[var(--ease-out-quart)] select-none motion-reduce:transition-none",
+                  isDraggingOver ? "opacity-100" : "opacity-0",
+                )}
+              >
+                {t("composer.dropToAttach")}
+              </div>
+            )}
 
             {/* Unified Context Tray — attachments, active atomic `@` mention chips, diff quotes & large pastes */}
             <ContextTray
@@ -2231,10 +2252,10 @@ export const OmniComposer = memo(function OmniComposer({
               onRemoveInlineMention={handleRemoveInlineMention}
             />
 
-            {/* Shared Native Scroll Container (`max-h-[200px]`): inline directive token + inline mention pill backdrop + full-height textarea scroll as one compositor layer */}
+            {/* Shared Native Scroll Container (`max-h-(--orbit-composer-max-h)`): inline directive token + inline mention pill backdrop + full-height textarea scroll as one compositor layer */}
             <div
               ref={scrollContainerRef}
-              className="orbit-native-scroll relative max-h-[200px] overflow-x-hidden overflow-y-auto rounded-t-[20px]"
+              className="orbit-native-scroll relative max-h-(--orbit-composer-max-h) overflow-x-hidden overflow-y-auto rounded-t-[20px]"
             >
               {slashDirective && (
                 <div
@@ -2249,7 +2270,7 @@ export const OmniComposer = memo(function OmniComposer({
                 <div
                   aria-hidden="true"
                   style={{ left: BASE_PAD_LEFT + indent }}
-                  className="text-ink-faint pointer-events-none absolute top-[12px] right-[14px] truncate text-[15px] leading-[22px] select-none"
+                  className="text-ink-faint pointer-events-none absolute top-[12px] right-[14px] truncate font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) select-none"
                 >
                   {dynamicPlaceholder}
                 </div>
@@ -2260,7 +2281,7 @@ export const OmniComposer = memo(function OmniComposer({
                 <div
                   aria-hidden="true"
                   style={inputInset}
-                  className="pointer-events-none absolute top-0 right-0 left-0 z-0 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words text-transparent select-none"
+                  className="pointer-events-none absolute top-0 right-0 left-0 z-0 block w-full px-[14px] pt-[12px] pb-[6px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) whitespace-pre-wrap break-words text-transparent select-none"
                 >
                   {inlineBackdropSegments.map((seg, idx) =>
                     seg.isMention ? (
@@ -2282,7 +2303,7 @@ export const OmniComposer = memo(function OmniComposer({
                 ref={mirrorTextareaRef}
                 style={inputInset}
                 aria-hidden="true"
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words transition-none"
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) whitespace-pre-wrap break-words transition-none"
               />
 
               <textarea
@@ -2311,7 +2332,7 @@ export const OmniComposer = memo(function OmniComposer({
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-ink-primary relative z-[1] block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] transition-none outline-none"
+                className="text-ink-primary relative z-[1] block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading) transition-none outline-none"
               />
             </div>
 

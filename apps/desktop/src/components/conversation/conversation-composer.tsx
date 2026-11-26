@@ -1,9 +1,11 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowUp } from "lucide-react";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
+import { resolveTypography } from "@/lib/typography";
+import { useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 export interface ConversationComposerProps {
@@ -55,8 +57,25 @@ export const ConversationComposer = memo(function ConversationComposer({
   const savedDraftRef = useRef<string>("");
   const ime = useImeCompositionGuard();
 
-  const minHeight = variant === "compact" ? 38 : 46;
-  const maxHeight = variant === "compact" ? 180 : 220;
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const uiFontId = useOrbitSelector((s) => s.uiFontId);
+  const contentFontId = useOrbitSelector((s) => s.contentFontId);
+  const uiFontCustom = useOrbitSelector((s) => s.uiFontCustom);
+  const contentFontCustom = useOrbitSelector((s) => s.contentFontCustom);
+  const { typographyKey, readScale } = useMemo(
+    () =>
+      resolveTypography({
+        conversationFontSize,
+        uiFontId,
+        contentFontId,
+        uiFontCustom,
+        contentFontCustom,
+      }),
+    [conversationFontSize, uiFontId, contentFontId, uiFontCustom, contentFontCustom],
+  );
+
+  const minHeight = variant === "compact" ? 38 : Math.max(46, Math.round(22 * readScale) + 24);
+  const maxHeight = variant === "compact" ? 180 : Math.round(220 * readScale);
 
   useEffect(() => {
     if (focusNonce === undefined) return;
@@ -103,7 +122,7 @@ export const ConversationComposer = memo(function ConversationComposer({
     const nextH = Math.min(maxHeight, Math.max(minHeight, measured));
     el.style.height = `${nextH}px`;
     el.style.overflowY = measured > maxHeight ? "auto" : "hidden";
-  }, [value, minHeight, maxHeight, widthTick]);
+  }, [value, minHeight, maxHeight, widthTick, typographyKey]);
 
   const canSend = value.trim().length > 0 && !isBusy;
   const showStop = isBusy && Boolean(onInterrupt) && value.trim().length === 0;
@@ -170,7 +189,7 @@ export const ConversationComposer = memo(function ConversationComposer({
   const textStyleClass =
     variant === "compact"
       ? "px-[12px] py-[9px] text-[13px] leading-[20px]"
-      : "px-[14px] py-[12px] text-[15px] leading-[22px]";
+      : "px-[14px] py-[12px] font-(family-name:--orbit-font-content) text-(length:--orbit-composer-size) leading-(--orbit-composer-leading)";
 
   const resolvedRightControls =
     typeof rightControlsSlot === "function"

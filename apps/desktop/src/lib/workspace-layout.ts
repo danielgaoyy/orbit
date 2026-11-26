@@ -49,6 +49,23 @@ export function clampSidePanelPrefWidth(width: number): number {
 }
 
 /**
+ * Computes the effective right side panel width while guaranteeing the main conversation
+ * column retains at least `STAGE_MIN_WIDTH_PX` (360px) and the panel itself stays at least
+ * `SIDE_PANEL_MIN_WIDTH_PX` (320px), without ever mutating the stored user preference.
+ */
+export function clampEffectiveSidePanelWidth(
+  storedWidth: number,
+  viewportWidth: number,
+  leftSidebarWidthPx: number,
+): number {
+  const rightPref = clampSidePanelPrefWidth(storedWidth);
+  const avail = Math.max(0, Math.round(viewportWidth) - Math.max(0, Math.round(leftSidebarWidthPx)));
+  return Math.round(
+    Math.max(SIDE_PANEL_MIN_WIDTH_PX, Math.min(rightPref, avail - STAGE_MIN_WIDTH_PX)),
+  );
+}
+
+/**
  * Generates pure-CSS custom properties expressing the EXACT same geometry constraints as
  * `resolveWorkspacePaneWidths`, allowing WebKit to resize panes in a single native C++
  * layout pass at 120Hz with zero React state updates.
@@ -66,10 +83,8 @@ export function buildWorkspaceShellCssVars(params: {
   const leftW = `clamp(${SIDEBAR_MIN_WIDTH_PX}px, ${leftPref}px, max(${SIDEBAR_MIN_WIDTH_PX}px, calc(100vw - ${minWork}px)))`;
   const leftActiveW = params.sidebarOpen ? "var(--orbit-left-w)" : "0px";
   const rightAvail = "calc(100vw - var(--orbit-left-active-w))";
-  const rightMin = `min(${SIDE_PANEL_MIN_WIDTH_PX}px, calc(var(--orbit-right-avail) * 0.45))`;
-  const rightDesired = `min(${rightPref}px, max(calc(var(--orbit-right-avail) * 0.5), calc(var(--orbit-right-avail) - ${STAGE_COMFORT_WIDTH_PX}px)))`;
-  const rightMax = `max(var(--orbit-right-min), min(${SIDE_PANEL_MAX_WIDTH_PX}px, calc(var(--orbit-right-avail) - ${STAGE_MIN_WIDTH_PX}px)))`;
-  const rightW = `clamp(var(--orbit-right-min), ${rightDesired}, ${rightMax})`;
+  const rightMin = `${SIDE_PANEL_MIN_WIDTH_PX}px`;
+  const rightW = `max(${SIDE_PANEL_MIN_WIDTH_PX}px, min(${rightPref}px, calc(var(--orbit-right-avail) - ${STAGE_MIN_WIDTH_PX}px)))`;
 
   return {
     "--orbit-left-w": leftW,
@@ -109,14 +124,7 @@ export function resolveWorkspacePaneWidths(params: {
   let rightWidthPx = 0;
   const avail = Math.max(0, V - leftWidthPx);
   if (params.sidePanelOpen && avail > 0) {
-    const rightMin = Math.min(SIDE_PANEL_MIN_WIDTH_PX, Math.floor(avail * 0.45));
-    const comfortBudget = Math.max(Math.round(avail * 0.5), avail - STAGE_COMFORT_WIDTH_PX);
-    const desired = Math.min(rightPref, comfortBudget);
-    const rightMax = Math.max(
-      rightMin,
-      Math.min(SIDE_PANEL_MAX_WIDTH_PX, avail - STAGE_MIN_WIDTH_PX),
-    );
-    rightWidthPx = Math.round(clamp(desired, rightMin, rightMax));
+    rightWidthPx = clampEffectiveSidePanelWidth(rightPref, V, leftWidthPx);
   }
 
   const centerWidthPx = Math.max(0, V - leftWidthPx - rightWidthPx);

@@ -2,11 +2,9 @@ import {
   memo,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
-  type ReactNode,
   type RefObject,
 } from "react";
 import {
@@ -16,9 +14,8 @@ import {
   FileText,
   Square,
   SquareTerminal,
-  X,
 } from "lucide-react";
-import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import { StageRailShell } from "@/components/stage/stage-rail-shell";
 import {
   ArmedTimerRow,
   OverviewArtifactRow,
@@ -35,11 +32,13 @@ import {
   archiveSettledSubagentsList,
 } from "@/components/stage/subagent-crew-dock";
 import { Badge } from "@/components/ui/badge";
-import { Card } from "@/components/ui/card";
 import { DiffStat } from "@/components/ui/diff-stat";
-import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
 import { SimpleTooltip } from "@/components/ui/overlays";
+import {
+  StageRailHeader,
+  StageRailScrollBody,
+} from "@/components/ui/stage-rail-primitives";
 import {
   cancelHoverPrefetch,
   scheduleHoverPrefetch,
@@ -82,7 +81,6 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
-import { OVERVIEW_PANEL_WIDTH_PX } from "@/lib/workspace-layout";
 import { cn } from "@/lib/utils";
 
 const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = Object.freeze({});
@@ -197,6 +195,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
           projects: [],
         },
         archivedSubagents: s.archivedSubagents,
+        archivedThreads: s.archivedThreads,
       },
       hostId,
       agentId,
@@ -467,23 +466,12 @@ const StageOverviewBody = memo(function StageOverviewBody({
   return (
     <>
       {/* 1. Fixed Top Workspace Quick Bar */}
-      <div className="shrink-0 px-2 pt-2 pb-1.5 select-none">
-        <div className="flex h-[26px] items-center justify-between pr-0.5 pl-2 pb-0.5">
-          <span className="text-ink-primary text-[13px] font-medium">
-            {t("overview.title")}
-          </span>
-          <IconButton
-            size="xs"
-            tooltip={t("topbar.hideOverview")}
-            shortcut={overviewShortcut}
-            aria-label={t("topbar.hideOverview")}
-            onClick={() => orbitActions.toggleOverviewPanel()}
-            className="text-ink-muted hover:text-ink-primary"
-          >
-            <X className="size-3 stroke-[1.85]" />
-          </IconButton>
-        </div>
-
+      <StageRailHeader
+        title={t("overview.title")}
+        closeTooltip={t("topbar.hideOverview")}
+        closeShortcut={overviewShortcut}
+        onClose={() => orbitActions.toggleOverviewPanel()}
+      >
         <div className="flex flex-col gap-0.5">
           <SimpleTooltip label={t("overview.review")} shortcut={reviewShortcut} side="left">
             <ListRow
@@ -571,11 +559,11 @@ const StageOverviewBody = memo(function StageOverviewBody({
             </ListRow>
           )}
         </div>
-      </div>
+      </StageRailHeader>
 
       {/* Shared Scrollable Body with pinned 1px top divider (Pure Flexbox, zero JS measurement) */}
       {hasSecondarySections && (
-        <div className="orbit-native-scroll border-border-subtle min-h-0 shrink overflow-y-auto overscroll-contain border-t select-none">
+        <StageRailScrollBody>
           {/* === Tier 1: Live Runtime (Subagents -> Goal & Timers -> Background Tasks) === */}
 
           {/* 1. Subagent crew, first for live work and approvals */}
@@ -961,198 +949,9 @@ const StageOverviewBody = memo(function StageOverviewBody({
               </div>
             </OverviewSection>
           )}
-        </div>
+        </StageRailScrollBody>
       )}
     </>
-  );
-});
-
-/**
- * Isolated Docked Shell so `useWorkspaceMotion()` phase transitions (e.g. Left Sidebar toggling)
- * animate the outer GPU transform without re-reconciling the memoized `StageOverviewBody` child.
- */
-const DockedOverviewShell = memo(function DockedOverviewShell({
-  ariaLabel,
-  dockedTopPx,
-  children,
-}: {
-  ariaLabel: string;
-  dockedTopPx: number;
-  children: ReactNode;
-}) {
-  const {
-    isAnimating,
-    dockedOverviewMounted,
-    dockedOverviewVisualOpen,
-    dockedOverviewTransform,
-    dockedOverviewTransition,
-  } = useWorkspaceMotion();
-
-  if (!dockedOverviewMounted) return null;
-
-  const responsiveMaxHeight = `min(640px, max(160px, calc(100dvh - ${dockedTopPx + 16}px)))`;
-
-  return (
-    <aside
-      aria-label={ariaLabel}
-      inert={!dockedOverviewVisualOpen}
-      style={{
-        top: `${dockedTopPx}px`,
-        width: `${OVERVIEW_PANEL_WIDTH_PX}px`,
-        maxHeight: responsiveMaxHeight,
-        transform: dockedOverviewTransform,
-        opacity: dockedOverviewVisualOpen ? 1 : 0,
-        transition: dockedOverviewTransition,
-        willChange: isAnimating ? "transform, opacity" : undefined,
-      }}
-      className={cn(
-        "fixed right-4 z-[25] flex origin-top-right flex-col",
-        !dockedOverviewVisualOpen && "pointer-events-none",
-      )}
-    >
-      <Card className="overview-card-surface flex min-h-0 max-h-full w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0">
-        {children}
-      </Card>
-    </aside>
-  );
-});
-
-const PopoverOverviewShell = memo(function PopoverOverviewShell({
-  canDock,
-  ariaLabel,
-  children,
-}: {
-  canDock: boolean;
-  ariaLabel: string;
-  children: ReactNode;
-}) {
-  const popoverOpen = useOrbitSelector((s) => s.overviewPopoverOpen);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const isPopoverVisible = !canDock && popoverOpen;
-  const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
-  const [popoverVisualOpen, setPopoverVisualOpen] = useState(isPopoverVisible);
-  const [isPopoverAnimating, setIsPopoverAnimating] = useState(false);
-  const mountedRef = useRef(popoverMounted);
-  mountedRef.current = popoverMounted;
-
-  useEffect(() => {
-    const prefersReducedMotion =
-      typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-
-    if (isPopoverVisible) {
-      setPopoverMounted(true);
-      if (prefersReducedMotion) {
-        setIsPopoverAnimating(false);
-        setPopoverVisualOpen(true);
-        const raf = window.requestAnimationFrame(() => {
-          popoverRef.current?.focus({ preventScroll: true });
-        });
-        return () => window.cancelAnimationFrame(raf);
-      }
-      setIsPopoverAnimating(true);
-      let raf2 = 0;
-      const raf1 = window.requestAnimationFrame(() => {
-        raf2 = window.requestAnimationFrame(() => {
-          setPopoverVisualOpen(true);
-          popoverRef.current?.focus({ preventScroll: true });
-        });
-      });
-      const settleTimer = window.setTimeout(() => setIsPopoverAnimating(false), 215);
-      return () => {
-        window.cancelAnimationFrame(raf1);
-        if (raf2) window.cancelAnimationFrame(raf2);
-        window.clearTimeout(settleTimer);
-      };
-    }
-
-    setPopoverVisualOpen(false);
-    if (!mountedRef.current) {
-      setIsPopoverAnimating(false);
-      return undefined;
-    }
-    if (prefersReducedMotion) {
-      setIsPopoverAnimating(false);
-      setPopoverMounted(false);
-      return undefined;
-    }
-    setIsPopoverAnimating(true);
-    const timer = window.setTimeout(() => {
-      setIsPopoverAnimating(false);
-      setPopoverMounted(false);
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [isPopoverVisible]);
-
-  useEffect(() => {
-    if (!isPopoverVisible) return;
-    const onPointerDown = (ev: MouseEvent) => {
-      const target = ev.target as Node | null;
-      if (popoverRef.current && target && !popoverRef.current.contains(target)) {
-        const el =
-          target instanceof Element
-            ? target.closest("[data-overview-trigger],[data-slot='dropdown-menu-content']")
-            : null;
-        if (!el) {
-          orbitActions.setOverviewPopoverOpen(false);
-        }
-      }
-    };
-    const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        ev.stopPropagation();
-        orbitActions.setOverviewPopoverOpen(false);
-        const trigger = document.querySelector<HTMLElement>("[data-overview-trigger]");
-        trigger?.focus({ preventScroll: true });
-      }
-    };
-    window.addEventListener("mousedown", onPointerDown);
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => {
-      window.removeEventListener("mousedown", onPointerDown);
-      window.removeEventListener("keydown", onKeyDown, true);
-    };
-  }, [isPopoverVisible]);
-
-  useEffect(() => {
-    if (canDock && popoverOpen) {
-      orbitActions.setOverviewPopoverOpen(false);
-    }
-  }, [canDock, popoverOpen]);
-
-  if (!popoverMounted) return null;
-
-  return (
-    <div
-      ref={popoverRef}
-      tabIndex={-1}
-      role="dialog"
-      aria-label={ariaLabel}
-      inert={!popoverVisualOpen}
-      onTransitionEnd={(e) => {
-        if (e.target !== e.currentTarget) return;
-        if (e.propertyName !== "transform" && e.propertyName !== "opacity") return;
-        setIsPopoverAnimating(false);
-        if (!isPopoverVisible) {
-          setPopoverMounted(false);
-        }
-      }}
-      style={
-        isPopoverAnimating
-          ? { width: `${OVERVIEW_PANEL_WIDTH_PX}px`, willChange: "transform, opacity" }
-          : { width: `${OVERVIEW_PANEL_WIDTH_PX}px` }
-      }
-      className={cn(
-        "absolute top-3 right-4 z-30 flex max-h-[min(560px,calc(100%-24px))] max-w-[calc(100%-32px)] origin-top-right flex-col outline-none motion-reduce:transition-none",
-        popoverVisualOpen
-          ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[165ms] ease-[var(--ease-out-expo)]"
-          : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[120ms] ease-[var(--ease-exit)]",
-      )}
-    >
-      <Card className="floating-surface flex min-h-0 max-h-full w-full flex-col gap-0 overflow-hidden rounded-[12px] border p-0">
-        {children}
-      </Card>
-    </div>
   );
 });
 
@@ -1203,35 +1002,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
   stageContainerRef,
 }: StageOverviewPanelProps) {
   const { t } = useI18n();
-  const [dockedTopPx, setDockedTopPx] = useState(52);
-
-  useLayoutEffect(() => {
-    const el = stageContainerRef?.current;
-    if (!el) return;
-    let rafId = 0;
-    const syncRect = () => {
-      const nextTop = Math.round(el.getBoundingClientRect().top) + 12;
-      setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
-    };
-    const scheduleSyncRect = () => {
-      if (rafId) return;
-      rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        syncRect();
-      });
-    };
-    syncRect();
-    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSyncRect) : null;
-    ro?.observe(el);
-    if (el.parentElement) ro?.observe(el.parentElement);
-    window.addEventListener("resize", scheduleSyncRect);
-    return () => {
-      ro?.disconnect();
-      window.removeEventListener("resize", scheduleSyncRect);
-      if (rafId) window.cancelAnimationFrame(rafId);
-    };
-  }, [stageContainerRef, canDock]);
-
   const overviewAriaLabel = t("overview.ariaLabel");
 
   const agentWorkspaceId = currentAgent?.workspace_id ?? null;
@@ -1267,20 +1037,12 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
   );
 
   return (
-    <>
-      <DockedOverviewShell
-        ariaLabel={overviewAriaLabel}
-        dockedTopPx={dockedTopPx}
-      >
-        {bodyNode}
-      </DockedOverviewShell>
-
-      <PopoverOverviewShell
-        canDock={canDock}
-        ariaLabel={overviewAriaLabel}
-      >
-        {bodyNode}
-      </PopoverOverviewShell>
-    </>
+    <StageRailShell
+      canDock={canDock}
+      ariaLabel={overviewAriaLabel}
+      stageContainerRef={stageContainerRef}
+    >
+      {bodyNode}
+    </StageRailShell>
   );
 }, areStageOverviewPanelPropsEqual);

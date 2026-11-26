@@ -13,7 +13,8 @@ use orbit_protocol::{
     AgentProfile, AgentStatus, AgentSummary, AttentionState, McpToolPolicy,
     ProviderSubagentDescriptor, ProviderSubagentEvent, ProviderSubagentStatus, ReasoningEffort,
     ScheduleKind, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
-    ScheduleTarget, SessionMode, TimelinePayload, WorkspaceSetupStatus, WorkspaceSummary,
+    ScheduleTarget, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    WorkspaceSetupStatus, WorkspaceSummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -506,6 +507,10 @@ impl OrbitStore {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         labels.retain(|k, _| !k.starts_with("orbit.open_tab."));
+        labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.to_string(),
+            orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
+        );
         let labels_json = serde_json::to_string(&labels)?;
         conn.execute(
             "UPDATE agents
@@ -514,6 +519,37 @@ impl OrbitStore {
             params![labels_json, Utc::now().to_rfc3339(), agent_id],
         )?;
         Ok(())
+    }
+
+    /// Collect all non-archived local descendant `Subagent`s of `root_agent_id` (cycle-safe, max depth 8).
+    pub fn list_local_descendant_subagents(
+        &self,
+        root_agent_id: &str,
+    ) -> Result<Vec<AgentSummary>, StoreError> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root_agent_id.to_string());
+        let mut frontier = vec![root_agent_id.to_string()];
+        let mut out = Vec::new();
+        for _ in 0..8 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for pid in frontier {
+                let children = self.list_agents_filtered(None, false, true, Some(&pid))?;
+                for child in children {
+                    if !visited.insert(child.agent_id.clone()) {
+                        continue;
+                    }
+                    if child.parent_host_id.is_none() && child.is_subagent() {
+                        next_frontier.push(child.agent_id.clone());
+                        out.push(child);
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+        Ok(out)
     }
 
     pub fn set_agent_attention(
@@ -1374,6 +1410,103 @@ impl OrbitStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Reconcile historical `provider_subagents` rows stuck in `Running` whose
+    /// parent timeline shows the corresponding `ToolCall(Subagent)` launch call
+    /// ended in `Failed` and no subagent timeline events were ever recorded.
+    ///
+    /// Returns the number of rows transitioned from `Running` to `Failed`.
+    pub fn reconcile_failed_launch_provider_subagents(&self) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let running_json = serde_json::to_string(&ProviderSubagentStatus::Running)?;
+        let failed_json = serde_json::to_string(&ProviderSubagentStatus::Failed)?;
+
+        let candidates: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT ps.parent_agent_id, ps.subagent_id
+                 FROM provider_subagents ps
+                 WHERE ps.status_json = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM provider_subagent_events e
+                       WHERE e.parent_agent_id = ps.parent_agent_id
+                         AND e.subagent_id = ps.subagent_id
+                   )",
+            )?;
+            let rows = stmt.query_map(params![&running_json], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        for (parent_id, subagent_id) in candidates {
+            by_parent.entry(parent_id).or_default().push(subagent_id);
+        }
+
+        let now_str = Utc::now().to_rfc3339();
+        let mut healed = 0usize;
+
+        for (parent_id, subagent_ids) in by_parent {
+            let mut latest_launch_status: HashMap<String, ToolCallStatus> = HashMap::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT payload_json
+                     FROM timeline_events
+                     WHERE agent_id = ?1
+                       AND payload_json LIKE '%\"kind\":\"subagent\"%'
+                     ORDER BY seq ASC",
+                )?;
+                let mut rows = stmt.query(params![&parent_id])?;
+                while let Some(row) = rows.next()? {
+                    let payload_json: String = row.get(0)?;
+                    if let Ok(TimelinePayload::ToolCall {
+                        status,
+                        detail:
+                            ToolCallDetail::Subagent {
+                                child_agent_id: Some(child_id),
+                                ..
+                            },
+                        ..
+                    }) = serde_json::from_str::<TimelinePayload>(&payload_json)
+                        && !child_id.is_empty()
+                    {
+                        latest_launch_status.insert(child_id, status);
+                    }
+                }
+            }
+
+            for subagent_id in subagent_ids {
+                if matches!(
+                    latest_launch_status.get(&subagent_id),
+                    Some(ToolCallStatus::Failed)
+                ) {
+                    let updated = tx.execute(
+                        "UPDATE provider_subagents
+                         SET status_json = ?1, updated_at = ?2
+                         WHERE parent_agent_id = ?3
+                           AND subagent_id = ?4
+                           AND status_json = ?5",
+                        params![
+                            &failed_json,
+                            &now_str,
+                            &parent_id,
+                            &subagent_id,
+                            &running_json,
+                        ],
+                    )?;
+                    healed += updated;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(healed)
+    }
+
     pub fn has_provider_subagent_events(
         &self,
         parent_agent_id: &str,
@@ -1756,5 +1889,218 @@ fn parse_schedule_run_status(s: &str) -> ScheduleRunStatus {
         "failed" => ScheduleRunStatus::Failed,
         "skipped" => ScheduleRunStatus::Skipped,
         _ => ScheduleRunStatus::Running,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbit_protocol::ProviderKind;
+
+    #[test]
+    fn reconcile_failed_launch_provider_subagents_heals_only_failed_zero_event_rows() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_1".into(),
+                title: "orbit".into(),
+                cwd: "/workspace/orbit".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_parent".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/workspace/orbit".into(),
+                    title: "Parent".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert parent");
+
+        let make_desc = |id: &str| ProviderSubagentDescriptor {
+            parent_agent_id: "ag_parent".into(),
+            subagent_id: id.into(),
+            parent_subagent_id: None,
+            title: format!("Role {id}"),
+            subtitle: None,
+            model: None,
+            status: ProviderSubagentStatus::Running,
+            created_at: now,
+            updated_at: now,
+        };
+
+        // 1. Failed launch with zero events -> MUST heal to Failed.
+        store
+            .upsert_provider_subagent(&make_desc("sub_failed_zero"))
+            .expect("upsert failed_zero");
+        store
+            .append_timeline_event(
+                "ag_parent",
+                1,
+                Some("turn_1"),
+                TimelinePayload::ToolCall {
+                    call_id: "call_1".into(),
+                    status: ToolCallStatus::Running,
+                    detail: ToolCallDetail::Subagent {
+                        child_agent_id: Some("sub_failed_zero".into()),
+                        role: "Stage File Drop Unifier".into(),
+                        prompt_preview: "Unify file drop".into(),
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("append running launch");
+        store
+            .append_timeline_event(
+                "ag_parent",
+                1,
+                Some("turn_1"),
+                TimelinePayload::ToolCall {
+                    call_id: "call_1".into(),
+                    status: ToolCallStatus::Failed,
+                    detail: ToolCallDetail::Subagent {
+                        child_agent_id: Some("sub_failed_zero".into()),
+                        role: "Stage File Drop Unifier".into(),
+                        prompt_preview: "Unify file drop".into(),
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("append failed launch");
+
+        // 2. Active healthy launch (Completed launch call, still running) -> MUST stay Running.
+        store
+            .upsert_provider_subagent(&make_desc("sub_active_ok"))
+            .expect("upsert active_ok");
+        store
+            .append_timeline_event(
+                "ag_parent",
+                1,
+                Some("turn_1"),
+                TimelinePayload::ToolCall {
+                    call_id: "call_2".into(),
+                    status: ToolCallStatus::Completed,
+                    detail: ToolCallDetail::Subagent {
+                        child_agent_id: Some("sub_active_ok".into()),
+                        role: "Sidebar Worker".into(),
+                        prompt_preview: "Upgrade sidebar".into(),
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("append completed launch");
+
+        // 3. Subagent with existing subagent events (even if launch call failed) -> MUST stay Running.
+        store
+            .upsert_provider_subagent(&make_desc("sub_has_events"))
+            .expect("upsert has_events");
+        store
+            .append_timeline_event(
+                "ag_parent",
+                1,
+                Some("turn_1"),
+                TimelinePayload::ToolCall {
+                    call_id: "call_3".into(),
+                    status: ToolCallStatus::Failed,
+                    detail: ToolCallDetail::Subagent {
+                        child_agent_id: Some("sub_has_events".into()),
+                        role: "Partial Worker".into(),
+                        prompt_preview: "Run task".into(),
+                    },
+                    background_task: None,
+                },
+            )
+            .expect("append failed launch for has_events");
+        store
+            .append_provider_subagent_event(
+                "ag_parent",
+                "sub_has_events",
+                TimelinePayload::AssistantMessage {
+                    item_id: "m1".into(),
+                    text: "Started work".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append subagent event");
+
+        let healed = store
+            .reconcile_failed_launch_provider_subagents()
+            .expect("reconcile");
+        assert_eq!(healed, 1);
+
+        let subs = store
+            .list_provider_subagents("ag_parent")
+            .expect("list provider subagents");
+        let statuses: HashMap<String, ProviderSubagentStatus> = subs
+            .into_iter()
+            .map(|s| (s.subagent_id, s.status))
+            .collect();
+        assert_eq!(
+            statuses.get("sub_failed_zero"),
+            Some(&ProviderSubagentStatus::Failed)
+        );
+        assert_eq!(
+            statuses.get("sub_active_ok"),
+            Some(&ProviderSubagentStatus::Running)
+        );
+        assert_eq!(
+            statuses.get("sub_has_events"),
+            Some(&ProviderSubagentStatus::Running)
+        );
+
+        // Idempotent on subsequent daemon restarts.
+        let healed_again = store
+            .reconcile_failed_launch_provider_subagents()
+            .expect("reconcile again");
+        assert_eq!(healed_again, 0);
     }
 }

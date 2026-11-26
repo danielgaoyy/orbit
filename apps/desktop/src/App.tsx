@@ -1,8 +1,8 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
 import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
-import { PersonalAgentControlView } from "@/components/overview/personal-agent-control-view";
+import { PersonalAgentSetupCard } from "@/components/personal-agent/personal-agent-setup-card";
 import { CommandPalette } from "@/components/command/command-palette";
 import {
   DetachedTerminalWindow,
@@ -11,11 +11,13 @@ import {
 import { MarkdownThemeProvider } from "@/components/markdown-blocks";
 import { CopyCodeBlocksModal } from "@/components/modals/copy-code-blocks-modal";
 import { ExportTranscriptModal } from "@/components/modals/export-transcript-modal";
+import { GoalDialogs } from "@/components/composer/goal-dialogs";
 import { WorktreeHandoffModal } from "@/components/modals/worktree-handoff-modal";
 import { OnboardingGuide } from "@/components/onboarding/onboarding-guide";
 import { MediaPreviewModal } from "@/components/viewers/media-preview-modal";
 import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
+import { GlobalZoomHudHost } from "@/components/layout/zoom-hud";
 import { SettingsView } from "@/components/settings/settings-view";
 import { QuickOpenFileDialog } from "@/components/side-panel/quick-open-file-dialog";
 import {
@@ -30,7 +32,10 @@ import { WorkspacePeerStrip } from "@/components/stage/workspace-peer-strip";
 import { IconButton } from "@/components/ui/icon-button";
 import { TooltipProvider } from "@/components/ui/overlays";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
+import { ResizeSash } from "@/components/ui/resize-sash";
 import { ToastViewport } from "@/components/ui/toast-viewport";
+import { installGlobalFileDropGuard } from "@/lib/drag/use-file-drop";
+import { useI18n } from "@/lib/i18n";
 import { SIDEBAR_DEFAULT_WIDTH_PX } from "@/lib/workspace-layout";
 import {
   isConfirmDialogOpen,
@@ -54,6 +59,8 @@ function prefersReducedMotion(): boolean {
 }
 
 export default function App() {
+  useEffect(() => installGlobalFileDropGuard(), []);
+
   const detachedTerminal = useMemo(
     () =>
       typeof window !== "undefined" ? parseDetachedTerminalParams(window.location.search) : null,
@@ -305,6 +312,7 @@ function MainDesktopApp() {
         <QuickOpenFileDialog />
         <RemoteFolderPickerDialog />
         <ExportTranscriptModal />
+        <GoalDialogs />
         <CopyCodeBlocksModal />
         <WorktreeHandoffModal />
         <OnboardingGuide />
@@ -312,6 +320,9 @@ function MainDesktopApp() {
 
         {/* Isolated Toast & Undo Host so ephemeral toasts never re-render Settings or Workspace */}
         <GlobalToastHost />
+
+        {/* Isolated Native Window Zoom bootstrap, event sync & ephemeral HUD */}
+        <GlobalZoomHudHost />
       </MarkdownThemeProvider>
     </TooltipProvider>
   );
@@ -406,8 +417,12 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
   isSettingsOpen: boolean;
   workspacePanel: WorkspacePanelMode;
 }) {
+  const { t } = useI18n();
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
+  const hasUnseenSidePanelActivity = useOrbitSelector(
+    (s) => !s.sidePanelOpen && s.sidePanelUnseenTabIds.length > 0,
+  );
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
@@ -432,74 +447,49 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
 
   const isMac = isMacDesktop();
 
-  const startSidebarResize = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    if (e.detail >= 2) {
-      e.preventDefault();
-      return;
-    }
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = Math.round(
+  const handleSidebarDragStart = useCallback(
+    () => Math.round(sidebarElRef.current?.getBoundingClientRect().width ?? SIDEBAR_DEFAULT_WIDTH_PX),
+    [],
+  );
+
+  const handleSidebarDragMove = useCallback((delta: number, startW: number) => {
+    orbitActions.setSidebarWidth(startW + delta, false);
+  }, []);
+
+  const handleSidebarDragCommit = useCallback((delta: number, startW: number) => {
+    orbitActions.setSidebarWidth(startW + delta, true);
+  }, []);
+
+  const handleSidebarDragCancel = useCallback((startW: number) => {
+    orbitActions.setSidebarWidth(startW, false);
+  }, []);
+
+  const handleSidebarDraggingChange = useCallback(
+    (dragging: boolean) => {
+      setIsResizingSidebar(dragging);
+      setIsResizingLeft(dragging);
+    },
+    [setIsResizingLeft],
+  );
+
+  const handleSidebarReset = useCallback(() => {
+    orbitActions.resetSidebarWidth();
+  }, []);
+
+  const handleSidebarKeyboardStep = useCallback((mult: number) => {
+    const cur = Math.round(
       sidebarElRef.current?.getBoundingClientRect().width ?? SIDEBAR_DEFAULT_WIDTH_PX,
     );
-    let latestW = startW;
-    let hasMoved = false;
-    let rafId: number | null = null;
-
-    const onMove = (ev: MouseEvent) => {
-      const delta = ev.clientX - startX;
-      if (!hasMoved) {
-        if (Math.abs(delta) < 2) return;
-        hasMoved = true;
-        setIsResizingSidebar(true);
-        setIsResizingLeft(true);
-        document.body.style.cursor = "col-resize";
-      }
-      latestW = startW + delta;
-      if (rafId === null) {
-        rafId = window.requestAnimationFrame(() => {
-          rafId = null;
-          orbitActions.setSidebarWidth(latestW, false);
-        });
-      }
-    };
-    const cleanup = () => {
-      if (rafId !== null) {
-        window.cancelAnimationFrame(rafId);
-        rafId = null;
-      }
-      if (hasMoved) {
-        orbitActions.setSidebarWidth(latestW, true);
-        setIsResizingSidebar(false);
-        setIsResizingLeft(false);
-        document.body.style.cursor = "";
-      }
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", cleanup);
-      window.removeEventListener("blur", cleanup);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", cleanup);
-    window.addEventListener("blur", cleanup);
-  };
-
-  const resetSidebarWidth = (e: React.MouseEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    orbitActions.resetSidebarWidth();
-  };
+    orbitActions.setSidebarWidth(cur + mult * 16, true);
+  }, []);
 
   return (
-    <>
-      {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
-      {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
-
-      <div inert={isSettingsOpen} className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
+    <div inert={isSettingsOpen} className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
         {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
         <div
           className={cn(
-            "pointer-events-none fixed top-0 z-30 flex h-[40px] items-center",
-            isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
+            "pointer-events-none fixed top-0 z-30 flex h-(--orbit-titlebar-h) items-center",
+            isMac ? "left-(--orbit-traffic-x) translate-y-[1px]" : "left-[12px]",
           )}
         >
           <IconButton
@@ -517,14 +507,21 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
         {hasSelectedHost && (
           <div
             className={cn(
-              "pointer-events-none fixed top-0 right-[10px] z-30 flex h-[40px] items-center",
+              "pointer-events-none fixed top-0 right-[10px] z-30 flex h-(--orbit-titlebar-h) items-center",
               isMac && "translate-y-[1px]",
             )}
           >
             <IconButton
               size="md"
               active={sidePanelOpen}
-              tooltip={sidePanelOpen ? "Hide side panel" : "Show side panel"}
+              indicatorTone={hasUnseenSidePanelActivity ? "info" : "none"}
+              tooltip={
+                sidePanelOpen
+                  ? t("topbar.hideSidePanel")
+                  : hasUnseenSidePanelActivity
+                    ? t("topbar.showSidePanelActivity")
+                    : t("topbar.showSidePanel")
+              }
               shortcut={toggleSidePanelShortcut}
               onClick={() => orbitActions.toggleSidePanel()}
               className="pointer-events-auto"
@@ -556,16 +553,19 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
           <StableFleetSidebar />
 
           {sidebarOpen && (
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Resize sidebar (double-click to reset)"
-              onMouseDown={startSidebarResize}
-              onDoubleClick={resetSidebarWidth}
-              className="group/sash absolute top-0 right-0 z-20 flex h-full w-[6px] cursor-col-resize justify-end"
-            >
-              <div className="group-hover/sash:bg-border-strong group-active/sash:bg-ink-muted h-full w-[1.5px] transition-colors duration-150" />
-            </div>
+            <ResizeSash
+              orientation="vertical"
+              variant="edge-end"
+              ariaLabel={t("sidebar.resizeAria")}
+              title={t("sidebar.resizeHint")}
+              onDragStart={handleSidebarDragStart}
+              onDragMove={handleSidebarDragMove}
+              onDragCommit={handleSidebarDragCommit}
+              onDragCancel={handleSidebarDragCancel}
+              onDraggingChange={handleSidebarDraggingChange}
+              onReset={handleSidebarReset}
+              onKeyboardStep={handleSidebarKeyboardStep}
+            />
           )}
         </div>
 
@@ -591,10 +591,10 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
               </PanelErrorBoundary>
             ) : workspacePanel === "overview" ? (
               <PanelErrorBoundary
-                panelName="Global Overview"
+                panelName="Personal Agent"
                 resetKey={`${selectedHostId ?? ""}:${workspacePanel}`}
               >
-                <PersonalAgentControlView />
+                <PersonalAgentSetupCard />
               </PanelErrorBoundary>
             ) : (
               <PanelErrorBoundary
@@ -610,6 +610,5 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
         {/* 3. Unified Multi-Tab Right Side Panel — Pure GPU translate3d Layer */}
         <WorkspaceSidePanel />
       </div>
-    </>
   );
 });

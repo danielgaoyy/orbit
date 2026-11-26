@@ -209,6 +209,35 @@ pub struct AgentCardView {
     pub acp_agent_id: Option<String>,
 }
 
+impl AgentCardView {
+    /// Resolve canonical session sovereignty tier (`Conversation`, `Subagent`, `PersonalRouter`, `Automation`).
+    pub fn session_tier(&self) -> SessionTier {
+        resolve_session_tier(
+            self.background,
+            self.parent_agent_id.as_deref(),
+            &self.labels,
+        )
+    }
+
+    /// True if this session is a managed subagent/helper that must remain hidden from primary conversation lists.
+    pub fn is_subagent(&self) -> bool {
+        self.session_tier() == SessionTier::Subagent
+    }
+
+    /// True if this session is a user-visible primary `Conversation`.
+    pub fn is_primary_conversation(&self) -> bool {
+        self.session_tier() == SessionTier::Conversation
+    }
+
+    /// Router agent ID if this conversation was dispatched by a `PersonalRouter`.
+    pub fn routed_by_agent_id(&self) -> Option<&str> {
+        self.labels
+            .get(LABEL_ROUTED_BY_AGENT)
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostDetailView {
     pub revision: u64,
@@ -852,14 +881,24 @@ pub(crate) fn render_timeline_event_view(
             text,
             badges,
         } => {
-            let key = (agent_id.to_string(), ev.seq, text.len());
+            let trimmed = text.trim_start();
+            let cleaned_for_blocks = if trimmed.starts_with("<orbit-")
+                || trimmed.starts_with("<WORKSPACE_RULES")
+                || trimmed.starts_with("<ATTACHED_CONTEXT")
+            {
+                orbit_protocol::clean_agent_message_display_body(text)
+            } else {
+                None
+            };
+            let parse_src = cleaned_for_blocks.as_deref().unwrap_or(text.as_str());
+            let key = (agent_id.to_string(), ev.seq, parse_src.len());
             if markdown_cache.len() > 2048 {
                 markdown_cache.clear();
             }
             let blocks = markdown_cache
                 .entry(key)
                 .or_insert_with(|| {
-                    crate::render::parse_markdown_blocks_with_math(text, false, false)
+                    crate::render::parse_markdown_blocks_with_math(parse_src, false, false)
                 })
                 .clone();
             Some(TimelineItemView::UserPrompt {
@@ -1019,14 +1058,22 @@ pub(crate) fn render_timeline_event_view(
             dispatched_at_ms,
             settled_at_ms,
         } => {
-            let key = (agent_id.to_string(), ev.seq, text.len());
+            let cleaned_for_blocks = if *kind == orbit_protocol::AgentMessageKind::DirectMessage
+                && permission_context.is_none()
+            {
+                orbit_protocol::clean_agent_message_display_body(text)
+            } else {
+                None
+            };
+            let parse_src = cleaned_for_blocks.as_deref().unwrap_or(text.as_str());
+            let key = (agent_id.to_string(), ev.seq, parse_src.len());
             if markdown_cache.len() > 2048 {
                 markdown_cache.clear();
             }
             let blocks = markdown_cache
                 .entry(key)
                 .or_insert_with(|| {
-                    crate::render::parse_markdown_blocks_with_math(text, false, false)
+                    crate::render::parse_markdown_blocks_with_math(parse_src, false, false)
                 })
                 .clone();
             let folded = delivery_updates.get(message_id);

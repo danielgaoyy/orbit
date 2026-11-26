@@ -1,0 +1,18 @@
+{
+  "item_type": "question_request",
+  "questions": [
+    {
+      "header": null,
+      "id": "q1",
+      "is_multi_select": false,
+      "options": [
+        "Yes"
+      ],
+      "question": "Continue?"
+    }
+  ],
+  "request_id": "question",
+  "resolved_answers": null,
+  "seq": 6,
+  "timestamp_ms": 150
+}

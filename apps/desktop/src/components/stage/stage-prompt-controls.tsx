@@ -11,6 +11,8 @@ import {
 import { createPortal } from "react-dom";
 import {
   AlertTriangle,
+  ArrowUpRight,
+  Bot,
   Check,
   ChevronRight,
   Copy,
@@ -26,6 +28,7 @@ import {
   GitFork,
   GitPullRequest,
   Globe,
+  MessageSquareText,
   Music,
   Quote,
   Sparkles,
@@ -57,6 +60,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
+import { extractDirectAgentMessagePresentation } from "@/lib/agent-message-clean";
 import { openOrbitLink, prefetchOrbitLink } from "@/lib/file-links";
 import {
   cancelHoverPrefetch,
@@ -85,8 +89,10 @@ import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { normalizeDirectiveLabel } from "@/lib/slash-commands";
 import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { personalAgentMatchRank } from "@/state/selectors/personal-agent-selectors";
 import {
   type PromptImagePreviewTarget,
+  type PromptSourceMeta,
   type RewindRequestTarget,
   USER_PROMPT_PREVIEW_MAX_PX,
   type ViewportAnchorHoldFn,
@@ -97,6 +103,8 @@ import {
   observeSharedBubbleResize,
   useSharedRelativeNow,
 } from "./stage-helpers";
+
+export type { PromptSourceMeta };
 
 function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
   switch (badge.kind) {
@@ -712,29 +720,157 @@ export const UserPromptBubble = memo(function UserPromptBubble({
   cwd,
   holdViewport,
   animateEntrance = false,
+  source,
+  onSelectSource,
   onRequestRewind,
   onPreviewImage,
 }: {
-  item: Extract<TimelineItemView, { item_type: "user_prompt" }>;
+  item: Extract<TimelineItemView, { item_type: "user_prompt" | "agent_message" }>;
   hostId: string;
   agentId: string;
   cwd?: string;
   holdViewport: ViewportAnchorHoldFn;
   animateEntrance?: boolean;
+  source?: PromptSourceMeta | null;
+  onSelectSource?: (targetHostId: string, targetAgentId: string) => void;
   onRequestRewind?: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
   const { t, locale } = useI18n();
+  const sourceRef = useRef<HTMLDivElement | null>(null);
   const imagesRef = useRef<HTMLDivElement | null>(null);
   const actionsRef = useRef<HTMLDivElement | null>(null);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
-  const { cleanText, badges, sanitizedLegacy } = useMemo(
-    () => extractUserPromptPresentation(item, locale),
-    [item, locale],
+  const presentation = useMemo(() => {
+    if (item.item_type === "user_prompt") {
+      const p = extractUserPromptPresentation(item, locale);
+      return {
+        cleanText: p.cleanText,
+        badges: p.badges,
+        sanitizedLegacy: p.sanitizedLegacy,
+        isSystemNoise: Boolean(p.isSystemNoise),
+        effectiveSource: source ?? p.inferredSource ?? null,
+      };
+    }
+    const parsed = extractDirectAgentMessagePresentation(item.text, item);
+    const mergedSource: PromptSourceMeta | null =
+      source ??
+      (parsed.sourceAgentId || parsed.sourceTitle || parsed.sourceHostId
+        ? {
+            agentId: parsed.sourceAgentId,
+            hostId: parsed.sourceHostId,
+            title: parsed.sourceTitle,
+          }
+        : null);
+    return {
+      cleanText: parsed.cleanText,
+      badges: [] as PromptBadge[],
+      sanitizedLegacy: false,
+      isSystemNoise: parsed.isSystemNoise,
+      effectiveSource: mergedSource,
+    };
+  }, [item, locale, source]);
+
+  const { cleanText, badges, sanitizedLegacy, isSystemNoise, effectiveSource } = presentation;
+
+  const sourceAgentId = effectiveSource?.agentId ?? null;
+  const preferredSourceHostId = effectiveSource?.hostId ?? hostId;
+  const resolvedSourceAgent = useOrbitSelector((s) => {
+    if (!sourceAgentId) return null;
+    const hostDetails = s.hostDetails ?? {};
+    const preferred = hostDetails[preferredSourceHostId]?.agents?.find(
+      (a) => a.agent_id === sourceAgentId,
+    );
+    if (preferred) return preferred;
+    for (const detail of Object.values(hostDetails)) {
+      const found = detail?.agents?.find((a) => a.agent_id === sourceAgentId);
+      if (found) return found;
+    }
+    return null;
+  });
+  const resolvedSourceHostId = useOrbitSelector((s) => {
+    if (!sourceAgentId) return null;
+    const hostDetails = s.hostDetails ?? {};
+    if (hostDetails[preferredSourceHostId]?.agents?.some((a) => a.agent_id === sourceAgentId)) {
+      return preferredSourceHostId;
+    }
+    for (const [hid, detail] of Object.entries(hostDetails)) {
+      if (detail?.agents?.some((a) => a.agent_id === sourceAgentId)) return hid;
+    }
+    return preferredSourceHostId;
+  });
+  const isSourceLocallyArchived = useOrbitSelector((s) =>
+    sourceAgentId && resolvedSourceHostId
+      ? Boolean(s.archivedThreads?.[`${resolvedSourceHostId}::${sourceAgentId}`])
+      : false,
+  );
+
+  const isPersonalSource = Boolean(
+    effectiveSource &&
+      (effectiveSource.isPersonalAgent ||
+        (resolvedSourceAgent && personalAgentMatchRank(resolvedSourceAgent) !== null) ||
+        effectiveSource.handle?.trim().toLowerCase() === "router" ||
+        (effectiveSource.title &&
+          /^(?:personal\s+(?:router|agent)|@?router|个人代理|パーソナルエージェント)$/i.test(
+            effectiveSource.title.trim(),
+          ))),
+  );
+  const sourceDisplayName = useMemo(() => {
+    if (!effectiveSource) return "";
+    if (isPersonalSource) return t("sidebar.personalRouter");
+    const liveHandle = resolvedSourceAgent?.handle?.trim();
+    if (liveHandle) return `@${liveHandle.replace(/^@+/, "")}`;
+    const metaHandle = effectiveSource.handle?.trim();
+    if (metaHandle) return `@${metaHandle.replace(/^@+/, "")}`;
+    const metaTitle = effectiveSource.title?.trim();
+    if (metaTitle) return metaTitle;
+    const liveTitle = resolvedSourceAgent?.title?.trim();
+    if (liveTitle) return liveTitle;
+    if (sourceAgentId) {
+      return sourceAgentId.length > 14 ? `${sourceAgentId.slice(0, 12)}…` : sourceAgentId;
+    }
+    return "";
+  }, [effectiveSource, isPersonalSource, resolvedSourceAgent, sourceAgentId, t]);
+
+  const sourceLabel = sourceDisplayName
+    ? t("stage.fromSource", { source: sourceDisplayName })
+    : "";
+  const canJumpToSource = Boolean(
+    sourceAgentId &&
+      resolvedSourceHostId &&
+      sourceAgentId !== agentId &&
+      !resolvedSourceAgent?.archived_at_rfc3339 &&
+      !isSourceLocallyArchived,
+  );
+  const handleJumpToSource = useCallback(() => {
+    if (!sourceAgentId || !resolvedSourceHostId) return;
+    if (onSelectSource) {
+      onSelectSource(resolvedSourceHostId, sourceAgentId);
+    } else {
+      orbitActions.selectAgent(resolvedSourceHostId, sourceAgentId);
+    }
+  }, [onSelectSource, resolvedSourceHostId, sourceAgentId]);
+
+  const canRenderPrecomputedBlocks = useMemo(() => {
+    if (sanitizedLegacy || !item.blocks || item.blocks.length === 0) return false;
+    const firstBlock = item.blocks[0];
+    if (firstBlock?.kind === "paragraph") {
+      const firstSpanText = firstBlock.spans[0]?.text?.trimStart() ?? "";
+      if (/^<(?:orbit-|WORKSPACE_RULES|WORKFLOW_INSTRUCTION|ATTACHED_CONTEXT)/i.test(firstSpanText)) {
+        return false;
+      }
+    }
+    return true;
+  }, [sanitizedLegacy, item.blocks]);
+
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const previewMaxPx = useMemo(
+    () => Math.round(USER_PROMPT_PREVIEW_MAX_PX * (conversationFontSize / 15)),
+    [conversationFontSize],
   );
 
   useLayoutEffect(() => {
@@ -745,19 +881,25 @@ export const UserPromptBubble = memo(function UserPromptBubble({
       return;
     }
     const measure = () => {
-      const nextOverflow = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
+      const nextOverflow = el.scrollHeight > previewMaxPx + 10;
       setOverflowing((prev) => (prev === nextOverflow ? prev : nextOverflow));
     };
     measure();
     return observeSharedBubbleResize(el, measure);
-  }, [cleanText, badges.length]);
+  }, [cleanText, badges.length, previewMaxPx]);
 
   useEffect(() => {
     if (!expanded) return;
     const handleClickOutside = (event: MouseEvent) => {
       if (!(event.target instanceof Element)) return;
-      if (bubbleRef.current?.contains(event.target) || imagesRef.current?.contains(event.target) ||
-          actionsRef.current?.contains(event.target)) return;
+      if (
+        bubbleRef.current?.contains(event.target) ||
+        sourceRef.current?.contains(event.target) ||
+        imagesRef.current?.contains(event.target) ||
+        actionsRef.current?.contains(event.target)
+      ) {
+        return;
+      }
       if (event.target.closest('[data-slot="dialog-content"], .orbit-dialog-overlay')) {
         return;
       }
@@ -817,6 +959,12 @@ export const UserPromptBubble = memo(function UserPromptBubble({
       ? item.timestamp_ms
       : null;
 
+  if ((isSystemNoise && imageBadges.length === 0 && !hasBubbleContent) || (!hasBubbleContent && imageBadges.length === 0)) {
+    return null;
+  }
+
+  const SourceIcon = isPersonalSource ? Bot : MessageSquareText;
+
   return (
     <div
       className={cn(
@@ -824,6 +972,34 @@ export const UserPromptBubble = memo(function UserPromptBubble({
         animateEntrance && "orbit-bubble-enter",
       )}
     >
+      {sourceLabel && (
+        <div
+          ref={sourceRef}
+          className="mb-1 flex max-w-[80%] items-center justify-end pr-2 select-none"
+        >
+          {canJumpToSource ? (
+            <button
+              type="button"
+              data-slot="prompt-source"
+              title={t("stage.openSourceSession", { source: sourceDisplayName })}
+              onClick={handleJumpToSource}
+              className="group/src text-ink-tertiary hover:text-ink-primary inline-flex max-w-full cursor-pointer items-center gap-1 rounded-[6px] px-1 py-0.5 text-[11px] leading-tight transition-colors"
+            >
+              <SourceIcon className="size-3 shrink-0 stroke-[1.75] opacity-75" />
+              <span className="truncate font-medium">{sourceLabel}</span>
+              <ArrowUpRight className="size-2.5 shrink-0 opacity-60 transition-transform duration-150 group-hover/src:translate-x-[0.5px] group-hover/src:-translate-y-[0.5px] group-hover/src:opacity-100" />
+            </button>
+          ) : (
+            <span
+              data-slot="prompt-source"
+              className="text-ink-muted inline-flex max-w-full items-center gap-1 px-1 py-0.5 text-[11px] leading-tight"
+            >
+              <SourceIcon className="size-3 shrink-0 stroke-[1.75] opacity-70" />
+              <span className="truncate font-medium">{sourceLabel}</span>
+            </span>
+          )}
+        </div>
+      )}
       {imageBadges.length > 0 && (
         <div
           ref={imagesRef}
@@ -862,7 +1038,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             ref={bodyRef}
             style={
               !expanded && overflowing
-                ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
+                ? { maxHeight: `${previewMaxPx}px`, overflow: "hidden" }
                 : undefined
             }
             className="relative space-y-1.5"
@@ -964,7 +1140,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             )}
 
             {slashDirectiveLabel ? (
-              <p className="selectable-text text-foreground text-[15px] leading-[1.65] whitespace-pre-wrap">
+              <p className="selectable-text text-foreground font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading) whitespace-pre-wrap">
                 <InlineDirectiveToken
                   directive={slashDirectiveLabel}
                   size="bubble"
@@ -975,8 +1151,8 @@ export const UserPromptBubble = memo(function UserPromptBubble({
               </p>
             ) : (
               cleanText.length > 0 &&
-              (sanitizedLegacy ? (
-                <p className="selectable-text text-foreground text-[15px] leading-[1.65] whitespace-pre-wrap">
+              (!canRenderPrecomputedBlocks ? (
+                <p className="selectable-text text-foreground font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading) whitespace-pre-wrap">
                   {cleanText}
                 </p>
               ) : (
@@ -1006,7 +1182,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
           <RelativeTimestampPill timestampMs={promptTimestampMs} />
         )}
         <StageCopyButton text={copyPayload} />
-        {onRequestRewind && item.seq > 0 && (
+        {onRequestRewind && item.item_type === "user_prompt" && item.seq > 0 && (
           <UndoActionButton label={t("stage.undoToHere")} onClick={handleRewindClick} />
         )}
       </div>

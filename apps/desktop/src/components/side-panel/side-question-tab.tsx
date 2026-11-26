@@ -12,9 +12,10 @@ import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { formatProviderLabel, type SessionMode } from "@/lib/orbit-ipc";
 import {
+  type SidePanelTab,
   type SideQuestionEntry,
   orbitActions,
-  sideQuestionScopeKey,
+  sidePanelTabScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
 
@@ -26,18 +27,16 @@ const QUICK_SIDE_PROMPTS = [
   "Check for potential edge cases",
 ] as const;
 
-export const SideQuestionTab = memo(function SideQuestionTab() {
-  const scope = useOrbitSelector((s) => sideQuestionScopeKey(s));
-  const hostId = useOrbitSelector((s) => s.selectedHostId);
-  const cwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+export const SideQuestionTab = memo(function SideQuestionTab({ tab }: { tab: SidePanelTab }) {
+  const scope = sidePanelTabScopeKey(tab);
+  const hostId = tab.hostId ?? null;
+  const tabAgentId = tab.agentId ?? null;
+  const cwd = tab.cwd ?? "~";
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const entries = useOrbitSelector((s) => s.sideQuestionsByScope[scope] ?? EMPTY_ENTRIES);
   const draft = useOrbitSelector((s) => s.sideQuestionDrafts[scope] ?? "");
   const focusNonce = useOrbitSelector((s) => s.sideQuestionFocusNonce);
-  const targetEntryId = useOrbitSelector(
-    (s) =>
-      s.sidePanelTabs.find((tab) => tab.kind === "side_question")?.sideQuestionEntryId ?? null,
-  );
+  const targetEntryId = tab.sideQuestionEntryId ?? null;
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -49,11 +48,9 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   }, [targetEntryId, focusNonce]);
 
   const activeProviderLabel = useOrbitSelector((s) => {
-    if (!s.selectedHostId) return "Assistant";
-    if (!s.isDraftNewSession && s.selectedAgentId) {
-      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
-        (a) => a.agent_id === s.selectedAgentId,
-      );
+    if (!hostId) return "Assistant";
+    if (tabAgentId) {
+      const ag = s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tabAgentId);
       if (ag?.provider_label) return ag.provider_label;
     }
     if (s.draftProvider === "acp") {
@@ -63,10 +60,8 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   });
 
   const activeMode: SessionMode = useOrbitSelector((s) => {
-    if (!s.isDraftNewSession && s.selectedHostId && s.selectedAgentId) {
-      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
-        (a) => a.agent_id === s.selectedAgentId,
-      );
+    if (hostId && tabAgentId) {
+      const ag = s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tabAgentId);
       if (ag) return ag.mode;
     }
     return s.draftMode;
@@ -77,10 +72,24 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   const lastEntry = entries[entries.length - 1];
   const contentVersion = `${entries.length}:${lastEntry?.id ?? ""}:${lastEntry?.answer.length ?? 0}:${lastEntry?.status ?? ""}`;
 
+  const submitForScope = (question: string) => {
+    if (!hostId) {
+      void orbitActions.submitSideQuestion(question);
+      return;
+    }
+    void orbitActions.submitSideQuestion(question, {
+      hostId,
+      scopeKey: scope,
+      isDraftNewSession: !tabAgentId,
+      agentId: tabAgentId,
+      workspaceCwd: cwd,
+    });
+  };
+
   const handleSubmit = () => {
     const trimmed = draft.trim();
     if (!trimmed || isStreaming) return;
-    void orbitActions.submitSideQuestion(trimmed);
+    submitForScope(trimmed);
   };
 
   return (
@@ -111,7 +120,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   <button
                     key={prompt}
                     type="button"
-                    onClick={() => void orbitActions.submitSideQuestion(prompt)}
+                    onClick={() => submitForScope(prompt)}
                     className="border-border/80 bg-elevated/45 text-foreground/80 hover:border-foreground/20 hover:bg-accent/70 hover:text-foreground inline-flex max-w-full cursor-pointer items-center rounded-full border px-3 py-1 text-[13px] leading-[18px] transition-colors"
                   >
                     <span className="truncate">{prompt}</span>
@@ -142,14 +151,14 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   ) : (
                     <>
                       {entry.answer && (
-                        <div className="min-w-0 text-[15px] leading-[1.65]">
+                        <div className="min-w-0 font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading)">
                           {entry.blocks.length > 0 ? (
                             <MarkdownBlocksView
                               blocks={entry.blocks}
                               streaming={entry.status === "streaming"}
                             />
                           ) : (
-                            <div className="selectable-text text-foreground/92 leading-[1.65] whitespace-pre-wrap">
+                            <div className="selectable-text text-foreground/92 leading-(--orbit-read-leading) whitespace-pre-wrap">
                               {entry.answer}
                             </div>
                           )}
@@ -174,6 +183,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                           onClick={() =>
                             orbitActions.promoteSideQuestionToComposer(
                               `Regarding "${entry.question}":\n${entry.answer}`,
+                              scope,
                             )
                           }
                           className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11px] transition-colors"
@@ -195,7 +205,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
       <ConversationComposer
         variant="docked"
         value={draft}
-        onChange={(next) => orbitActions.setSideQuestionDraft(next)}
+        onChange={(next) => orbitActions.setSideQuestionDraft(next, scope)}
         onSubmit={handleSubmit}
         onInterrupt={isStreaming ? () => orbitActions.cancelSideQuestion(scope) : undefined}
         isBusy={isStreaming}
@@ -225,7 +235,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
               <button
                 type="button"
                 title="Clear side thread"
-                onClick={() => orbitActions.clearSideQuestions()}
+                onClick={() => orbitActions.clearSideQuestions(scope)}
                 className="text-muted-foreground hover:text-foreground inline-flex size-8 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
               >
                 <Trash2 className="size-[14px]" />

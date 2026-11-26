@@ -17,6 +17,10 @@ import {
 } from "./model-metadata.ts";
 import type { ReasoningEffort, SlashCommandView } from "./orbit-ipc.ts";
 import {
+  formatGoalDuration,
+  computeGoalElapsedSecs,
+} from "./goal-format.ts";
+import {
   filterSlashCommands,
   isSlashCommandSessionRequired,
   normalizeDirectiveLabel,
@@ -258,20 +262,78 @@ describe("model metadata context window & effort localization", () => {
 });
 
 describe("composer directive submission", () => {
-  for (const kind of ["btw", "goal"] as const) {
-    it(`routes bare, inline and pasted /${kind} locally`, () => {
-      for (const text of ["", "some text"]) {
-        assert.deepEqual(resolveComposerSubmission(kind, `  ${text}  `), { kind, text });
-        assert.deepEqual(resolveComposerSubmission(null, `/${kind} ${text}`), { kind, text });
-      }
-      assert.deepEqual(resolveComposerSubmission(null, `/${kind}`), { kind, text: "" });
-    });
-  }
+  it("routes bare, inline and pasted /btw locally", () => {
+    for (const text of ["", "some text"]) {
+      assert.deepEqual(resolveComposerSubmission("btw", `  ${text}  `), { kind: "btw", text });
+      assert.deepEqual(resolveComposerSubmission(null, `/btw ${text}`), { kind: "btw", text });
+    }
+    assert.deepEqual(resolveComposerSubmission(null, "/btw"), { kind: "btw", text: "" });
+  });
 
-  it("preserves plan and only recognizes whole raw commands", () => {
+  it("routes /goal objectives through normal user prompt pipeline and handles subcommands locally", () => {
+    assert.deepEqual(resolveComposerSubmission("goal", "  Ship release  "), {
+      kind: "prompt",
+      directive: "goal",
+    });
+    assert.deepEqual(resolveComposerSubmission(null, "/goal Ship release"), {
+      kind: "prompt",
+      directive: null,
+    });
+    assert.deepEqual(resolveComposerSubmission("goal", ""), { kind: "goal_inspect" });
+    assert.deepEqual(resolveComposerSubmission(null, "/goal"), { kind: "goal_inspect" });
+    assert.deepEqual(resolveComposerSubmission(null, "/goal clear"), { kind: "goal_clear" });
+    assert.deepEqual(resolveComposerSubmission("goal", "stop"), { kind: "goal_clear" });
+    assert.deepEqual(resolveComposerSubmission(null, "/goal edit"), { kind: "goal_edit" });
+    assert.deepEqual(resolveComposerSubmission("goal", "edit"), { kind: "goal_edit" });
+    assert.equal(
+      isSlashCommandSessionRequired({
+        id: "goal",
+        command: "/goal",
+        label: "Goal",
+        description: "",
+        shortcut_key: null,
+        icon_key: "target",
+        keywords: [],
+        desktop_only: false,
+      }),
+      false,
+    );
+  });
+
+  it("formats goal durations in concise human units without raw seconds dumps", () => {
+    assert.equal(formatGoalDuration(0), "0s");
+    assert.equal(formatGoalDuration(45), "45s");
+    assert.equal(formatGoalDuration(125), "2m 5s");
+    assert.equal(formatGoalDuration(8370), "2h 19m");
+    assert.equal(formatGoalDuration(90000), "1d 1h");
+    const elapsed = computeGoalElapsedSecs(
+      {
+        goal_id: "g1",
+        agent_id: "a1",
+        workspace_id: "",
+        objective: "Ship",
+        criteria: [],
+        max_iterations: 25,
+        current_iteration: 1,
+        max_duration_secs: 0,
+        status: "paused",
+        consecutive_identical_failures: 0,
+        active_duration_secs: 3720,
+        started_at_ms: 1000,
+        updated_at_ms: 9999999,
+      },
+      99999999,
+    );
+    assert.equal(elapsed, 3720);
+  });
+
+  it("preserves plan and only recognizes whole unescaped raw commands", () => {
     assert.deepEqual(resolveComposerSubmission("plan", "/btw example"), { kind: "prompt", directive: "plan" });
     assert.deepEqual(resolveComposerSubmission(null, "/goalkeeper"), { kind: "prompt", directive: null });
     assert.deepEqual(resolveComposerSubmission("btw", "/goal example"), { kind: "btw", text: "/goal example" });
+    assert.deepEqual(resolveComposerSubmission(null, "\\/goal example"), { kind: "prompt", directive: null });
+    assert.deepEqual(resolveComposerSubmission(null, "\\/btw example"), { kind: "prompt", directive: null });
+    assert.deepEqual(resolveComposerSubmission(null, "explain /goal command"), { kind: "prompt", directive: null });
   });
 
   it("normalizes slash directive labels and shares frameless InlineDirectiveToken across surfaces", () => {
@@ -308,16 +370,17 @@ describe("composer directive submission", () => {
 });
 
 describe("composer caret triggers", () => {
-  it("matches the slash and mention grammar at every caret boundary", () => {
+  it("matches leading-only slash and anywhere-whitespace mention grammar at every caret boundary", () => {
     for (const text of [
-      "/plan", "prefix /plan suffix", "see /src/main.rs then type here",
+      "/plan", "  /goal", "\n/review", "prefix /plan suffix", "see /src/main.rs then type here",
+      "\\/goal escaped", "如何实现 /goal 命令", "如何实现 \\/goal 命令",
       "@file", "read @src/main.rs next", "mail@host a@b/c",
       "/x@y @x/y @a@b //", "x\t/@\n@file  /", "你好　/计划 接续　@文件",
       "前缀@无效 🪐 /计划", "",
     ]) {
       for (let pos = 0; pos <= text.length; pos++) {
         const prefix = text.slice(0, pos);
-        const expected = /(?:^|\s)\/([^\s/]*)$/.test(prefix) ? "slash"
+        const expected = /^\s*\/([^\s/]*)$/.test(prefix) ? "slash"
           : /(?:^|\s)@([^\s@]*)$/.test(prefix) ? "mention" : null;
         assert.equal(detectActiveTriggerKind(text, pos), expected, JSON.stringify(prefix));
       }

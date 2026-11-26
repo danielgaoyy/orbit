@@ -2,6 +2,7 @@
 //! multi-host Fleet Router auto-discovery, 3-tier Guardian pre-review policy, and
 //! bidirectional Hermes MCP / Webhook bridging.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentStatus, AgentSummary, ProviderKind, ReasoningEffort};
@@ -10,6 +11,94 @@ use crate::{AgentStatus, AgentSummary, ProviderKind, ReasoningEffort};
 pub const LABEL_AGENT_ROLE: &str = "orbit.role";
 /// Label value stored under [`LABEL_AGENT_ROLE`] for the host's canonical Personal Router session.
 pub const AGENT_ROLE_PERSONAL_ROUTER: &str = "personal_router";
+/// Audit-chain category recorded for Personal Agent, Guardian Tier-1, and permission-rule decisions.
+pub const AUDIT_CATEGORY_PERSONAL_AGENT_DECISION: &str = "personal_agent_decision";
+
+/// Label key persisted on `AgentSummary.labels` recording the immutable visibility & lifecycle tier.
+pub const LABEL_SESSION_TIER: &str = "orbit.session_tier";
+pub const SESSION_TIER_CONVERSATION: &str = "conversation";
+pub const SESSION_TIER_SUBAGENT: &str = "subagent";
+pub const SESSION_TIER_PERSONAL_ROUTER: &str = "personal_router";
+pub const SESSION_TIER_AUTOMATION: &str = "automation";
+
+/// Label keys persisted on `AgentSummary.labels` when a user-visible `Conversation` was dispatched
+/// by a `PersonalRouter` (kept strictly orthogonal to `parent_agent_id` so routed conversations
+/// appear in the user's Left Sidebar while still notifying and answering to the Router).
+pub const LABEL_ROUTED_BY_AGENT: &str = "orbit.routed_by_agent";
+pub const LABEL_ROUTED_BY_HOST: &str = "orbit.routed_by_host";
+
+/// Canonical session visibility and lifecycle tier across Daemon, Store, and all Client UIs.
+///
+/// Only [`SessionTier::Conversation`] sessions appear in the user's Left Sidebar, Workspace Peer
+/// strips, Auto-Organizer, and `<orbit-fleet-atlas>`. [`SessionTier::Subagent`] sessions (both
+/// local and cross-host remote) are strictly encapsulated inside their parent Conversation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTier {
+    /// Primary user-visible conversation in the Left Sidebar (created ONLY by Human or PersonalRouter).
+    #[default]
+    Conversation,
+    /// Strictly internal child execution session of a Conversation (local or cross-host; NEVER in Sidebar).
+    Subagent,
+    /// Persistent Personal Router ("Chief-of-Staff / 分工师") session.
+    PersonalRouter,
+    /// Scheduled/background automation or ephemeral system organizer session.
+    Automation,
+}
+
+impl SessionTier {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Conversation => SESSION_TIER_CONVERSATION,
+            Self::Subagent => SESSION_TIER_SUBAGENT,
+            Self::PersonalRouter => SESSION_TIER_PERSONAL_ROUTER,
+            Self::Automation => SESSION_TIER_AUTOMATION,
+        }
+    }
+
+    pub fn from_slug(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "conversation" | "primary" => Some(Self::Conversation),
+            "subagent" | "child" => Some(Self::Subagent),
+            "personal_router" | "router" | "chief_of_staff" => Some(Self::PersonalRouter),
+            "automation" | "background" => Some(Self::Automation),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical single-source-of-truth resolution of [`SessionTier`] shared by `AgentSummary` and `AgentCardView`.
+///
+/// Crucially, `Subagent` status NEVER depends on `parent_host_id.is_none()` or whether the parent
+/// session is still unarchived in memory: cross-host remote subagents and orphaned subagents remain
+/// `SessionTier::Subagent` deterministically.
+pub fn resolve_session_tier(
+    background: bool,
+    parent_agent_id: Option<&str>,
+    labels: &std::collections::HashMap<String, String>,
+) -> SessionTier {
+    if background {
+        return SessionTier::Automation;
+    }
+    if labels
+        .get(LABEL_AGENT_ROLE)
+        .is_some_and(|v| AgentRole::from_slug(v) == AgentRole::PersonalRouter)
+    {
+        return SessionTier::PersonalRouter;
+    }
+    if let Some(explicit) = labels
+        .get(LABEL_SESSION_TIER)
+        .and_then(|v| SessionTier::from_slug(v))
+    {
+        return explicit;
+    }
+    if parent_agent_id.is_some_and(|p| !p.trim().is_empty())
+        && !labels.contains_key(LABEL_ROUTED_BY_AGENT)
+    {
+        return SessionTier::Subagent;
+    }
+    SessionTier::Conversation
+}
 
 fn router_default_true() -> bool {
     true
@@ -223,6 +312,37 @@ pub struct HermesBridgeBundle {
     pub skill_md_template: String,
 }
 
+/// Personal Agent's non-binding recommendation attached to a pending permission request
+/// (used in `assist_only` mode or for Tier-3 human-only checkpoints).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterRecommendation {
+    /// Recommended decision: `"allow"` or `"deny"`.
+    pub decision: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Logged automatic permission decision performed by the Personal Agent, Guardian Tier-1,
+/// or a persistent permission rule, projected from the host's signed security audit chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalAgentActivityEntry {
+    pub seq: u64,
+    pub timestamp_ms: i64,
+    pub actor: String,
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub agent_title: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
 /// Client-persisted global selection of WHICH host in the Multi-Host Fleet owns the user's
 /// canonical Primary Personal Router (e.g. an always-on remote Mac mini or cloud Devbox).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +365,24 @@ pub struct FleetProjectEntry {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_branch: Option<String>,
+}
+
+/// Concise curated Mission Workspace entry discovered on a local or connected remote host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetWorkspaceEntry {
+    pub host_id: String,
+    pub host_name: String,
+    #[serde(default)]
+    pub is_local: bool,
+    pub workspace_id: String,
+    pub title: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_goal: Option<String>,
+    #[serde(default)]
+    pub board_revision: u64,
 }
 
 /// Token-bounded remote/local project context packet fetched by a Personal Router before
@@ -285,16 +423,77 @@ impl AgentSummary {
         self.role() == AgentRole::PersonalRouter
     }
 
+    /// Return the authoritative visibility & lifecycle tier of this session.
+    pub fn session_tier(&self) -> SessionTier {
+        resolve_session_tier(
+            self.background,
+            self.parent_agent_id.as_deref(),
+            &self.labels,
+        )
+    }
+
+    /// Returns `true` when this session is an internal `Subagent` (local or remote; hidden from Sidebar).
+    pub fn is_subagent(&self) -> bool {
+        self.session_tier() == SessionTier::Subagent
+    }
+
+    /// Returns `true` when this session is a primary user-visible `Conversation` in the Sidebar.
+    pub fn is_primary_conversation(&self) -> bool {
+        self.session_tier() == SessionTier::Conversation
+    }
+
+    /// Explicitly persist the session's [`SessionTier`] in `self.labels`.
+    pub fn set_session_tier(&mut self, tier: SessionTier) {
+        self.labels
+            .insert(LABEL_SESSION_TIER.to_string(), tier.slug().to_string());
+    }
+
+    /// Return the `PersonalRouter` agent ID that dispatched this conversation, if any.
+    pub fn routed_by_agent_id(&self) -> Option<&str> {
+        self.labels
+            .get(LABEL_ROUTED_BY_AGENT)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Return the `PersonalRouter` host ID that dispatched this conversation, if any.
+    pub fn routed_by_host_id(&self) -> Option<&str> {
+        self.labels
+            .get(LABEL_ROUTED_BY_HOST)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Stamp Personal Router provenance on a user-visible `Conversation` without turning it into a hidden `Subagent`.
+    pub fn set_routed_by(&mut self, router_agent_id: String, router_host_id: Option<String>) {
+        self.labels
+            .insert(LABEL_ROUTED_BY_AGENT.to_string(), router_agent_id);
+        if let Some(hid) = router_host_id.filter(|h| !h.trim().is_empty()) {
+            self.labels.insert(LABEL_ROUTED_BY_HOST.to_string(), hid);
+        }
+    }
+
     /// Set the logical orchestration role in `self.labels`.
     pub fn set_role(&mut self, role: AgentRole) {
         match role {
             AgentRole::Worker => {
                 self.labels.remove(LABEL_AGENT_ROLE);
+                if self.labels.get(LABEL_SESSION_TIER).map(String::as_str)
+                    == Some(SESSION_TIER_PERSONAL_ROUTER)
+                {
+                    self.labels.remove(LABEL_SESSION_TIER);
+                }
             }
             AgentRole::PersonalRouter => {
                 self.labels.insert(
                     LABEL_AGENT_ROLE.to_string(),
                     AGENT_ROLE_PERSONAL_ROUTER.to_string(),
+                );
+                self.labels.insert(
+                    LABEL_SESSION_TIER.to_string(),
+                    SESSION_TIER_PERSONAL_ROUTER.to_string(),
                 );
             }
         }
@@ -304,6 +503,7 @@ impl AgentSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn router_config_roundtrip_defaults() {
@@ -329,5 +529,93 @@ mod tests {
         assert_eq!(AgentRole::from_slug("router"), AgentRole::PersonalRouter);
         assert_eq!(AgentRole::from_slug("worker"), AgentRole::Worker);
         assert_eq!(AgentRole::from_slug("unknown"), AgentRole::Worker);
+    }
+
+    #[test]
+    fn pending_permission_summary_backward_compat_without_router_recommendation() {
+        let legacy_json = serde_json::json!({
+            "agent_id": "ag_1",
+            "agent_title": "Worker 1",
+            "workspace_id": "ws_1",
+            "request_id": "perm_1",
+            "title": "Run tests",
+            "detail": {
+                "kind": "shell",
+                "command": "cargo test",
+                "cwd": null,
+                "exit_code": null,
+                "output_preview": null
+            },
+            "allowed_decisions": ["allow", "deny"],
+            "created_at": "2026-11-26T00:00:00Z"
+        });
+        let parsed: crate::PendingPermissionSummary =
+            serde_json::from_value(legacy_json).expect("legacy PendingPermissionSummary parses");
+        assert!(parsed.router_recommendation.is_none());
+        assert!(!parsed.human_only);
+
+        let wire_list: crate::WireMessage = serde_json::from_value(serde_json::json!({
+            "op": "list_personal_agent_activity",
+            "request_id": uuid::Uuid::new_v4(),
+            "limit": 50
+        }))
+        .expect("ListPersonalAgentActivity parses without since_ms");
+        assert!(matches!(
+            wire_list,
+            crate::WireMessage::ListPersonalAgentActivity {
+                limit: 50,
+                since_ms: None,
+                ..
+            }
+        ));
+
+        let req_id = uuid::Uuid::new_v4();
+        let rec_wire = crate::WireMessage::RecommendPermission {
+            request_id: req_id,
+            agent_id: "ag_1".into(),
+            permission_request_id: "perm_1".into(),
+            decision: "deny".into(),
+            reason: "Too broad".into(),
+        };
+        let encoded = serde_json::to_string(&rec_wire).expect("serialize RecommendPermission");
+        let decoded: crate::WireMessage =
+            serde_json::from_str(&encoded).expect("deserialize RecommendPermission");
+        assert!(matches!(
+            decoded,
+            crate::WireMessage::RecommendPermission {
+                request_id: rid,
+                ref decision,
+                ..
+            } if rid == req_id && decision == "deny"
+        ));
+    }
+
+    #[test]
+    fn resolve_session_tier_keeps_remote_and_orphan_subagents_hidden_and_routed_conversations_visible()
+     {
+        let empty = HashMap::new();
+        assert_eq!(
+            resolve_session_tier(false, None, &empty),
+            SessionTier::Conversation
+        );
+        assert_eq!(
+            resolve_session_tier(false, Some("parent_remote"), &empty),
+            SessionTier::Subagent
+        );
+        assert_eq!(
+            resolve_session_tier(true, None, &empty),
+            SessionTier::Automation
+        );
+
+        let mut routed_labels = HashMap::new();
+        routed_labels.insert(LABEL_ROUTED_BY_AGENT.to_string(), "ag_router".to_string());
+        routed_labels.insert(
+            LABEL_SESSION_TIER.to_string(),
+            SESSION_TIER_CONVERSATION.to_string(),
+        );
+        assert_eq!(
+            resolve_session_tier(false, None, &routed_labels),
+            SessionTier::Conversation
+        );
     }
 }

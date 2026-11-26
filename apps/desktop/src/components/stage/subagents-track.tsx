@@ -4,6 +4,7 @@ import {
   ChevronRight,
   HeartPulse,
   MessageSquareText,
+  Target,
 } from "lucide-react";
 import {
   type RichBlockView,
@@ -20,6 +21,7 @@ import type { SubagentCharacterSpec } from "@/lib/subagent-avatar";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
+  isDirectAgentPromptBubble,
   isTimelineAgentMessageHidden,
   peerFinishStatus,
   type CoalescedFinishStatus,
@@ -95,7 +97,7 @@ export const LazyMarkdownMessageBody = memo(function LazyMarkdownMessageBody({
     return <MarkdownBlocksView blocks={parsedBlocks as RichBlockView[]} compact />;
   }
   return (
-    <p className="selectable-text text-ink-secondary whitespace-pre-wrap break-words leading-[1.55]">
+    <p className="selectable-text text-ink-secondary font-(family-name:--orbit-font-content) text-(length:--orbit-read-compact) leading-(--orbit-read-compact-leading) whitespace-pre-wrap break-words">
       {text}
     </p>
   );
@@ -271,11 +273,12 @@ export const AgentMessageCard = memo(function AgentMessageCard({
     <LazyMarkdownMessageBody text={body} precomputedBlocks={precomputedBlocks} />
   ) : undefined;
 
-  if (isTimelineAgentMessageHidden(item)) {
+  if (isTimelineAgentMessageHidden(item) || isDirectAgentPromptBubble(item)) {
     return null;
   }
 
   if (item.kind === "heartbeat" && !perm) {
+    const isGoalWakeup = Boolean(item.source_title && /^Goal\b/i.test(item.source_title));
     return (
       <Collapsible open={expanded} onOpenChange={heartbeat.onOpenChange} className={wrapperClass}>
         <CollapsibleTrigger
@@ -283,7 +286,11 @@ export const AgentMessageCard = memo(function AgentMessageCard({
           disabled={!body}
           className="-mx-[6px] inline-flex min-h-[28px] max-w-[calc(100%+12px)] cursor-pointer items-center gap-1.5 rounded-[8px] px-[6px] text-left text-[13px] leading-[18px] text-ink-tertiary outline-none transition-colors hover:bg-accent/55 focus-visible:ring-2 focus-visible:ring-ring/50 disabled:cursor-default"
         >
-          <HeartPulse className="text-signal-danger/80 size-3.5 shrink-0" />
+          {isGoalWakeup ? (
+            <Target className="text-ink-tertiary size-3.5 shrink-0" />
+          ) : (
+            <HeartPulse className="text-signal-danger/80 size-3.5 shrink-0" />
+          )}
           <span className="truncate">{item.source_title && item.source_title !== "Heartbeat wakeup" ? item.source_title : t("stage.heartbeat")}</span>
           {body && <ChevronRight aria-hidden="true" className={cn("size-3 shrink-0 transition-transform duration-[150ms] ease-[var(--ease-panel)] motion-reduce:transition-none", expanded && "rotate-90")} />}
         </CollapsibleTrigger>

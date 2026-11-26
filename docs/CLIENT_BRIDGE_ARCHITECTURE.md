@@ -12,7 +12,7 @@ Desktop, Web PWA, iOS, Android and HarmonyOS share the Rust presentation model i
    - Unified sidebar tree (`Needs Attention`, `Pinned`, `Projects`, `Launchpad`), git branch enrichment, worktree folding, filter/sort/search, and persisted thread `pinned` + `seen_seq` flags (`client_thread_prefs` in `orbit-store`)
    - Incremental conversation stage projection (`AgentStageDelta` / `TurnLiveSegment` with `Wakeup` & `StepGroup`)
    - Canonical provider fallback model catalogs, retired-slug migration, and effort resolution (`resolve_model_selection`)
-   - Platform-filtered slash command catalog (`slash_commands`), fuzzy `@` mention candidate ranking (`rank_mention_candidates`), and prompt/workflow composition (`compose_prompt` including `/plan`, `/review`, `/compact`, `/btw`)
+   - Platform-filtered slash command catalog (`slash_commands`), fuzzy `@` mention candidate ranking (`rank_mention_candidates`), and prompt/workflow composition (`compose_prompt` including `/plan`, `/goal`, `/review`, `/compact`, `/btw`, plus leading `\/` verbatim escape passthrough)
    - Detached multi-slot VT100 terminal emulation (`terminal_screen_slot`)
    - Conversation rewind (`rewind_agent`), workspace file preview (`read_workspace_file`), and side-question context & streaming (`build_side_question_context`, `ask_side_question`)
    - Pure-Rust native diagram rendering (`diagram.rs`: Mermaid via `mermaid-rs-renderer`, Graphviz DOT via `layout-rs`, XSS-sanitized inline SVG, deterministic SVG `id` namespacing, and a 128-entry LRU cache)
@@ -21,7 +21,7 @@ Desktop, Web PWA, iOS, Android and HarmonyOS share the Rust presentation model i
 3. **Standardized Contract v2 Across All 3 Bridges**:
    - **Desktop**: Tauri IPC commands & typed Channel events (`apps/desktop/src-tauri/src/lib.rs` -> `apps/desktop/src/lib/orbit-ipc.ts`)
    - **iOS & Android**: UniFFI v2 typed records/enums & `MobileCoreListener` (`crates/orbit-ffi-uniffi/src/lib.rs` -> `apps/ios/Generated/*` & `apps/android/.../uniffi/orbit_ffi_uniffi/orbit_ffi_uniffi.kt`)
-   - **HarmonyOS**: N-API Contract v2 JSON DTO endpoints & `subscribeEvents` (`crates/orbit-ffi-ohos/src/lib.rs` -> `apps/harmony/entry/src/main/cpp/types/liborbit_ohos/index.d.ts`)
+   - **HarmonyOS** exposes Contract v2 JSON DTOs and `subscribeEvents` through `crates/orbit-ffi-ohos/src/napi/`. ArkTS consumes the declarations in `apps/harmony/entry/src/main/cpp/types/liborbit_ohos/index.d.ts`.
 
 ---
 
@@ -81,7 +81,8 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Model catalogs & effort resolution | `fallback_provider_catalogs`, `resolve_model_selection` | `get_fallback_provider_catalogs`, `resolve_model_selection` | `fallback_provider_catalogs`, `resolve_model_selection` | `fallbackProviderCatalogsJson`, `resolveModelSelectionJson` |
 | Slash command catalog | `slash_commands(platform, query)` | `get_slash_commands` | `slash_commands(platform, query)` | `slashCommandsJson(platform, query)` |
 | `@` Mention fuzzy ranking | `rank_mention_candidates` | `rank_mention_candidates` | `rank_mention_candidates` | `rankMentionCandidatesJson` |
-| Prompt & workflow composition | `compose_prompt` | `compose_prompt` | `compose_prompt` | `composePromptJson` |
+| Prompt & workflow composition | `compose_prompt` (`SlashDirective::Goal` + `\/` escape) | `compose_prompt` + `ComposerGoalShelf` / `GoalDialogs` | `compose_prompt` (`FfiSlashDirective::Goal`) | `composePromptJson` |
+| Autonomous Goal runs | `start_goal_run_on_host` (`replace_existing`, `dispatch_initial_prompt`), `update_goal_run_on_host`, `control_goal_run_on_host` | `start_goal_run`, `update_goal_run`, `control_goal_run` (+ `WasmWebBackend` & `WasmHost` parity) | `start_goal`, `update_goal_run`, `control_goal_run` | `startGoalRunJson`, `updateGoalRunJson`, `controlGoalRunJson` |
 | Conversation rewind | `rewind_agent` | `rewind_agent` | `rewind_agent_request` / `rewind_agent` | `rewindAgentJson` |
 | Workspace file viewer | `read_workspace_file` | `read_workspace_file` | `read_workspace_file_request` / `read_workspace_file` | `readWorkspaceFileJson` |
 | Diagram detection & rendering | `detect_diagram_kind`, `render_diagram` (`diagram.rs`) | `render_diagram` | `detect_diagram_kind`, `render_diagram` | `detectDiagramKind`, `renderDiagramJson` |
@@ -90,6 +91,7 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Lifecycle & connectivity | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `onAppForeground`, `onAppBackground`, `onNetworkChanged` |
 | Host & Agent identity flags | `HostCardView.is_local`, `AgentCardView.has_armed_timers` | Same JSON fields + `isAgentTimerWaiting` | `FfiHostCard.isLocal`, `FfiAgentCard.hasArmedTimers` | Same DTO fields via N-API |
 | Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | Wired via Desktop Tauri (`App -> Personal Agent`, host-independent) | `discover_fleet_router_hosts` / `get_router_config` | `discoverFleetRouterHostsJson` / `getRouterConfigJson` |
+| Personal Agent briefing & activity log | `personal_agent_briefing` (`personal_agent.rs`, zero-IO), `list_personal_agent_activity` (`WireMessage::ListPersonalAgentActivity`) | `get_personal_agent_briefing`, `list_personal_agent_activity` (+ `WasmWebBackend` & `WasmHost` parity) | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | SEP-1865 MCP Apps bridge | `read_mcp_resource_async`, `call_artifact_mcp_tool_async` | `read_mcp_resource`, `call_artifact_mcp_tool` | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | M3 Security, Audit, Diagnostics & IDE Migration | `get_sandbox_config`, `update_sandbox_config`, `get_audit_chain_status`, `export_audit_chain`, `export_diagnostic_bundle`, `compact_agent_context`, `inspect_external_ide_migration`, `execute_external_ide_migration` | Wired 1:1 in Tauri IPC + `WasmWebBackend` | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | M4 Project Memory | `list_project_memories`, `upsert_project_memory`, `confirm_project_memory`, `delete_project_memory`, `recall_project_memory` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`Instructions & Rules -> Memory`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
@@ -99,6 +101,14 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 ---
 
 Plugin discovery, operation results and UI trees are host-local correlated wire replies. A client renders the typed JSON tree and routes button actions back to the originating host and plugin. The ABI, limits and supported slots are specified in the [plugin SDK](architecture/plugins.md).
+
+### HarmonyOS N-API
+
+In `crates/orbit-ffi-ohos/src/`, `facade/*` groups the host-testable Rust methods by domain. `napi/*` binds them to `OrbitHarmonyCore` and compiles only for HarmonyOS. `events.rs` translates core notifications into JSON for subscribers, and `dto.rs` defines HarmonyOS request payloads.
+
+PR-0 preserved all 227 existing declarations byte-for-byte and added one performance hook, bringing the total to **228 exports**. With `--features perf-hooks`, `debug_replay_stage_deltas_json` is callable from ArkTS as `debugReplayStageDeltasJson(hostId, agentId, framesJson)`. The hook replays recorded stage deltas in memory for that host and agent. Subscribers receive `timeline_changed` and pull each update through the normal stage API. In a standard build the same call returns `perf hooks disabled`.
+
+`bash scripts/check-ohos-dts-sync.sh --print-count` scans `lib.rs` first, then `napi/**/*.rs` in lexical path order. It rejects duplicate method names on the same class and compares the generated declarations with the checked-in `index.d.ts`. For the JSON payload contract, `node scripts/check-harmony-dto-contract.mjs` compares the top-level keys of Rust-generated fixtures in `apps/harmony/contract/fixtures/` with ArkTS interfaces in `model/OrbitTypes.ets` and `model/dto/*.ets`. Missing and extra fields both fail the check.
 
 ## 4. Thread Preferences Persistence & Legacy Migration
 
@@ -136,7 +146,7 @@ Pass a platform-protected 32-byte key through `OrbitMobileCore.newWithMasterKey`
 
 ## 6. Binding Synchronization & Verification Workflow
 
-Whenever Rust FFI types in `crates/orbit-client-core` or `crates/orbit-ffi-uniffi` change, regenerate Swift and Kotlin bindings and run the workspace checks:
+Use `bash scripts/sync-bindings.sh --check` to generate Swift and Kotlin bindings in a temporary directory and compare them with the checked-in bindings. A difference on either platform fails the check. When FFI types change, regenerate the affected bindings before running the workspace checks.
 
 ```bash
 # 1. Regenerate iOS (Swift) and Android (Kotlin) UniFFI bindings

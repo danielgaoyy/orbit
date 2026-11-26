@@ -3,20 +3,25 @@ import {
   Archive,
   ArrowDownAZ,
   ArrowUpDown,
+  Bot,
   Check,
   ChevronsDownUp,
   ChevronsUpDown,
   CircleDot,
   Clock,
-  LayoutGrid,
   List,
   ListFilter,
+  MessageSquare,
   Plus,
   Search,
   Settings,
-  Sparkles,
   X,
 } from "lucide-react";
+import { usePersonalAgentBriefing } from "@/components/personal-agent/use-personal-agent-briefing";
+import {
+  type PersonalAgentRef,
+  selectPersonalAgentRef,
+} from "@/state/selectors/personal-agent-selectors";
 import { useActionShortcutDisplay } from "@/lib/keybindings";
 import {
   type AgentCardView,
@@ -25,7 +30,6 @@ import {
   compareSemver,
   isMacDesktop,
   normalizeSemver,
-  orbitIpc,
 } from "@/lib/orbit-ipc";
 import { normalizeProjectPath } from "@/lib/projects";
 import { useImeCompositionGuard } from "@/lib/ime";
@@ -54,8 +58,12 @@ import {
   type InlineCreateGroupTarget,
   SidebarProjectSection,
 } from "@/components/sidebar/sidebar-project-section";
-import { useSidebarDrag } from "@/components/sidebar/use-sidebar-drag";
+import {
+  getInlineSortNeighborOffset,
+  useSidebarDrag,
+} from "@/components/sidebar/use-sidebar-drag";
 import { Button } from "@/components/ui/button";
+import { DragRowPreview, DragShield } from "@/components/ui/drag-feedback";
 import { IconButton } from "@/components/ui/icon-button";
 import { ShortcutKbd } from "@/components/ui/kbd";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -77,6 +85,67 @@ import {
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+const SidebarPersonalAgentRow = memo(function SidebarPersonalAgentRow({
+  activePersonalAgent,
+  isActive,
+  shortcut,
+}: {
+  activePersonalAgent: PersonalAgentRef | null;
+  isActive: boolean;
+  shortcut: string;
+}) {
+  const { t } = useI18n();
+  const { briefing } = usePersonalAgentBriefing({
+    enabled: activePersonalAgent !== null,
+    includeActivity: false,
+  });
+  const needsYouCount = briefing?.counts.needs_you ?? 0;
+
+  return (
+    <button
+      type="button"
+      onClick={() => orbitActions.openGlobalOverview()}
+      aria-label={
+        needsYouCount > 0
+          ? `${t("sidebar.personalRouter")} · ${t("sidebar.personalAgentNeedsYou", { count: needsYouCount })}`
+          : undefined
+      }
+      className={cn(
+        "group/pa flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors",
+        isActive
+          ? "bg-accent text-ink-primary font-medium"
+          : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+      )}
+    >
+      <span className="flex min-w-0 items-center gap-2.5">
+        <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+          <Bot
+            className={cn(
+              "size-[14.5px] stroke-[1.75] transition-colors",
+              isActive ? "text-ink-primary" : "text-ink-muted group-hover/pa:text-ink-primary",
+            )}
+          />
+        </span>
+        <span className="truncate">{t("sidebar.personalRouter")}</span>
+      </span>
+      {/* Single-line row (same height as sibling nav rows): a compact "needs you" count replaces
+          the hover shortcut hint only while decisions are pending. */}
+      {needsYouCount > 0 ? (
+        <span className="text-signal-warning shrink-0 text-[11px] font-medium tabular-nums">
+          {needsYouCount}
+        </span>
+      ) : (
+        <ShortcutKbd
+          keys={shortcut}
+          size="xs"
+          variant="subtle"
+          className="shrink-0 opacity-0 transition-opacity group-hover/pa:opacity-100"
+        />
+      )}
+    </button>
+  );
+});
 
 export const FleetSidebar = memo(function FleetSidebar() {
   const fleet = useOrbitSelector((s) => s.fleet);
@@ -185,22 +254,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const isFleetUpdating =
     fleetUpdate.phase === "upgrading_hosts" || fleetUpdate.phase === "upgrading_desktop";
-
-  const [primaryRouterHostId, setPrimaryRouterHostId] = useState<string | null>(null);
-  useEffect(() => {
-    let active = true;
-    void orbitIpc
-      .getPrimaryRouterSelection()
-      .then((sel) => {
-        if (active && sel?.host_id) {
-          setPrimaryRouterHostId(sel.host_id);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, [fleet.hosts.length]);
+  const activePersonalAgent = useOrbitSelector(selectPersonalAgentRef);
 
   // O(N) lookup of parent threads with active subagents — zero `s.stages` topic subscription!
   const runningParentThreadKeys = useMemo(
@@ -309,25 +363,38 @@ export const FleetSidebar = memo(function FleetSidebar() {
     [displayProjects, collapsedProjectIds],
   );
 
-  // Pointer-driven zero-rerender drag engine (with edge auto-scroll)
+  const pinnedThreadKeys = useMemo(
+    () => filteredPinnedEntries.map((entry) => entry.key),
+    [filteredPinnedEntries],
+  );
+  const canReorderPinned = !isFilteringThreads && filteredPinnedEntries.length > 1;
+
+  // Pointer-driven zero-rerender tactile drag-along engine (with edge auto-scroll)
   const {
+    liftedThread,
+    liftedThreadElRef,
+    isAnyDragging,
     draggingThread,
+    threadInlineSort,
     threadDropIndicator,
     dragOverDropId,
-    draggingProjectId,
-    projectDropIndicator,
-    floatingPreviewRef,
+    projectSortState,
+    pinnedSortState,
     syncScopeAgentIds,
     registerProjectRow,
     registerThreadRow,
+    registerPinnedRow,
     registerWorkspaceHeader,
     registerInboxArea,
     shouldSuppressThreadClick,
     shouldSuppressProjectClick,
+    shouldSuppressPinnedClick,
     startThreadDrag,
     startProjectDrag,
+    startPinnedDrag,
   } = useSidebarDrag({
     displayProjects,
+    pinnedThreadKeys,
     sidebarProjectSort,
     scrollViewportRef,
   });
@@ -492,39 +559,13 @@ export const FleetSidebar = memo(function FleetSidebar() {
     }
   };
 
-  const activeRouter = useMemo(() => {
-    const orderedHosts = primaryRouterHostId
-      ? [
-          ...fleet.hosts.filter((h) => h.host_id === primaryRouterHostId),
-          ...fleet.hosts.filter((h) => h.host_id !== primaryRouterHostId),
-        ]
-      : fleet.hosts;
-    for (const h of orderedHosts) {
-      const detail = hostDetails[h.host_id];
-      if (!detail) continue;
-      const found = detail.agents.find(
-        (a) =>
-          !archivedThreads[threadScopeKey(h.host_id, a.agent_id)] &&
-          (a.handle === "router" || a.title.includes("Personal Router")),
-      );
-      if (found) {
-        return {
-          hostId: h.host_id,
-          hostName: h.display_name,
-          agent: found,
-        };
-      }
-    }
-    return null;
-  }, [primaryRouterHostId, fleet.hosts, hostDetails, archivedThreads]);
-
   return (
     <aside
       data-orbit-sidebar="true"
       className="bg-surface-base flex h-full w-full flex-col select-none"
     >
       {/* 1. Native Window Titlebar Drag Strip (`40px`; `[◫]` lives left in shell, symmetric `[🔍]` lives right) */}
-      <div className="flex h-[40px] shrink-0 items-center pr-2">
+      <div className="flex h-(--orbit-titlebar-h) shrink-0 items-center pr-2">
         <div data-tauri-drag-region className="h-full flex-1" />
         <IconButton
           size="md"
@@ -550,7 +591,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
         </IconButton>
       </div>
 
-      {/* 2. Top Global Navigation: Quiet borderless nav rows (`New Conversation`, `Automations`, `Personal Router`) */}
+      {/* 2. Top Global Navigation: Quiet borderless nav rows (`New Conversation`, `Automations`, `Personal Agent`) */}
       <div className="border-border-subtle/75 space-y-0.5 border-b px-2 pt-0.5 pb-2.5">
         {(() => {
           const isNewConversationActive =
@@ -610,71 +651,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
           <span className="truncate">{t("sidebar.automations")}</span>
         </button>
 
-        {(() => {
-          const isRouterActive =
-            activeRouter !== null &&
-            workspacePanel === "conversation" &&
-            !isDraftNewSession &&
-            selectedHostId === activeRouter.hostId &&
-            selectedAgentId === activeRouter.agent.agent_id;
-
-          return (
-            <div className="group/pa flex items-center gap-0.5">
-              <button
-                type="button"
-                onClick={() => {
-                  if (activeRouter) {
-                    orbitActions.selectAgent(activeRouter.hostId, activeRouter.agent.agent_id);
-                  } else {
-                    orbitActions.openGlobalOverview();
-                  }
-                }}
-                className={cn(
-                  "flex h-[30px] min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors",
-                  isRouterActive
-                    ? "bg-accent text-ink-primary font-medium"
-                    : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
-                )}
-              >
-                <span className="flex min-w-0 flex-1 items-center gap-2.5">
-                  <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-                    <Sparkles
-                      className={cn(
-                        "size-[14.5px] stroke-[1.75]",
-                        isRouterActive ? "text-ink-primary" : "text-ink-muted",
-                      )}
-                    />
-                  </span>
-                  <span className="truncate">{t("sidebar.personalRouter")}</span>
-                </span>
-                {activeRouter && (
-                  <span className="text-ink-faint max-w-20 shrink-0 truncate text-[11px]">
-                    {activeRouter.hostName}
-                  </span>
-                )}
-              </button>
-              <SimpleTooltip
-                label={t("overview.globalOverviewTooltip")}
-                shortcut={globalOverviewShortcut}
-              >
-                <button
-                  type="button"
-                  aria-label={t("overview.title")}
-                  aria-pressed={isOverviewActive}
-                  onClick={() => orbitActions.openGlobalOverview()}
-                  className={cn(
-                    "inline-flex size-[28px] shrink-0 cursor-pointer items-center justify-center rounded-[8px] transition-colors",
-                    isOverviewActive
-                      ? "bg-accent text-ink-primary"
-                      : "text-ink-muted hover:bg-accent/55 hover:text-ink-primary",
-                  )}
-                >
-                  <LayoutGrid className="size-[13.5px] stroke-[1.75]" />
-                </button>
-              </SimpleTooltip>
-            </div>
-          );
-        })()}
+        <SidebarPersonalAgentRow
+          activePersonalAgent={activePersonalAgent}
+          isActive={
+            isOverviewActive ||
+            (activePersonalAgent !== null &&
+              workspacePanel === "conversation" &&
+              !isDraftNewSession &&
+              selectedHostId === activePersonalAgent.hostId &&
+              selectedAgentId === activePersonalAgent.agentId)
+          }
+          shortcut={globalOverviewShortcut}
+        />
       </div>
 
       {/* 2B. On-Demand Sidebar Filter Bar (0px at rest; smoothly glides open above ALL list sections via Titlebar `🔍` or `⌘F`) */}
@@ -857,7 +845,17 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       isChild={false}
                       menuOpen={convMenu?.threadKey === key}
                       isRenaming={renamingThreadKey === key}
+                      isDragging={pinnedSortState?.fromId === key}
+                      isDragLiftedInline={pinnedSortState?.fromId === key}
+                      isDragSettling={
+                        pinnedSortState?.fromId === key && pinnedSortState.phase === "settling"
+                      }
+                      isDragSorting={Boolean(pinnedSortState)}
+                      dragOffsetY={getInlineSortNeighborOffset(pinnedSortState, key)}
                       onRegisterNavRow={registerNavRow}
+                      onRegisterPinnedRow={canReorderPinned ? registerPinnedRow : undefined}
+                      onStartPinnedDrag={canReorderPinned ? startPinnedDrag : undefined}
+                      shouldSuppressClick={shouldSuppressPinnedClick}
                       onOpenMenu={handleOpenConvMenu}
                       onStartRename={handleStartRenameThread}
                       onFinishRename={handleFinishRenameThread}
@@ -1130,6 +1128,11 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       ? draggingThread
                       : null;
 
+                  const threadInlineSortForProj =
+                    threadInlineSort && threadInlineSort.projectId === model.project.id
+                      ? threadInlineSort
+                      : null;
+
                   const threadDropForProj =
                     threadDropIndicator &&
                     (threadDropIndicator.scopeKey === model.projThreadScopeKey ||
@@ -1146,6 +1149,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
                         Boolean(projWsIdSet?.has(dragOverDropId.slice(3)))))
                       ? dragOverDropId
                       : null;
+
+                  const isDraggingThisProject = projectSortState?.fromId === model.project.id;
+                  const projectDragOffsetY = getInlineSortNeighborOffset(
+                    projectSortState,
+                    model.project.id,
+                  );
 
                   return (
                     <SidebarProjectSection
@@ -1183,13 +1192,14 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       onOpenWsMenu={setWsMenu}
                       onStartRenameThread={handleStartRenameThread}
                       onFinishRenameThread={handleFinishRenameThread}
-                      isDraggingProject={draggingProjectId === model.project.id}
-                      projectDropPosition={
-                        projectDropIndicator?.targetId === model.project.id
-                          ? projectDropIndicator.position
-                          : null
+                      isDraggingProject={isDraggingThisProject}
+                      isProjectDragSettling={
+                        isDraggingThisProject && projectSortState?.phase === "settling"
                       }
+                      isProjectDragSorting={Boolean(projectSortState)}
+                      projectDragOffsetY={projectDragOffsetY}
                       draggingThread={draggingThreadForProj}
+                      threadInlineSort={threadInlineSortForProj}
                       threadDropIndicator={threadDropForProj}
                       dragOverDropId={dragOverForProj}
                       onRegisterProjectRow={registerProjectRow}
@@ -1326,14 +1336,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
         onClose={() => setDeleteProjectTarget(null)}
       />
 
-      {/* Pointer-driven GPU-translated drag preview (0 React re-renders per frame) */}
-      {draggingThread && (
-        <div
-          ref={floatingPreviewRef}
-          className="floating-surface text-ink-primary pointer-events-none fixed top-0 left-0 z-50 max-w-[210px] truncate rounded-[8px] border px-2.5 py-1 text-[12.5px] font-medium opacity-0 transition-opacity duration-[110ms] ease-[var(--ease-out-quart)] will-change-transform"
-        >
-          {draggingThread.title}
-        </div>
+      <DragShield active={isAnyDragging} cursor="grabbing" />
+
+      {/* Full-width lifted row clone for Conversations (portaled so cross-group drags never clip) */}
+      {liftedThread && (
+        <DragRowPreview
+          ref={liftedThreadElRef}
+          label={liftedThread.label}
+          width={liftedThread.width}
+          height={liftedThread.height}
+          settling={liftedThread.settling}
+          icon={<MessageSquare className="text-ink-muted size-[14px] stroke-[1.75]" />}
+        />
       )}
     </aside>
   );

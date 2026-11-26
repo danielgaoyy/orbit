@@ -1,4 +1,19 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import {
+  DRAG_THRESHOLD_SORT_PX,
+  type InlineSortSlot,
+  buildInlineSortSlots,
+  clampInlineSortDelta,
+  computeInlineSortNeighborOffset,
+  computeInlineSortSettleDelta,
+  computeInlineSortTargetIndex,
+  isNoOpLinearDrop,
+  prefersReducedMotion,
+  startTransformSettle,
+} from "@/lib/drag/drag-constants";
+import { useEdgeAutoScroll } from "@/lib/drag/use-edge-auto-scroll";
+import { usePointerDrag } from "@/lib/drag/use-pointer-drag";
 import type { SidebarProjectGroupView } from "@/lib/orbit-ipc";
 import { projectPathScopeKey } from "@/lib/projects";
 import type { SidebarProjectSort } from "@/state/store-types";
@@ -13,15 +28,37 @@ export interface ThreadDragSource {
   workspaceId: string | null;
 }
 
+export interface PinnedDragSource {
+  threadKey: string;
+  title: string;
+}
+
+/** Only used for cross-group / cross-scope thread insertion; same-scope reorder uses live neighbor displacement. */
 export interface ThreadDropIndicator {
   scopeKey: string;
   targetAgentId: string;
   position: "before" | "after";
 }
 
-export interface ProjectDropIndicator {
-  targetId: string;
-  position: "before" | "after";
+export interface SidebarInlineSortState {
+  phase: "dragging" | "settling";
+  fromId: string;
+  fromIndex: number;
+  overIndex: number;
+  ids: readonly string[];
+  slots: readonly InlineSortSlot[];
+}
+
+export interface ThreadInlineSortState extends SidebarInlineSortState {
+  scopeKey: string;
+  projectId: string;
+}
+
+export interface LiftedThreadRowMeta {
+  label: string;
+  width: number;
+  height: number;
+  settling: boolean;
 }
 
 interface ThreadRowEntry {
@@ -47,7 +84,7 @@ interface InboxAreaEntry {
   scopeKey: string;
 }
 
-type ThreadDropTarget =
+type CrossScopeThreadTarget =
   | {
       kind: "thread";
       scopeKey: string;
@@ -59,123 +96,142 @@ type ThreadDropTarget =
   | { kind: "inbox"; projectId: string; scopeKey: string }
   | null;
 
-const AUTO_SCROLL_EDGE_PX = 36;
-const AUTO_SCROLL_MAX_SPEED_PX = 10;
+const PROJECT_SORT_MAX_LEAD_IN_PX = 56;
 
-function computeEdgeScrollVelocity(clientY: number, viewport: HTMLElement | null): number {
-  if (!viewport) return 0;
-  const rect = viewport.getBoundingClientRect();
-  if (rect.height <= AUTO_SCROLL_EDGE_PX * 2) return 0;
-  if (clientY < rect.top + AUTO_SCROLL_EDGE_PX) {
-    const ratio = Math.min(1, Math.max(0, (rect.top + AUTO_SCROLL_EDGE_PX - clientY) / AUTO_SCROLL_EDGE_PX));
-    return -Math.ceil(ratio * AUTO_SCROLL_MAX_SPEED_PX);
-  }
-  if (clientY > rect.bottom - AUTO_SCROLL_EDGE_PX) {
-    const ratio = Math.min(
-      1,
-      Math.max(0, (clientY - (rect.bottom - AUTO_SCROLL_EDGE_PX)) / AUTO_SCROLL_EDGE_PX),
-    );
-    return Math.ceil(ratio * AUTO_SCROLL_MAX_SPEED_PX);
-  }
-  return 0;
+export function getInlineSortNeighborOffset(
+  state: SidebarInlineSortState | null,
+  itemId: string,
+): number {
+  if (!state || state.fromId === itemId) return 0;
+  const idx = state.ids.indexOf(itemId);
+  if (idx < 0) return 0;
+  return computeInlineSortNeighborOffset(state.slots, state.fromIndex, state.overIndex, idx);
 }
 
 /**
- * Pointer-driven drag engine for both Projects and Conversations in `FleetSidebar`.
+ * Unified tactile "drag-along" pointer engine for Conversations, Projects, and Pinned threads
+ * in `FleetSidebar`.
  *
  * Key engineering invariants:
- * - Zero React re-renders during pointer movement (floating preview uses direct DOM `transform`).
- * - Automatic edge scrolling when dragging near top/bottom of the sidebar viewport.
- * - Cross-group moves preserve `Recent`/`Name` sort mode instead of silently flipping to `manual`.
- * - Works cleanly in macOS Tauri WKWebView where HTML5 Drag-and-Drop is unreliable.
+ * - Zero React re-renders per pixel: dragged items track the pointer 1:1 via direct DOM `translate3d`.
+ * - Real-time sibling displacement (`150ms --ease-out-expo`) for Pinned threads, Projects
+ *   (variable-height), and same-scope Conversations — no static insertion line for in-list reorders.
+ * - Conversations use a portaled full-width lifted row (`DragRowPreview`) so dragging out of
+ *   overflow-hidden Curated Groups stays 100% unclipped while cross-group targets light up cleanly.
+ * - Smooth `140ms --ease-out-expo` settle into the vacated target slot before committing reorder,
+ *   with `useLayoutEffect` transform cleanup to guarantee zero reverse-transition flicker.
+ * - Full macOS WKWebView & touch/keyboard safety via shared `usePointerDrag` + `useEdgeAutoScroll`.
  */
 export function useSidebarDrag(params: {
   displayProjects: ReadonlyArray<{ project: SidebarProjectGroupView }>;
+  pinnedThreadKeys?: readonly string[];
   sidebarProjectSort: SidebarProjectSort;
   scrollViewportRef: React.RefObject<HTMLDivElement | null>;
 }) {
-  const { displayProjects, sidebarProjectSort, scrollViewportRef } = params;
+  const { displayProjects, pinnedThreadKeys = [], sidebarProjectSort, scrollViewportRef } = params;
 
   const displayProjectsRef = useRef(displayProjects);
   displayProjectsRef.current = displayProjects;
+  const pinnedThreadKeysRef = useRef(pinnedThreadKeys);
+  pinnedThreadKeysRef.current = pinnedThreadKeys;
   const sortModeRef = useRef(sidebarProjectSort);
   sortModeRef.current = sidebarProjectSort;
 
+  const [liftedThread, setLiftedThread] = useState<LiftedThreadRowMeta | null>(null);
   const [draggingThread, setDraggingThread] = useState<ThreadDragSource | null>(null);
+  const [threadInlineSort, setThreadInlineSort] = useState<ThreadInlineSortState | null>(null);
   const [threadDropIndicator, setThreadDropIndicator] = useState<ThreadDropIndicator | null>(null);
   const [dragOverDropId, setDragOverDropId] = useState<string | null>(null);
-  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(null);
-  const [projectDropIndicator, setProjectDropIndicator] = useState<ProjectDropIndicator | null>(null);
+  const [projectSortState, setProjectSortState] = useState<SidebarInlineSortState | null>(null);
+  const [pinnedSortState, setPinnedSortState] = useState<SidebarInlineSortState | null>(null);
 
-  const floatingPreviewRef = useRef<HTMLDivElement | null>(null);
-  const lastPreviewPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const liftedThreadElRef = useRef<HTMLDivElement | null>(null);
+  const liftedThreadPosRef = useRef<{ x: number; y: number; scale: number }>({
+    x: 0,
+    y: 0,
+    scale: 1,
+  });
+  const draggedProjectElRef = useRef<HTMLDivElement | null>(null);
+  const draggedPinnedElRef = useRef<HTMLDivElement | null>(null);
+  const activeSettleFlushRef = useRef<(() => void) | null>(null);
+  const settleCancelRef = useRef<(() => void) | null>(null);
+  const activeScrollTickRef = useRef<((clientX: number, clientY: number) => void) | null>(null);
+
   const projectRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const threadRowRefs = useRef<Map<string, ThreadRowEntry>>(new Map());
+  const pinnedRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const workspaceHeaderRefs = useRef<Map<string, WorkspaceHeaderEntry>>(new Map());
   const inboxAreaRefs = useRef<Map<string, InboxAreaEntry>>(new Map());
   const scopeAgentIdsRef = useRef<Map<string, string[]>>(new Map());
 
-  const suppressNextProjectClickRef = useRef(false);
-  const suppressNextThreadClickRef = useRef(false);
-  const projectDragCleanupRef = useRef<(() => void) | null>(null);
-  const threadDragCleanupRef = useRef<(() => void) | null>(null);
-  const autoScrollRafRef = useRef<number | null>(null);
-  const autoScrollVelocityRef = useRef<number>(0);
+  const {
+    isDragging: isPointerDragging,
+    start: startPointerDrag,
+    shouldSuppressClick,
+  } = usePointerDrag();
 
-  const stopAutoScroll = useCallback(() => {
-    autoScrollVelocityRef.current = 0;
-    if (autoScrollRafRef.current !== null) {
-      window.cancelAnimationFrame(autoScrollRafRef.current);
-      autoScrollRafRef.current = null;
-    }
+  const handleAutoScrollTick = useCallback((clientX: number, clientY: number) => {
+    activeScrollTickRef.current?.(clientX, clientY);
   }, []);
 
-  const updateAutoScroll = useCallback(
-    (clientY: number) => {
-      const velocity = computeEdgeScrollVelocity(clientY, scrollViewportRef.current);
-      autoScrollVelocityRef.current = velocity;
-      if (velocity === 0) {
-        stopAutoScroll();
-        return;
-      }
-      if (autoScrollRafRef.current !== null) return;
-      const step = () => {
-        const v = autoScrollVelocityRef.current;
-        const viewport = scrollViewportRef.current;
-        if (v === 0 || !viewport) {
-          autoScrollRafRef.current = null;
-          return;
-        }
-        viewport.scrollTop += v;
-        autoScrollRafRef.current = window.requestAnimationFrame(step);
-      };
-      autoScrollRafRef.current = window.requestAnimationFrame(step);
-    },
-    [scrollViewportRef, stopAutoScroll],
-  );
+  const { update: updateAutoScroll, stop: stopAutoScroll } = useEdgeAutoScroll({
+    viewportRef: scrollViewportRef,
+    axis: "y",
+    onScrollTick: handleAutoScrollTick,
+  });
 
-  // Sync initial preview coordinates & lift scale immediately before paint, then crisp 110ms fade-in
-  useLayoutEffect(() => {
-    const el = floatingPreviewRef.current;
-    if (!draggingThread || !el) return;
-    const { x, y } = lastPreviewPosRef.current;
-    el.style.transform = `translate3d(${x + 12}px, ${y - 14}px, 0) scale(1.02)`;
-    el.style.opacity = "0";
-    const raf = window.requestAnimationFrame(() => {
-      if (el.isConnected) {
-        el.style.opacity = "1";
-      }
-    });
-    return () => window.cancelAnimationFrame(raf);
-  }, [draggingThread]);
+  const clearSettle = useCallback(() => {
+    settleCancelRef.current?.();
+    settleCancelRef.current = null;
+    activeSettleFlushRef.current = null;
+  }, []);
 
+  // Unmount cleanup for any pending settle animation
   useEffect(() => {
     return () => {
-      projectDragCleanupRef.current?.();
-      threadDragCleanupRef.current?.();
-      stopAutoScroll();
+      settleCancelRef.current?.();
+      settleCancelRef.current = null;
+      activeSettleFlushRef.current = null;
+      if (draggedProjectElRef.current) {
+        draggedProjectElRef.current.style.transition = "";
+        draggedProjectElRef.current.style.transform = "";
+        draggedProjectElRef.current = null;
+      }
+      if (draggedPinnedElRef.current) {
+        draggedPinnedElRef.current.style.transition = "";
+        draggedPinnedElRef.current.style.transform = "";
+        draggedPinnedElRef.current = null;
+      }
     };
-  }, [stopAutoScroll]);
+  }, []);
+
+  // Clear residual direct DOM transition + transform inside the same `flushSync` commit as `null` sort state
+  useLayoutEffect(() => {
+    if (projectSortState !== null) return;
+    if (draggedProjectElRef.current) {
+      draggedProjectElRef.current.style.transition = "";
+      draggedProjectElRef.current.style.transform = "";
+      draggedProjectElRef.current = null;
+    }
+  }, [projectSortState]);
+
+  useLayoutEffect(() => {
+    if (pinnedSortState !== null) return;
+    if (draggedPinnedElRef.current) {
+      draggedPinnedElRef.current.style.transition = "";
+      draggedPinnedElRef.current.style.transform = "";
+      draggedPinnedElRef.current = null;
+    }
+  }, [pinnedSortState]);
+
+  // Position portaled lifted thread row once on mount before first paint (never overwriting settle animation)
+  const hasLiftedThread = liftedThread !== null;
+  useLayoutEffect(() => {
+    const el = liftedThreadElRef.current;
+    if (!hasLiftedThread || !el) return;
+    const { x, y, scale } = liftedThreadPosRef.current;
+    el.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
+  }, [hasLiftedThread]);
 
   const syncScopeAgentIds = useCallback((nextScopes: ReadonlyMap<string, string[]>) => {
     const map = scopeAgentIdsRef.current;
@@ -207,6 +263,11 @@ export function useSidebarDrag(params: {
     },
     [],
   );
+
+  const registerPinnedRow = useCallback((threadKey: string, el: HTMLDivElement | null) => {
+    if (el) pinnedRowRefs.current.set(threadKey, el);
+    else pinnedRowRefs.current.delete(threadKey);
+  }, []);
 
   const registerWorkspaceHeader = useCallback(
     (
@@ -248,42 +309,55 @@ export function useSidebarDrag(params: {
     [],
   );
 
-  const shouldSuppressThreadClick = useCallback(() => suppressNextThreadClickRef.current, []);
-  const shouldSuppressProjectClick = useCallback(() => suppressNextProjectClickRef.current, []);
-
   const startThreadDrag = useCallback(
     (e: React.PointerEvent<HTMLDivElement>, source: ThreadDragSource) => {
-      if (e.button !== 0) return;
-      const targetEl = e.target as HTMLElement | null;
-      if (targetEl?.closest("[data-thread-action]") || targetEl?.tagName === "INPUT") return;
+      activeSettleFlushRef.current?.();
 
-      const startX = e.clientX;
-      const startY = e.clientY;
-      let activeDrag = false;
-      let currentTarget: ThreadDropTarget = null;
-      let lastIndicatorKey = "";
+      const sourceRefKey = `${source.hostId}::${source.agentId}`;
+      let startX = e.clientX;
+      let startY = e.clientY;
+      let startScroll = 0;
+      let origLeft = 0;
+      let origTop = 0;
+      let origWidth = 220;
+      let origHeight = 30;
+      let sameScopeIds: string[] = [];
+      let sameScopeSlots: InlineSortSlot[] = [];
+      let fromIndex = -1;
+      let overIndex = -1;
+      let crossTarget: CrossScopeThreadTarget = null;
+      let lastCrossIndicatorKey = "";
       let lastDropId: string | null = null;
+      let currentLiftedX = 0;
+      let currentLiftedY = 0;
+      let latestPointerY = e.clientY;
 
-      const onMove = (ev: PointerEvent) => {
-        if (!activeDrag) {
-          if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
-          activeDrag = true;
-          suppressNextThreadClickRef.current = true;
-          document.body.style.cursor = "grabbing";
-          lastPreviewPosRef.current = { x: ev.clientX, y: ev.clientY };
-          setDraggingThread(source);
+      const applyLiftedTransform = (x: number, y: number, scale: number) => {
+        currentLiftedX = x;
+        currentLiftedY = y;
+        liftedThreadPosRef.current = { x, y, scale };
+        const el = liftedThreadElRef.current;
+        if (el) {
+          el.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
         }
+      };
 
-        // Direct DOM transform keeps drag preview locked at 60fps with 0 React re-renders
-        lastPreviewPosRef.current = { x: ev.clientX, y: ev.clientY };
-        if (floatingPreviewRef.current) {
-          floatingPreviewRef.current.style.transform = `translate3d(${ev.clientX + 12}px, ${ev.clientY - 14}px, 0) scale(1.02)`;
-        }
-        updateAutoScroll(ev.clientY);
+      const updateAtPointer = (clientX: number, clientY: number) => {
+        latestPointerY = clientY;
+        const dampedDeltaX = Math.max(-14, Math.min(14, (clientX - startX) * 0.18));
+        const nextX = Math.max(
+          6,
+          Math.min(window.innerWidth - origWidth - 6, origLeft + dampedDeltaX),
+        );
+        const nextY = Math.max(
+          6,
+          Math.min(window.innerHeight - origHeight - 6, origTop + (clientY - startY)),
+        );
+        applyLiftedTransform(nextX, nextY, 1);
 
-        let best: ThreadDropTarget = null;
+        // 1. Check cross-group targets first (Curated Group header, different-scope rows, Inbox ungroup)
+        let bestCross: CrossScopeThreadTarget = null;
 
-        // 1. Curated Group headers in the same project (drop into group)
         for (const wsEntry of workspaceHeaderRefs.current.values()) {
           if (
             wsEntry.hostId !== source.hostId ||
@@ -295,90 +369,48 @@ export function useSidebarDrag(params: {
           }
           const rect = wsEntry.el.getBoundingClientRect();
           if (
-            ev.clientX >= rect.left - 8 &&
-            ev.clientX <= rect.right + 16 &&
-            ev.clientY >= rect.top - 2 &&
-            ev.clientY <= rect.bottom + 2
+            clientX >= rect.left - 8 &&
+            clientX <= rect.right + 16 &&
+            clientY >= rect.top - 2 &&
+            clientY <= rect.bottom + 2
           ) {
-            best = { kind: "group", workspaceId: wsEntry.workspaceId };
+            bestCross = { kind: "group", workspaceId: wsEntry.workspaceId };
             break;
           }
         }
 
-        // 2. Thread rows in the same project (reorder or cross-group insert)
-        if (!best) {
-          const sameScopeEntries: Array<{ entry: ThreadRowEntry; rect: DOMRect }> = [];
-
+        if (!bestCross) {
           for (const entry of threadRowRefs.current.values()) {
             if (
               entry.hostId !== source.hostId ||
               entry.projectId !== source.projectId ||
+              entry.scopeKey === source.scopeKey ||
               entry.el.closest('.orbit-collapse-grid[data-open="false"]')
             ) {
               continue;
             }
             const rect = entry.el.getBoundingClientRect();
             if (rect.height === 0) continue;
-            if (entry.scopeKey === source.scopeKey) {
-              sameScopeEntries.push({ entry, rect });
-            }
             if (
-              ev.clientX >= rect.left - 12 &&
-              ev.clientX <= rect.right + 24 &&
-              ev.clientY >= rect.top - 4 &&
-              ev.clientY <= rect.bottom + 4
+              clientX >= rect.left - 12 &&
+              clientX <= rect.right + 24 &&
+              clientY >= rect.top - 2 &&
+              clientY <= rect.bottom + 2
             ) {
-              if (entry.agentId !== source.agentId) {
-                best = {
-                  kind: "thread",
-                  scopeKey: entry.scopeKey,
-                  workspaceId: entry.workspaceId,
-                  targetAgentId: entry.agentId,
-                  position: ev.clientY < rect.top + rect.height / 2 ? "before" : "after",
-                };
-              }
+              const position = clientY < rect.top + rect.height / 2 ? "before" : "after";
+              bestCross = {
+                kind: "thread",
+                scopeKey: entry.scopeKey,
+                workspaceId: entry.workspaceId,
+                targetAgentId: entry.agentId,
+                position,
+              };
               break;
-            }
-          }
-
-          if (!best && sameScopeEntries.length > 1) {
-            sameScopeEntries.sort((a, b) => a.rect.top - b.rect.top);
-            const first = sameScopeEntries[0];
-            const last = sameScopeEntries[sameScopeEntries.length - 1];
-            const inHorizontalBounds =
-              ev.clientX >= first.rect.left - 12 && ev.clientX <= first.rect.right + 24;
-            if (
-              inHorizontalBounds &&
-              ev.clientY < first.rect.top &&
-              ev.clientY >= first.rect.top - 28 &&
-              first.entry.agentId !== source.agentId
-            ) {
-              best = {
-                kind: "thread",
-                scopeKey: first.entry.scopeKey,
-                workspaceId: first.entry.workspaceId,
-                targetAgentId: first.entry.agentId,
-                position: "before",
-              };
-            } else if (
-              inHorizontalBounds &&
-              ev.clientY > last.rect.bottom &&
-              ev.clientY <= last.rect.bottom + 28 &&
-              last.entry.agentId !== source.agentId
-            ) {
-              best = {
-                kind: "thread",
-                scopeKey: last.entry.scopeKey,
-                workspaceId: last.entry.workspaceId,
-                targetAgentId: last.entry.agentId,
-                position: "after",
-              };
             }
           }
         }
 
-        // 3. Unclassified project area (ungroup when dragging out of a curated group)
-        if (!best && source.workspaceId !== null) {
+        if (!bestCross && source.workspaceId !== null) {
           for (const inboxEntry of inboxAreaRefs.current.values()) {
             if (
               inboxEntry.hostId !== source.hostId ||
@@ -389,11 +421,11 @@ export function useSidebarDrag(params: {
             }
             const rect = inboxEntry.el.getBoundingClientRect();
             if (
-              ev.clientY >= rect.top - 4 &&
-              ev.clientY <= rect.bottom + 12 &&
-              ev.clientX <= rect.right + 24
+              clientY >= rect.top - 4 &&
+              clientY <= rect.bottom + 12 &&
+              clientX <= rect.right + 24
             ) {
-              best = {
+              bestCross = {
                 kind: "inbox",
                 projectId: inboxEntry.projectId,
                 scopeKey: inboxEntry.scopeKey,
@@ -403,28 +435,52 @@ export function useSidebarDrag(params: {
           }
         }
 
-        currentTarget = best;
+        crossTarget = bestCross;
 
-        // Only call setState when the visual drop highlight actually changes
+        // 2. Update same-scope live neighbor displacement (silently glides back while hovering cross-group)
+        if (fromIndex >= 0 && sameScopeSlots.length >= 2) {
+          let nextOver = fromIndex;
+          if (!bestCross) {
+            const currentScroll = scrollViewportRef.current?.scrollTop ?? startScroll;
+            const rawDelta = clientY - startY + (currentScroll - startScroll);
+            const clamped = clampInlineSortDelta(sameScopeSlots, fromIndex, rawDelta);
+            nextOver = computeInlineSortTargetIndex(sameScopeSlots, fromIndex, clamped);
+          }
+          if (nextOver !== overIndex) {
+            overIndex = nextOver;
+            setThreadInlineSort({
+              phase: "dragging",
+              scopeKey: source.scopeKey,
+              projectId: source.projectId,
+              fromId: source.agentId,
+              fromIndex,
+              overIndex: nextOver,
+              ids: sameScopeIds,
+              slots: sameScopeSlots,
+            });
+          }
+        }
+
+        // 3. Only show DropIndicatorLine / container ring for cross-scope targets
         const nextIndicatorKey =
-          best?.kind === "thread"
-            ? `${best.scopeKey}::${best.targetAgentId}::${best.position}`
+          bestCross?.kind === "thread"
+            ? `${bestCross.scopeKey}::${bestCross.targetAgentId}::${bestCross.position}`
             : "";
         const nextDropId =
-          best?.kind === "group"
-            ? `ws:${best.workspaceId}`
-            : best?.kind === "inbox"
-              ? `inbox:${best.projectId}`
+          bestCross?.kind === "group"
+            ? `ws:${bestCross.workspaceId}`
+            : bestCross?.kind === "inbox"
+              ? `inbox:${bestCross.projectId}`
               : null;
 
-        if (nextIndicatorKey !== lastIndicatorKey) {
-          lastIndicatorKey = nextIndicatorKey;
+        if (nextIndicatorKey !== lastCrossIndicatorKey) {
+          lastCrossIndicatorKey = nextIndicatorKey;
           setThreadDropIndicator(
-            best?.kind === "thread"
+            bestCross?.kind === "thread"
               ? {
-                  scopeKey: best.scopeKey,
-                  targetAgentId: best.targetAgentId,
-                  position: best.position,
+                  scopeKey: bestCross.scopeKey,
+                  targetAgentId: bestCross.targetAgentId,
+                  position: bestCross.position,
                 }
               : null,
           );
@@ -435,214 +491,593 @@ export function useSidebarDrag(params: {
         }
       };
 
-      const finish = (commit: boolean) => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onPointerUp);
-        window.removeEventListener("pointercancel", onCancel);
-        window.removeEventListener("keydown", onKeyDown);
-        threadDragCleanupRef.current = null;
-        document.body.style.cursor = "";
-        stopAutoScroll();
+      const clearThreadVisuals = () => {
+        setDraggingThread(null);
+        setThreadInlineSort(null);
+        setThreadDropIndicator(null);
+        setDragOverDropId(null);
+        setLiftedThread(null);
+      };
 
-        if (activeDrag) {
-          setDraggingThread(null);
-          setThreadDropIndicator(null);
-          setDragOverDropId(null);
+      const startSettle = (targetOverIdx: number, shouldCommitSameScope: boolean) => {
+        const scrollDiff = (scrollViewportRef.current?.scrollTop ?? startScroll) - startScroll;
+        const targetDelta =
+          fromIndex >= 0 && sameScopeSlots.length >= 2
+            ? computeInlineSortSettleDelta(sameScopeSlots, fromIndex, targetOverIdx)
+            : 0;
+        const targetY = origTop + targetDelta - scrollDiff;
 
-          if (commit) {
-            if (currentTarget?.kind === "thread") {
-              const crossGroup = source.workspaceId !== currentTarget.workspaceId;
-              if (crossGroup) {
-                if (currentTarget.workspaceId) {
-                  void orbitActions.moveAgentToWorkspace(
-                    source.hostId,
-                    source.agentId,
-                    currentTarget.workspaceId,
-                  );
-                } else {
-                  void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
-                    makeUnclassified: true,
-                  });
-                }
-              }
-
-              // Only reorder (and switch to manual sort) when dragging within the same scope
-              // or when the user is already explicitly using manual sort mode.
-              const shouldPersistOrder = !crossGroup || sortModeRef.current === "manual";
-              if (shouldPersistOrder) {
-                const fullIds = scopeAgentIdsRef.current.get(currentTarget.scopeKey) ?? [];
+        let finished = false;
+        const finalize = () => {
+          if (finished) return;
+          finished = true;
+          clearSettle();
+          flushSync(() => {
+            if (
+              shouldCommitSameScope &&
+              fromIndex >= 0 &&
+              targetOverIdx >= 0 &&
+              targetOverIdx !== fromIndex
+            ) {
+              const targetAgentId = sameScopeIds[targetOverIdx];
+              const position: "before" | "after" = targetOverIdx > fromIndex ? "after" : "before";
+              const fullIds = scopeAgentIdsRef.current.get(source.scopeKey) ?? sameScopeIds;
+              if (
+                targetAgentId &&
+                !isNoOpLinearDrop(fullIds, source.agentId, targetAgentId, position)
+              ) {
                 const orderedIds = fullIds.filter((id) => id !== source.agentId);
-                let toIdx = orderedIds.indexOf(currentTarget.targetAgentId);
+                let toIdx = orderedIds.indexOf(targetAgentId);
                 if (toIdx >= 0) {
-                  if (currentTarget.position === "after") toIdx += 1;
+                  if (position === "after") toIdx += 1;
                   orderedIds.splice(toIdx, 0, source.agentId);
                 } else {
                   orderedIds.unshift(source.agentId);
                 }
-                orbitActions.reorderThreads(currentTarget.scopeKey, orderedIds);
+                orbitActions.reorderThreads(source.scopeKey, orderedIds);
               }
-            } else if (currentTarget?.kind === "group") {
+            }
+            clearThreadVisuals();
+          });
+        };
+
+        const reduced = prefersReducedMotion();
+        const dist = Math.hypot(currentLiftedX - origLeft, currentLiftedY - targetY);
+        const liftedEl = liftedThreadElRef.current;
+        if (reduced || !liftedEl || dist < 1) {
+          finalize();
+          return;
+        }
+
+        clearSettle();
+        activeSettleFlushRef.current = finalize;
+
+        if (fromIndex >= 0 && sameScopeSlots.length >= 2) {
+          setThreadInlineSort({
+            phase: "settling",
+            scopeKey: source.scopeKey,
+            projectId: source.projectId,
+            fromId: source.agentId,
+            fromIndex,
+            overIndex: targetOverIdx,
+            ids: sameScopeIds,
+            slots: sameScopeSlots,
+          });
+        }
+        setLiftedThread({
+          label: source.title,
+          width: origWidth,
+          height: origHeight,
+          settling: true,
+        });
+        currentLiftedX = origLeft;
+        currentLiftedY = targetY;
+        liftedThreadPosRef.current = { x: origLeft, y: targetY, scale: 1 };
+        settleCancelRef.current = startTransformSettle(
+          liftedEl,
+          `translate3d(${origLeft}px, ${targetY}px, 0) scale(1)`,
+          finalize,
+        );
+      };
+
+      startPointerDrag(e, {
+        thresholdPx: DRAG_THRESHOLD_SORT_PX,
+        cursor: "grabbing",
+        ignoreDoubleClick: true,
+        ignoreSelector: "[data-thread-action], input",
+        onActivate: (frame) => {
+          const srcEntry = threadRowRefs.current.get(sourceRefKey);
+          if (!srcEntry) return false;
+          const srcRect = srcEntry.el.getBoundingClientRect();
+          if (srcRect.height === 0) return false;
+
+          startX = frame.startX;
+          startY = frame.startY;
+          origLeft = srcRect.left;
+          origTop = srcRect.top;
+          origWidth = srcRect.width;
+          origHeight = srcRect.height;
+
+          const viewport = scrollViewportRef.current;
+          const vpRect = viewport?.getBoundingClientRect() ?? null;
+          startScroll = viewport?.scrollTop ?? 0;
+
+          // Snapshot all visible rows in the same scope sorted visually top-to-bottom
+          const mountedSameScope: Array<{ id: string; rect: DOMRect }> = [];
+          for (const entry of threadRowRefs.current.values()) {
+            if (
+              entry.hostId !== source.hostId ||
+              entry.projectId !== source.projectId ||
+              entry.scopeKey !== source.scopeKey ||
+              entry.el.closest('.orbit-collapse-grid[data-open="false"]')
+            ) {
+              continue;
+            }
+            const rect = entry.el.getBoundingClientRect();
+            if (rect.height === 0) continue;
+            mountedSameScope.push({ id: entry.agentId, rect });
+          }
+          mountedSameScope.sort((a, b) => a.rect.top - b.rect.top);
+          sameScopeIds = mountedSameScope.map((m) => m.id);
+          fromIndex = sameScopeIds.indexOf(source.agentId);
+          overIndex = fromIndex;
+          sameScopeSlots = buildInlineSortSlots(
+            mountedSameScope.map((m) => ({
+              start: vpRect ? m.rect.top - vpRect.top + startScroll : m.rect.top,
+              size: m.rect.height,
+            })),
+          );
+
+          liftedThreadPosRef.current = {
+            x: origLeft,
+            y: origTop + (frame.clientY - startY),
+            scale: 1,
+          };
+          currentLiftedX = liftedThreadPosRef.current.x;
+          currentLiftedY = liftedThreadPosRef.current.y;
+
+          activeScrollTickRef.current = updateAtPointer;
+          setDraggingThread(source);
+          if (fromIndex >= 0 && sameScopeSlots.length >= 2) {
+            setThreadInlineSort({
+              phase: "dragging",
+              scopeKey: source.scopeKey,
+              projectId: source.projectId,
+              fromId: source.agentId,
+              fromIndex,
+              overIndex: fromIndex,
+              ids: sameScopeIds,
+              slots: sameScopeSlots,
+            });
+          }
+          setLiftedThread({
+            label: source.title,
+            width: origWidth,
+            height: origHeight,
+            settling: false,
+          });
+          return true;
+        },
+        onMove: (frame) => {
+          updateAutoScroll(frame.clientX, frame.clientY);
+          updateAtPointer(frame.clientX, frame.clientY);
+        },
+        onCommit: () => {
+          activeScrollTickRef.current = null;
+          stopAutoScroll();
+          if (crossTarget?.kind === "thread") {
+            const target = crossTarget;
+            flushSync(() => {
+              if (target.workspaceId) {
+                void orbitActions.moveAgentToWorkspace(
+                  source.hostId,
+                  source.agentId,
+                  target.workspaceId,
+                );
+              } else {
+                void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
+                  makeUnclassified: true,
+                });
+              }
+              if (sortModeRef.current === "manual") {
+                const fullIds = scopeAgentIdsRef.current.get(target.scopeKey) ?? [];
+                const orderedIds = fullIds.filter((id) => id !== source.agentId);
+                let toIdx = orderedIds.indexOf(target.targetAgentId);
+                if (toIdx >= 0) {
+                  if (target.position === "after") toIdx += 1;
+                  orderedIds.splice(toIdx, 0, source.agentId);
+                } else {
+                  orderedIds.unshift(source.agentId);
+                }
+                orbitActions.reorderThreads(target.scopeKey, orderedIds);
+              }
+              clearThreadVisuals();
+            });
+          } else if (crossTarget?.kind === "group") {
+            const targetWorkspaceId = crossTarget.workspaceId;
+            flushSync(() => {
               void orbitActions.moveAgentToWorkspace(
                 source.hostId,
                 source.agentId,
-                currentTarget.workspaceId,
+                targetWorkspaceId,
               );
-            } else if (currentTarget?.kind === "inbox") {
+              clearThreadVisuals();
+            });
+          } else if (crossTarget?.kind === "inbox") {
+            flushSync(() => {
               void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
                 makeUnclassified: true,
               });
+              clearThreadVisuals();
+            });
+          } else {
+            // Recompute overIndex at final pointer position in case no extra move arrived after scroll
+            if (fromIndex >= 0 && sameScopeSlots.length >= 2) {
+              const currentScroll = scrollViewportRef.current?.scrollTop ?? startScroll;
+              const rawDelta = latestPointerY - startY + (currentScroll - startScroll);
+              const clamped = clampInlineSortDelta(sameScopeSlots, fromIndex, rawDelta);
+              overIndex = computeInlineSortTargetIndex(sameScopeSlots, fromIndex, clamped);
             }
+            startSettle(overIndex >= 0 ? overIndex : fromIndex, overIndex !== fromIndex);
           }
-
-          window.setTimeout(() => {
-            suppressNextThreadClickRef.current = false;
-          }, 80);
-        }
-      };
-
-      const onPointerUp = () => finish(true);
-      const onCancel = () => finish(false);
-      const onKeyDown = (ev: KeyboardEvent) => {
-        if (ev.key === "Escape") finish(false);
-      };
-
-      threadDragCleanupRef.current?.();
-      threadDragCleanupRef.current = onCancel;
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onPointerUp);
-      window.addEventListener("pointercancel", onCancel);
-      window.addEventListener("keydown", onKeyDown);
+        },
+        onCancel: () => {
+          activeScrollTickRef.current = null;
+          stopAutoScroll();
+          setThreadDropIndicator(null);
+          setDragOverDropId(null);
+          startSettle(fromIndex, false);
+        },
+      });
     },
-    [stopAutoScroll, updateAutoScroll],
+    [clearSettle, scrollViewportRef, startPointerDrag, stopAutoScroll, updateAutoScroll],
   );
 
   const startProjectDrag = useCallback(
     (e: React.PointerEvent<HTMLDivElement>, projectId: string) => {
-      const currentProjects = displayProjectsRef.current;
-      if (e.button !== 0 || currentProjects.length < 2) return;
-      const targetEl = e.target as HTMLElement | null;
-      if (targetEl?.closest("[data-proj-action]") || targetEl?.tagName === "INPUT") return;
+      if (displayProjectsRef.current.length < 2) return;
+      activeSettleFlushRef.current?.();
 
-      const startY = e.clientY;
-      let activeDrag = false;
-      let currentDrop: ProjectDropIndicator | null = null;
-      let lastDropKey = "";
+      let startY = e.clientY;
+      let startScroll = 0;
+      let ids: string[] = [];
+      let slots: InlineSortSlot[] = [];
+      let fromIndex = -1;
+      let overIndex = -1;
+      let latestDelta = 0;
 
-      const onMove = (ev: PointerEvent) => {
-        if (!activeDrag) {
-          if (Math.abs(ev.clientY - startY) < 4) return;
-          activeDrag = true;
-          suppressNextProjectClickRef.current = true;
-          setDraggingProjectId(projectId);
-          document.body.style.cursor = "grabbing";
-        }
+      const applyDraggedTransform = (delta: number) => {
+        const el = projectRowRefs.current.get(projectId);
+        if (!el) return;
+        draggedProjectElRef.current = el;
+        el.style.transform = `translate3d(0, ${delta}px, 0)`;
+      };
 
-        updateAutoScroll(ev.clientY);
+      const updateAtPointer = (_clientX: number, clientY: number) => {
+        const currentScroll = scrollViewportRef.current?.scrollTop ?? startScroll;
+        const rawDelta = clientY - startY + (currentScroll - startScroll);
+        const clamped = clampInlineSortDelta(slots, fromIndex, rawDelta);
+        latestDelta = clamped;
+        applyDraggedTransform(clamped);
 
-        const list = displayProjectsRef.current;
-        let best: ProjectDropIndicator | null = null;
-        for (const entry of list) {
-          const el = projectRowRefs.current.get(entry.project.id);
-          if (!el) continue;
-          const rect = el.getBoundingClientRect();
-          if (ev.clientY >= rect.top - 8 && ev.clientY <= rect.bottom + 8) {
-            const mid = rect.top + rect.height / 2;
-            best = {
-              targetId: entry.project.id,
-              position: ev.clientY < mid ? "before" : "after",
-            };
-            break;
-          }
-        }
-        if (!best && list.length > 0) {
-          const firstRect = projectRowRefs.current
-            .get(list[0].project.id)
-            ?.getBoundingClientRect();
-          if (firstRect && ev.clientY < firstRect.top) {
-            best = { targetId: list[0].project.id, position: "before" };
-          } else {
-            best = {
-              targetId: list[list.length - 1].project.id,
-              position: "after",
-            };
-          }
-        }
-        currentDrop = best;
-        const nextKey = best ? `${best.targetId}::${best.position}` : "";
-        if (nextKey !== lastDropKey) {
-          lastDropKey = nextKey;
-          setProjectDropIndicator(best);
+        const nextOver = computeInlineSortTargetIndex(
+          slots,
+          fromIndex,
+          clamped,
+          PROJECT_SORT_MAX_LEAD_IN_PX,
+        );
+        if (nextOver !== overIndex) {
+          overIndex = nextOver;
+          setProjectSortState({
+            phase: "dragging",
+            fromId: projectId,
+            fromIndex,
+            overIndex: nextOver,
+            ids,
+            slots,
+          });
         }
       };
 
-      const finish = (commit: boolean) => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onPointerUp);
-        window.removeEventListener("pointercancel", onCancel);
-        window.removeEventListener("keydown", onKeyDown);
-        projectDragCleanupRef.current = null;
-        document.body.style.cursor = "";
-        stopAutoScroll();
+      const startSettle = (targetOverIdx: number, shouldCommit: boolean) => {
+        const targetDelta = computeInlineSortSettleDelta(slots, fromIndex, targetOverIdx);
+        const reduced = prefersReducedMotion();
 
-        if (activeDrag) {
-          setDraggingProjectId(null);
-          setProjectDropIndicator(null);
-          if (commit && currentDrop && currentDrop.targetId !== projectId) {
-            const ordered = displayProjectsRef.current.map((d) => d.project);
-            const fromIdx = ordered.findIndex((p) => p.id === projectId);
-            if (fromIdx >= 0) {
-              const [moved] = ordered.splice(fromIdx, 1);
-              let toIdx = ordered.findIndex((p) => p.id === currentDrop?.targetId);
-              if (toIdx >= 0) {
-                if (currentDrop.position === "after") toIdx += 1;
-                ordered.splice(toIdx, 0, moved);
-                const keys = ordered.map(
-                  (p) =>
-                    p.sort_order_key ||
-                    p.pinned_project_id ||
-                    projectPathScopeKey(p.host_id, p.primary_cwd),
-                );
-                void orbitActions.reorderProjects(keys);
+        let finished = false;
+        const finalize = () => {
+          if (finished) return;
+          finished = true;
+          clearSettle();
+          flushSync(() => {
+            if (shouldCommit && targetOverIdx !== fromIndex) {
+              const ordered = displayProjectsRef.current.map((d) => d.project);
+              const curFrom = ordered.findIndex((p) => p.id === projectId);
+              const targetId = ids[targetOverIdx];
+              if (curFrom >= 0 && targetId) {
+                const [moved] = ordered.splice(curFrom, 1);
+                let toIdx = ordered.findIndex((p) => p.id === targetId);
+                if (toIdx >= 0) {
+                  if (targetOverIdx > fromIndex) toIdx += 1;
+                  ordered.splice(toIdx, 0, moved);
+                  const keys = ordered.map(
+                    (p) =>
+                      p.sort_order_key ||
+                      p.pinned_project_id ||
+                      projectPathScopeKey(p.host_id, p.primary_cwd),
+                  );
+                  void orbitActions.reorderProjects(keys);
+                }
               }
             }
+            setProjectSortState(null);
+          });
+        };
+
+        const draggedEl = projectRowRefs.current.get(projectId) ?? draggedProjectElRef.current;
+        if (reduced || !draggedEl || Math.abs(latestDelta - targetDelta) < 0.5) {
+          finalize();
+          return;
+        }
+
+        clearSettle();
+        activeSettleFlushRef.current = finalize;
+        setProjectSortState({
+          phase: "settling",
+          fromId: projectId,
+          fromIndex,
+          overIndex: targetOverIdx,
+          ids,
+          slots,
+        });
+        draggedProjectElRef.current = draggedEl;
+        settleCancelRef.current = startTransformSettle(
+          draggedEl,
+          `translate3d(0, ${targetDelta}px, 0)`,
+          finalize,
+        );
+      };
+
+      startPointerDrag(e, {
+        thresholdPx: DRAG_THRESHOLD_SORT_PX,
+        cursor: "grabbing",
+        ignoreSelector: "[data-proj-action], input",
+        onActivate: (frame) => {
+          const list = displayProjectsRef.current;
+          const viewport = scrollViewportRef.current;
+          const vpRect = viewport?.getBoundingClientRect() ?? null;
+          startScroll = viewport?.scrollTop ?? 0;
+          startY = frame.startY;
+
+          const mounted: Array<{ id: string; start: number; size: number }> = [];
+          for (const entry of list) {
+            const el = projectRowRefs.current.get(entry.project.id);
+            if (!el) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.height === 0) continue;
+            mounted.push({
+              id: entry.project.id,
+              start: vpRect ? rect.top - vpRect.top + startScroll : rect.top,
+              size: rect.height,
+            });
           }
-          window.setTimeout(() => {
-            suppressNextProjectClickRef.current = false;
-          }, 80);
+          if (mounted.length < 2) return false;
+
+          ids = mounted.map((m) => m.id);
+          fromIndex = ids.indexOf(projectId);
+          if (fromIndex < 0) return false;
+          overIndex = fromIndex;
+          slots = buildInlineSortSlots(mounted.map(({ start, size }) => ({ start, size })));
+          latestDelta = 0;
+
+          activeScrollTickRef.current = updateAtPointer;
+          setProjectSortState({
+            phase: "dragging",
+            fromId: projectId,
+            fromIndex,
+            overIndex: fromIndex,
+            ids,
+            slots,
+          });
+          return true;
+        },
+        onMove: (frame) => {
+          updateAutoScroll(frame.clientX, frame.clientY);
+          updateAtPointer(frame.clientX, frame.clientY);
+        },
+        onCommit: () => {
+          activeScrollTickRef.current = null;
+          stopAutoScroll();
+          startSettle(overIndex, overIndex !== fromIndex);
+        },
+        onCancel: () => {
+          activeScrollTickRef.current = null;
+          stopAutoScroll();
+          startSettle(fromIndex, false);
+        },
+      });
+    },
+    [clearSettle, scrollViewportRef, startPointerDrag, stopAutoScroll, updateAutoScroll],
+  );
+
+  const startPinnedDrag = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>, source: PinnedDragSource) => {
+      if (pinnedThreadKeysRef.current.length < 2) return;
+      activeSettleFlushRef.current?.();
+
+      let startY = e.clientY;
+      let startScroll = 0;
+      let ids: string[] = [];
+      let slots: InlineSortSlot[] = [];
+      let fromIndex = -1;
+      let overIndex = -1;
+      let latestDelta = 0;
+
+      const applyDraggedTransform = (delta: number) => {
+        const el = pinnedRowRefs.current.get(source.threadKey);
+        if (!el) return;
+        draggedPinnedElRef.current = el;
+        el.style.transform = `translate3d(0, ${delta}px, 0)`;
+      };
+
+      const updateAtPointer = (_clientX: number, clientY: number) => {
+        const currentScroll = scrollViewportRef.current?.scrollTop ?? startScroll;
+        const rawDelta = clientY - startY + (currentScroll - startScroll);
+        const clamped = clampInlineSortDelta(slots, fromIndex, rawDelta);
+        latestDelta = clamped;
+        applyDraggedTransform(clamped);
+
+        const nextOver = computeInlineSortTargetIndex(slots, fromIndex, clamped);
+        if (nextOver !== overIndex) {
+          overIndex = nextOver;
+          setPinnedSortState({
+            phase: "dragging",
+            fromId: source.threadKey,
+            fromIndex,
+            overIndex: nextOver,
+            ids,
+            slots,
+          });
         }
       };
 
-      const onPointerUp = () => finish(true);
-      const onCancel = () => finish(false);
-      const onKeyDown = (ev: KeyboardEvent) => {
-        if (ev.key === "Escape") finish(false);
+      const startSettle = (targetOverIdx: number, shouldCommit: boolean) => {
+        const targetDelta = computeInlineSortSettleDelta(slots, fromIndex, targetOverIdx);
+        const reduced = prefersReducedMotion();
+
+        let finished = false;
+        const finalize = () => {
+          if (finished) return;
+          finished = true;
+          clearSettle();
+          flushSync(() => {
+            if (shouldCommit && targetOverIdx !== fromIndex) {
+              const fullKeys = pinnedThreadKeysRef.current;
+              const targetKey = ids[targetOverIdx];
+              const position: "before" | "after" = targetOverIdx > fromIndex ? "after" : "before";
+              if (targetKey && !isNoOpLinearDrop(fullKeys, source.threadKey, targetKey, position)) {
+                const orderedKeys = fullKeys.filter((k) => k !== source.threadKey);
+                let toIdx = orderedKeys.indexOf(targetKey);
+                if (toIdx >= 0) {
+                  if (position === "after") toIdx += 1;
+                  orderedKeys.splice(toIdx, 0, source.threadKey);
+                  orbitActions.reorderPinnedThreads(orderedKeys);
+                }
+              }
+            }
+            setPinnedSortState(null);
+          });
+        };
+
+        const draggedEl =
+          pinnedRowRefs.current.get(source.threadKey) ?? draggedPinnedElRef.current;
+        if (reduced || !draggedEl || Math.abs(latestDelta - targetDelta) < 0.5) {
+          finalize();
+          return;
+        }
+
+        clearSettle();
+        activeSettleFlushRef.current = finalize;
+        setPinnedSortState({
+          phase: "settling",
+          fromId: source.threadKey,
+          fromIndex,
+          overIndex: targetOverIdx,
+          ids,
+          slots,
+        });
+        draggedPinnedElRef.current = draggedEl;
+        settleCancelRef.current = startTransformSettle(
+          draggedEl,
+          `translate3d(0, ${targetDelta}px, 0)`,
+          finalize,
+        );
       };
 
-      projectDragCleanupRef.current?.();
-      projectDragCleanupRef.current = onCancel;
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onPointerUp);
-      window.addEventListener("pointercancel", onCancel);
-      window.addEventListener("keydown", onKeyDown);
+      startPointerDrag(e, {
+        thresholdPx: DRAG_THRESHOLD_SORT_PX,
+        cursor: "grabbing",
+        ignoreDoubleClick: true,
+        ignoreSelector: "[data-thread-action], input",
+        onActivate: (frame) => {
+          const orderedKeys = pinnedThreadKeysRef.current;
+          const viewport = scrollViewportRef.current;
+          const vpRect = viewport?.getBoundingClientRect() ?? null;
+          startScroll = viewport?.scrollTop ?? 0;
+          startY = frame.startY;
+
+          const mounted: Array<{ id: string; start: number; size: number }> = [];
+          for (const key of orderedKeys) {
+            const el = pinnedRowRefs.current.get(key);
+            if (!el) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.height === 0) continue;
+            mounted.push({
+              id: key,
+              start: vpRect ? rect.top - vpRect.top + startScroll : rect.top,
+              size: rect.height,
+            });
+          }
+          if (mounted.length < 2) return false;
+
+          ids = mounted.map((m) => m.id);
+          fromIndex = ids.indexOf(source.threadKey);
+          if (fromIndex < 0) return false;
+          overIndex = fromIndex;
+          slots = buildInlineSortSlots(mounted.map(({ start, size }) => ({ start, size })));
+          latestDelta = 0;
+
+          activeScrollTickRef.current = updateAtPointer;
+          setPinnedSortState({
+            phase: "dragging",
+            fromId: source.threadKey,
+            fromIndex,
+            overIndex: fromIndex,
+            ids,
+            slots,
+          });
+          return true;
+        },
+        onMove: (frame) => {
+          updateAutoScroll(frame.clientX, frame.clientY);
+          updateAtPointer(frame.clientX, frame.clientY);
+        },
+        onCommit: () => {
+          activeScrollTickRef.current = null;
+          stopAutoScroll();
+          startSettle(overIndex, overIndex !== fromIndex);
+        },
+        onCancel: () => {
+          activeScrollTickRef.current = null;
+          stopAutoScroll();
+          startSettle(fromIndex, false);
+        },
+      });
     },
-    [stopAutoScroll, updateAutoScroll],
+    [clearSettle, scrollViewportRef, startPointerDrag, stopAutoScroll, updateAutoScroll],
   );
 
   return {
+    liftedThread,
+    liftedThreadElRef,
+    isAnyDragging: isPointerDragging,
     draggingThread,
+    threadInlineSort,
     threadDropIndicator,
     dragOverDropId,
-    draggingProjectId,
-    projectDropIndicator,
-    floatingPreviewRef,
+    projectSortState,
+    pinnedSortState,
     syncScopeAgentIds,
     registerProjectRow,
     registerThreadRow,
+    registerPinnedRow,
     registerWorkspaceHeader,
     registerInboxArea,
-    shouldSuppressThreadClick,
-    shouldSuppressProjectClick,
+    shouldSuppressClick,
+    shouldSuppressThreadClick: shouldSuppressClick,
+    shouldSuppressProjectClick: shouldSuppressClick,
+    shouldSuppressPinnedClick: shouldSuppressClick,
     startThreadDrag,
     startProjectDrag,
+    startPinnedDrag,
   };
 }

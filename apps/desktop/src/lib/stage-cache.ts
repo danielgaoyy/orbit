@@ -13,6 +13,9 @@ export interface StageCachePinTab {
   kind: string;
   title?: string;
   hostId?: string;
+  parentHostId?: string;
+  agentId?: string | null;
+  cwd?: string;
   subagentCallId?: string;
   subagentRole?: string;
   subagentPrompt?: string;
@@ -29,6 +32,7 @@ export interface OpenSubagentTabSpec {
   tabHostId: string | null;
   parentHostId: string | null;
   parentAgentId: string | null;
+  cwd?: string;
   effectiveChildAgentId: string | null;
   effectiveProviderSubagentId: string | null;
 }
@@ -53,7 +57,9 @@ export function upsertSubagentSidePanelTab<T extends StageCachePinTab & { id: st
 ): { tabs: T[]; activeTabId: string; created: boolean } {
   const canonicalId = resolveSubagentTabId(spec);
   const normalizedHostId = spec.tabHostId ?? undefined;
+  const normalizedParentHostId = spec.parentHostId ?? undefined;
   const normalizedParentId = spec.parentAgentId ?? null;
+  const normalizedCwd = spec.cwd;
 
   const existingIdx = tabs.findIndex((t) => {
     if (t.kind !== "subagent") return false;
@@ -89,6 +95,9 @@ export function upsertSubagentSidePanelTab<T extends StageCachePinTab & { id: st
       ...existing,
       title: spec.role || existing.title || "Subagent",
       hostId: normalizedHostId,
+      parentHostId: normalizedParentHostId ?? existing.parentHostId,
+      agentId: normalizedParentId,
+      ...(normalizedCwd ? { cwd: normalizedCwd } : {}),
       subagentCallId: spec.callId || existing.subagentCallId,
       subagentRole: spec.role || existing.subagentRole,
       subagentPrompt: spec.promptPreview || existing.subagentPrompt,
@@ -106,6 +115,9 @@ export function upsertSubagentSidePanelTab<T extends StageCachePinTab & { id: st
     kind: "subagent",
     title: spec.role || "Subagent",
     hostId: normalizedHostId,
+    parentHostId: normalizedParentHostId,
+    agentId: normalizedParentId,
+    ...(normalizedCwd ? { cwd: normalizedCwd } : {}),
     subagentCallId: spec.callId,
     subagentRole: spec.role,
     subagentPrompt: spec.promptPreview,

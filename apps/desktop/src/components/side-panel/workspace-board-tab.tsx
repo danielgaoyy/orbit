@@ -1,6 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlarmClock,
   AlertTriangle,
   ArrowUpRight,
   Check,
@@ -13,12 +12,12 @@ import {
   FileCode2,
   FileEdit,
   FileText,
-  GitBranch,
   History,
   Lightbulb,
   Loader2,
   MessageSquare,
   RefreshCw,
+  RotateCcw,
   Save,
   ShieldCheck,
   Target,
@@ -31,14 +30,32 @@ import {
   type RichBlockView,
   type WorkspaceEventRecord,
   isAgentForegroundRunning,
-  isAgentTimerWaiting,
+  isSubagentCard,
   orbitIpc,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
+import {
+  buildAgentListItemTooltip,
+  filterDistinctWorkerStepPreview,
+  formatAgentListItemStatusLabel,
+  mapAgentCardToItemStatus,
+  resolveAgentItemRuntime,
+} from "@/lib/agent-list-item";
+import { assignSubagentCharacters } from "@/lib/subagent-avatar";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import { AgentListItem } from "@/components/ui/agent-list-item";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { IconButton } from "@/components/ui/icon-button";
 import { Input } from "@/components/ui/input";
-import { ProviderIcon } from "@/components/ui/provider-icons";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -371,6 +388,9 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const workspaceId = tab.workspaceId ?? "";
   const scopeKey = `${hostId}::${workspaceId}`;
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
+  const hostDetail = useOrbitSelector((s) =>
+    hostId ? (s.hostDetails[hostId] ?? null) : null,
+  );
 
   const board = useOrbitSelector((s) =>
     hostId && workspaceId ? (s.hostDetails[hostId]?.workspace_boards?.[workspaceId] ?? null) : null,
@@ -416,7 +436,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
         a.workspace_id === workspaceId &&
         !a.archived_at_rfc3339 &&
         !a.background &&
-        !a.parent_agent_id,
+        !isSubagentCard(a),
     );
     if (sameBoardPeers(peersCacheRef.current, nextPeers)) {
       return peersCacheRef.current;
@@ -441,8 +461,13 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const [editingTitle, setEditingTitle] = useState(false);
   const titleIme = useImeCompositionGuard();
   const goalIme = useImeCompositionGuard();
+  const resetGoalIme = useImeCompositionGuard();
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [sectionBlocks, setSectionBlocks] = useState<Record<string, RichBlockView[]>>({});
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [resetGoalDraft, setResetGoalDraft] = useState("");
+  const [resetKeepNotesDraft, setResetKeepNotesDraft] = useState("");
+  const [resettingBoard, setResettingBoard] = useState(false);
 
   const isBoardDirty = boardDraft !== serverContent;
   const previewSource = isBoardDirty ? boardDraft : serverContent;
@@ -592,7 +617,42 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     setEditingGoal(false);
   };
 
+  const handleOpenResetDialog = () => {
+    setResetGoalDraft(workspace?.mission_goal?.trim() || parsedDoc.extractedGoal || "");
+    setResetKeepNotesDraft("");
+    setResetDialogOpen(true);
+  };
+
+  const handleConfirmResetBoard = async () => {
+    if (!hostId || !workspaceId || resettingBoard) return;
+    setResettingBoard(true);
+    try {
+      await orbitActions.resetWorkspaceBoard(hostId, workspaceId, {
+        newGoal: resetGoalDraft.trim(),
+        keepNotes: resetKeepNotesDraft.trim() || null,
+      });
+      setEditingBoard(false);
+      setEditingGoal(false);
+      setResetDialogOpen(false);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      orbitActions.showToast(
+        detail ? t("store.failedUpdateGroup", { detail }) : t("common.actionFailed"),
+      );
+    } finally {
+      setResettingBoard(false);
+    }
+  };
+
   const runningPeersCount = peers.filter((p) => isAgentForegroundRunning(p)).length;
+  const peerCharacters = useMemo(
+    () =>
+      assignSubagentCharacters(
+        peers.map((peer) => ({ key: peer.agent_id })),
+        (entry) => entry.key,
+      ),
+    [peers],
+  );
   const effectiveGoal = workspace?.mission_goal?.trim() || parsedDoc.extractedGoal || "";
 
   return (
@@ -660,6 +720,15 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
             className="text-muted-foreground hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
           >
             <RefreshCw className="h-[13px] w-[13px]" />
+          </button>
+          <button
+            type="button"
+            title={t("board.resetBoardTitle")}
+            onClick={handleOpenResetDialog}
+            className="border-border text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-md border px-2 text-[12px] transition-colors"
+          >
+            <RotateCcw className="h-[12px] w-[12px]" />
+            <span>{t("board.resetBoardButton")}</span>
           </button>
           <button
             type="button"
@@ -770,85 +839,68 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
 
         {/* 3. Threads in Group */}
         {peers.length > 0 && (
-          <section className="space-y-2">
+          <section className="space-y-1.5">
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
                 <Users className="h-[12.5px] w-[12.5px]" />
                 <span>Threads ({peers.length})</span>
               </span>
             </div>
-            <div className="space-y-1.5">
+            <div className="flex flex-col gap-0.5">
               {peers.map((peer) => {
                 const isFocused = peer.agent_id === selectedAgentId;
                 const handle = semanticAgentTabLabel(peer);
-                const peerForegroundRunning = isAgentForegroundRunning(peer);
-                const peerTimerArmed = !peerForegroundRunning && isAgentTimerWaiting(peer);
-                const statusText = peerForegroundRunning
-                  ? "Running"
-                  : peer.is_awaiting_permission
-                    ? "Approval"
-                    : "Idle";
+                const status = mapAgentCardToItemStatus(peer);
+                const runtime = resolveAgentItemRuntime({
+                  agent: peer,
+                  hostDetail,
+                  t,
+                });
+                const statusText = formatAgentListItemStatusLabel(status, t);
+                const distinctSummary = filterDistinctWorkerStepPreview(
+                  peer.task_summary || peer.title,
+                  handle,
+                );
+                const tooltip = buildAgentListItemTooltip({
+                  title: handle,
+                  agentLabel: runtime.agentLabel,
+                  rawModel: runtime.rawModel,
+                  modelLabel: runtime.modelLabel,
+                  effortLabel: runtime.effortLabel,
+                  statusLabel: statusText,
+                  worktreeBranch: peer.worktree_branch,
+                  detail: distinctSummary,
+                });
+
                 return (
-                  <div
+                  <AgentListItem
                     key={peer.agent_id}
-                    className={cn(
-                      "border-border/65 flex items-start justify-between gap-2 rounded-xl border px-3 py-2 text-[12px] transition-colors",
-                      isFocused
-                        ? "border-foreground/20 bg-foreground/[0.04]"
-                        : "bg-elevated/35 hover:bg-elevated/65",
-                    )}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => orbitActions.selectAgent(hostId, peer.agent_id)}
-                      className="flex min-w-0 flex-1 cursor-pointer items-start gap-2.5 text-left"
-                    >
-                      {peerForegroundRunning ? (
-                        <Loader2 className="text-foreground/70 mt-0.5 h-[13px] w-[13px] shrink-0 animate-spin" />
-                      ) : peerTimerArmed ? (
-                        <AlarmClock className="text-ink-faint mt-0.5 h-[12.5px] w-[12.5px] shrink-0 stroke-[1.7]" />
-                      ) : (
-                        <ProviderIcon
-                          provider={peer.provider}
-                          className="mt-0.5 h-[13.5px] w-[13.5px] shrink-0 opacity-80"
-                        />
-                      )}
-                      <div className="min-w-0 flex-1 space-y-0.5">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="text-foreground truncate font-medium">{handle}</span>
-                          <span
-                            className={cn(
-                              "rounded-full px-1.5 py-[1px] text-[10px] font-medium",
-                              peerForegroundRunning
-                                ? "bg-foreground/[0.07] text-foreground/80"
-                                : peer.is_awaiting_permission
-                                  ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
-                                  : "bg-black/[0.05] text-muted-foreground dark:bg-white/[0.08]",
-                            )}
-                          >
-                            {statusText}
-                          </span>
-                          {peer.worktree_branch && (
-                            <span className="bg-muted text-muted-foreground inline-flex items-center gap-0.5 rounded px-1.5 py-[1px] font-mono text-[10px]">
-                              <GitBranch className="h-[9.5px] w-[9.5px]" />
-                              {peer.worktree_branch}
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-muted-foreground line-clamp-2 text-[11.5px] leading-snug">
-                          {peer.task_summary || peer.title}
-                        </div>
-                      </div>
-                    </button>
-                    <button
-                      type="button"
-                      title="Open side-by-side"
-                      onClick={() => orbitActions.openPeerSplitTab(hostId, peer.agent_id, handle)}
-                      className="text-muted-foreground hover:text-foreground mt-0.5 inline-flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-                    >
-                      <Columns2 className="h-[12px] w-[12px]" />
-                    </button>
-                  </div>
+                    title={handle}
+                    status={status}
+                    character={peerCharacters.get(peer.agent_id)}
+                    avatarSeedKey={peer.agent_id}
+                    provider={runtime.provider}
+                    modelLabel={runtime.modelLabel}
+                    effortLabel={runtime.effortLabel}
+                    agentLabel={runtime.agentLabel}
+                    statusLabel={statusText}
+                    selected={isFocused}
+                    tooltip={tooltip}
+                    onClick={() => orbitActions.selectAgent(hostId, peer.agent_id)}
+                    trailing={
+                      <IconButton
+                        size="xs"
+                        tooltip={t("peerStrip.openSideBySide", { label: handle })}
+                        aria-label={t("peerStrip.openSideBySide", { label: handle })}
+                        onClick={() =>
+                          orbitActions.openPeerSplitTab(hostId, peer.agent_id, handle)
+                        }
+                        className="text-ink-muted hover:text-ink-primary"
+                      >
+                        <Columns2 className="size-3" />
+                      </IconButton>
+                    }
+                  />
                 );
               })}
             </div>
@@ -1070,6 +1122,76 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           </section>
         )}
       </ScrollArea>
+
+      <Dialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader>
+            <DialogTitle>{t("board.resetBoardTitle")}</DialogTitle>
+            <DialogDescription>{t("board.resetBoardDescription")}</DialogDescription>
+          </DialogHeader>
+
+          <FieldGroup className="py-1">
+            <Field>
+              <FieldLabel htmlFor="orbit-reset-board-goal">
+                {t("board.resetNewGoalLabel")}
+              </FieldLabel>
+              <Input
+                id="orbit-reset-board-goal"
+                autoFocus
+                value={resetGoalDraft}
+                onChange={(e) => setResetGoalDraft(e.target.value)}
+                {...resetGoalIme.compositionProps}
+                onKeyDown={(e) => {
+                  if (resetGoalIme.shouldIgnoreKeyDown(e)) return;
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    void handleConfirmResetBoard();
+                  }
+                }}
+                placeholder={t("board.resetNewGoalPlaceholder")}
+              />
+            </Field>
+
+            <Field>
+              <FieldLabel htmlFor="orbit-reset-board-notes">
+                {t("board.resetKeepNotesLabel")}
+              </FieldLabel>
+              <Textarea
+                id="orbit-reset-board-notes"
+                rows={4}
+                value={resetKeepNotesDraft}
+                onChange={(e) => setResetKeepNotesDraft(e.target.value)}
+                placeholder={t("board.resetKeepNotesPlaceholder")}
+                className="text-[12.5px] leading-relaxed"
+              />
+            </Field>
+          </FieldGroup>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={resettingBoard}
+              onClick={() => setResetDialogOpen(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={resettingBoard}
+              onClick={() => void handleConfirmResetBoard()}
+            >
+              {resettingBoard ? (
+                <Loader2 className="h-[12px] w-[12px] animate-spin" />
+              ) : (
+                <RotateCcw className="h-[12px] w-[12px]" />
+              )}
+              <span>{t("board.resetConfirmAction")}</span>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 });

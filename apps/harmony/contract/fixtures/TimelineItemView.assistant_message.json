@@ -1,0 +1,23 @@
+{
+  "blocks": [
+    {
+      "kind": "paragraph",
+      "spans": [
+        {
+          "bold": false,
+          "inline_code": false,
+          "italic": false,
+          "link_url": null,
+          "strikethrough": false,
+          "text": "Finished."
+        }
+      ]
+    }
+  ],
+  "item_id": "reply-0",
+  "item_type": "assistant_message",
+  "seq": 3,
+  "streaming": false,
+  "text": "Finished.",
+  "timestamp_ms": 75
+}

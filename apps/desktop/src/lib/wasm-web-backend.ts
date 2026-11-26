@@ -42,6 +42,11 @@ export interface BrowserBindings {
   WasmHost: new (profile: Profile, cached: unknown) => HostModel;
   parse_pairing_uri(text: string): Profile;
   project_fleet_sidebar(data: unknown, req: unknown): unknown;
+  get_personal_agent_briefing(
+    hosts: HostDetailView[],
+    primaryRouterHostId?: string | null,
+    nowMs?: number | null,
+  ): unknown;
   compose_prompt(req: unknown): unknown;
   provider_catalogs(live: unknown): unknown;
   resolve_model_selection(req: unknown, live: unknown): unknown;
@@ -418,6 +423,7 @@ export class WasmWebBackend implements OrbitTransportBackend {
       "list_models",
       "list_provider_models",
       "list_pending_permissions",
+      "list_goal_runs",
     ])
       this.send(h, { op, request_id: crypto.randomUUID() });
   }
@@ -476,6 +482,12 @@ export class WasmWebBackend implements OrbitTransportBackend {
             hosts: hosts.map((h) => h.model.snapshot()),
           },
           req,
+        );
+      case "get_personal_agent_briefing":
+        return this.wasm.get_personal_agent_briefing(
+          hosts.map((h) => h.model.snapshot()),
+          a.primaryRouterHostId == null ? null : String(a.primaryRouterHostId),
+          Date.now(),
         );
       case "pair_host":
         return this.pair(String(a.pairingUri));
@@ -949,6 +961,67 @@ export class WasmWebBackend implements OrbitTransportBackend {
           130000,
         );
         return reply.report;
+      }
+      case "start_goal_run": {
+        const reply = await this.rpc(h, "start_goal_run", {
+          agent_id: agent,
+          objective: String(a.objective ?? ""),
+          criteria: a.criteria ?? [],
+          verify_command: a.verifyCommand ?? null,
+          max_iterations: a.maxIterations ?? null,
+          max_duration_secs: a.maxDurationSecs ?? null,
+          replace_existing: Boolean(a.replaceExisting),
+          dispatch_initial_prompt:
+            a.dispatchInitialPrompt === undefined ? null : a.dispatchInitialPrompt,
+        });
+        return reply.goal;
+      }
+      case "update_goal_run": {
+        const reply = await this.rpc(h, "update_goal_run", {
+          goal_id: String(a.goalId ?? ""),
+          objective: a.objective ?? null,
+          criteria: a.criteria ?? null,
+          verify_command: a.verifyCommand === undefined ? null : a.verifyCommand,
+          max_iterations: a.maxIterations ?? null,
+          max_duration_secs: a.maxDurationSecs ?? null,
+        });
+        return reply.goal;
+      }
+      case "list_goal_runs": {
+        const reply = await this.rpc(h, "list_goal_runs", {
+          agent_id: a.agentId ?? null,
+        });
+        return reply.goals ?? [];
+      }
+      case "control_goal_run": {
+        const reply = await this.rpc(h, "control_goal_run", {
+          goal_id: String(a.goalId ?? ""),
+          action: a.action,
+        });
+        return reply.goal;
+      }
+      case "reset_workspace_board": {
+        await this.rpc(h, "reset_workspace_board", {
+          workspace_id: String(a.workspaceId ?? ""),
+          new_goal: a.newGoal ?? null,
+          keep_notes: a.keepNotes ?? null,
+        });
+        return;
+      }
+      case "harvest_conversation": {
+        await this.rpc(h, "harvest_conversation", {
+          agent_id: agent,
+          summary_note: a.summaryNote ?? null,
+          append_to_workspace_board: Boolean(a.appendToWorkspaceBoard),
+        });
+        return;
+      }
+      case "list_personal_agent_activity": {
+        const reply = await this.rpc(h, "list_personal_agent_activity", {
+          limit: Number(a.limit ?? 50),
+          since_ms: a.sinceMs ?? null,
+        });
+        return reply.entries ?? [];
       }
     }
     throw new Error("This action is unavailable in Orbit Web (" + cmd + ")");

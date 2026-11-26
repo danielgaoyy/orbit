@@ -1618,16 +1618,19 @@ fn starts_stage_turn(
         TimelineItemView::AgentMessage {
             kind,
             delivery_status,
+            blocking_turn_id,
             ..
         } => {
             let stay_inline = has_open_turn
                 && (matches!(
                     kind,
                     AgentMessageKind::FinishNotification | AgentMessageKind::Heartbeat
-                ) || matches!(
+                ) || (matches!(
                     delivery_status,
                     Some(orbit_protocol::AgentMessageDeliveryStatus::Queued)
-                ) || (delivery_status.is_some() && !current_turn_has_settled_assistant));
+                ) && (blocking_turn_id.is_some()
+                    || !current_turn_has_settled_assistant))
+                    || (delivery_status.is_some() && !current_turn_has_settled_assistant));
             !stay_inline
         }
         _ => false,
@@ -2038,12 +2041,20 @@ fn finalize_turn(
 
     let mut terminal_reply_index: Option<usize> = None;
     for (idx, candidate) in non_notice_body.iter().enumerate().rev() {
-        if matches!(candidate, TimelineItemView::AssistantMessage { .. }) {
-            terminal_reply_index = Some(idx);
-            break;
-        }
-        if is_step_row_item(candidate) {
-            break;
+        match candidate {
+            TimelineItemView::AssistantMessage {
+                text, streaming, ..
+            } => {
+                if text.trim().is_empty() && !*streaming {
+                    continue;
+                }
+                terminal_reply_index = Some(idx);
+                break;
+            }
+            _ if is_step_row_item(candidate) => {
+                break;
+            }
+            _ => {}
         }
     }
 
@@ -4141,6 +4152,24 @@ pub fn derive_session_insights(
                     outline_prompts.push(SessionOutlinePromptView::from(prompt));
                 }
             }
+            TimelineItemView::AgentMessage {
+                seq,
+                kind,
+                text,
+                permission_context,
+                ..
+            } => {
+                if *seq > 0
+                    && let Some(prompt) = TimelineOutlinePrompt::from_agent_message(
+                        *seq,
+                        *kind,
+                        text,
+                        permission_context.is_some(),
+                    )
+                {
+                    outline_prompts.push(SessionOutlinePromptView::from(prompt));
+                }
+            }
             TimelineItemView::AssistantMessage { seq, text, .. } => {
                 collect_local_urls(text, &mut detected_local_urls);
                 collect_prose_urls(text, *seq, &mut pr_map, &mut link_map);
@@ -4493,7 +4522,15 @@ pub fn derive_session_insights(
         if let Some(key) = matched_key
             && let Some(existing) = subagent_map.get_mut(&key)
         {
-            existing.status = status;
+            // A failed `invoke_subagent` tool call never spawned a live subagent; do not let
+            // a stale persisted `Running` provider descriptor override the terminal failure.
+            let preserve_failed_launch = existing.status == ToolCallStatus::Failed
+                && status == ToolCallStatus::Running
+                && existing.child_agent_id.as_deref() == Some(ps.subagent_id.as_str())
+                && !host_agent_ids.contains(ps.subagent_id.as_str());
+            if !preserve_failed_launch {
+                existing.status = status;
+            }
             existing.provider_subagent_id = Some(ps.subagent_id.clone());
             // Native provider subagents carry a provider-side conversation UUID, NOT an Orbit
             // managed agent ID; clear non-host `child_agent_id` so the UI opens the provider
@@ -6212,6 +6249,44 @@ Log: file:///tmp/spoofed.log\n";
     }
 
     #[test]
+    fn derive_session_insights_preserves_failed_launch_over_stale_running_provider_subagent() {
+        use chrono::Utc;
+
+        let items = vec![make_tool(
+            10,
+            ToolCallStatus::Failed,
+            "Run invoke_subagent",
+            ToolCallDetail::Subagent {
+                child_agent_id: Some("1d30b95b-2118-463a-aabb-e8cd72ba25da".into()),
+                role: "Stage File Drop Unifier".into(),
+                prompt_preview: "Upgrade stage file drop".into(),
+            },
+            Vec::new(),
+            2_000,
+        )];
+        let stale_provider_subs = vec![ProviderSubagentDescriptor {
+            subagent_id: "1d30b95b-2118-463a-aabb-e8cd72ba25da".into(),
+            parent_agent_id: "ag_parent".into(),
+            parent_subagent_id: None,
+            title: "Stage File Drop Unifier".into(),
+            subtitle: Some("Upgrade stage file drop".into()),
+            model: None,
+            status: ProviderSubagentStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let insights =
+            derive_session_insights(&items, Some("/repo"), None, &[], &stale_provider_subs);
+        assert_eq!(insights.subagents.len(), 1);
+        assert_eq!(insights.subagents[0].status, ToolCallStatus::Failed);
+        assert_eq!(
+            insights.subagents[0].provider_subagent_id.as_deref(),
+            Some("1d30b95b-2118-463a-aabb-e8cd72ba25da")
+        );
+    }
+
+    #[test]
     fn background_waiting_keeps_tasks_visible_when_foreground_is_idle() {
         use orbit_protocol::{AgentStatus, BackgroundTaskInfo, ProviderKind, SessionMode};
 
@@ -7040,5 +7115,147 @@ Log: file:///tmp/spoofed.log\n";
             [TurnLiveSegmentView::Compaction { key, label }]
                 if key == "compact-11" && label == "Context compacted (from 367k tokens)"
         ));
+    }
+
+    #[test]
+    fn finalize_turn_skips_trailing_empty_finalized_assistant_message() {
+        let prompt = TimelineItemView::UserPrompt {
+            seq: 1,
+            message_id: "u1".into(),
+            text: "Investigate folding".into(),
+            badges: Vec::new(),
+            blocks: Vec::new(),
+            timestamp_ms: Some(1_000),
+        };
+        let tool = TimelineItemView::ToolCall {
+            seq: 2,
+            call_id: "c1".into(),
+            summary_title: "Read stage.rs".into(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::FileRead {
+                path: "/repo/stage.rs".into(),
+                start_line: None,
+                end_line: None,
+            },
+            diff_files: Vec::new(),
+            background_task: None,
+            step_descriptor: None,
+            timestamp_ms: Some(2_000),
+        };
+        let real_reply = TimelineItemView::AssistantMessage {
+            seq: 3,
+            item_id: "m1".into(),
+            text: "Here are the root causes.".into(),
+            blocks: Vec::new(),
+            streaming: false,
+            timestamp_ms: Some(3_000),
+        };
+        let empty_trailing = TimelineItemView::AssistantMessage {
+            seq: 4,
+            item_id: "m2".into(),
+            text: "   \n\t  ".into(),
+            blocks: Vec::new(),
+            streaming: false,
+            timestamp_ms: Some(4_000),
+        };
+
+        let (turns, _, _, _) =
+            process_timeline_for_stage(&[prompt, tool, real_reply, empty_trailing], Some("/repo"));
+        assert_eq!(turns.len(), 1);
+        let t = &turns[0];
+        assert!(matches!(
+            t.terminal_reply,
+            Some(TimelineItemView::AssistantMessage { ref item_id, ref text, .. })
+                if item_id == "m1" && text == "Here are the root causes."
+        ));
+        assert_eq!(t.folded_steps.len(), 1);
+        assert!(matches!(
+            t.folded_steps.first(),
+            Some(TimelineItemView::ToolCall { call_id, .. }) if call_id == "c1"
+        ));
+        assert_eq!(t.live_segments.len(), 2);
+        assert!(matches!(
+            t.live_segments.last(),
+            Some(TurnLiveSegmentView::AssistantMessage {
+                item: TimelineItemView::AssistantMessage { item_id, .. },
+                ..
+            }) if item_id == "m1"
+        ));
+    }
+
+    #[test]
+    fn idle_queued_direct_message_opens_new_turn_and_populates_outline_without_protocol_noise() {
+        let items = vec![
+            TimelineItemView::UserPrompt {
+                seq: 1,
+                message_id: "u1".into(),
+                text: "First task".into(),
+                badges: Vec::new(),
+                blocks: Vec::new(),
+                timestamp_ms: Some(1_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 2,
+                item_id: "a1".into(),
+                text: "First task complete.".into(),
+                blocks: Vec::new(),
+                streaming: false,
+                timestamp_ms: Some(2_000),
+            },
+            TimelineItemView::AgentMessage {
+                seq: 3,
+                message_id: "am_follow".into(),
+                kind: AgentMessageKind::DirectMessage,
+                source_agent_id: Some("ag_router".into()),
+                source_host_id: Some("host_a".into()),
+                source_title: Some("Personal Router".into()),
+                event: None,
+                text: "<orbit-system version=\"1\" kind=\"agent-message\" source-agent-id=\"ag_router\">\nRun phase 2 verification\n</orbit-system>".into(),
+                permission_context: None,
+                delivery_status: Some(orbit_protocol::AgentMessageDeliveryStatus::Queued),
+                delivery_turn_id: Some("turn_2".into()),
+                blocking_turn_id: None,
+                queued_at_ms: Some(3_000),
+                dispatched_at_ms: None,
+                settled_at_ms: None,
+                blocks: Vec::new(),
+                timestamp_ms: Some(3_000),
+            },
+            TimelineItemView::AgentMessage {
+                seq: 4,
+                message_id: "am_noise".into(),
+                kind: AgentMessageKind::DirectMessage,
+                source_agent_id: Some("ag_router".into()),
+                source_host_id: Some("host_a".into()),
+                source_title: Some("Personal Router".into()),
+                event: None,
+                text: "<orbit-fleet-delta rev=\"2\">\n- w1 idle\n</orbit-fleet-delta>".into(),
+                permission_context: None,
+                delivery_status: Some(orbit_protocol::AgentMessageDeliveryStatus::Settled),
+                delivery_turn_id: None,
+                blocking_turn_id: None,
+                queued_at_ms: None,
+                dispatched_at_ms: None,
+                settled_at_ms: None,
+                blocks: Vec::new(),
+                timestamp_ms: Some(4_000),
+            },
+        ];
+
+        let (turns, _, _, _) = process_timeline_for_stage(&items, Some("/repo"));
+        assert!(turns.len() >= 2);
+        assert!(matches!(
+            &turns[1].agent_message,
+            Some(TimelineItemView::AgentMessage { message_id, .. }) if message_id == "am_follow"
+        ));
+
+        let insights = derive_session_insights(&items, None, None, &[], &[]);
+        assert_eq!(insights.outline_prompts.len(), 2);
+        assert_eq!(insights.outline_prompts[0].seq, 1);
+        assert_eq!(insights.outline_prompts[1].seq, 3);
+        assert_eq!(
+            insights.outline_prompts[1].preview,
+            "Run phase 2 verification"
+        );
     }
 }

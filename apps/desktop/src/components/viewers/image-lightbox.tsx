@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Dialog as BaseDialog } from "@base-ui/react/dialog";
 import { ChevronLeft, ChevronRight, FileSymlink, X } from "lucide-react";
+import { usePanZoom } from "@/lib/drag/use-pan-zoom";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -24,10 +25,6 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
 const TOGGLE_ZOOM = 1.85;
 
-function clampZoom(value: number): number {
-  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value));
-}
-
 /**
  * Frameless Claude-style image preview lightbox:
  * - Full-viewport dark scrim with the image floating directly at center (zero card/dialog chrome).
@@ -44,36 +41,35 @@ export const ImageLightbox = memo(function ImageLightbox({
 }: ImageLightboxProps) {
   const { t } = useI18n();
   const [activeIndex, setActiveIndex] = useState(initialIndex);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [dragging, setDragging] = useState(false);
   const [stageEl, setStageEl] = useState<HTMLDivElement | null>(null);
-  const zoomRef = useRef(zoom);
-  zoomRef.current = zoom;
-  const dragRef = useRef<{
-    active: boolean;
-    pointerId: number;
-    startX: number;
-    startY: number;
-    origX: number;
-    origY: number;
-    moved: boolean;
-  }>({
-    active: false,
-    pointerId: -1,
-    startX: 0,
-    startY: 0,
-    origX: 0,
-    origY: 0,
-    moved: false,
-  });
+  const imgRef = useRef<HTMLImageElement | null>(null);
 
-  const resetTransform = useCallback(() => {
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-    setDragging(false);
-    dragRef.current.active = false;
-  }, []);
+  const count = items.length;
+  const safeIndex = count > 0 ? Math.min(Math.max(activeIndex, 0), count - 1) : 0;
+  const current = count > 0 ? items[safeIndex] : null;
+  const hasGallery = count > 1;
+  const isOpen = open && current !== null;
+
+  const {
+    zoom,
+    isDragging,
+    setZoom,
+    zoomIn,
+    zoomOut,
+    resetTransform,
+    consumeMovedClick,
+    transformStyle,
+    pointerHandlers,
+  } = usePanZoom({
+    open: isOpen,
+    minZoom: MIN_ZOOM,
+    maxZoom: MAX_ZOOM,
+    allowPanAtBaseZoom: false,
+    zoomStep: 1.25,
+    wheelMode: "zoomed-or-mod",
+    contentRef: imgRef,
+    viewportEl: stageEl,
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -82,11 +78,6 @@ export const ImageLightbox = memo(function ImageLightbox({
     setActiveIndex(clamped);
     resetTransform();
   }, [open, initialIndex, items.length, resetTransform]);
-
-  const count = items.length;
-  const safeIndex = count > 0 ? Math.min(Math.max(activeIndex, 0), count - 1) : 0;
-  const current = count > 0 ? items[safeIndex] : null;
-  const hasGallery = count > 1;
 
   const stepGallery = useCallback(
     (delta: -1 | 1) => {
@@ -98,8 +89,9 @@ export const ImageLightbox = memo(function ImageLightbox({
   );
 
   useEffect(() => {
-    if (!open) return;
+    if (!isOpen) return;
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === "ArrowLeft" && count > 1) {
         ev.preventDefault();
         stepGallery(-1);
@@ -108,14 +100,10 @@ export const ImageLightbox = memo(function ImageLightbox({
         stepGallery(1);
       } else if (ev.key === "+" || ev.key === "=") {
         ev.preventDefault();
-        setZoom((z) => clampZoom(z * 1.25));
+        zoomIn();
       } else if (ev.key === "-") {
         ev.preventDefault();
-        setZoom((z) => {
-          const next = clampZoom(z / 1.25);
-          if (next <= 1.01) setPan({ x: 0, y: 0 });
-          return next;
-        });
+        zoomOut();
       } else if (ev.key === "0") {
         ev.preventDefault();
         resetTransform();
@@ -123,71 +111,11 @@ export const ImageLightbox = memo(function ImageLightbox({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, count, stepGallery, resetTransform]);
-
-  useEffect(() => {
-    if (!open || !stageEl) return;
-    const handleWheel = (ev: WheelEvent) => {
-      if (!ev.ctrlKey && !ev.metaKey && zoomRef.current <= 1.01) return;
-      ev.preventDefault();
-      const factor = ev.deltaY < 0 ? 1.14 : 1 / 1.14;
-      setZoom((prev) => {
-        const next = clampZoom(prev * factor);
-        if (next <= 1.01) {
-          setPan({ x: 0, y: 0 });
-          return 1;
-        }
-        return next;
-      });
-    };
-    stageEl.addEventListener("wheel", handleWheel, { passive: false });
-    return () => stageEl.removeEventListener("wheel", handleWheel);
-  }, [open, stageEl]);
-
-  const handleImagePointerDown = (ev: React.PointerEvent<HTMLImageElement>) => {
-    if (ev.button !== 0 || zoom <= 1.01) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    ev.currentTarget.setPointerCapture(ev.pointerId);
-    dragRef.current = {
-      active: true,
-      pointerId: ev.pointerId,
-      startX: ev.clientX,
-      startY: ev.clientY,
-      origX: pan.x,
-      origY: pan.y,
-      moved: false,
-    };
-    setDragging(true);
-  };
-
-  const handleImagePointerMove = (ev: React.PointerEvent<HTMLImageElement>) => {
-    const d = dragRef.current;
-    if (!d.active || d.pointerId !== ev.pointerId) return;
-    const dx = ev.clientX - d.startX;
-    const dy = ev.clientY - d.startY;
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-      d.moved = true;
-    }
-    setPan({ x: d.origX + dx, y: d.origY + dy });
-  };
-
-  const handleImagePointerUp = (ev: React.PointerEvent<HTMLImageElement>) => {
-    const d = dragRef.current;
-    if (!d.active || d.pointerId !== ev.pointerId) return;
-    if (ev.currentTarget.hasPointerCapture(ev.pointerId)) {
-      ev.currentTarget.releasePointerCapture(ev.pointerId);
-    }
-    d.active = false;
-    setDragging(false);
-  };
+  }, [isOpen, count, stepGallery, zoomIn, zoomOut, resetTransform]);
 
   const handleImageClick = (ev: React.MouseEvent<HTMLImageElement>) => {
     ev.stopPropagation();
-    if (dragRef.current.moved) {
-      dragRef.current.moved = false;
-      return;
-    }
+    if (consumeMovedClick()) return;
     if (zoom > 1.01) {
       resetTransform();
     } else {
@@ -201,7 +129,7 @@ export const ImageLightbox = memo(function ImageLightbox({
 
   return (
     <BaseDialog.Root
-      open={open && current !== null}
+      open={isOpen}
       onOpenChange={(next) => {
         if (!next) onClose();
       }}
@@ -282,26 +210,17 @@ export const ImageLightbox = memo(function ImageLightbox({
             {/* Pure floating image — no card, no frame, no title bar */}
             {current && (
               <img
+                ref={imgRef}
                 src={current.url}
                 alt={current.label}
                 draggable={false}
                 onClick={handleImageClick}
-                onPointerDown={handleImagePointerDown}
-                onPointerMove={handleImagePointerMove}
-                onPointerUp={handleImagePointerUp}
-                onPointerCancel={handleImagePointerUp}
-                style={{
-                  transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
-                  transition: dragging
-                    ? "none"
-                    : "transform 180ms cubic-bezier(0.22, 1, 0.36, 1)",
-                }}
+                {...pointerHandlers}
+                style={transformStyle}
                 className={cn(
                   "max-h-[88vh] max-w-[90vw] rounded-lg object-contain shadow-[0_24px_80px_rgba(0,0,0,0.55)] will-change-transform",
                   zoom > 1.01
-                    ? dragging
-                      ? "cursor-grabbing"
-                      : "cursor-zoom-out"
+                    ? cn("touch-none", isDragging ? "cursor-grabbing" : "cursor-grab")
                     : "cursor-zoom-in",
                 )}
               />

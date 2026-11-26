@@ -68,6 +68,7 @@ import {
   slugifyPrefixedBranch,
   syncStageRunningSubagentMeta,
 } from "../store-helpers";
+import { selectActiveGoalForAgent } from "../selectors/session-selectors";
 import type { OrbitStoreContext } from "../store-runtime";
 import type {
   ContextMentionItem,
@@ -1404,40 +1405,40 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         };
         if (submission.kind === "btw") {
           clearDirectiveDraft();
-          ctx.actions.openSideQuestionTab();
+          ctx.actions.openSideQuestionTab({ source: "auto" });
           if (submission.text) void ctx.actions.submitSideQuestion(submission.text);
           return;
         }
 
-        const agentId = state.selectedAgentId;
-        if (state.isDraftNewSession || !agentId || !state.hostDetails[hostId]?.agents.some((a) => a.agent_id === agentId)) {
-          notifyToast(translateGlobal("composer.toastSessionRequiredGoal"));
+        const agentId = state.isDraftNewSession ? null : state.selectedAgentId;
+        const activeGoal = selectActiveGoalForAgent(state.hostDetails[hostId], agentId);
+        if (submission.kind === "goal_clear") {
+          clearDirectiveDraft();
+          if (!activeGoal) {
+            notifyToast(translateGlobal("composer.toastNoActiveGoal"));
+            return;
+          }
+          void ctx.actions.controlGoalRun(hostId, activeGoal.goal_id, "cancel");
           return;
         }
-        if (!submission.text) {
+        if (submission.kind === "goal_edit") {
+          clearDirectiveDraft();
+          if (!activeGoal) {
+            notifyToast(translateGlobal("composer.toastNoActiveGoal"));
+            return;
+          }
+          ctx.actions.openGoalEditDialog(hostId, activeGoal);
+          return;
+        }
+        if (submission.kind === "goal_inspect") {
+          if (activeGoal) {
+            clearDirectiveDraft();
+            ctx.actions.openGoalEditDialog(hostId, activeGoal);
+            return;
+          }
           notifyToast(translateGlobal("composer.toastGoalObjectiveRequired"));
           ctx.actions.focusComposer();
           return;
-        }
-        const prevGoalDraft = getState().composerDrafts[key] ?? "";
-        const prevGoalDirective = getState().slashDirectives[key] ?? null;
-        clearDirectiveDraft();
-        try {
-          await ctx.actions.startGoalRun({ hostId, agentId, objective: submission.text });
-        } catch (err) {
-          setState((s) => ({
-            ...s,
-            composerDrafts: {
-              ...s.composerDrafts,
-              [key]: mergeRestoredDraftText(prevGoalDraft, s.composerDrafts[key] ?? ""),
-            },
-            slashDirectives: {
-              ...s.slashDirectives,
-              [key]: s.slashDirectives[key] ?? prevGoalDirective,
-            },
-          }));
-          draftPersistence.flushNow();
-          notifyToast(formatSubmitErrorToast(err));
         }
         return;
       }
@@ -1458,6 +1459,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       steerImmediately: boolean,
       rawDraft: string,
       storedDirective: SlashDirective | null,
+      options?: { replaceExistingGoalConfirmed?: boolean },
     ): Promise<void> {
       // Snapshot ALL routing and draft config fields up front before any async upload/diff/compose
       // awaits so switching Agent or Workspace mid-submit can never misroute the prompt or settings.
@@ -2000,7 +2002,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           (getState().isDraftNewSession || !getState().selectedAgentId) === submitTarget.isDraftNewSession &&
           (submitTarget.isDraftNewSession || getState().selectedAgentId === submitTarget.agentId);
         if (stillOnOrigin) {
-          ctx.actions.openSideQuestionTab();
+          ctx.actions.openSideQuestionTab({ source: "auto" });
         }
         if (composed.btw_question) {
           void ctx.actions.submitSideQuestion(composed.btw_question, {
@@ -2131,6 +2133,44 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const effectiveDirective = composed.effective_directive;
       const cleanUserText =
         customCommandDisplayText !== null ? customCommandDisplayText : composed.display_prompt;
+      const isGoalPrompt = effectiveDirective === "goal";
+      const goalObjective = cleanUserText.trim();
+      if (isGoalPrompt && !goalObjective) {
+        notifyToast(translateGlobal("composer.toastGoalObjectiveRequired"));
+        ctx.actions.focusComposer();
+        return;
+      }
+      // Codex-style replacement confirmation when an existing session already has an active goal:
+      // confirm BEFORE clearing draft or revoking attachment previews so cancel preserves everything.
+      const existingGoalForSession =
+        isGoalPrompt && !isCreatingNewAgent && submitTarget.agentId
+          ? selectActiveGoalForAgent(getState().hostDetails[submitTarget.hostId], submitTarget.agentId)
+          : null;
+      if (existingGoalForSession && !options?.replaceExistingGoalConfirmed) {
+        ctx.actions.openGoalReplaceConfirm({
+          hostId: submitTarget.hostId,
+          agentId: submitTarget.agentId!,
+          currentGoal: existingGoalForSession,
+          newObjective: goalObjective,
+          onConfirm: async () => {
+            if (submittingComposerScopes.has(key)) return;
+            submittingComposerScopes.add(key);
+            try {
+              await ctx.actions._submitComposerUnlocked(
+                hostId,
+                key,
+                steerImmediately,
+                rawDraft,
+                storedDirective,
+                { replaceExistingGoalConfirmed: true },
+              );
+            } finally {
+              submittingComposerScopes.delete(key);
+            }
+          },
+        });
+        return;
+      }
       const imagePathQueueByLabel = new Map<string, string[]>();
       const filePathQueueByLabel = new Map<string, string[]>();
       const sentImages: SentImagePreviewMeta[] = [];
@@ -2431,6 +2471,20 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         }
 
         const agentId = submitTarget.agentId!;
+        if (isGoalPrompt) {
+          const started = await ctx.actions.startGoalRun({
+            hostId: submitTarget.hostId,
+            agentId,
+            objective: goalObjective,
+            replaceExisting: Boolean(existingGoalForSession),
+            dispatchInitialPrompt: false,
+            silentToast: true,
+          });
+          if (!started) {
+            restoreComposerDraftSnapshot(submitTarget.scopeKey, draftSnapshot);
+            return;
+          }
+        }
         const detail = getState().hostDetails[submitTarget.hostId];
         const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
         const supportsServerQueue = Boolean(detail?.host.supports_server_queue);

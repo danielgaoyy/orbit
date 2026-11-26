@@ -185,6 +185,7 @@ interface CommittedToggleFlags {
   shouldRightOpen: boolean;
   dockedOverview: boolean;
   hasActiveSession: boolean;
+  scopeSwitchNonce: number;
 }
 
 export interface WorkspaceMotionContextValue {
@@ -273,6 +274,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
   const sidebarWidth = useOrbitSelector((s) => s.sidebarWidth);
   const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
   const sidePanelWidth = useOrbitSelector((s) => s.sidePanelWidth);
+  const sidePanelScopeSwitchNonce = useOrbitSelector((s) => s.sidePanelScopeSwitchNonce);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const overviewDesktopOpenPref = useOrbitSelector((s) => s.overviewDesktopOpenPref);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
@@ -390,6 +392,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     shouldRightOpen,
     dockedOverview,
     hasActiveSession,
+    scopeSwitchNonce: sidePanelScopeSwitchNonce,
   });
 
   const snapshotTupleFor = (
@@ -438,6 +441,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       shouldRightOpen,
       dockedOverview,
       hasActiveSession,
+      scopeSwitchNonce: sidePanelScopeSwitchNonce,
     };
     setCommittedSig(toggleSig);
     setCommittedFlags(nextFlags);
@@ -472,13 +476,14 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
           : 0;
 
     // Switching between views (e.g. New Conversation <-> Session, or Automations <-> Session)
-    // mounts a different page rather than toggling Overview on the current conversation.
+    // or swapping session scopes snaps the side-panel shell cleanly without a slide-out/in flash.
     const onlyViewPresenceChanged =
       hasActiveSession !== prevFlags.hasActiveSession &&
       sidebarOpen === prevFlags.sidebarOpen &&
       shouldRightOpen === prevFlags.shouldRightOpen;
+    const scopeSwitched = sidePanelScopeSwitchNonce !== prevFlags.scopeSwitchNonce;
 
-    if (prefersReducedMotion || isResizing || onlyViewPresenceChanged) {
+    if (prefersReducedMotion || isResizing || onlyViewPresenceChanged || scopeSwitched) {
       setPhase("idle");
     } else if (
       phase === "playing" &&
@@ -524,12 +529,16 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       });
       setPhase("prep");
     }
-  } else if (hasActiveSession !== committedFlags.hasActiveSession) {
+  } else if (
+    hasActiveSession !== committedFlags.hasActiveSession ||
+    sidePanelScopeSwitchNonce !== committedFlags.scopeSwitchNonce
+  ) {
     setCommittedFlags({
       sidebarOpen,
       shouldRightOpen,
       dockedOverview,
       hasActiveSession,
+      scopeSwitchNonce: sidePanelScopeSwitchNonce,
     });
   }
 

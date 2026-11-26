@@ -140,6 +140,7 @@ export class OrbitHarmonyCore {
   fireConditionalTimerNowJson(hostId: string, timerId: string): Promise<string>;
   listGoalRunsJson(hostId: string, agentId?: string | null): Promise<string>;
   controlGoalRunJson(reqJson: string): Promise<string>;
+  updateGoalRunJson(reqJson: string): Promise<string>;
   listMonitorWatchesJson(hostId: string, agentId?: string | null): Promise<string>;
   stopMonitorWatchJson(reqJson: string): Promise<string>;
   listWorkflowRunsJson(hostId: string, includeCompleted: boolean): Promise<string>;
@@ -226,5 +227,6 @@ export class OrbitHarmonyCore {
   static openInMemory(): OrbitHarmonyCore;
   subscribe(callback: (err: Error | null, payloadJson: string) => void): void;
   subscribeCoalesced(minIntervalMs: number, callback: (err: Error | null, payloadJson: string) => void): void;
+  debugReplayStageDeltasJson(hostId: string, agentId: string, framesJson: string): void;
 }
 export { OrbitHarmonyCore as OhosOrbitCore };

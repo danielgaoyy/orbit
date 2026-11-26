@@ -581,6 +581,7 @@ impl ScheduleEngine {
                     workspace_id: cfg.workspace_id.clone(),
                     parent_agent_id: None,
                     parent_host_id: None,
+                    initial_prompt_source: None,
                     profile_id: cfg.profile_id.clone(),
                     background: cfg.background,
                     auto_archive: cfg.archive_on_finish,

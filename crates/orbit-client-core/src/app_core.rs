@@ -77,9 +77,10 @@ pub use crate::contract::{
     SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
     SelectBestOfNWinnerRequest, StartBatchFanoutRequest, StartBestOfNRequest,
     StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
-    StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
-    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, UpsertProjectMemoryRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    StopMonitorWatchRequest, UpdateGoalRunRequest, UpsertArtifactRequest,
+    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    UpsertProjectMemoryRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 use crate::viewmodel::*;
@@ -1281,21 +1282,32 @@ impl HostMemoryState {
     }
 
     fn observe_outline_prompt(&mut self, event: &TimelineEvent) -> bool {
-        let TimelinePayload::UserPrompt { text, badges, .. } = &event.payload else {
-            return false;
-        };
         if event.seq == 0 {
             return false;
         }
+        let next_prompt = match &event.payload {
+            TimelinePayload::UserPrompt { text, badges, .. } => {
+                TimelineOutlinePrompt::from_user_prompt(event.seq, text, badges)
+            }
+            TimelinePayload::AgentMessage {
+                kind,
+                text,
+                permission_context,
+                ..
+            } => TimelineOutlinePrompt::from_agent_message(
+                event.seq,
+                *kind,
+                text,
+                permission_context.is_some(),
+            ),
+            _ => return false,
+        };
         let prompts = self
             .full_outline_prompts
             .entry(event.agent_id.clone())
             .or_default();
         let position = prompts.binary_search_by_key(&event.seq, |prompt| prompt.seq);
-        match (
-            position,
-            TimelineOutlinePrompt::from_user_prompt(event.seq, text, badges),
-        ) {
+        match (position, next_prompt) {
             (Ok(i), Some(prompt)) => {
                 if prompts[i] != prompt {
                     prompts[i] = prompt;
@@ -1359,11 +1371,27 @@ impl HostMemoryState {
         }
         if let Some(events) = self.timelines.get(agent_id) {
             for ev in events {
-                if ev.seq > 0
-                    && let TimelinePayload::UserPrompt { text, badges, .. } = &ev.payload
-                    && let Some(prompt) =
+                if ev.seq == 0 {
+                    continue;
+                }
+                let maybe_prompt = match &ev.payload {
+                    TimelinePayload::UserPrompt { text, badges, .. } => {
                         TimelineOutlinePrompt::from_user_prompt(ev.seq, text, badges)
-                {
+                    }
+                    TimelinePayload::AgentMessage {
+                        kind,
+                        text,
+                        permission_context,
+                        ..
+                    } => TimelineOutlinePrompt::from_agent_message(
+                        ev.seq,
+                        *kind,
+                        text,
+                        permission_context.is_some(),
+                    ),
+                    _ => None,
+                };
+                if let Some(prompt) = maybe_prompt {
                     combined.push(prompt);
                 }
             }
@@ -1608,7 +1636,7 @@ impl HostMemoryState {
         let active_agent_count = self
             .agents
             .values()
-            .filter(|a| a.archived_at.is_none() && !a.background)
+            .filter(|a| a.archived_at.is_none() && !a.background && !a.is_subagent())
             .count() as u32;
         HostCardView {
             host_id: self.profile.host_id.clone(),
@@ -3391,8 +3419,18 @@ impl OrbitAppCore {
                     .workspace_events
                     .iter()
                     .filter_map(|(ws_id, evs)| {
+                        let reset_seq = evs
+                            .iter()
+                            .filter(|ev| {
+                                ev.kind == WorkspaceEventKind::BoardUpdated
+                                    && ev.summary.starts_with("Reset Shared Board")
+                            })
+                            .map(|ev| ev.seq)
+                            .max()
+                            .unwrap_or(0);
                         let recent_conflict = evs.iter().any(|ev| {
                             ev.kind == WorkspaceEventKind::ConflictWarning
+                                && ev.seq > reset_seq
                                 && ev.created_at.timestamp_millis() >= conflict_cutoff_ms
                         });
                         recent_conflict.then(|| ws_id.clone())
@@ -7150,6 +7188,21 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                 }
+                WireMessage::ConversationHarvested {
+                    agent_id, summary, ..
+                } => {
+                    state.pending_permissions.retain(|p| p.agent_id != agent_id);
+                    if let Some(ag) = state.agents.get_mut(&agent_id) {
+                        if ag.archived_at.is_none() {
+                            ag.archived_at = Some(chrono::Utc::now());
+                        }
+                        if !summary.trim().is_empty() {
+                            ag.task_summary = Some(summary);
+                        }
+                    }
+                    notify_fleet = true;
+                    notify_host = true;
+                }
                 WireMessage::WorkspaceEventsSnapshot {
                     workspace_id,
                     events,
@@ -7161,7 +7214,12 @@ impl OrbitAppCore {
                 }
                 WireMessage::WorkspaceEventRecorded { event } => {
                     let ws_id = event.workspace_id.clone();
+                    let is_board_reset = event.kind == WorkspaceEventKind::BoardUpdated
+                        && event.summary.starts_with("Reset Shared Board");
                     let list = state.workspace_events.entry(ws_id).or_default();
+                    if is_board_reset {
+                        list.retain(|existing| existing.seq >= event.seq);
+                    }
                     if !list.iter().any(|existing| existing.seq == event.seq) {
                         list.insert(0, event);
                         if list.len() > 200 {
@@ -9493,6 +9551,7 @@ impl OrbitAppCore {
                 workspace_id: explicit_ws,
                 parent_agent_id: None,
                 parent_host_id: None,
+                parent_title: None,
                 profile_id,
                 background: false,
                 auto_archive: false,
@@ -9803,6 +9862,8 @@ impl OrbitAppCore {
                 active_turn_behavior,
                 message_id: Some(opt_msg_id),
                 caller_agent_id: None,
+                caller_host_id: None,
+                caller_title: None,
                 notify_on_finish: None,
             },
         );
@@ -10331,6 +10392,7 @@ impl OrbitAppCore {
         {
             ag.parent_agent_id = None;
             ag.parent_host_id = None;
+            ag.set_session_tier(orbit_protocol::SessionTier::Conversation);
         }
         self.dispatch_wire_queued(
             host_id,
@@ -10339,6 +10401,37 @@ impl OrbitAppCore {
                 agent_id: agent_id.to_string(),
             },
         );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn harvest_conversation(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        summary_note: Option<String>,
+        append_to_workspace_board: bool,
+    ) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.archived_at = Some(chrono::Utc::now());
+            h.pending_permissions.retain(|p| p.agent_id != agent_id);
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::HarvestConversation {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                summary_note,
+                append_to_workspace_board,
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
             host_id: host_id.to_string(),
@@ -10742,6 +10835,43 @@ impl OrbitAppCore {
                 workspace_id: workspace_id.to_string(),
                 title: None,
                 mission_goal: Some(goal),
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn reset_workspace_board(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        new_goal: Option<String>,
+        keep_notes: Option<String>,
+    ) {
+        if let Some(ref raw_goal) = new_goal {
+            let trimmed = raw_goal.trim();
+            let next_goal = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(host_id)
+                && let Some(ws) = h
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace_id == workspace_id)
+            {
+                ws.mission_goal = next_goal;
+            }
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ResetWorkspaceBoard {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                new_goal,
+                keep_notes,
+                updated_by: Some("human".to_string()),
             },
         );
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -15434,6 +15564,8 @@ impl OrbitAppCore {
                     target: req.target,
                     title: req.title,
                     initial_prompt: req.initial_prompt,
+                    parent_agent_id: None,
+                    parent_host_id: None,
                 })
                 .await
             {
@@ -18836,6 +18968,142 @@ impl OrbitAppCore {
             .map_err(|_| "fleet router discovery cancelled".to_string())?
     }
 
+    /// Build a zero-IO chief-of-staff briefing projection across all paired hosts in memory.
+    pub fn personal_agent_briefing(
+        &self,
+        primary_router_host_id: Option<String>,
+    ) -> crate::personal_agent::PersonalAgentBriefingView {
+        let hosts_guard = self.hosts.read().ok();
+        let prefs_guard = self.thread_prefs.read().ok();
+
+        struct OwnedBriefingHost {
+            host_id: String,
+            host_name: String,
+            online: bool,
+            agents: Vec<AgentCardView>,
+            pending_permissions: Vec<PendingPermissionSummary>,
+            conditional_timers: Vec<ConditionalTimerRecord>,
+            goal_runs: Vec<GoalRunRecord>,
+            agent_read_at_ms: HashMap<String, i64>,
+            step_previews: HashMap<String, String>,
+        }
+
+        let mut owned_hosts: Vec<OwnedBriefingHost> = Vec::new();
+        if let Some(ref hg) = hosts_guard {
+            let active_subagent_parents = collect_parents_with_running_subagents(hg);
+            for (hid, state) in hg.iter() {
+                let armed_timer_agents = collect_agents_with_armed_timers(state);
+                let mut agent_read_at_ms = HashMap::new();
+                let mut step_previews = HashMap::new();
+                let agents: Vec<AgentCardView> = state
+                    .agents
+                    .values()
+                    .map(|a| {
+                        let pref = prefs_guard
+                            .as_ref()
+                            .and_then(|p| p.get(&(hid.clone(), a.agent_id.clone())));
+                        if let Some(p) = pref
+                            && p.updated_at_ms > 0
+                        {
+                            agent_read_at_ms.insert(a.agent_id.clone(), p.updated_at_ms);
+                        }
+                        let has_running_subagents =
+                            active_subagent_parents.contains(&(hid.clone(), a.agent_id.clone()));
+                        let card = agent_to_card_view_with_timers(
+                            a,
+                            pref,
+                            has_running_subagents,
+                            armed_timer_agents.contains(&a.agent_id),
+                        );
+                        if let Some(cached) = state.stage_cache.get(&a.agent_id)
+                            && let Some(last_turn) = cached.turns.last()
+                        {
+                            let preview = if card.is_running && !card.has_background_tasks {
+                                &last_turn.work_summary_live_label
+                            } else {
+                                &last_turn.work_summary_label
+                            };
+                            if !preview.trim().is_empty() {
+                                step_previews.insert(a.agent_id.clone(), preview.clone());
+                            }
+                        }
+                        card
+                    })
+                    .collect();
+
+                owned_hosts.push(OwnedBriefingHost {
+                    host_id: hid.clone(),
+                    host_name: state.profile.effective_display_name(),
+                    online: matches!(
+                        state.profile.state,
+                        HostConnectionState::OnlineDirect | HostConnectionState::OnlineRelay
+                    ),
+                    agents,
+                    pending_permissions: state.pending_permissions.clone(),
+                    conditional_timers: state.conditional_timers.clone(),
+                    goal_runs: state.goal_runs.clone(),
+                    agent_read_at_ms,
+                    step_previews,
+                });
+            }
+        }
+
+        let inputs: Vec<crate::personal_agent::BriefingHostInput<'_>> = owned_hosts
+            .iter()
+            .map(|h| crate::personal_agent::BriefingHostInput {
+                host_id: h.host_id.as_str(),
+                host_name: h.host_name.as_str(),
+                online: h.online,
+                agents: h.agents.as_slice(),
+                pending_permissions: h.pending_permissions.as_slice(),
+                conditional_timers: h.conditional_timers.as_slice(),
+                goal_runs: h.goal_runs.as_slice(),
+                agent_read_at_ms: &h.agent_read_at_ms,
+                step_previews: &h.step_previews,
+            })
+            .collect();
+
+        crate::personal_agent::build_personal_agent_briefing(
+            &inputs,
+            primary_router_host_id.as_deref(),
+            unix_ms_now() as i64,
+        )
+    }
+
+    /// Fetch recent Personal Agent / Guardian / permission-rule auto-handled decisions from a host.
+    pub async fn list_personal_agent_activity(
+        &self,
+        host_id: &str,
+        limit: u32,
+        since_ms: Option<i64>,
+    ) -> Result<Vec<orbit_protocol::PersonalAgentActivityEntry>, String> {
+        let request_id = Uuid::new_v4();
+        let clamped_limit = limit.clamp(1, 200);
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ListPersonalAgentActivity {
+                    request_id,
+                    limit: clamped_limit,
+                    since_ms,
+                },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PersonalAgentActivitySnapshot { request_id: rid, .. }
+                            if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PersonalAgentActivitySnapshot { entries, .. } => Ok(entries),
+            _ => Err("unexpected daemon reply for list_personal_agent_activity".into()),
+        }
+    }
+
     /// Return the user's persisted global Primary Personal Router host selection (if configured).
     pub fn get_primary_router_selection(&self) -> Option<orbit_protocol::PrimaryRouterSelection> {
         let raw = self
@@ -18892,6 +19160,9 @@ impl OrbitAppCore {
                 None
             }
         };
+        if let Some(ref sel) = result {
+            self.sync_fleet_connected_hosts(&sel.host_id);
+        }
         if self.cloud_sync_status().state == crate::cloud_sync::CloudSyncState::Ready {
             self.schedule_cloud_auto_sync(false);
         }
@@ -20542,6 +20813,8 @@ impl OrbitAppCore {
                     verify_command: req.verify_command,
                     max_iterations: req.max_iterations,
                     max_duration_secs: req.max_duration_secs,
+                    replace_existing: req.replace_existing,
+                    dispatch_initial_prompt: req.dispatch_initial_prompt,
                 })
                 .await
             {
@@ -20713,6 +20986,71 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "ControlGoalRun task cancelled".to_string())?
+    }
+
+    pub async fn update_goal_run_on_host(
+        self: &Arc<Self>,
+        req: UpdateGoalRunRequest,
+    ) -> Result<GoalRunRecord, String> {
+        let host_id = req.host_id;
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_goal_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before updating goal run".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpdateGoalRun {
+                    request_id: req_id,
+                    goal_id: req.goal_id,
+                    objective: req.objective,
+                    criteria: req.criteria,
+                    verify_command: req.verify_command,
+                    max_iterations: req.max_iterations,
+                    max_duration_secs: req.max_duration_secs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_goal_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send UpdateGoalRun: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while updating goal run".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_goal_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for UpdateGoalRun reply".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "UpdateGoalRun task cancelled".to_string())?
     }
 
     pub async fn start_monitor_watch_on_host(
@@ -28046,6 +28384,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
             });
             mem.pending_permissions.push(PendingPermissionSummary {
                 agent_id: "ag_other".into(),
@@ -28064,6 +28403,7 @@ mod tests {
                 guardian_assessment: None,
                 plan_approval: None,
                 human_only: false,
+                router_recommendation: None,
             });
             guard.insert("h1".into(), mem);
         }

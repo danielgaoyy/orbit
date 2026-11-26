@@ -19,6 +19,7 @@ export type ShortcutActionId =
   | "toggle_sidebar"
   | "toggle_side_panel"
   | "new_side_tab"
+  | "reopen_closed_side_tab"
   | "toggle_overview_hud"
   | "quick_open_file"
   | "toggle_diff"
@@ -115,6 +116,13 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = [
     groupKey: "settings.groupPanels",
     labelKey: "settings.scNewSideTab",
     defaultChord: "Mod+T",
+  },
+  {
+    id: "reopen_closed_side_tab",
+    scope: "panels",
+    groupKey: "settings.groupPanels",
+    labelKey: "settings.scReopenClosedSideTab",
+    defaultChord: "Mod+Shift+T",
   },
   {
     id: "toggle_overview_hud",
@@ -221,6 +229,9 @@ export const OS_RESERVED_CHORDS: ReadonlySet<string> = new Set([
   "Mod+X",
   "Mod+A",
   "Mod+Z",
+  "Mod+=",
+  "Mod+-",
+  "Mod+0",
 ]);
 
 const MODIFIER_ONLY_KEYS = new Set(["Meta", "Control", "Alt", "Shift", "OS", "AltGraph"]);

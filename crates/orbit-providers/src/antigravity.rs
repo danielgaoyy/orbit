@@ -158,6 +158,9 @@ struct AgyStreamSegmentState {
     active_msg_id: Option<String>,
     active_thought_id: Option<String>,
     msg_accum: HashMap<String, String>,
+    /// Chronological insertion order of keys in `msg_accum` so end-of-turn finalization
+    /// emits `streaming: false` deterministically instead of `HashMap` iteration order.
+    msg_order: Vec<String>,
     thought_accum: HashMap<String, String>,
     latest_msg_text: Option<String>,
 }
@@ -467,6 +470,26 @@ fn try_consume_replay_buffer(
     ReplayBufferMatch::MatchedAll
 }
 
+async fn finalize_active_agy_message(
+    seg_state: &mut AgyStreamSegmentState,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    if let Some(prev_mid) = seg_state.active_msg_id.take() {
+        seg_state.msg_order.retain(|id| id != &prev_mid);
+        if let Some(prev_text) = seg_state.msg_accum.remove(&prev_mid)
+            && !prev_text.trim().is_empty()
+        {
+            let _ = evt_tx
+                .send(DriverEvent::AssistantText {
+                    item_id: prev_mid,
+                    text: prev_text,
+                    streaming: false,
+                })
+                .await;
+        }
+    }
+}
+
 async fn emit_acp_message_text_to_stream(
     explicit_id: Option<&str>,
     text: &str,
@@ -483,7 +506,12 @@ async fn emit_acp_message_text_to_stream(
     };
     seg_state.active_thought_id = None;
     let mid = if let Some(explicit) = explicit_id.filter(|s| !s.is_empty()) {
-        format!("{turn_tag}_{explicit}")
+        let next_mid = format!("{turn_tag}_{explicit}");
+        if seg_state.active_msg_id.as_deref() != Some(next_mid.as_str()) {
+            finalize_active_agy_message(seg_state, evt_tx).await;
+            seg_state.active_msg_id = Some(next_mid.clone());
+        }
+        next_mid
     } else if let Some(ref cur) = seg_state.active_msg_id {
         cur.clone()
     } else {
@@ -492,8 +520,14 @@ async fn emit_acp_message_text_to_stream(
         seg_state.active_msg_id = Some(id.clone());
         id
     };
-    let entry = seg_state.msg_accum.entry(mid.clone()).or_default();
+    let entry = seg_state.msg_accum.entry(mid.clone()).or_insert_with(|| {
+        seg_state.msg_order.push(mid.clone());
+        String::new()
+    });
     entry.push_str(text);
+    if entry.trim().is_empty() {
+        return;
+    }
     seg_state.latest_msg_text = Some(entry.clone());
     let _ = evt_tx
         .send(DriverEvent::AssistantText {
@@ -518,19 +552,11 @@ async fn emit_acp_thought_text_to_stream(
     } else {
         seg_state.turn_tag.clone()
     };
-    if let Some(prev_mid) = seg_state.active_msg_id.take()
-        && let Some(prev_text) = seg_state.msg_accum.remove(&prev_mid)
-    {
-        let _ = evt_tx
-            .send(DriverEvent::AssistantText {
-                item_id: prev_mid,
-                text: prev_text,
-                streaming: false,
-            })
-            .await;
-    }
+    finalize_active_agy_message(seg_state, evt_tx).await;
     let tid = if let Some(explicit) = explicit_id.filter(|s| !s.is_empty()) {
-        format!("{turn_tag}_th_{explicit}")
+        let next_tid = format!("{turn_tag}_th_{explicit}");
+        seg_state.active_thought_id = Some(next_tid.clone());
+        next_tid
     } else if let Some(ref cur) = seg_state.active_thought_id {
         cur.clone()
     } else {
@@ -4472,14 +4498,34 @@ async fn finalize_agy_stream_segments(
 ) {
     seg_state.active_msg_id = None;
     seg_state.active_thought_id = None;
-    for (mid, text) in seg_state.msg_accum.drain() {
-        let _ = evt_tx
-            .send(DriverEvent::AssistantText {
-                item_id: mid,
-                text,
-                streaming: false,
-            })
-            .await;
+    let ordered_ids = std::mem::take(&mut seg_state.msg_order);
+    for mid in ordered_ids {
+        if let Some(text) = seg_state.msg_accum.remove(&mid)
+            && !text.trim().is_empty()
+        {
+            let _ = evt_tx
+                .send(DriverEvent::AssistantText {
+                    item_id: mid,
+                    text,
+                    streaming: false,
+                })
+                .await;
+        }
+    }
+    if !seg_state.msg_accum.is_empty() {
+        let mut remaining: Vec<(String, String)> = seg_state.msg_accum.drain().collect();
+        remaining.sort_by(|a, b| a.0.cmp(&b.0));
+        for (mid, text) in remaining {
+            if !text.trim().is_empty() {
+                let _ = evt_tx
+                    .send(DriverEvent::AssistantText {
+                        item_id: mid,
+                        text,
+                        streaming: false,
+                    })
+                    .await;
+            }
+        }
     }
 }
 
@@ -4665,18 +4711,23 @@ async fn flush_agy_wakeup_steps_before_steer(
                         ref prompt_preview,
                     } = emit_detail
                     {
-                        register_agy_subagent_monitor_in_dir(
-                            parent_agent_id,
-                            child_conv_id,
-                            role,
-                            prompt_preview,
-                            false,
-                            false,
-                            Some(agy_data_dir),
-                            subagent_monitors,
-                            evt_tx,
-                        )
-                        .await;
+                        if emit_status == ToolCallStatus::Failed {
+                            fail_agy_subagent_monitor(child_conv_id, subagent_monitors, evt_tx)
+                                .await;
+                        } else {
+                            register_agy_subagent_monitor_in_dir(
+                                parent_agent_id,
+                                child_conv_id,
+                                role,
+                                prompt_preview,
+                                false,
+                                false,
+                                Some(agy_data_dir),
+                                subagent_monitors,
+                                evt_tx,
+                            )
+                            .await;
+                        }
                     } else if let Some(recipient_id) =
                         extract_send_message_recipient_from_detail(&emit_detail)
                     {
@@ -5202,18 +5253,27 @@ async fn run_agy_maintenance_pass(
                                 ref prompt_preview,
                             } = emit_detail
                             {
-                                register_agy_subagent_monitor_in_dir(
-                                    agent_id,
-                                    child_conv_id,
-                                    role,
-                                    prompt_preview,
-                                    false,
-                                    false,
-                                    Some(agy_data_dir),
-                                    subagent_monitors,
-                                    evt_tx,
-                                )
-                                .await;
+                                if emit_status == ToolCallStatus::Failed {
+                                    fail_agy_subagent_monitor(
+                                        child_conv_id,
+                                        subagent_monitors,
+                                        evt_tx,
+                                    )
+                                    .await;
+                                } else {
+                                    register_agy_subagent_monitor_in_dir(
+                                        agent_id,
+                                        child_conv_id,
+                                        role,
+                                        prompt_preview,
+                                        false,
+                                        false,
+                                        Some(agy_data_dir),
+                                        subagent_monitors,
+                                        evt_tx,
+                                    )
+                                    .await;
+                                }
                             } else if let Some(recipient_id) =
                                 extract_send_message_recipient_from_detail(&emit_detail)
                             {
@@ -6037,17 +6097,7 @@ async fn handle_acp_session_update(
             }
 
             seg_state.active_thought_id = None;
-            if let Some(prev_mid) = seg_state.active_msg_id.take()
-                && let Some(prev_text) = seg_state.msg_accum.remove(&prev_mid)
-            {
-                let _ = evt_tx
-                    .send(DriverEvent::AssistantText {
-                        item_id: prev_mid,
-                        text: prev_text,
-                        streaming: false,
-                    })
-                    .await;
-            }
+            finalize_active_agy_message(seg_state, evt_tx).await;
             if let Some(q_arr) = update
                 .pointer("/rawInput/questions")
                 .and_then(|v| v.as_array())
@@ -6061,19 +6111,23 @@ async fn handle_acp_session_update(
                 ref prompt_preview,
             } = detail
             {
-                let data_dir_opt = wakeup_tools.agy_data_dir.clone();
-                register_agy_subagent_monitor_in_dir(
-                    parent_agent_id,
-                    child_conv_id,
-                    role,
-                    prompt_preview,
-                    false,
-                    false,
-                    data_dir_opt.as_deref(),
-                    subagent_monitors,
-                    evt_tx,
-                )
-                .await;
+                if effective_status == ToolCallStatus::Failed {
+                    fail_agy_subagent_monitor(child_conv_id, subagent_monitors, evt_tx).await;
+                } else {
+                    let data_dir_opt = wakeup_tools.agy_data_dir.clone();
+                    register_agy_subagent_monitor_in_dir(
+                        parent_agent_id,
+                        child_conv_id,
+                        role,
+                        prompt_preview,
+                        false,
+                        false,
+                        data_dir_opt.as_deref(),
+                        subagent_monitors,
+                        evt_tx,
+                    )
+                    .await;
+                }
             } else if let Some(recipient_id) = extract_send_message_recipient_from_detail(&detail)
                 .or_else(|| {
                     let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -6104,10 +6158,23 @@ async fn handle_acp_session_update(
                     );
                 if is_manage {
                     let raw_out_text = extract_acp_raw_output_text(update.get("rawOutput"));
+                    let detail_args_fallback: Option<Value> = match &detail {
+                        ToolCallDetail::Generic { arguments_json, .. }
+                            if !arguments_json.trim().is_empty() =>
+                        {
+                            serde_json::from_str(arguments_json).ok()
+                        }
+                        _ => None,
+                    };
                     if let Some(target_ids) = extract_manage_subagents_cancel(
                         update.get("rawInput"),
                         raw_out_text.as_deref(),
-                    ) {
+                    )
+                    .or_else(|| {
+                        detail_args_fallback.as_ref().and_then(|args| {
+                            extract_manage_subagents_cancel(Some(args), raw_out_text.as_deref())
+                        })
+                    }) {
                         cancel_agy_subagent_monitors(
                             target_ids.as_deref(),
                             subagent_monitors,
@@ -6373,6 +6440,37 @@ async fn cancel_agy_subagent_monitors(
             .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
             .await;
     }
+}
+
+async fn fail_agy_subagent_monitor(
+    subagent_id: &str,
+    subagent_monitors: &mut HashMap<String, AgySubagentMonitorEntry>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let clean_id = subagent_id.trim();
+    if clean_id.is_empty() {
+        return;
+    }
+    let Some(entry) = subagent_monitors.get_mut(clean_id) else {
+        return;
+    };
+    if entry.desc.status != ProviderSubagentStatus::Running {
+        return;
+    }
+    for payload in entry.drain_open_tool_timelines(ToolCallStatus::Failed) {
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentTimeline {
+                subagent_id: clean_id.to_string(),
+                payload,
+            })
+            .await;
+    }
+    entry.desc.status = ProviderSubagentStatus::Failed;
+    entry.desc.updated_at = Utc::now();
+    entry.monitor.in_wakeup = false;
+    let _ = evt_tx
+        .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
+        .await;
 }
 
 async fn resume_agy_subagent_monitor(
@@ -6916,8 +7014,13 @@ fn extract_subagent_conversation_id_from_value(val: &Value) -> Option<String> {
 
 fn agy_subagent_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCallDetail {
     let mut dispatch = crate::managed_dispatch::acp_detail(update, prev);
+    let is_failed = update
+        .get("status")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("failed"));
     if let ToolCallDetail::Subagent { child_agent_id, .. } = &mut dispatch
         && child_agent_id.is_none()
+        && !is_failed
     {
         *child_agent_id = extract_subagent_conversation_id(update.get("rawOutput"), None)
             .or_else(|| {
@@ -10512,8 +10615,10 @@ impl AgyTranscriptMonitor {
                     PendingTranscriptToolMeta::Shell { command } => Some(command.clone()),
                     _ => None,
                 };
-                if (popped_subagent.is_some()
-                    || content.contains("Created the following subagent:"))
+                let is_error_step = matches!(status.as_str(), "ERROR" | "FAILED" | "CANCELED");
+                if !is_error_step
+                    && (popped_subagent.is_some()
+                        || content.contains("Created the following subagent:"))
                     && let Some(sub_id) = extract_subagent_conversation_id(None, Some(content))
                 {
                     let (role, prompt_preview) =
@@ -15291,6 +15396,209 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             extract_manage_subagents_cancel(Some(&json!({ "Action": "kill_all" })), None),
             Some(None)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_invoke_subagent_never_registers_running_monitor_and_acp_kill_all_cancels_from_cached_args()
+     {
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut replay_filter = PostWakeupAcpReplayFilter::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut seg_state = AgyStreamSegmentState::default();
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors: HashMap<String, AgySubagentMonitorEntry> = HashMap::new();
+        let mut last_ask = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        // 1. Initial `invoke_subagent` starts cleanly
+        let invoke_start = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_sub_fail_1",
+            "title": "Run invoke_subagent",
+            "status": "in_progress",
+            "rawInput": {
+                "Role": "Stage File Drop Unifier",
+                "Prompt": "Upgrade file drop"
+            }
+        });
+        handle_acp_session_update(
+            "ag_parent",
+            "sess_parent",
+            &invoke_start,
+            false,
+            &mut wakeup_tools,
+            &mut replay_filter,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask,
+            &evt_tx,
+        )
+        .await;
+        let _ = evt_rx.try_recv();
+
+        // 2. Failed `invoke_subagent` whose error text mentions an aborted cascade UUID must NOT
+        // scrape that UUID into `child_agent_id` or register a stuck `Running` monitor.
+        let invoke_failed = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_sub_fail_1",
+            "title": "Run invoke_subagent",
+            "status": "failed",
+            "content": [{
+                "type": "content",
+                "content": {
+                    "type": "text",
+                    "text": "Encountered error in step execution: failed to create subagent conversation: created trajectory for cascade 1d30b95b-2118-463a-aabb-e8cd72ba25da"
+                }
+            }]
+        });
+        handle_acp_session_update(
+            "ag_parent",
+            "sess_parent",
+            &invoke_failed,
+            false,
+            &mut wakeup_tools,
+            &mut replay_filter,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask,
+            &evt_tx,
+        )
+        .await;
+        assert!(
+            subagent_monitors.is_empty(),
+            "failed invoke_subagent must never register a Running subagent monitor"
+        );
+        match evt_rx.try_recv().expect("failed subagent tool call event") {
+            DriverEvent::ToolCall {
+                status,
+                detail: ToolCallDetail::Subagent { child_agent_id, .. },
+                ..
+            } => {
+                assert_eq!(status, ToolCallStatus::Failed);
+                assert!(
+                    child_agent_id.is_none(),
+                    "failed invoke_subagent must not scrape aborted cascade UUID"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // 3. Register a legitimate running subagent, then complete `manage_subagents(Action=kill_all)`
+        // where ACP's `tool_call_update` omits `rawInput` (must fall back to cached `arguments_json`).
+        let live_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        register_agy_subagent_monitor_in_dir(
+            "ag_parent",
+            live_id,
+            "Live Worker",
+            "Do work",
+            false,
+            false,
+            None,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+        while evt_rx.try_recv().is_ok() {}
+        assert_eq!(
+            subagent_monitors[live_id].desc.status,
+            ProviderSubagentStatus::Running
+        );
+
+        let manage_start = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_kill_all",
+            "title": "Run manage_subagents",
+            "status": "in_progress",
+            "rawInput": { "Action": "kill_all" }
+        });
+        handle_acp_session_update(
+            "ag_parent",
+            "sess_parent",
+            &manage_start,
+            false,
+            &mut wakeup_tools,
+            &mut replay_filter,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask,
+            &evt_tx,
+        )
+        .await;
+        while evt_rx.try_recv().is_ok() {}
+
+        let manage_done_without_raw_input = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_kill_all",
+            "title": "Run manage_subagents",
+            "status": "completed",
+            "rawOutput": "All subagents killed."
+        });
+        handle_acp_session_update(
+            "ag_parent",
+            "sess_parent",
+            &manage_done_without_raw_input,
+            false,
+            &mut wakeup_tools,
+            &mut replay_filter,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask,
+            &evt_tx,
+        )
+        .await;
+        assert_eq!(
+            subagent_monitors[live_id].desc.status,
+            ProviderSubagentStatus::Canceled,
+            "completed manage_subagents(kill_all) without rawInput must cancel via cached args"
+        );
+
+        // 4. Transcript monitor must ignore `ERROR` `GENERIC` steps for `invoke_subagent`
+        let tmp =
+            std::env::temp_dir().join(format!("orbit_subagent_err_step_{}", uuid::Uuid::new_v4()));
+        let logs = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("create logs dir");
+        let transcript = logs.join("transcript_full.jsonl");
+        let lines = [
+            json!({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "tool_calls": [{
+                    "id": "tc_sub_err",
+                    "name": "invoke_subagent",
+                    "args": { "Role": "Broken Worker", "Prompt": "Try spawn" }
+                }]
+            }),
+            json!({
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "ERROR",
+                "content": "failed to create subagent conversation: conversationId=47f25ee2-c3f4-438b-ae53-9045d89a172e"
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&transcript, lines).expect("write transcript");
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(tmp.clone(), "sess_e");
+        let deltas = monitor.poll_foreground_bg_deltas();
+        assert!(
+            !deltas
+                .iter()
+                .any(|d| matches!(d, BgTaskDelta::SubagentSpawned { .. })),
+            "ERROR invoke_subagent transcript step must never emit SubagentSpawned"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(unix)]
@@ -22093,5 +22401,83 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         server.abort();
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_dir_all(&tmp_data);
+    }
+
+    #[tokio::test]
+    async fn acp_explicit_message_ids_finalize_in_chronological_order_and_skip_whitespace() {
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "t1".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        // 1. Whitespace-only opening chunk should not emit a phantom streaming AssistantText.
+        emit_acp_message_text_to_stream(Some("m_blank"), "  \n\t ", &mut seg_state, &evt_tx).await;
+        assert!(evt_rx.try_recv().is_err());
+
+        // 2. Switching to explicit messageId "m1" finalizes (and skips) the whitespace-only
+        //    entry, tracks active_msg_id = "t1_m1", and streams "First analysis".
+        emit_acp_message_text_to_stream(Some("m1"), "First analysis", &mut seg_state, &evt_tx)
+            .await;
+        assert_eq!(seg_state.active_msg_id.as_deref(), Some("t1_m1"));
+        let ev1 = evt_rx.try_recv().expect("m1 streaming event");
+        assert!(matches!(
+            ev1,
+            DriverEvent::AssistantText { ref item_id, ref text, streaming: true }
+                if item_id == "t1_m1" && text == "First analysis"
+        ));
+
+        // 3. Entering a thinking chunk must immediately finalize "t1_m1" in place BEFORE
+        //    emitting ThinkingText so SQLite keeps "t1_m1" ahead of the thinking step.
+        emit_acp_thought_text_to_stream(Some("th1"), "Double-checking", &mut seg_state, &evt_tx)
+            .await;
+        assert!(seg_state.active_msg_id.is_none());
+        assert_eq!(seg_state.active_thought_id.as_deref(), Some("t1_th_th1"));
+        let ev2 = evt_rx.try_recv().expect("m1 finalized before thinking");
+        assert!(matches!(
+            ev2,
+            DriverEvent::AssistantText { ref item_id, ref text, streaming: false }
+                if item_id == "t1_m1" && text == "First analysis"
+        ));
+        let ev3 = evt_rx.try_recv().expect("thinking event");
+        assert!(matches!(
+            ev3,
+            DriverEvent::ThinkingText { ref item_id, ref text }
+                if item_id == "t1_th_th1" && text == "Double-checking"
+        ));
+
+        // 4. Subsequent explicit messageId "m2" followed by "m3" finalizes "m2" before "m3",
+        //    and finalize_agy_stream_segments drains remaining entries in insertion order.
+        emit_acp_message_text_to_stream(Some("m2"), "Second reply", &mut seg_state, &evt_tx).await;
+        emit_acp_message_text_to_stream(Some("m3"), "Final reply", &mut seg_state, &evt_tx).await;
+        finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+
+        let mut remaining = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            remaining.push(ev);
+        }
+        assert_eq!(remaining.len(), 4);
+        assert!(matches!(
+            &remaining[0],
+            DriverEvent::AssistantText { item_id, text, streaming: true }
+                if item_id == "t1_m2" && text == "Second reply"
+        ));
+        assert!(matches!(
+            &remaining[1],
+            DriverEvent::AssistantText { item_id, text, streaming: false }
+                if item_id == "t1_m2" && text == "Second reply"
+        ));
+        assert!(matches!(
+            &remaining[2],
+            DriverEvent::AssistantText { item_id, text, streaming: true }
+                if item_id == "t1_m3" && text == "Final reply"
+        ));
+        assert!(matches!(
+            &remaining[3],
+            DriverEvent::AssistantText { item_id, text, streaming: false }
+                if item_id == "t1_m3" && text == "Final reply"
+        ));
+        assert!(seg_state.msg_accum.is_empty());
+        assert!(seg_state.msg_order.is_empty());
     }
 }

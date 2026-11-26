@@ -239,11 +239,22 @@ function VisiblePlanShelf({
           hasPendingDecisions && "opacity-75",
         )}
       >
-        <div className="flex items-center">
+        <div
+          className={cn(
+            "flex items-center transition-colors",
+            !hasPendingDecisions && "hover:bg-accent/45",
+          )}
+        >
           <CollapsibleTrigger
             ref={triggerRef}
             aria-disabled={hasPendingDecisions || undefined}
-            className="group/plan flex min-h-[34px] min-w-0 flex-1 cursor-pointer items-center gap-2 px-[14px] text-left text-[13px] outline-none transition-colors hover:bg-accent/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50 aria-disabled:cursor-default"
+            onClick={(e) => {
+              if (e.detail > 0) e.currentTarget.blur();
+            }}
+            className={cn(
+              "group/plan flex min-h-[34px] min-w-0 flex-1 cursor-pointer items-center gap-2 pl-[14px] text-left text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50 aria-disabled:cursor-default",
+              plan.canDismiss ? "pr-2" : "pr-[14px]",
+            )}
           >
             <span aria-hidden="true" className="flex size-4 shrink-0 items-center justify-center">
               <PlanHeaderIcon

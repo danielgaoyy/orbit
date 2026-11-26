@@ -5,6 +5,7 @@ import { type AvatarPath, type SubagentCharacterSpec, resolveSubagentCharacter }
 import { cn } from "@/lib/utils";
 
 export type SubagentAvatarSize = "xs" | "sm" | "md" | "lg";
+export type SubagentAvatarStatus = ResolvedSubagentStatus | "idle";
 
 const SIZE_PX = { xs: 18, sm: 20, md: 24, lg: 28 };
 
@@ -88,7 +89,7 @@ export interface SubagentAvatarProps {
   /** Pre-assigned collision-free character spec (falls back to deterministic `seedKey`) */
   character?: SubagentCharacterSpec | null;
   seedKey?: string;
-  status?: ResolvedSubagentStatus;
+  status?: SubagentAvatarStatus;
   size?: SubagentAvatarSize;
   showStatusBadge?: boolean;
   className?: string;
@@ -105,6 +106,7 @@ export const SubagentAvatar = memo(function SubagentAvatar({
   }, [motion]);
   const px = SIZE_PX[size];
   const Badge = status === "completed" ? Check : X;
+  const showTerminalBadge = showStatusBadge && !motion && status !== "idle";
 
   return (
     <span
@@ -117,7 +119,7 @@ export const SubagentAvatar = memo(function SubagentAvatar({
       className={cn("relative inline-flex shrink-0 items-center justify-center select-none", className)}
     >
       <Portrait character={spec} />
-      {showStatusBadge && !motion && (
+      {showTerminalBadge && (
         <Badge
           aria-hidden="true"
           size={size === "lg" ? 11 : 10}

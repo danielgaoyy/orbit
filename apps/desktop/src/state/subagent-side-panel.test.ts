@@ -521,6 +521,27 @@ it("mounts actionable DecisionDock in SubagentTab and PeerSplitTab and recovers 
   assert.match(subagentHtml, />Deny</);
   assert.doesNotMatch(subagentHtml, /data-slot="context-banner"/);
   assert.doesNotMatch(subagentHtml, />Refresh</);
+  assert.doesNotMatch(subagentHtml, /aria-label="Open in main stage"|aria-label="Focus session"/);
+
+  // Top-level worker opened from Personal Agent Briefing reuses the exact same SubagentTab
+  // header + DecisionDock, while exposing a quiet Focus session jump button
+  const paWorkerSubagentHtml = renderToStaticMarkup(
+    createElement(SubagentTab, {
+      tab: {
+        id: "tab:subagent:call:peer-1",
+        kind: "subagent",
+        title: "Peer Reviewer",
+        hostId: "local",
+        parentHostId: "local",
+        childAgentId: "peer-1",
+        parentAgentId: "parent-1",
+      },
+    }),
+  );
+  assert.match(paWorkerSubagentHtml, /data-slot="subagent-context-header"/);
+  assert.match(paWorkerSubagentHtml, /approval-dock-surface/);
+  assert.match(paWorkerSubagentHtml, /Clarification needed/);
+  assert.match(paWorkerSubagentHtml, /aria-label="Focus session"/);
 
   // PeerSplitTab renders real actionable DecisionDock for pending clarification/approval
   const peerHtml = renderToStaticMarkup(

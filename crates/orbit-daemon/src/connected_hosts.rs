@@ -638,6 +638,11 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConditionalTimerCreated { request_id, .. }
         | WireMessage::ConditionalTimersSnapshot { request_id, .. }
         | WireMessage::ConditionalTimerUpdated { request_id, .. }
+        | WireMessage::WorkspaceBoardSnapshot { request_id, .. }
+        | WireMessage::WorkspaceEventsSnapshot { request_id, .. }
+        | WireMessage::AcpAgentsSnapshot { request_id, .. }
+        | WireMessage::AcpAgentProbeResult { request_id, .. }
+        | WireMessage::ConversationHarvested { request_id, .. }
         | WireMessage::GuardianConfigSnapshot { request_id, .. }
         | WireMessage::PermissionRulesSnapshot { request_id, .. }
         | WireMessage::PermissionRuleUpdated { request_id, .. }
@@ -662,6 +667,7 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::PreviewTunnelOpened { request_id, .. }
         | WireMessage::McpResourceResponse { request_id, .. }
         | WireMessage::ArtifactMcpToolResponse { request_id, .. }
+        | WireMessage::PersonalAgentActivitySnapshot { request_id, .. }
         | WireMessage::RewindPreviewResult { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }

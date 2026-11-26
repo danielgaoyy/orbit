@@ -96,7 +96,7 @@ export struct OrbitTerminalView {
   get renderedRows(): OrbitTerminalRenderRow[] {
     const screen = this.store.terminalScreen;
     const rows = this.store.terminalRows;
-    const cursorVisible = screen !== null && screen.cursor_visible !== false && screen.cols > 0;
+    const cursorVisible = screen !== null && screen.cols > 0;
     const cursorRow = cursorVisible && screen !== null ? screen.cursor_row : -1;
     const cursorCol = cursorVisible && screen !== null && screen.cursor_col >= 0
       ? Math.min(screen.cursor_col, screen.cols - 1)

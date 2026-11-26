@@ -307,6 +307,8 @@ struct OmniComposerView: View {
         let tokenStart = withoutTrailingSpace.lastIndex(where: { $0.isWhitespace })
             .map { withoutTrailingSpace.index(after: $0) }
             ?? withoutTrailingSpace.startIndex
+        // Only promote leading slash directives; mid-sentence `/goal ` stays plain text.
+        guard withoutTrailingSpace[..<tokenStart].allSatisfy({ $0.isWhitespace }) else { return }
         let token = String(withoutTrailingSpace[tokenStart...]).lowercased()
         guard token.hasPrefix("/"),
               let directive = OrbitSlashDirective(rawValue: String(token.dropFirst())) else {

@@ -100,6 +100,12 @@ pub struct GoalRunRecord {
     pub last_verify_output: Option<String>,
     #[serde(default)]
     pub consecutive_identical_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+    #[serde(default)]
+    pub paused_by_user: bool,
+    #[serde(default)]
+    pub active_duration_secs: u64,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

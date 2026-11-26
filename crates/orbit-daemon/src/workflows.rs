@@ -801,6 +801,7 @@ impl WorkflowStepExecutor for OrchestratorStepExecutor {
                 workspace_id: None,
                 parent_agent_id: req.owner_agent_id.clone(),
                 parent_host_id: None,
+                initial_prompt_source: None,
                 profile_id: None,
                 background: req.kind == WorkflowKind::BatchCsv,
                 auto_archive: false,

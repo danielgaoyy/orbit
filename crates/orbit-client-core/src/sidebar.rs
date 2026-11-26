@@ -516,6 +516,76 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
     let mut needs_attention: Vec<SidebarConversationView> = Vec::new();
     let mut pinned_with_order: Vec<(i64, SidebarConversationView)> = Vec::new();
 
+    // Pre-resolve root ancestor conversations for any active Subagent awaiting permission across
+    // the Fleet so subagent permission gates bubble onto their root Conversation in `Needs Attention`
+    // without leaking subagents as standalone Left Sidebar threads.
+    let mut subagent_approval_roots: HashSet<(String, String)> = HashSet::new();
+    let has_awaiting_subagent = params.hosts.iter().any(|h| {
+        h.agents.iter().any(|(a, _)| {
+            !a.background
+                && a.archived_at_rfc3339.is_none()
+                && a.is_subagent()
+                && a.is_awaiting_permission
+        })
+    });
+    if has_awaiting_subagent {
+        let fleet_by_key: HashMap<(&str, &str), &AgentCardView> = params
+            .hosts
+            .iter()
+            .flat_map(|h| {
+                h.agents
+                    .iter()
+                    .map(move |(a, _)| ((h.host_id, a.agent_id.as_str()), a))
+            })
+            .collect();
+        for h in &params.hosts {
+            for (a, _) in &h.agents {
+                if a.background
+                    || a.archived_at_rfc3339.is_some()
+                    || !a.is_subagent()
+                    || !a.is_awaiting_permission
+                {
+                    continue;
+                }
+                let mut cur_host = h.host_id;
+                let mut cur_agent = a;
+                let mut visited: HashSet<(&str, &str)> = HashSet::new();
+                visited.insert((cur_host, cur_agent.agent_id.as_str()));
+                for _ in 0..crate::subagents::MAX_SUBAGENT_LINEAGE_DEPTH {
+                    let Some(pid) = cur_agent
+                        .parent_agent_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        break;
+                    };
+                    let phost = cur_agent
+                        .parent_host_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(cur_host);
+                    if !visited.insert((phost, pid)) {
+                        break;
+                    }
+                    let Some(parent_ag) = fleet_by_key.get(&(phost, pid)).copied() else {
+                        break;
+                    };
+                    cur_host = phost;
+                    cur_agent = parent_ag;
+                    if !cur_agent.is_subagent() {
+                        if !cur_agent.background && cur_agent.archived_at_rfc3339.is_none() {
+                            subagent_approval_roots
+                                .insert((cur_host.to_string(), cur_agent.agent_id.clone()));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     for host in &params.hosts {
         let host_id = host.host_id;
         let host_name = host.host_name;
@@ -626,15 +696,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             host_groups.push(group);
         }
 
-        // 2. Group active conversations
-        let agents_by_id: HashMap<&str, &AgentCardView> = host
-            .agents
-            .iter()
-            .map(|(a, _)| (a.agent_id.as_str(), a))
-            .collect();
-
+        // 2. Group active primary conversations (strictly excluding background tasks and subagents)
         for (raw_agent, pinned_order) in &host.agents {
-            if raw_agent.background || raw_agent.archived_at_rfc3339.is_some() {
+            if raw_agent.background
+                || raw_agent.archived_at_rfc3339.is_some()
+                || raw_agent.is_subagent()
+            {
                 continue;
             }
             let mut agent = raw_agent.clone();
@@ -644,6 +711,9 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 agent.is_unread = false;
             } else if agent.attention != AttentionState::None {
                 agent.is_unread = true;
+            }
+            if subagent_approval_roots.contains(&(host_id.to_string(), agent.agent_id.clone())) {
+                agent.is_awaiting_permission = true;
             }
 
             let clean_cwd = normalize_project_path(&agent.cwd);
@@ -682,15 +752,11 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 needs_attention.push(conv.clone());
             }
 
-            // Collapse same-host managed subagents under their parent's Subagents Track (even if parent moved workspace)
-            if let Some(ref parent_id) = agent.parent_agent_id
-                && agent.parent_host_id.is_none()
-                && let Some(parent) = agents_by_id.get(parent_id.as_str())
-                && parent.archived_at_rfc3339.is_none()
-            {
+            // The Personal Agent has its own top-level sidebar entry, so its conversation is
+            // never listed under Pinned or Projects (it still surfaces in Needs Attention).
+            if crate::personal_agent::is_personal_agent_card(&agent) {
                 continue;
             }
-
             if agent.is_pinned
                 && matches_conversation_filter(&conv, params.filter)
                 && matches_agent_query_full(
@@ -1807,14 +1873,20 @@ mod tests {
             active_cwd: Some("/Users/jess/Code/orbit"),
         });
 
-        // Only `parent` appears in the project list; subagent still surfaces under needs_attention
+        // Only `parent` appears in the project list; subagent never leaks into `needs_attention`
+        // and instead bubbles its pending approval onto `parent`.
         assert_eq!(view.projects.len(), 1);
         assert_eq!(view.projects[0].conversations.len(), 1);
         assert_eq!(view.projects[0].conversations[0].agent.agent_id, "parent");
         assert!(view.projects[0].conversations[0].is_unread);
+        assert!(
+            view.projects[0].conversations[0]
+                .agent
+                .is_awaiting_permission
+        );
         assert_eq!(view.pinned_conversations.len(), 0);
         assert_eq!(view.needs_attention.len(), 1);
-        assert_eq!(view.needs_attention[0].agent.agent_id, "sub_same");
+        assert_eq!(view.needs_attention[0].agent.agent_id, "parent");
     }
 
     #[test]
@@ -2390,6 +2462,110 @@ mod tests {
     }
 
     #[test]
+    fn personal_agent_conversation_is_hidden_from_pinned_and_projects() {
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        // The Personal Agent usually runs in the bare home directory; hiding it must not leave
+        // behind an empty "Workspace (~)" project group.
+        let mut pa = sample_agent(
+            "ag_pa",
+            "/Users/dev",
+            "2026-01-01T00:00:10Z",
+            true,
+            false,
+            false,
+            true,
+        );
+        pa.labels.insert(
+            orbit_protocol::LABEL_AGENT_ROLE.into(),
+            orbit_protocol::AGENT_ROLE_PERSONAL_ROUTER.into(),
+        );
+        let worker = sample_agent(
+            "ag_worker",
+            "/Users/dev/code/orbit",
+            "2026-01-01T00:00:05Z",
+            true,
+            false,
+            false,
+            false,
+        );
+
+        // Mirrors real data: the Personal Agent's own non-curated workspace rooted at `~`.
+        let home_ws = vec![WorkspaceSummary {
+            workspace_id: "ws_1".into(),
+            title: "Personal Agent".into(),
+            mission_goal: None,
+            cwd: "/Users/dev".into(),
+            project_root: Some("/Users/dev".into()),
+            git_branch: None,
+            is_worktree: false,
+            updated_at: chrono::Utc::now(),
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: false,
+        }];
+
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 1,
+            hosts: vec![SidebarHostInput {
+                host_id: "h_local",
+                host_name: "Mac Studio",
+                workspaces: &home_ws,
+                discovered_projects: &[],
+                agents: vec![(pa, 1), (worker, 2)],
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &[],
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h_local"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        let pinned: Vec<&str> = view
+            .pinned_conversations
+            .iter()
+            .map(|c| c.agent.agent_id.as_str())
+            .collect();
+        assert_eq!(pinned, vec!["ag_worker"]);
+        let in_projects = view
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.conversations
+                    .iter()
+                    .chain(p.unclassified_conversations.iter())
+            })
+            .any(|c| c.agent.agent_id == "ag_pa");
+        assert!(
+            !in_projects,
+            "Personal Agent must not appear under Projects"
+        );
+        assert!(
+            view.projects.iter().all(|p| !p.is_home_workspace),
+            "hiding the Personal Agent must not leave an empty Workspace (~) group"
+        );
+        // A Personal Agent awaiting approval still surfaces in Needs Attention.
+        assert!(
+            view.needs_attention
+                .iter()
+                .any(|c| c.agent.agent_id == "ag_pa")
+        );
+    }
+
+    #[test]
     fn sidebar_search_matches_plain_fields_and_inline_host_provider_tokens() {
         let empty_git_repos = HashMap::new();
         let empty_conflicts = HashSet::new();
@@ -2610,5 +2786,133 @@ mod tests {
             proj.unclassified_conversations[0].agent.agent_id,
             "ag_stray"
         );
+    }
+
+    #[test]
+    fn cross_host_and_orphaned_subagents_stay_hidden_while_routed_conversations_remain_visible() {
+        let mut root_conv = sample_agent(
+            "conv_root",
+            "/work/app",
+            "2026-11-26T10:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        root_conv.labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.into(),
+            orbit_protocol::SESSION_TIER_CONVERSATION.into(),
+        );
+
+        let mut archived_parent = sample_agent(
+            "conv_archived",
+            "/work/app",
+            "2026-11-26T09:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        archived_parent.archived_at_rfc3339 = Some("2026-11-26T09:30:00Z".into());
+
+        // Orphaned same-host subagent whose parent was archived (must NOT surface as surprise thread)
+        let mut orphan_sub = sample_agent(
+            "sub_orphan",
+            "/work/app/worktree-1",
+            "2026-11-26T10:01:00Z",
+            false,
+            false,
+            true,
+            false,
+        );
+        orphan_sub.parent_agent_id = Some("conv_archived".into());
+        orphan_sub.labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.into(),
+            orbit_protocol::SESSION_TIER_SUBAGENT.into(),
+        );
+
+        // Cross-host subagent dispatched onto `h2` by `conv_root` on `h1`, awaiting permission (even if pinned)
+        let mut remote_sub = sample_agent(
+            "sub_remote_h2",
+            "/remote/gpu-repo",
+            "2026-11-26T10:02:00Z",
+            true,
+            false,
+            true,
+            true,
+        );
+        remote_sub.parent_agent_id = Some("conv_root".into());
+        remote_sub.parent_host_id = Some("h1".into());
+        remote_sub.labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.into(),
+            orbit_protocol::SESSION_TIER_SUBAGENT.into(),
+        );
+
+        // Conversation dispatched by PersonalRouter (must be visible on both local and remote hosts)
+        let mut routed_conv = sample_agent(
+            "conv_routed_h2",
+            "/remote/gpu-repo",
+            "2026-11-26T10:03:00Z",
+            false,
+            false,
+            true,
+            false,
+        );
+        routed_conv.labels.insert(
+            orbit_protocol::LABEL_ROUTED_BY_AGENT.into(),
+            "ag_router_h1".into(),
+        );
+        routed_conv.labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.into(),
+            orbit_protocol::SESSION_TIER_CONVERSATION.into(),
+        );
+
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 7,
+            hosts: vec![
+                SidebarHostInput {
+                    host_id: "h1",
+                    host_name: "MacBook",
+                    workspaces: &[],
+                    discovered_projects: &[],
+                    agents: vec![(root_conv, 0), (archived_parent, 0), (orphan_sub, 10)],
+                    active_git_branch: None,
+                    git_repos_by_cwd: &empty_git_repos,
+                    workspace_conflict_ids: &empty_conflicts,
+                },
+                SidebarHostInput {
+                    host_id: "h2",
+                    host_name: "Linux GPU",
+                    workspaces: &[],
+                    discovered_projects: &[],
+                    agents: vec![(remote_sub, 20), (routed_conv, 0)],
+                    active_git_branch: None,
+                    git_repos_by_cwd: &empty_git_repos,
+                    workspace_conflict_ids: &empty_conflicts,
+                },
+            ],
+            pinned_projects: &[],
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: None,
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        let visible_ids: Vec<&str> = view
+            .projects
+            .iter()
+            .flat_map(|p| p.conversations.iter().map(|c| c.agent.agent_id.as_str()))
+            .collect();
+        assert_eq!(visible_ids, vec!["conv_root", "conv_routed_h2"]);
+        assert!(view.pinned_conversations.is_empty());
+        // Cross-host subagent approval bubbles onto `conv_root` on `h1`
+        assert_eq!(view.needs_attention.len(), 1);
+        assert_eq!(view.needs_attention[0].host_id, "h1");
+        assert_eq!(view.needs_attention[0].agent.agent_id, "conv_root");
     }
 }

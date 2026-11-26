@@ -342,6 +342,8 @@ fn strip_leading_slash_directive(raw: &str) -> &str {
         "/plan",
         "/review",
         "/compact",
+        "/goal",
+        "/fork",
         "/btw",
     ] {
         if let Some(after) = trimmed.get(prefix.len()..)
@@ -1221,7 +1223,12 @@ async fn organize_project_workspaces_inner(
         .iter()
         .map(|w| (w.workspace_id.clone(), w.clone()))
         .collect();
-    let all_agents = mgr.store().list_agents_filtered(None, false, false, None)?;
+    let all_agents: Vec<AgentSummary> = mgr
+        .store()
+        .list_agents_filtered(None, false, false, None)?
+        .into_iter()
+        .filter(|a| a.is_primary_conversation())
+        .collect();
 
     let mut curated_workspaces: Vec<(WorkspaceSummary, Vec<AgentSummary>)> = Vec::new();
     for ws in &all_workspaces {
@@ -1634,6 +1641,19 @@ mod tests {
 
         let only_mention = "@src/components/export-modal.tsx";
         assert_eq!(extract_fallback_title(only_mention), "export-modal.tsx");
+
+        assert_eq!(
+            extract_fallback_title("/goal Finish all unit tests cleanly"),
+            "Finish all unit tests cleanly"
+        );
+        assert_eq!(
+            extract_fallback_title("/fork Refactor sidebar spacing"),
+            "Refactor sidebar spacing"
+        );
+        assert_eq!(
+            extract_fallback_title("/goalkeeper stats summary"),
+            "/goalkeeper stats summary"
+        );
     }
 
     async fn make_test_orchestrator() -> (Arc<AgentOrchestrator>, Arc<orbit_store::OrbitStore>) {

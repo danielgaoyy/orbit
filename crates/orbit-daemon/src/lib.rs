@@ -5463,6 +5463,7 @@ async fn handle_wire_rpc(
             handle,
             auto_cluster,
             acp_agent_id,
+            labels,
         } => {
             let mut reserved_key: Option<String> = None;
             if let Some(ref idem) = idempotency_key
@@ -5571,34 +5572,37 @@ async fn handle_wire_rpc(
                 });
                 let reply = match rt
                     .orchestrator
-                    .create_and_start_agent(CreateAgentSpec {
-                        cwd,
-                        extra_dirs,
-                        title,
-                        provider,
-                        model,
-                        effort,
-                        fast_mode,
-                        mode,
-                        initial_prompt,
-                        initial_display_prompt,
-                        initial_badges,
-                        worktree,
-                        workspace_id,
-                        parent_agent_id,
-                        parent_host_id,
-                        initial_prompt_source,
-                        profile_id,
-                        background,
-                        auto_archive,
-                        base_ref,
-                        worktree_mode,
-                        branch,
-                        pr_number: None,
-                        handle,
-                        auto_cluster,
-                        acp_agent_id,
-                    })
+                    .create_and_start_agent_with_labels(
+                        CreateAgentSpec {
+                            cwd,
+                            extra_dirs,
+                            title,
+                            provider,
+                            model,
+                            effort,
+                            fast_mode,
+                            mode,
+                            initial_prompt,
+                            initial_display_prompt,
+                            initial_badges,
+                            worktree,
+                            workspace_id,
+                            parent_agent_id,
+                            parent_host_id,
+                            initial_prompt_source,
+                            profile_id,
+                            background,
+                            auto_archive,
+                            base_ref,
+                            worktree_mode,
+                            branch,
+                            pr_number: None,
+                            handle,
+                            auto_cluster,
+                            acp_agent_id,
+                        },
+                        labels,
+                    )
                     .await
                 {
                     Ok(agent) => {
@@ -9161,8 +9165,32 @@ async fn handle_wire_rpc(
             let config = runtime.orch_config.read().await.clone();
             Some(WireMessage::OrchestrationConfigSnapshot { request_id, config })
         }
-        WireMessage::UpdateOrchestrationConfig { request_id, config } => {
-            *runtime.orch_config.write().await = config.clone();
+        WireMessage::UpdateOrchestrationConfig {
+            request_id,
+            mut config,
+        } => {
+            {
+                let mut cur = runtime.orch_config.write().await;
+                // Preserve existing account-wide default permission mode when an older client
+                // or Host Settings panel sends an OrchestrationConfig without `default_session_mode`,
+                // and never allow `SessionMode::Plan` to become the account-wide default.
+                if matches!(
+                    config.default_session_mode,
+                    Some(orbit_protocol::SessionMode::Plan)
+                ) {
+                    config.default_session_mode = None;
+                }
+                if config.default_session_mode.is_none()
+                    || (cur.default_session_mode.is_some()
+                        && config.default_session_mode_updated_at_ms
+                            < cur.default_session_mode_updated_at_ms)
+                {
+                    config.default_session_mode = cur.default_session_mode.clone();
+                    config.default_session_mode_updated_at_ms =
+                        cur.default_session_mode_updated_at_ms;
+                }
+                *cur = config.clone();
+            }
             runtime
                 .keep_awake
                 .set_enabled(config.keep_awake_while_running);
@@ -9170,6 +9198,46 @@ async fn handle_wire_rpc(
                 cfg.orchestration = config.clone()
             }) {
                 Ok(()) => Some(WireMessage::OrchestrationConfigSnapshot { request_id, config }),
+                Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
+            }
+        }
+        WireMessage::SetAccountDefaultMode {
+            request_id,
+            mode,
+            updated_at_ms,
+        } => {
+            // Never allow transient Plan mode to become the account-wide default permission mode.
+            if matches!(mode, orbit_protocol::SessionMode::Plan) {
+                return Some(WireMessage::Ack { request_id });
+            }
+            let applied = {
+                let mut cur = runtime.orch_config.write().await;
+                let should_apply = if updated_at_ms > 0 {
+                    updated_at_ms >= cur.default_session_mode_updated_at_ms
+                } else {
+                    // Cold-start / unversioned fallback (`0`) only seeds when host has no default yet.
+                    cur.default_session_mode.is_none()
+                };
+                if should_apply {
+                    cur.default_session_mode = Some(mode.clone());
+                    if updated_at_ms > 0 {
+                        cur.default_session_mode_updated_at_ms = updated_at_ms;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if !applied {
+                return Some(WireMessage::Ack { request_id });
+            }
+            match DaemonPersistedConfig::update(&runtime.home_dir, |cfg| {
+                cfg.orchestration.default_session_mode = Some(mode.clone());
+                if updated_at_ms > 0 {
+                    cfg.orchestration.default_session_mode_updated_at_ms = updated_at_ms;
+                }
+            }) {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
                 Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
             }
         }

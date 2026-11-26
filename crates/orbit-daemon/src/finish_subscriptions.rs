@@ -534,6 +534,22 @@ impl FinishSubscriptionManager {
         if sub.delivered_perm_ids.iter().any(|id| id == request_id) {
             return;
         }
+        // PersonalRouter receives single-source risk-tiered pre-review notifications directly
+        // from `AgentOrchestrator` (`manager.rs`); never emit a duplicate raw `permission_required`
+        // wake-up that contradicts `pre_review_mode` or wakes the Router on Tier-3 / Plan gates.
+        if self
+            .store
+            .get_agent(&sub.caller_agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|caller| caller.is_personal_router())
+        {
+            sub.delivered_perm_ids.push(request_id.to_string());
+            let _ = self
+                .store
+                .mark_finish_subscription_perm_delivered(&sub.id, request_id);
+            return;
+        }
         // Wait briefly in case `StatusChanged(AwaitingPermission)` arrived just ahead of
         // `PermissionRequest` ingestion on another task.
         let mut perm = None;
@@ -604,24 +620,130 @@ impl FinishSubscriptionManager {
         if sub.delivered_perm_ids.iter().any(|id| id == request_id) {
             return;
         }
-        let req_id = Uuid::new_v4();
-        let perm_resp = self
-            .connected_hosts
-            .send_rpc(
-                target_host_id,
-                req_id,
-                WireMessage::ListPendingPermissions {
-                    request_id: req_id,
-                    agent_id: Some(child.agent_id.clone()),
-                },
-                Duration::from_secs(10),
-            )
-            .await;
-        let Ok(WireMessage::PendingPermissionsSnapshot { permissions, .. }) = perm_resp else {
+        // Remote async Guardian Tier-2 evaluation may still be in-flight when `StatusChanged(AwaitingPermission)`
+        // arrives; retry with bounded backoff until the remote host publishes the pending permission.
+        let mut matched_perm: Option<orbit_protocol::PendingPermissionSummary> = None;
+        for attempt in 0..12u32 {
+            let req_id = Uuid::new_v4();
+            let perm_resp = self
+                .connected_hosts
+                .send_rpc(
+                    target_host_id,
+                    req_id,
+                    WireMessage::ListPendingPermissions {
+                        request_id: req_id,
+                        agent_id: Some(child.agent_id.clone()),
+                    },
+                    Duration::from_secs(10),
+                )
+                .await;
+            match perm_resp {
+                Ok(WireMessage::PendingPermissionsSnapshot { permissions, .. }) => {
+                    if let Some(found) =
+                        permissions.into_iter().find(|p| p.request_id == request_id)
+                    {
+                        matched_perm = Some(found);
+                        break;
+                    }
+                    if attempt < 11 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+                _ => return,
+            }
+        }
+        let Some(perm) = matched_perm else {
             return;
         };
-        let Some(perm) = permissions.into_iter().find(|p| p.request_id == request_id) else {
-            return;
+        let caller_is_router = self
+            .store
+            .get_agent(&sub.caller_agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|caller| caller.is_personal_router());
+        let (event_tag, body) = if caller_is_router {
+            let risk_level = perm
+                .guardian_assessment
+                .as_ref()
+                .map(|a| a.risk_level)
+                .unwrap_or(orbit_protocol::GuardianRiskLevel::High);
+            let pre_review_mode = if let Some(router) = self.orchestrator.personal_router().await {
+                router.config().await.pre_review_mode
+            } else {
+                orbit_protocol::RouterPreReviewMode::Disabled
+            };
+            // Never wake PersonalRouter for Tier-3 High/Critical, human_only, plan approvals,
+            // or when pre-review is disabled.
+            if perm.human_only
+                || perm.plan_approval.is_some()
+                || !matches!(
+                    pre_review_mode,
+                    orbit_protocol::RouterPreReviewMode::MediumRiskOnly
+                        | orbit_protocol::RouterPreReviewMode::AssistOnly
+                )
+                || !matches!(
+                    risk_level,
+                    orbit_protocol::GuardianRiskLevel::Low
+                        | orbit_protocol::GuardianRiskLevel::Medium
+                )
+            {
+                sub.delivered_perm_ids.push(request_id.to_string());
+                let _ = self
+                    .store
+                    .mark_finish_subscription_perm_delivered(&sub.id, request_id);
+                return;
+            }
+            let prompt_body = if pre_review_mode == orbit_protocol::RouterPreReviewMode::AssistOnly
+            {
+                format!(
+                    "Worker `{}` ({}) on host `{}` requests Tier-2 ({}) permission `{}`: {}.\n\
+                     Pre-review mode is `assist_only`: do NOT resolve directly. \
+                     Call `orbit_control(action=\"recommend_permission\", host_id=\"{}\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\"|\"deny\", reason=\"...\")` \
+                     to attach your recommendation for the human.",
+                    child.title,
+                    child.agent_id,
+                    target_host_id,
+                    risk_level.as_str(),
+                    perm.request_id,
+                    perm.title,
+                    target_host_id,
+                    child.agent_id,
+                    perm.request_id,
+                )
+            } else {
+                format!(
+                    "Worker `{}` ({}) on host `{}` requests Tier-2 ({}) permission `{}`: {}.\n\
+                     Evaluate whether this aligns with the user's stated intent. \
+                     If aligned and mode allows, call `orbit_control(action=\"respond_permission\", host_id=\"{}\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\", reason=\"...\")`; \
+                     otherwise deny or call `orbit_control(action=\"recommend_permission\", host_id=\"{}\", agent_id=\"{}\", request_id=\"{}\", decision=\"allow\"|\"deny\", reason=\"...\")` for human review.",
+                    child.title,
+                    child.agent_id,
+                    target_host_id,
+                    risk_level.as_str(),
+                    perm.request_id,
+                    perm.title,
+                    target_host_id,
+                    child.agent_id,
+                    perm.request_id,
+                    target_host_id,
+                    child.agent_id,
+                    perm.request_id,
+                )
+            };
+            ("permission_pre_review", prompt_body)
+        } else {
+            let perm_ref_tmp = PermissionCheckpointRef {
+                agent_id: child.agent_id.clone(),
+                host_id: Some(target_host_id.to_string()),
+                request_id: perm.request_id.clone(),
+                title: perm.title.clone(),
+                detail: perm.detail.clone(),
+                allowed_decisions: perm.allowed_decisions.clone(),
+            };
+            (
+                "permission_required",
+                format_permission_notification_body(child, Some(target_host_id), &perm_ref_tmp),
+            )
         };
         let perm_ref = PermissionCheckpointRef {
             agent_id: child.agent_id.clone(),
@@ -631,7 +753,6 @@ impl FinishSubscriptionManager {
             detail: perm.detail.clone(),
             allowed_decisions: perm.allowed_decisions.clone(),
         };
-        let body = format_permission_notification_body(child, Some(target_host_id), &perm_ref);
         let message_id = format!("rperm_chk_{}", Uuid::new_v4().simple());
         let msg = QueuedAgentMessage {
             recipient_id: sub.caller_agent_id.clone(),
@@ -641,7 +762,7 @@ impl FinishSubscriptionManager {
                 source_agent_id: Some(child.agent_id.clone()),
                 source_host_id: Some(target_host_id.to_string()),
                 source_title: Some(child.title.clone()),
-                event: Some("permission_required".into()),
+                event: Some(event_tag.into()),
                 permission_context: Some(perm_ref),
             },
             body,

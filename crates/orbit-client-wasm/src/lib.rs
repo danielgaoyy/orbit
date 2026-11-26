@@ -154,9 +154,20 @@ pub fn parse_unified_diff(text: &str) -> Result<JsValue, JsError> {
     js(&render::parse_unified_diff(text))
 }
 #[wasm_bindgen]
-pub fn project_stage_turns(items: JsValue, cwd: Option<String>) -> Result<JsValue, JsError> {
+pub fn project_stage_turns(
+    items: JsValue,
+    cwd: Option<String>,
+    split_finish_reports: Option<bool>,
+) -> Result<JsValue, JsError> {
     let items: Vec<viewmodel::TimelineItemView> = from_js(items)?;
-    js(&stage::process_timeline_turns_slice(&items, 0, 0, cwd.as_deref()).turns)
+    js(&stage::process_timeline_turns_slice_with_options(
+        &items,
+        0,
+        0,
+        cwd.as_deref(),
+        split_finish_reports.unwrap_or(false),
+    )
+    .turns)
 }
 #[derive(Deserialize)]
 struct SidebarData {

@@ -116,7 +116,8 @@ function openWorkerSurface(
     orbitActions.focusComposer();
     return;
   }
-  if (e.metaKey || e.ctrlKey) {
+  if (!e.metaKey && !e.ctrlKey) {
+    orbitActions.setOverviewPopoverOpen(false);
     orbitActions.selectAgent(hostId, agentId);
     return;
   }

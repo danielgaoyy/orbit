@@ -1766,6 +1766,17 @@ fn update_orchestration_config(
 }
 
 #[tauri::command]
+fn set_account_default_mode(
+    state: State<'_, DesktopAppState>,
+    mode: SessionMode,
+    updated_at_ms: Option<i64>,
+) {
+    state
+        .core
+        .set_account_default_mode(mode, updated_at_ms.unwrap_or(0));
+}
+
+#[tauri::command]
 fn sync_orchestration_skills(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -5413,6 +5424,7 @@ pub fn run() {
             sync_fleet_connected_hosts,
             export_host_pairing_uri,
             update_orchestration_config,
+            set_account_default_mode,
             sync_orchestration_skills,
             list_managed_skills,
             read_managed_skill,

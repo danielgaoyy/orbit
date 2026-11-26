@@ -864,6 +864,7 @@ pub(crate) struct AgentMessageDeliveryFold {
     pub(crate) delivery_status: Option<AgentMessageDeliveryStatus>,
     pub(crate) delivery_turn_id: Option<String>,
     pub(crate) blocking_turn_id: Option<String>,
+    pub(crate) blocking_turn_cleared: bool,
     pub(crate) queued_at_ms: Option<i64>,
     pub(crate) dispatched_at_ms: Option<i64>,
     pub(crate) settled_at_ms: Option<i64>,
@@ -904,7 +905,20 @@ pub(crate) fn collect_delivery_updates(
                 if entry.delivery_turn_id.is_none() && delivery_turn_id.is_some() {
                     entry.delivery_turn_id = delivery_turn_id.clone();
                 }
-                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                if matches!(
+                    delivery_status,
+                    Some(
+                        AgentMessageDeliveryStatus::Dispatched
+                            | AgentMessageDeliveryStatus::Settled
+                            | AgentMessageDeliveryStatus::Dropped
+                    )
+                ) {
+                    entry.blocking_turn_id = None;
+                    entry.blocking_turn_cleared = true;
+                } else if !entry.blocking_turn_cleared
+                    && entry.blocking_turn_id.is_none()
+                    && blocking_turn_id.is_some()
+                {
                     entry.blocking_turn_id = blocking_turn_id.clone();
                 }
                 if entry.queued_at_ms.is_none() {
@@ -934,7 +948,18 @@ pub(crate) fn collect_delivery_updates(
                 if delivery_turn_id.is_some() {
                     entry.delivery_turn_id = delivery_turn_id.clone();
                 }
-                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                if matches!(
+                    status,
+                    AgentMessageDeliveryStatus::Dispatched
+                        | AgentMessageDeliveryStatus::Settled
+                        | AgentMessageDeliveryStatus::Dropped
+                ) {
+                    entry.blocking_turn_id = None;
+                    entry.blocking_turn_cleared = true;
+                } else if !entry.blocking_turn_cleared
+                    && entry.blocking_turn_id.is_none()
+                    && blocking_turn_id.is_some()
+                {
                     entry.blocking_turn_id = blocking_turn_id.clone();
                 }
                 match status {
@@ -1221,9 +1246,13 @@ pub(crate) fn render_timeline_event_view(
                 delivery_turn_id: folded
                     .and_then(|f| f.delivery_turn_id.clone())
                     .or_else(|| delivery_turn_id.clone()),
-                blocking_turn_id: folded
-                    .and_then(|f| f.blocking_turn_id.clone())
-                    .or_else(|| blocking_turn_id.clone()),
+                blocking_turn_id: if folded.is_some_and(|f| f.blocking_turn_cleared) {
+                    None
+                } else {
+                    folded
+                        .and_then(|f| f.blocking_turn_id.clone())
+                        .or_else(|| blocking_turn_id.clone())
+                },
                 queued_at_ms: queued_at_ms.or_else(|| folded.and_then(|f| f.queued_at_ms)),
                 dispatched_at_ms: folded
                     .and_then(|f| f.dispatched_at_ms)

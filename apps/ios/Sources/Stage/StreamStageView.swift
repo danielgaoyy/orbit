@@ -270,6 +270,15 @@ struct StreamStageView: View {
         let hostOnline = store.activeHost.map(isHostOnline(_:)) ?? true
         let firstTurnKey = turns.first?.key
         let firstStepBearingTurnKey = turns.first(where: { !$0.foldedSteps.isEmpty })?.key
+        let livePendingPermissionIds = Set(
+            store.globalPendingDecisions.filter { !$0.isQuestion }.map(\.requestId)
+        )
+        let hostDisplayNames: [String: String] = Dictionary(
+            store.hosts.map { h in
+                (h.hostId, h.displayName.isEmpty ? h.hostname : h.displayName)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
 
         return GeometryReader { outerGeo in
             ScrollViewReader { proxy in
@@ -296,6 +305,9 @@ struct StreamStageView: View {
                                 expandFirstTurnByDefault: store.expandFirstTurnByDefault,
                                 isFirstStepBearingTurn: turn.key == firstStepBearingTurnKey,
                                 isFirstTurn: turn.key == firstTurnKey,
+                                isPersonalAgentSession: store.isActiveAgentPersonalAgent,
+                                livePendingPermissionIds: livePendingPermissionIds,
+                                hostDisplayNames: hostDisplayNames,
                                 actions: turnActions
                             )
                             .equatable()

@@ -227,6 +227,7 @@ export class OrbitHarmonyCore {
   static openInMemory(): OrbitHarmonyCore;
   subscribe(callback: (err: Error | null, payloadJson: string) => void): void;
   subscribeCoalesced(minIntervalMs: number, callback: (err: Error | null, payloadJson: string) => void): void;
+  setAccountDefaultMode(mode: string, updatedAtMs?: number | null): void;
   debugReplayStageDeltasJson(hostId: string, agentId: string, framesJson: string): void;
   markAgentRead(hostId: string, agentId: string): void;
   personalAgentBriefingJson(primaryRouterHostId?: string | null): string;

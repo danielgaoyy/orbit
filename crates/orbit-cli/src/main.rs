@@ -1900,6 +1900,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         handle: None,
                         auto_cluster: None,
                         acp_agent_id: acp_agent,
+                        labels: std::collections::HashMap::new(),
                     },
                     Duration::from_secs(45),
                     |w| {

@@ -29,6 +29,7 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { selectIsSelectedAgentPersonalAgent } from "@/state/selectors/personal-agent-selectors";
 import { cn } from "@/lib/utils";
 
 const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
@@ -144,6 +145,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const isPersonalAgentSession = useOrbitSelector(selectIsSelectedAgentPersonalAgent);
   const localQueued = useOrbitSelector((s) => s.queuedPrompts[composerScopeKey(s)] ?? EMPTY_QUEUED);
   const hostSupportsServerQueue = useOrbitSelector((s) =>
     Boolean(s.selectedHostId && s.hostDetails[s.selectedHostId]?.host.supports_server_queue),
@@ -334,15 +336,17 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                   queueSortable.isActive && "pointer-events-none opacity-45",
                 )}
               >
-                <SimpleTooltip label={t("composer.sendNowTooltip")} side="top">
-                  <button
-                    type="button"
-                    onClick={() => void orbitActions.flushQueuedPromptImmediately(idx, qItem.id)}
-                    className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11px] font-medium transition-colors"
-                  >
-                    {t("composer.steerAction")}
-                  </button>
-                </SimpleTooltip>
+                {!isPersonalAgentSession && (
+                  <SimpleTooltip label={t("composer.sendNowTooltip")} side="top">
+                    <button
+                      type="button"
+                      onClick={() => void orbitActions.flushQueuedPromptImmediately(idx, qItem.id)}
+                      className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11px] font-medium transition-colors"
+                    >
+                      {t("composer.steerAction")}
+                    </button>
+                  </SimpleTooltip>
+                )}
                 <SimpleTooltip label={t("composer.editQueuedTooltip")} side="top">
                   <button
                     type="button"

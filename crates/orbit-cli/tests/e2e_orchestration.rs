@@ -445,6 +445,7 @@ async fn create_agent_rpc(
                 handle: None,
                 auto_cluster: Some(false),
                 acp_agent_id: None,
+                labels: std::collections::HashMap::new(),
             },
             Duration::from_secs(20),
             |w| matches!(w, WireMessage::AgentCreated { request_id, .. } if *request_id == req_id),

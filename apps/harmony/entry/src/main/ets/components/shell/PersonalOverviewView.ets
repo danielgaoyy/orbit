@@ -1,6 +1,6 @@
 import {
+  BriefingDecisionDto,
   HostCardDto,
-  OverviewPendingApprovalItem,
   SidebarConversationDto,
   basenameOfPath,
   formatCompactTopBarConnectionLabel
@@ -32,7 +32,7 @@ export struct PersonalOverviewView {
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
   aboutToAppear(): void {
-    this.store.refreshOverviewApprovals();
+    this.store.refreshPersonalAgentBriefing(true);
   }
 
   aboutToDisappear(): void {
@@ -81,10 +81,11 @@ export struct PersonalOverviewView {
   }
 
   @Computed
-  get lowRiskApprovalCount(): number {
+  get batchEligibleApprovalCount(): number {
     let count = 0;
-    for (let i = 0; i < this.store.overviewPendingApprovals.length; i++) {
-      if (this.store.overviewPendingApprovals[i].is_low_risk) {
+    const list = this.store.briefingNeedsYou;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].batch_eligible && !list[i].human_only && list[i].request_id !== null) {
         count += 1;
       }
     }
@@ -121,8 +122,8 @@ export struct PersonalOverviewView {
 
   private handleRefresh(): void {
     this.isRefreshing = true;
-    this.store.reloadFleet();
-    this.store.refreshOverviewApprovals();
+    this.store.reloadFleetAsync();
+    this.store.refreshPersonalAgentBriefing(true);
     if (this.refreshTimerId !== -1) {
       clearTimeout(this.refreshTimerId);
     }
@@ -156,7 +157,7 @@ export struct PersonalOverviewView {
 
   @Builder
   private renderNeedsDecisionSection() {
-    if (this.store.overviewPendingApprovals.length > 0) {
+    if (this.store.briefingNeedsYou.length > 0) {
       Column({ space: OrbitTokens.SPACE_SM }) {
         Row({ space: OrbitTokens.SPACE_SM }) {
           Row()
@@ -169,7 +170,7 @@ export struct PersonalOverviewView {
             .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
             .layoutWeight(1)
 
-          if (this.lowRiskApprovalCount > 0) {
+          if (this.batchEligibleApprovalCount > 0) {
             Button({ type: ButtonType.Capsule, stateEffect: true }) {
               Text($r('app.string.overview_batch_approve_safe'))
                 .attributeModifier(orbitTextMeta(this.store.palette.onAccent, FontWeight.Medium))
@@ -186,16 +187,16 @@ export struct PersonalOverviewView {
         .alignItems(VerticalAlign.Center)
 
         ForEach(
-          this.store.overviewPendingApprovals,
-          (item: OverviewPendingApprovalItem) => {
+          this.store.briefingNeedsYou,
+          (item: BriefingDecisionDto) => {
             Column({ space: OrbitTokens.SPACE_SM }) {
               Row({ space: OrbitTokens.SPACE_SM }) {
                 Column({ space: 2 }) {
-                  Text(item.title)
+                  Text(item.agent_title.length > 0 ? item.agent_title : item.kind)
                     .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  Text(`${item.host_name} · ${item.agent_title}`)
+                  Text(`${item.host_name} · ${item.kind}`)
                     .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -206,7 +207,7 @@ export struct PersonalOverviewView {
                   this.store.openSessionFromDeepLink(item.host_id, item.agent_id, 'permission_required');
                 })
 
-                if (item.is_low_risk) {
+                if (item.batch_eligible && !item.human_only) {
                   Text('Low risk')
                     .attributeModifier(orbitTextMeta(this.store.palette.statusDirect, FontWeight.Medium))
                     .padding({ left: 7, right: 7, top: 2, bottom: 2 })
@@ -217,7 +218,7 @@ export struct PersonalOverviewView {
               .width('100%')
               .alignItems(VerticalAlign.Center)
 
-              Text(item.target_preview)
+              Text(item.summary)
                 .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -226,28 +227,30 @@ export struct PersonalOverviewView {
                 .borderRadius(OrbitTokens.RADIUS_SM)
                 .attributeModifier(OrbitTheme.recessedWell(this.store.palette))
 
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                Button($r('app.string.action_allow_once'), { type: ButtonType.Capsule, stateEffect: true })
-                  .attributeModifier(
-                    orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
-                  )
-                  .height(36)
-                  .layoutWeight(1)
-                  .onClick(() => {
-                    this.store.resolveSingleOverviewApproval(item, 'allow');
-                  })
+              if (item.request_id !== null && item.request_id.length > 0 && item.kind === 'permission') {
+                Row({ space: OrbitTokens.SPACE_SM }) {
+                  Button($r('app.string.action_allow_once'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(
+                      orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+                    )
+                    .height(36)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.store.resolveBriefingDecision(item, 'allow');
+                    })
 
-                Button($r('app.string.action_decline'), { type: ButtonType.Capsule, stateEffect: true })
-                  .attributeModifier(
-                    orbitButtonMeta(this.store.palette.statusDanger, this.store.palette.statusDangerSoft)
-                  )
-                  .height(36)
-                  .layoutWeight(1)
-                  .onClick(() => {
-                    this.store.resolveSingleOverviewApproval(item, 'deny');
-                  })
+                  Button($r('app.string.action_decline'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(
+                      orbitButtonMeta(this.store.palette.statusDanger, this.store.palette.statusDangerSoft)
+                    )
+                    .height(36)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.store.resolveBriefingDecision(item, 'deny');
+                    })
+                }
+                .width('100%')
               }
-              .width('100%')
             }
             .width('100%')
             .padding(OrbitTokens.SPACE_MD)
@@ -255,7 +258,7 @@ export struct PersonalOverviewView {
             .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
             .alignItems(HorizontalAlign.Start)
           },
-          (item: OverviewPendingApprovalItem): string => item.key
+          (item: BriefingDecisionDto): string => item.key
         )
       }
       .width('100%')

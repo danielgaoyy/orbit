@@ -1,8 +1,9 @@
 use crate::OhosCoreFacade;
+use crate::events::{DeliveryState, DeliveryStatus, OhosCoreNotification};
 use napi_derive_ohos::napi;
 use napi_ohos::bindgen_prelude::*;
 use napi_ohos::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use std::sync::Arc;
+use std::sync::Mutex;
 
 #[napi]
 pub struct OrbitHarmonyCore {
@@ -35,9 +36,17 @@ impl OrbitHarmonyCore {
 
     #[napi]
     pub fn subscribe_events(&self, callback: ThreadsafeFunction<String, ()>) -> Result<()> {
-        let tsfn = Arc::new(callback);
+        let resync = serde_json::to_string(&OhosCoreNotification::ResyncRequired)
+            .map_err(|err| Error::from_reason(err.to_string()))?;
+        let delivery = Mutex::new(DeliveryState::default());
         self.facade.subscribe_coalesced(24, move |payload_json| {
-            let _ = tsfn.call(Ok(payload_json), ThreadsafeFunctionCallMode::NonBlocking);
+            let mut delivery = delivery.lock().unwrap_or_else(|err| err.into_inner());
+            delivery.deliver(payload_json, &resync, |payload| {
+                match callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking) {
+                    Status::Ok => DeliveryStatus::Ok,
+                    _ => DeliveryStatus::Dropped,
+                }
+            });
         });
         Ok(())
     }

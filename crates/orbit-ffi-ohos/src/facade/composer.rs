@@ -18,6 +18,18 @@ use orbit_client_core::contract::{
 use orbit_protocol::{ProviderModelCatalog, ProviderModelSpec};
 
 impl OhosCoreFacade {
+    pub fn get_composer_draft_json(&self, draft_key: &str) -> Result<Option<String>, String> {
+        self.inner.get_composer_draft(draft_key)
+    }
+
+    pub fn set_composer_draft(&self, draft_key: &str, draft_json: &str) -> Result<(), String> {
+        self.inner.set_composer_draft(draft_key, draft_json)
+    }
+
+    pub fn delete_composer_draft(&self, draft_key: &str) -> Result<(), String> {
+        self.inner.delete_composer_draft(draft_key)
+    }
+
     pub fn create_session_json(&self, req_json: &str) -> Result<String, String> {
         let req: CreateSessionRequest =
             serde_json::from_str(req_json).map_err(|e| e.to_string())?;

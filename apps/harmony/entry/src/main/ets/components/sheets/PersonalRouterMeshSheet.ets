@@ -4,6 +4,7 @@ import {
   RouterHostCapabilitiesDto
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { OrbitPersonalAgentStore } from '../../model/stores/OrbitPersonalAgentStore';
 import {
   OrbitTokens,
   orbitButtonMeta,
@@ -18,6 +19,7 @@ import { OrbitSectionHeader, OrbitSheetHeader } from '../common/OrbitCommonContr
 @ComponentV2
 export struct PersonalRouterMeshSheet {
   @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private personalAgentStore: OrbitPersonalAgentStore = OrbitHarmonyStore.getInstance().personalAgentStore;
   @Local private selectedRouterHostId: string = '';
   @Local private draftEnabled: boolean = false;
   @Local private draftScope: string = 'global_fleet';
@@ -29,7 +31,7 @@ export struct PersonalRouterMeshSheet {
     this.store.refreshRouterAndMesh();
   }
 
-  @Monitor('store.activeRouterStatus')
+  @Monitor('personalAgentStore.activeRouterStatus')
   onRouterStatusUpdated(_mon: IMonitor): void {
     this.syncDraftFromStore();
   }

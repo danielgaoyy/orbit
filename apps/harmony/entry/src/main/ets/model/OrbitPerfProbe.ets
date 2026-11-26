@@ -11,6 +11,7 @@ const COLD_CREATE_START_MARK: string = 'cold.create_start';
 
 class OrbitPerfBucket {
   readonly samplesUs: Float64Array = new Float64Array(PERF_RING_CAPACITY);
+  readonly samplesBytes: Float64Array = new Float64Array(PERF_RING_CAPACITY);
   writeIdx: number = 0;
   sampleCount: number = 0;
   totalCalls: number = 0;
@@ -22,6 +23,7 @@ class OrbitPerfBucket {
     const safeMicros = micros >= 0 ? micros : 0;
     const safeBytes = payloadBytes > 0 ? payloadBytes : 0;
     this.samplesUs[this.writeIdx] = safeMicros;
+    this.samplesBytes[this.writeIdx] = safeBytes;
     this.writeIdx = (this.writeIdx + 1) % PERF_RING_CAPACITY;
     if (this.sampleCount < PERF_RING_CAPACITY) {
       this.sampleCount += 1;
@@ -30,6 +32,12 @@ class OrbitPerfBucket {
     this.totalBytes += safeBytes;
     if (safeBytes > this.maxBytes) {
       this.maxBytes = safeBytes;
+    }
+  }
+
+  increment(delta: number): void {
+    if (delta > 0) {
+      this.totalCalls += delta;
     }
   }
 
@@ -133,6 +141,10 @@ export class OrbitPerfProbe {
     }
   }
 
+  public static nowUs(): number {
+    return monotonicNowUs();
+  }
+
   public static begin(name: string): void {
     const nowUs = monotonicNowUs();
     OrbitPerfProbe.ensureClockInitialized(nowUs);
@@ -197,6 +209,26 @@ export class OrbitPerfProbe {
     OrbitPerfProbe.flushIfDue();
   }
 
+  public static recordBytes(name: string, payloadBytes: number): void {
+    const nowUs = monotonicNowUs();
+    OrbitPerfProbe.ensureClockInitialized(nowUs);
+    const bucket = OrbitPerfProbe.getOrCreateBucket(name);
+    if (bucket !== null) {
+      bucket.record(0, payloadBytes);
+    }
+    OrbitPerfProbe.flushIfDue();
+  }
+
+  public static count(name: string, delta: number = 1): void {
+    const nowUs = monotonicNowUs();
+    OrbitPerfProbe.ensureClockInitialized(nowUs);
+    const bucket = OrbitPerfProbe.getOrCreateBucket(name);
+    if (bucket !== null) {
+      bucket.increment(delta);
+    }
+    OrbitPerfProbe.flushIfDue();
+  }
+
   public static flushIfDue(): void {
     const nowMs = monotonicNowMs();
     if (OrbitPerfProbe.lastFlushMs === 0) {
@@ -206,7 +238,11 @@ export class OrbitPerfProbe {
     if (nowMs - OrbitPerfProbe.lastFlushMs < PERF_FLUSH_INTERVAL_MS) {
       return;
     }
-    OrbitPerfProbe.lastFlushMs = nowMs;
+    OrbitPerfProbe.flushNow();
+  }
+
+  public static flushNow(): void {
+    OrbitPerfProbe.lastFlushMs = monotonicNowMs();
     OrbitPerfProbe.buckets.forEach((bucket: OrbitPerfBucket, name: string): void => {
       if (bucket.sampleCount === 0 && bucket.totalCalls === 0) {
         return;
@@ -218,8 +254,16 @@ export class OrbitPerfProbe {
       sortPrefixAscending(OrbitPerfProbe.sortScratch, n);
       const p50Us = Math.round(percentileNearestRank(OrbitPerfProbe.sortScratch, n, 0.5));
       const p95Us = Math.round(percentileNearestRank(OrbitPerfProbe.sortScratch, n, 0.95));
+
+      for (let i = 0; i < n; i++) {
+        OrbitPerfProbe.sortScratch[i] = bucket.samplesBytes[i];
+      }
+      sortPrefixAscending(OrbitPerfProbe.sortScratch, n);
+      const p50Bytes = Math.round(percentileNearestRank(OrbitPerfProbe.sortScratch, n, 0.5));
+      const p95Bytes = Math.round(percentileNearestRank(OrbitPerfProbe.sortScratch, n, 0.95));
+
       const line =
-        `metric=${name} count=${bucket.totalCalls} samples=${n} p50_us=${p50Us} p95_us=${p95Us} bytes=${bucket.totalBytes} max_bytes=${bucket.maxBytes}`;
+        `metric=${name} count=${bucket.totalCalls} samples=${n} p50_us=${p50Us} p95_us=${p95Us} bytes=${bucket.totalBytes} max_bytes=${bucket.maxBytes} p50_bytes=${p50Bytes} p95_bytes=${p95Bytes}`;
       hilog.info(ORBIT_LOG_DOMAIN, PERF_LOG_TAG, '%{public}s', line);
       bucket.resetWindow();
     });

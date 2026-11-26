@@ -9,6 +9,22 @@ use orbit_client_core::export::ExportOptions;
 use orbit_client_core::stage::describe_tool_step;
 
 impl OhosCoreFacade {
+    pub fn agent_stage_turns_slice_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        start_turn_index: u32,
+        count: u32,
+    ) -> Result<String, String> {
+        let turns = self.inner.agent_stage_turns_slice(
+            host_id,
+            agent_id,
+            start_turn_index as usize,
+            count as usize,
+        );
+        serde_json::to_string(&turns).map_err(|error| error.to_string())
+    }
+
     pub fn export_agent_transcript_json(
         &self,
         host_id: &str,

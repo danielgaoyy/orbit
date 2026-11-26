@@ -2256,3 +2256,118 @@ export interface PersonalAgentBriefingDto {
   counts: BriefingCountsDto;
   since_last_visit: BriefingSinceLastVisitDto;
 }
+
+export interface AgentStageDeltaRequestDto {
+  host_id: string;
+  agent_id: string;
+  since_revision: number;
+  since_aux_revision?: number | null;
+  turn_limit?: number | null;
+  since_window_start_turn_index?: number | null;
+}
+
+export interface PersonalAgentActivityEntryDto {
+  seq: number;
+  timestamp_ms: number;
+  actor: string;
+  decision: string;
+  host_id?: string | null;
+  agent_id?: string | null;
+  agent_title: string;
+  summary: string;
+  risk_level?: string | null;
+  reason: string;
+  request_id?: string | null;
+}
+
+export interface PersistedPastedAttachmentDto {
+  id: string;
+  label: string;
+  filename?: string;
+  lineCount: number;
+  content: string;
+}
+
+export interface PersistedDiffQuoteDto {
+  id: string;
+  path: string;
+  lineNumber: number | null;
+  code: string;
+}
+
+export interface PersistedContextItemDto {
+  id: string;
+  kind: string;
+  path?: string;
+  filename?: string;
+  previewUrl?: string;
+  sizeBytes?: number;
+  stagedHostId?: string;
+  mediaKind?: string;
+  mimeType?: string;
+  pdfPageCount?: number | null;
+  staged?: boolean;
+  label?: string;
+  lineCount?: number;
+  content?: string;
+  startLine?: number;
+  endLine?: number;
+  symbolName?: string;
+  symbolKind?: string;
+  signature?: string | null;
+  container?: string | null;
+  language?: string;
+  snippet?: string | null;
+  slug?: string;
+  description?: string;
+  url?: string;
+  fileCount?: number;
+  treeSummary?: string | null;
+  number?: number;
+  title?: string;
+  state?: string | null;
+  headRef?: string | null;
+  baseRef?: string | null;
+  summary?: string | null;
+}
+
+export interface PersistedInlineMentionDto {
+  token: string;
+  kind: string;
+  path?: string;
+  staged?: boolean;
+  label?: string;
+  lineCount?: number;
+  content?: string;
+  startLine?: number;
+  endLine?: number;
+  symbolName?: string;
+  symbolKind?: string;
+  signature?: string | null;
+  container?: string | null;
+  language?: string;
+  fileCount?: number;
+  number?: number;
+  title?: string;
+  url?: string | null;
+  state?: string | null;
+  headRef?: string | null;
+  baseRef?: string | null;
+  summary?: string | null;
+}
+
+export interface PersistedScopeDraftDto {
+  updatedAt: number;
+  text?: string;
+  pastedAttachments?: PersistedPastedAttachmentDto[];
+  diffQuotes?: PersistedDiffQuoteDto[];
+  contextItems?: PersistedContextItemDto[];
+  inlineMentions?: PersistedInlineMentionDto[];
+  slashDirective?: string;
+  sideQuestionDraft?: string;
+}
+
+export interface PersistedDraftPayloadV1Dto {
+  version: number;
+  drafts: Record<string, PersistedScopeDraftDto>;
+}

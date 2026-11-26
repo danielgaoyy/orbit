@@ -4145,6 +4145,35 @@ mod tests {
     use orbit_protocol::AttentionState;
 
     #[test]
+    fn composer_draft_roundtrip_and_delete() {
+        let path = std::env::temp_dir().join(format!("orbit-drafts-{}.db", uuid::Uuid::new_v4()));
+        let key = "host-a::agent";
+        let other = "host-b::agent";
+        let draft = serde_json::json!({"text": "长草稿".repeat(50_000)}).to_string();
+        {
+            let store = OrbitStore::open(&path).expect("open");
+            store.set_composer_draft(key, "{}", 1).expect("seed");
+            store
+                .set_composer_draft(other, "{}", 1)
+                .expect("other host");
+            store.set_composer_draft(key, &draft, 2).expect("overwrite");
+        }
+        let store = OrbitStore::open(&path).expect("reopen");
+        assert_eq!(store.get_composer_draft(key).expect("get"), Some(draft));
+        store.delete_composer_draft(key).expect("delete");
+        assert_eq!(store.get_composer_draft(key).expect("deleted"), None);
+        assert_eq!(
+            store
+                .get_composer_draft(other)
+                .expect("other host")
+                .as_deref(),
+            Some("{}")
+        );
+        drop(store);
+        std::fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
     fn sqlite_wal_timeline_cursor_catchup_and_coalescing() {
         let store = OrbitStore::open_in_memory().expect("open store");
         let now = Utc::now();

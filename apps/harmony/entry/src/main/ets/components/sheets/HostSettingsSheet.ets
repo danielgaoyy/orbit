@@ -68,7 +68,7 @@ export struct HostSettingsSheet {
     if (mode === 'light') {
       return 1;
     }
-    if (mode === 'dark' || mode === 'graphite' || mode === 'oled') {
+    if (mode === 'dark') {
       return 2;
     }
     return 0;

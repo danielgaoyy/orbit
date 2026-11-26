@@ -48,6 +48,10 @@ export struct OmniComposer {
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
+  aboutToDisappear(): void {
+    this.store.flushComposerDraftNow();
+  }
+
   @Computed
   get activeTrigger(): AutocompleteTriggerState | null {
     return this.detectTrigger();

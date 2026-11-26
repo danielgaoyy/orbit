@@ -32765,8 +32765,7 @@ mod tests {
         assert_eq!(parent_has_sub(&core), (false, false, false));
     }
 
-    #[test]
-    fn agent_stage_delta_tail_window_and_turns_slice_pagination() {
+    fn core_with_stage_turns(count: u64) -> Arc<OrbitAppCore> {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let now = Utc::now();
 
@@ -32786,9 +32785,8 @@ mod tests {
             state: HostConnectionState::OnlineDirect,
         });
 
-        // Build 12 turns (24 events)
         let mut events = Vec::new();
-        for t in 0..12u64 {
+        for t in 0..count {
             events.push(TimelineEvent {
                 seq: t * 2 + 1,
                 epoch: 1,
@@ -32819,6 +32817,158 @@ mod tests {
             .write()
             .expect("hosts write")
             .insert("h_win".into(), mem);
+
+        core
+    }
+
+    fn stage_request() -> crate::contract::AgentStageDeltaRequest {
+        crate::contract::AgentStageDeltaRequest {
+            host_id: "h_win".into(),
+            agent_id: "ag_win".into(),
+            since_revision: 0,
+            since_aux_revision: None,
+            turn_limit: Some(24),
+            since_window_start_turn_index: None,
+        }
+    }
+
+    // Start at a known revision, then change every auxiliary projection
+    // through the same live wire path as a streaming session.
+    fn core_with_changed_aux() -> (Arc<OrbitAppCore>, crate::contract::AgentStageDeltaRequest) {
+        let core = core_with_stage_turns(1);
+        let mut req = stage_request();
+        let prev = core.agent_stage_delta_by_request(&req);
+        req.since_revision = prev.revision;
+        req.since_aux_revision = Some(prev.aux_revision);
+        req.since_window_start_turn_index = Some(prev.window_start_turn_index);
+        let detail = ToolCallDetail::FileEdit {
+            path: "/repo/main.rs".into(),
+            unified_diff: Some(
+                "diff --git a/main.rs b/main.rs\n--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-a\n+b"
+                    .into(),
+            ),
+        };
+        let payloads = [
+            TimelinePayload::PermissionRequest {
+                request_id: "plan".into(),
+                title: "Review".into(),
+                detail: detail.clone(),
+                allowed_decisions: vec!["allow_once".into()],
+                guardian_assessment: None,
+                plan_approval: Some(orbit_protocol::PlanApprovalPayload {
+                    plan_markdown: "# Implement".into(),
+                    plan_title: None,
+                    plan_file_path: None,
+                    summary: None,
+                    plan_file_backed: false,
+                    allowed_prompts: vec![],
+                    source: None,
+                }),
+            },
+            TimelinePayload::QuestionRequest {
+                request_id: "question".into(),
+                questions: vec![],
+            },
+            TimelinePayload::ToolCall {
+                call_id: "edit".into(),
+                status: ToolCallStatus::Completed,
+                detail,
+                background_task: None,
+            },
+        ];
+        for (seq, payload) in (3..).zip(payloads) {
+            core.handle_inbound_wire(
+                &req.host_id,
+                WireMessage::TimelineLive {
+                    event: TimelineEvent {
+                        seq,
+                        epoch: 1,
+                        agent_id: req.agent_id.clone(),
+                        turn_id: None,
+                        timestamp: Utc::now(),
+                        payload,
+                    },
+                },
+            );
+        }
+        (core, req)
+    }
+
+    #[test]
+    fn aux_fields_present_when_aux_changed() {
+        let (core, req) = core_with_changed_aux();
+        let delta = core.agent_stage_delta_by_request(&req);
+        assert!(!delta.reset);
+        assert!(!delta.aux_unchanged);
+        assert_ne!(Some(delta.aux_revision), req.since_aux_revision);
+        assert_eq!(delta.pending_permissions.len(), 1);
+        assert_eq!(delta.pending_questions.len(), 1);
+        assert_eq!(
+            delta.pending_plan_approval.expect("plan").request_id,
+            "plan"
+        );
+        assert_eq!(delta.session_turn_diffs[0].path, "main.rs");
+        assert!(!delta.insights.touched_files.is_empty());
+    }
+
+    #[test]
+    fn aux_fields_empty_when_aux_unchanged() {
+        let (core, mut req) = core_with_changed_aux();
+        let prev = core.agent_stage_delta_by_request(&req);
+        req.since_revision = prev.revision;
+        req.since_aux_revision = Some(prev.aux_revision);
+        let delta = core.agent_stage_delta_by_request(&req);
+        assert!(delta.aux_unchanged);
+        assert_eq!(delta.aux_revision, prev.aux_revision);
+        assert!(delta.pending_permissions.is_empty());
+        assert!(delta.pending_questions.is_empty());
+        assert!(delta.pending_plan_approval.is_none());
+        assert!(delta.session_turn_diffs.is_empty());
+        assert_eq!(delta.insights, crate::stage::SessionInsightsView::default());
+    }
+
+    #[test]
+    fn slice_and_delta_reconstruct_full_stage() {
+        let core = core_with_stage_turns(60);
+        let req = stage_request();
+        let delta = core.agent_stage_delta_by_request(&req);
+        let full = core.agent_stage(&req.host_id, &req.agent_id);
+        let mut turns = core.agent_stage_turns_slice(&req.host_id, &req.agent_id, 0, 60);
+        assert_eq!(turns.len(), 60);
+        turns.truncate((delta.window_start_turn_index + delta.replace_from_turn_index) as usize);
+        turns.extend(delta.changed_turns);
+        assert_eq!(turns.len(), full.turns.len());
+        assert_eq!(turns.len(), delta.total_turn_count as usize);
+        assert!(
+            turns
+                .iter()
+                .map(|turn| &turn.key)
+                .eq(full.turns.iter().map(|turn| &turn.key))
+        );
+    }
+
+    #[test]
+    fn delta_respects_turn_limit_and_window() {
+        for count in [12, 24, 60] {
+            let core = core_with_stage_turns(count);
+            let delta = core.agent_stage_delta_by_request(&stage_request());
+            assert_eq!(delta.changed_turns.len(), count.min(24) as usize);
+            assert_eq!(
+                delta.window_start_turn_index,
+                count.saturating_sub(24) as u32
+            );
+            assert_eq!(
+                delta.changed_turns[0].turn_index,
+                delta.window_start_turn_index
+            );
+            assert_eq!(delta.has_older_turns, count > 24);
+        }
+    }
+
+    #[test]
+    fn agent_stage_delta_tail_window_and_turns_slice_pagination() {
+        let core = core_with_stage_turns(12);
+        let now = Utc::now();
 
         // Initial windowed delta with tail_turn_limit = Some(4) returns only turns 8..12
         let d0 = core.agent_stage_delta_with_options("h_win", "ag_win", 0, None, Some(4));

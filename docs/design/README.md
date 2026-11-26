@@ -16,6 +16,7 @@ User experience comes first. Keep complexity inside the system; never leak it in
 - **Never interrupt the user's flow** — Preserve focus, scroll position, selection, and unsent drafts across background updates and panel transitions.
 - **Low friction for frequent actions; guarded for destructive ones** — Keep common paths one click or keystroke away; gate data-losing actions with clear confirmation or undo.
 - **Self-explanatory interfaces** — Communicate through visual hierarchy, layout, and concise labels—never through explanatory paragraphs or internal jargon.
+- **Orthogonal zoom and typography** — Window zoom scales the entire interface chrome uniformly, while reading and code text sizes scale content independently; the two compose multiplicatively without altering layout geometry or introducing transitions on scale variables.
 
 ---
 

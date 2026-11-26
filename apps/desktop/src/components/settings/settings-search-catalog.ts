@@ -17,6 +17,12 @@ export const SETTING_ENTRIES = [
   ["general", "securityOps.migrationConflictTitle", "migration conflict strategy 冲突策略 競合"],
 
   ["appearance", "settings.groupTheme", "system light dark color scheme 主题 暗色 ダーク ライト テーマ"],
+  ["appearance", "settings.windowZoom", "zoom scale window actual size 缩放 放大 缩小 窗口缩放 ズーム 拡大 縮小"],
+  ["appearance", "settings.conversationTextSize", "font size text size conversation reading prose 字号 对话文字 字体大小 文字サイズ フォントサイズ"],
+  ["appearance", "settings.codeTextSize", "code font size monospace editor diff terminal 代码字号 等宽 代码文字 コード 文字サイズ 等幅"],
+  ["appearance", "settings.uiFont", "interface font typeface sans ui 界面字体 字体 フォント 書体"],
+  ["appearance", "settings.contentFont", "conversation font typeface serif reading 对话字体 字体 衬线 会話フォント フォント"],
+  ["appearance", "settings.codeFont", "code font monospace typeface terminal editor 代码字体 等宽 字体 コードフォント 等幅 フォント"],
   ["appearance", "settings.diffLayout", "git code review diff layout unified split 统一 分栏 差分 並列"],
   ["appearance", "settings.collapseExploration", "coalesce exploration steps collapse 折叠探索 探索ステップ"],
 

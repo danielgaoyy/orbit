@@ -10,10 +10,17 @@ import {
   SIDE_PANEL_SELECTOR,
 } from "@/lib/file-viewer-shortcuts";
 import {
+  type ZoomSource,
   isAgentForegroundRunning,
   isMacDesktop,
+  isTauriRuntime,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import {
+  type DesktopZoomAction,
+  ZOOM_DEFAULT_PERCENT,
+  matchDesktopZoomAction,
+} from "@/lib/typography";
 import {
   type ShortcutActionId,
   getActionShortcutDisplay,
@@ -54,6 +61,61 @@ function isShortcutRecorderActive(): boolean {
   );
 }
 
+const ZOOM_SHORTCUT_THROTTLE_MS = 60;
+let lastZoomEventTimeStamp = -1;
+let lastZoomDispatchAction: DesktopZoomAction | null = null;
+let lastZoomDispatchAtMs = 0;
+let lastMenuZoomAtMs = 0;
+
+/** Records a native menu-initiated zoom event so a concurrent WebKit keydown won't double-step. */
+export function noteExternalZoomEvent(source: ZoomSource): void {
+  if (source === "menu") {
+    lastMenuZoomAtMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
+}
+
+/**
+ * Shared desktop window-zoom keydown handler used by both `MainDesktopApp` and
+ * `DetachedTerminalWindow`. Deduplicates by `event.timeStamp` and throttles identical
+ * actions within 60ms while permitting hold-to-repeat (`e.repeat`).
+ */
+export function handleDesktopZoomKeyDown(e: KeyboardEvent): boolean {
+  if (!isTauriRuntime()) return false;
+  const action = matchDesktopZoomAction(e, isMacDesktop());
+  if (!action) return false;
+
+  e.preventDefault();
+  e.stopPropagation();
+
+  if (e.timeStamp > 0 && e.timeStamp === lastZoomEventTimeStamp) {
+    return true;
+  }
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  if (now - lastMenuZoomAtMs < ZOOM_SHORTCUT_THROTTLE_MS) {
+    lastZoomEventTimeStamp = e.timeStamp;
+    return true;
+  }
+  if (lastZoomDispatchAction === action && now - lastZoomDispatchAtMs < ZOOM_SHORTCUT_THROTTLE_MS) {
+    lastZoomEventTimeStamp = e.timeStamp;
+    return true;
+  }
+
+  lastZoomEventTimeStamp = e.timeStamp;
+  lastZoomDispatchAction = action;
+  lastZoomDispatchAtMs = now;
+
+  const req =
+    action === "reset"
+      ? orbitIpc.setUiZoom(ZOOM_DEFAULT_PERCENT, "shortcut")
+      : orbitIpc.stepUiZoom(action === "in" ? 1 : -1, "shortcut");
+  void req
+    .then((next) => {
+      orbitActions.applyUiZoomState(next);
+    })
+    .catch(() => undefined);
+  return true;
+}
+
 export function useGlobalErgonomicKeybindings(): void {
   const lastEscTimeRef = useRef<number>(0);
 
@@ -64,12 +126,6 @@ export function useGlobalErgonomicKeybindings(): void {
         && hasOpenSettingsBlockingOverlay()) innerEscapes.add(event);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      const snap = orbitActions.getSnapshot();
-      const custom = snap.customKeybindings;
-      const isMac = isMacDesktop();
-      const mod = isMac ? e.metaKey : e.ctrlKey;
-      const keyLower = e.key.toLowerCase();
-
       // A nested layer may have already dismissed itself during event propagation.
       if (e.defaultPrevented || e.isComposing) return;
 
@@ -77,6 +133,17 @@ export function useGlobalErgonomicKeybindings(): void {
       if (isShortcutRecorderActive() || isConfirmDialogOpen()) {
         return;
       }
+
+      // Desktop Window Zoom (`⌘=` / `⌘⇧=` / `⌘-` / `⌘0` + numpad; Ctrl on Windows/Linux)
+      if (handleDesktopZoomKeyDown(e)) {
+        return;
+      }
+
+      const snap = orbitActions.getSnapshot();
+      const custom = snap.customKeybindings;
+      const isMac = isMacDesktop();
+      const mod = isMac ? e.metaKey : e.ctrlKey;
+      const keyLower = e.key.toLowerCase();
 
       // 1. Command Palette (`⌘K` / custom) — yield to terminal clear/kill-line and inline CodeMirror AI Edit
       if (matchesActionChord(e, "command_palette", custom, isMac) && !snap.terminalFocused) {

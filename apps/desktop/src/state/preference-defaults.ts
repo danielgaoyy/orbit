@@ -23,4 +23,12 @@ export const preferenceDefaults = {
   terminalCursorStyle: "bar",
   terminalScrollback: 5000,
   terminalThemeMode: "harmonized",
+  conversationFontSize: 15,
+  codeFontSize: 13,
+  uiFontId: "default",
+  contentFontId: "match-ui",
+  codeFontId: "default",
+  uiFontCustom: null,
+  contentFontCustom: null,
+  codeFontCustom: null,
 } as const;

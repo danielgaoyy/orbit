@@ -1304,8 +1304,32 @@ export interface TurnListRow {
   spacingPx: number;
 }
 
-export function getTurnItemHeight(turn: StageTurnView, row: TurnListRow, contentHeight?: number): number {
-  return row.spacingPx + (contentHeight ?? estimateTurnSizeFallback(turn));
+export interface TurnSizeEstimateMetrics {
+  readonly readScale: number;
+  readonly codeLinePx: number;
+}
+
+export const DEFAULT_TURN_SIZE_METRICS: TurnSizeEstimateMetrics = {
+  readScale: 1,
+  codeLinePx: 20,
+};
+
+export function buildTurnHeightCachePrefix(
+  hostId: string,
+  agentId: string,
+  widthBucket: number | string,
+  typographyKey: string,
+): string {
+  return `${hostId}::${agentId}::${widthBucket}::${typographyKey}::`;
+}
+
+export function getTurnItemHeight(
+  turn: StageTurnView,
+  row: TurnListRow,
+  contentHeight?: number,
+  metrics: TurnSizeEstimateMetrics = DEFAULT_TURN_SIZE_METRICS,
+): number {
+  return row.spacingPx + (contentHeight ?? estimateTurnSizeFallback(turn, metrics));
 }
 
 export function getTurnContentStart(row: TurnListRow, itemStart: number): number {
@@ -1369,20 +1393,36 @@ function spanCharLen(spans: InlineSpanView[]): number {
   return len;
 }
 
-function estimateRichBlockHeight(block: RichBlockView): number {
+function estimateRichBlockHeight(
+  block: RichBlockView,
+  metrics: TurnSizeEstimateMetrics = DEFAULT_TURN_SIZE_METRICS,
+): number {
+  const r = metrics.readScale;
   switch (block.kind) {
     case "code_block":
-      return Math.min(1400, Math.max(84, block.lines.length * 21 + 52));
+      return Math.min(1400, Math.max(84, block.lines.length * (metrics.codeLinePx + 1) + 52));
     case "table":
-      return Math.min(1200, Math.max(96, (block.rows.length + 1) * 38 + 24));
+      return Math.min(1200, Math.max(96, (block.rows.length + 1) * Math.round(38 * r) + 24));
     case "heading":
-      return 42;
+      return Math.round(42 * r);
     case "list_item":
-      return Math.max(28, Math.ceil(spanCharLen(block.spans) / 68) * 24 + 8);
+      return Math.max(
+        28,
+        Math.ceil(spanCharLen(block.spans) / Math.max(1, Math.round(68 / r))) * Math.round(24 * r) +
+          8,
+      );
     case "paragraph":
-      return Math.max(34, Math.ceil(spanCharLen(block.spans) / 72) * 25 + 14);
+      return Math.max(
+        34,
+        Math.ceil(spanCharLen(block.spans) / Math.max(1, Math.round(72 / r))) * Math.round(25 * r) +
+          14,
+      );
     case "block_quote":
-      return Math.max(44, Math.ceil(spanCharLen(block.spans) / 66) * 24 + 16);
+      return Math.max(
+        44,
+        Math.ceil(spanCharLen(block.spans) / Math.max(1, Math.round(66 / r))) * Math.round(24 * r) +
+          16,
+      );
     case "math_block":
       return Math.max(68, block.tex.split("\n").length * 28 + 40);
     case "horizontal_rule":
@@ -1390,8 +1430,12 @@ function estimateRichBlockHeight(block: RichBlockView): number {
   }
 }
 
-export function estimateTurnSizeFallback(turn: StageTurnView | undefined): number {
+export function estimateTurnSizeFallback(
+  turn: StageTurnView | undefined,
+  metrics: TurnSizeEstimateMetrics = DEFAULT_TURN_SIZE_METRICS,
+): number {
   if (!turn) return 180;
+  const r = metrics.readScale;
   let est = 24;
   if (turn.user_prompt?.item_type === "user_prompt") {
     const promptLen = turn.user_prompt.text?.length ?? 0;
@@ -1400,7 +1444,10 @@ export function estimateTurnSizeFallback(turn: StageTurnView | undefined): numbe
     const otherBadgeCount = badges.length - imageCount;
     est =
       56 +
-      Math.min(124, Math.ceil(promptLen / 56) * 24) +
+      Math.min(
+        Math.round(124 * r),
+        Math.ceil(promptLen / Math.max(1, Math.round(56 / r))) * Math.round(24 * r),
+      ) +
       (otherBadgeCount > 0 ? 28 : 0) +
       (imageCount > 0 ? Math.min(204, Math.ceil(imageCount / 5) * 102) : 0);
   }
@@ -1414,7 +1461,7 @@ export function estimateTurnSizeFallback(turn: StageTurnView | undefined): numbe
       } else {
         let blockSum = 16;
         for (const block of seg.item.blocks) {
-          blockSum += estimateRichBlockHeight(block);
+          blockSum += estimateRichBlockHeight(block, metrics);
         }
         est += blockSum;
       }

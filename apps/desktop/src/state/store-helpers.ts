@@ -19,6 +19,13 @@ import {
 import { isBareHomeDir } from "@/lib/projects";
 import { sanitizeCustomKeybindings } from "@/lib/shortcut-registry";
 import {
+  ZOOM_DEFAULT_PERCENT,
+  normalizeCodeFontSize,
+  normalizeConversationFontSize,
+  normalizeFontId,
+  sanitizeFontName,
+} from "@/lib/typography";
+import {
   SIDEBAR_DEFAULT_WIDTH_PX,
   SIDE_PANEL_DEFAULT_WIDTH_PX,
   clampSidebarPrefWidth,
@@ -169,6 +176,14 @@ export function buildPersistedPrefsPayload(snap: OrbitUiState): PersistedPrefs {
     terminalCursorStyle: snap.terminalCursorStyle,
     terminalScrollback: snap.terminalScrollback,
     terminalThemeMode: snap.terminalThemeMode,
+    conversationFontSize: snap.conversationFontSize,
+    codeFontSize: snap.codeFontSize,
+    uiFontId: snap.uiFontId,
+    contentFontId: snap.contentFontId,
+    codeFontId: snap.codeFontId,
+    uiFontCustom: snap.uiFontCustom,
+    contentFontCustom: snap.contentFontCustom,
+    codeFontCustom: snap.codeFontCustom,
     sidebarOpen: snap.sidebarDesktopOpenPref,
     sidebarWidth: snap.sidebarWidth,
     hiddenProjectKeys: snap.hiddenProjectKeys,
@@ -792,6 +807,15 @@ export function createDefaultInitialState(
     terminalScrollback: preferenceDefaults.terminalScrollback,
     terminalThemeMode: preferenceDefaults.terminalThemeMode,
     customKeybindings: sanitizeCustomKeybindings(initialPrefs.customKeybindings),
+    conversationFontSize: normalizeConversationFontSize(initialPrefs.conversationFontSize),
+    codeFontSize: normalizeCodeFontSize(initialPrefs.codeFontSize),
+    uiFontId: normalizeFontId("ui", initialPrefs.uiFontId),
+    contentFontId: normalizeFontId("content", initialPrefs.contentFontId),
+    codeFontId: normalizeFontId("code", initialPrefs.codeFontId),
+    uiFontCustom: sanitizeFontName(initialPrefs.uiFontCustom),
+    contentFontCustom: sanitizeFontName(initialPrefs.contentFontCustom),
+    codeFontCustom: sanitizeFontName(initialPrefs.codeFontCustom),
+    uiZoomPercent: ZOOM_DEFAULT_PERCENT,
   };
 }
 

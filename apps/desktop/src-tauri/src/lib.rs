@@ -1,8 +1,10 @@
+mod app_menu;
 mod notifications;
 mod qr;
 mod tray;
 mod updater;
 mod window_state;
+mod zoom;
 
 use std::collections::HashMap;
 use std::fs;
@@ -2596,9 +2598,10 @@ async fn open_detached_terminal_window(
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
 
-    builder
+    let window = builder
         .build()
         .map_err(|e| format!("Failed to open detached terminal window: {e}"))?;
+    zoom::inherit(&window);
 
     Ok(label)
 }
@@ -5252,7 +5255,7 @@ pub fn run() {
         .expect("failed to initialize OrbitAppCore");
     core.connect_all_hosts();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(DesktopAppState::new(core))
         .manage(tray::TrayMenuState::default())
         .on_window_event(|window, event| {
@@ -5262,12 +5265,25 @@ pub fn run() {
                 app_state.cleanup_window_terminal_subscriptions(window.label());
             }
         })
+        .on_menu_event(app_menu::on_menu_event)
         .setup(|app| {
-            window_state::setup_main_window_state(app);
+            let percent = window_state::setup_main_window_state(app);
+            let persist = window_state::zoom_persistence(app);
+            app.manage(zoom::ZoomController::new(percent, persist));
+            #[cfg(target_os = "macos")]
+            {
+                let (menu, items) = app_menu::build_app_menu(app.handle())?;
+                app.set_menu(menu)?;
+                app.manage(items);
+                app_menu::sync(&app.state::<app_menu::ZoomMenuItems>(), percent);
+            }
             tray::setup_system_tray(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            zoom::get_ui_zoom,
+            zoom::step_ui_zoom,
+            zoom::set_ui_zoom,
             subscribe_core_events,
             subscribe_terminal_binary,
             unsubscribe_terminal_binary,
@@ -5612,8 +5628,18 @@ pub fn run() {
             synthesize_voice_speech,
             list_system_audio_inputs,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Orbit Tauri desktop application");
+        .build(tauri::generate_context!());
+    match app {
+        Ok(app) => app.run(|handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                window_state::flush_on_exit(handle);
+            }
+        }),
+        Err(error) => {
+            tracing::error!(%error, "Failed to build Orbit Tauri desktop application");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -97,7 +97,7 @@ export const LazyMarkdownMessageBody = memo(function LazyMarkdownMessageBody({
     return <MarkdownBlocksView blocks={parsedBlocks as RichBlockView[]} compact />;
   }
   return (
-    <p className="selectable-text text-ink-secondary whitespace-pre-wrap break-words leading-[1.55]">
+    <p className="selectable-text text-ink-secondary font-(family-name:--orbit-font-content) text-(length:--orbit-read-compact) leading-(--orbit-read-compact-leading) whitespace-pre-wrap break-words">
       {text}
     </p>
   );

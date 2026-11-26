@@ -565,7 +565,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         {shouldRenderBody && (
           <>
             {/* Flush 40px Two-State Side Panel Header Bar (No-Tab vs With-Tab) */}
-            <div className="@container border-border-subtle flex h-[40px] min-w-0 shrink-0 items-center gap-1 border-b pr-[44px] pl-2">
+            <div className="@container border-border-subtle flex h-(--orbit-titlebar-h) min-w-0 shrink-0 items-center gap-1 border-b pr-[44px] pl-2">
               {tabs.length > 0 ? (
                 <>
                   <div

@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type MutableRefObject,
@@ -22,6 +23,7 @@ import {
   USER_PROMPT_PREVIEW_MAX_PX,
   type ViewportAnchorHoldFn,
 } from "@/components/stage/stage-helpers";
+import { useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 interface ViewportTracking {
@@ -533,6 +535,11 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
   const [overflowing, setOverflowing] = useState(false);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  const conversationFontSize = useOrbitSelector((s) => s.conversationFontSize);
+  const previewMaxPx = useMemo(
+    () => Math.round(USER_PROMPT_PREVIEW_MAX_PX * (conversationFontSize / 15)),
+    [conversationFontSize],
+  );
 
   useLayoutEffect(() => {
     const el = bodyRef.current;
@@ -542,12 +549,12 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
       return;
     }
     const measure = () => {
-      const next = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
+      const next = el.scrollHeight > previewMaxPx + 10;
       setOverflowing((prev) => (prev === next ? prev : next));
     };
     measure();
     return observeSharedBubbleResize(el, measure);
-  }, [text]);
+  }, [text, previewMaxPx]);
 
   useEffect(() => {
     if (!expanded) return;
@@ -595,7 +602,7 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
           "prompt-bubble-surface selectable-text text-foreground relative max-w-[90%] overflow-hidden rounded-[20px] whitespace-pre-wrap break-words",
           compact
             ? "px-3.5 py-2 text-[13px] leading-[1.5]"
-            : "px-4 py-2.5 text-[15px] leading-[1.65]",
+            : "px-4 py-2.5 font-(family-name:--orbit-font-content) text-(length:--orbit-read-body) leading-(--orbit-read-leading)",
           overflowing && !expanded && "cursor-pointer",
         )}
       >
@@ -603,7 +610,7 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
           ref={bodyRef}
           style={
             !expanded && overflowing
-              ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
+              ? { maxHeight: `${previewMaxPx}px`, overflow: "hidden" }
               : undefined
           }
         >

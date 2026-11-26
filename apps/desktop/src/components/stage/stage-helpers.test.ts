@@ -8,7 +8,9 @@ import { buildSubagentNameMatcher } from "../../lib/subagents.ts";
 import { computePrependRestoredScrollTop } from "../../lib/stage-pagination.ts";
 import type { OrbitUiState } from "../../state/store-types.ts";
 import {
+  DEFAULT_TURN_SIZE_METRICS,
   EMPTY_WORK_COUNTS,
+  buildTurnHeightCachePrefix,
   createHostAgentSelector,
   createRelativeClock,
   createStableHostArtifactsSelector,
@@ -430,4 +432,99 @@ test("narrow host selectors preserve identity across unrelated sibling host upda
   assert.equal(selectAgent(state3)?.status_label, "Running");
   assert.notEqual(selectArtifacts(state3), firstArtifacts);
   assert.equal(selectArtifacts(state3)[0]?.version, 2);
+});
+
+test("F9 turn height cache prefix includes typographyKey and fallback estimate matches default exactly", () => {
+  assert.equal(
+    buildTurnHeightCachePrefix("host1", "agent1", 24, "r15:c13:default:match-ui:default"),
+    "host1::agent1::24::r15:c13:default:match-ui:default::",
+  );
+  assert.equal(
+    buildTurnHeightCachePrefix("side", "scope-1", "panel", "r18:c16:inter:system-serif:menlo"),
+    "side::scope-1::panel::r18:c16:inter:system-serif:menlo::",
+  );
+
+  const plainSpan = (text: string) => ({
+    text,
+    bold: false,
+    italic: false,
+    strikethrough: false,
+    inline_code: false,
+    link_url: null,
+  });
+
+  const richTurn: StageTurnView = {
+    ...turn(42, [
+      {
+        kind: "assistant_message",
+        key: "msg-42",
+        item: {
+          item_type: "assistant_message",
+          seq: 43,
+          item_id: "m-43",
+          text: "",
+          streaming: false,
+          blocks: [
+            { kind: "heading", level: 2, spans: [plainSpan("Summary")] },
+            {
+              kind: "paragraph",
+              spans: [plainSpan("A".repeat(144))],
+            },
+            {
+              kind: "list_item",
+              ordered: false,
+              index: 0,
+              checked: null,
+              depth: 0,
+              spans: [plainSpan("B".repeat(136))],
+            },
+            {
+              kind: "table",
+              alignments: ["left", "left"],
+              headers: [
+                { spans: [plainSpan("Col A")] },
+                { spans: [plainSpan("Col B")] },
+              ],
+              rows: [
+                { cells: [{ spans: [plainSpan("1")] }, { spans: [plainSpan("2")] }] },
+                { cells: [{ spans: [plainSpan("3")] }, { spans: [plainSpan("4")] }] },
+              ],
+            },
+            {
+              kind: "code_block",
+              language: "ts",
+              raw_code: "1\n2\n3\n4\n5",
+              lines: [1, 2, 3, 4, 5].map((n) => ({
+                line_number: n,
+                tokens: [{ text: `const x${n} = ${n};`, fg_hex: "#d4d4d8", bold: false, italic: false }],
+              })),
+            },
+          ],
+        },
+      },
+    ]),
+    user_prompt: {
+      item_type: "user_prompt",
+      seq: 42,
+      message_id: "u-42",
+      text: "C".repeat(112),
+      blocks: [],
+    },
+  };
+
+  // Legacy default calculation at readScale=1, codeLinePx=20:
+  // prompt: 56 + min(124, ceil(112/56)*24=48) = 104
+  // blocks: 16 + heading(42) + para(max(34, 2*25+14)=64) + list(max(28, 2*24+8)=56)
+  //       + table(max(96, 3*38+24)=138) + code(max(84, 5*21+52)=157) = 473
+  // total = 104 + 473 = 577
+  const defaultEst = estimateTurnSizeFallback(richTurn);
+  assert.equal(defaultEst, 577);
+  assert.equal(estimateTurnSizeFallback(richTurn, DEFAULT_TURN_SIZE_METRICS), 577);
+
+  const largerEst = estimateTurnSizeFallback(richTurn, { readScale: 22 / 15, codeLinePx: 28 });
+  assert.ok(largerEst > defaultEst, `Expected larger estimate (${largerEst}) > default (${defaultEst})`);
+
+  const row = { key: richTurn.key, topGapPx: 14, spacingPx: 40 };
+  assert.equal(getTurnItemHeight(richTurn, row, undefined, DEFAULT_TURN_SIZE_METRICS), 40 + 577);
+  assert.equal(getTurnItemHeight(richTurn, row, undefined, { readScale: 22 / 15, codeLinePx: 28 }), 40 + largerEst);
 });

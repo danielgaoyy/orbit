@@ -1,8 +1,8 @@
 import {
   QuestionItemDto,
-  TimelineItemDto,
   formatPermissionDecisionLabel
 } from '../../model/OrbitTypes';
+import { OrbitTimelineItemModel } from '../../model/viewmodels/OrbitStageModels';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
@@ -18,7 +18,7 @@ interface QueuedDecisionCard {
   key: string;
   kind: string; // 'permission' | 'question'
   seq: number;
-  item: TimelineItemDto;
+  item: OrbitTimelineItemModel;
 }
 
 @ComponentV2
@@ -46,7 +46,7 @@ export struct StickyDecisionDock {
     for (let i = 0; i < this.store.pendingPermissions.length; i++) {
       const perm = this.store.pendingPermissions[i];
       combined.push({
-        key: `perm_${perm.request_id ?? perm.seq}`,
+        key: `perm_${perm.requestId.length > 0 ? perm.requestId : perm.seq}`,
         kind: 'permission',
         seq: perm.seq,
         item: perm
@@ -55,7 +55,7 @@ export struct StickyDecisionDock {
     for (let i = 0; i < this.store.pendingQuestions.length; i++) {
       const q = this.store.pendingQuestions[i];
       combined.push({
-        key: `q_${q.request_id ?? q.seq}`,
+        key: `q_${q.requestId.length > 0 ? q.requestId : q.seq}`,
         kind: 'question',
         seq: q.seq,
         item: q
@@ -117,8 +117,8 @@ export struct StickyDecisionDock {
     this.store.triggerHaptic(8);
   }
 
-  private permissionTargetPreview(item: TimelineItemDto): string {
-    if (item.detail !== undefined) {
+  private permissionTargetPreview(item: OrbitTimelineItemModel): string {
+    if (item.detail !== null) {
       if (item.detail.kind === 'shell' && (item.detail.command ?? '').length > 0) {
         return `$ ${item.detail.command ?? ''}`;
       }
@@ -129,7 +129,7 @@ export struct StickyDecisionDock {
         return item.detail.tool_name ?? '';
       }
     }
-    return item.title ?? 'Tool execution requires approval';
+    return item.title.length > 0 ? item.title : 'Tool execution requires approval';
   }
 
   private submitSingleCustomAnswer(reqId: string, qId: string): void {
@@ -141,9 +141,9 @@ export struct StickyDecisionDock {
     this.store.answerQuestion(reqId, [[custom]]);
   }
 
-  private submitMultiQuestion(req: TimelineItemDto): void {
-    const reqId = req.request_id ?? '';
-    const questions = req.questions ?? [];
+  private submitMultiQuestion(req: OrbitTimelineItemModel): void {
+    const reqId = req.requestId;
+    const questions = req.questions;
     if (reqId.length === 0 || questions.length === 0) {
       return;
     }
@@ -225,14 +225,14 @@ export struct StickyDecisionDock {
   }
 
   @Builder
-  private renderQuestionOptionsList(reqId: string, qItem: TimelineItemDto, q: QuestionItemDto) {
+  private renderQuestionOptionsList(reqId: string, qItem: OrbitTimelineItemModel, q: QuestionItemDto) {
     Column({ space: OrbitTokens.SPACE_XS }) {
       ForEach(
         q.options,
         (opt: string) => {
           Button({ type: ButtonType.Normal, stateEffect: true }) {
             Row({ space: OrbitTokens.SPACE_SM }) {
-              if (q.is_multi_select || (qItem.questions?.length ?? 1) > 1) {
+              if (q.is_multi_select || qItem.questions.length > 1) {
                 Checkbox({ name: `${reqId}_${q.id}_${opt}` })
                   .select(this.isOptionSelected(`${reqId}_${q.id}_${opt}`))
                   .selectedColor(this.store.palette.accentPrimaryFill)
@@ -286,7 +286,7 @@ export struct StickyDecisionDock {
             if (reqId.length === 0) {
               return;
             }
-            if (!q.is_multi_select && (qItem.questions?.length ?? 1) === 1) {
+            if (!q.is_multi_select && qItem.questions.length === 1) {
               this.setCustomAnswer(reqId, q.id, '');
               this.store.answerQuestion(reqId, [[opt]]);
             } else {
@@ -301,7 +301,7 @@ export struct StickyDecisionDock {
   }
 
   @Builder
-  private renderPermissionCard(perm: TimelineItemDto, currentIdx: number, total: number) {
+  private renderPermissionCard(perm: OrbitTimelineItemModel, currentIdx: number, total: number) {
     Column({ space: OrbitTokens.SPACE_SM }) {
       Row({ space: OrbitTokens.SPACE_SM }) {
         Row()
@@ -310,7 +310,7 @@ export struct StickyDecisionDock {
           .borderRadius(3)
           .backgroundColor(this.store.palette.statusWarning)
 
-        Text(perm.title ?? 'Approval Required')
+        Text(perm.title.length > 0 ? perm.title : 'Approval Required')
           .attributeModifier(orbitTextSubhead(this.store.palette.statusWarning, FontWeight.Bold))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -347,8 +347,8 @@ export struct StickyDecisionDock {
 
       Row({ space: OrbitTokens.SPACE_SM }) {
         ForEach(
-          (perm.allowed_decisions !== undefined && perm.allowed_decisions.length > 0)
-            ? perm.allowed_decisions
+          perm.allowedDecisions.length > 0
+            ? perm.allowedDecisions
             : ['allow', 'allow_always', 'deny'],
           (dec: string) => {
             Button(formatPermissionDecisionLabel(dec))
@@ -372,12 +372,12 @@ export struct StickyDecisionDock {
               .borderRadius(OrbitTokens.RADIUS_MD)
               .layoutWeight(1)
               .onClick(() => {
-                if (perm.request_id !== undefined) {
-                  this.store.resolvePermission(perm.request_id, dec);
+                if (perm.requestId.length > 0) {
+                  this.store.resolvePermission(perm.requestId, dec);
                 }
               })
           },
-          (dec: string) => `${perm.request_id ?? perm.seq}_${dec}`
+          (dec: string) => `${perm.requestId.length > 0 ? perm.requestId : perm.seq}_${dec}`
         )
       }
       .width('100%')
@@ -393,7 +393,7 @@ export struct StickyDecisionDock {
   }
 
   @Builder
-  private renderQuestionCard(qItem: TimelineItemDto, currentIdx: number, total: number) {
+  private renderQuestionCard(qItem: OrbitTimelineItemModel, currentIdx: number, total: number) {
     Column({ space: OrbitTokens.SPACE_SM }) {
       Row({ space: OrbitTokens.SPACE_SM }) {
         Row()
@@ -403,8 +403,7 @@ export struct StickyDecisionDock {
           .backgroundColor(this.store.palette.accentPrimary)
 
         Text(
-          (qItem.questions !== undefined &&
-            qItem.questions.length > 0 &&
+          (qItem.questions.length > 0 &&
             qItem.questions[0].header !== null &&
             qItem.questions[0].header.length > 0)
             ? qItem.questions[0].header
@@ -421,7 +420,7 @@ export struct StickyDecisionDock {
       .alignItems(VerticalAlign.Center)
 
       ForEach(
-        qItem.questions ?? [],
+        qItem.questions,
         (q: QuestionItemDto, qIdx: number) => {
           Column({ space: OrbitTokens.SPACE_SM }) {
             if (qIdx > 0 && q.header !== null && q.header.length > 0) {
@@ -435,10 +434,10 @@ export struct StickyDecisionDock {
 
             // Natural-height unclipped Column for <= 6 options; bounded Scroll only when > 6
             if (q.options.length <= 6) {
-              this.renderQuestionOptionsList(qItem.request_id ?? '', qItem, q)
+              this.renderQuestionOptionsList(qItem.requestId, qItem, q)
             } else {
               Scroll() {
-                this.renderQuestionOptionsList(qItem.request_id ?? '', qItem, q)
+                this.renderQuestionOptionsList(qItem.requestId, qItem, q)
               }
               .constraintSize({ maxHeight: 224 })
               .scrollBar(BarState.Auto)
@@ -449,7 +448,7 @@ export struct StickyDecisionDock {
             Row({ space: OrbitTokens.SPACE_SM }) {
               TextInput({
                 placeholder: 'Custom answer…',
-                text: this.getCustomAnswer(qItem.request_id ?? '', q.id)
+                text: this.getCustomAnswer(qItem.requestId, q.id)
               })
                 .attributeModifier(
                   orbitInputSubhead(
@@ -466,22 +465,22 @@ export struct StickyDecisionDock {
                 })
                 .layoutWeight(1)
                 .onChange((val: string) => {
-                  this.setCustomAnswer(qItem.request_id ?? '', q.id, val);
+                  this.setCustomAnswer(qItem.requestId, q.id, val);
                 })
                 .onSubmit(() => {
-                  if (!q.is_multi_select && (qItem.questions?.length ?? 1) === 1) {
-                    this.submitSingleCustomAnswer(qItem.request_id ?? '', q.id);
+                  if (!q.is_multi_select && qItem.questions.length === 1) {
+                    this.submitSingleCustomAnswer(qItem.requestId, q.id);
                   }
                 })
 
-              if (!q.is_multi_select && (qItem.questions?.length ?? 1) === 1) {
+              if (!q.is_multi_select && qItem.questions.length === 1) {
                 Button('Send')
                   .attributeModifier(
                     orbitButtonMeta(
-                      this.getCustomAnswer(qItem.request_id ?? '', q.id).trim().length > 0
+                      this.getCustomAnswer(qItem.requestId, q.id).trim().length > 0
                         ? this.store.palette.onAccent
                         : this.store.palette.fgMuted,
-                      this.getCustomAnswer(qItem.request_id ?? '', q.id).trim().length > 0
+                      this.getCustomAnswer(qItem.requestId, q.id).trim().length > 0
                         ? this.store.palette.accentPrimaryFill
                         : this.store.palette.subtleSurface
                     )
@@ -489,13 +488,13 @@ export struct StickyDecisionDock {
                   .height(OrbitTokens.HIT_COMPACT)
                   .borderRadius(OrbitTokens.RADIUS_SM)
                   .onClick(() => {
-                    this.submitSingleCustomAnswer(qItem.request_id ?? '', q.id);
+                    this.submitSingleCustomAnswer(qItem.requestId, q.id);
                   })
               }
             }
             .width('100%')
 
-            if (q.is_multi_select && (qItem.questions?.length ?? 1) === 1) {
+            if (q.is_multi_select && qItem.questions.length === 1) {
               Button('Submit Selection')
                 .attributeModifier(
                   orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
@@ -514,7 +513,7 @@ export struct StickyDecisionDock {
         (q: QuestionItemDto) => q.id
       )
 
-      if ((qItem.questions?.length ?? 0) > 1) {
+      if (qItem.questions.length > 1) {
         Button('Submit Answers')
           .attributeModifier(
             orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)

@@ -3,15 +3,17 @@ import {
   InlineSpanDto,
   PromptBadgeDto,
   RichBlockDto,
-  StageTurnDto,
-  TimelineItemDto,
   ToolStepDescriptorDto,
   TurnFileDiffSummaryDto,
-  TurnLiveSegmentDto,
   basenameOfPath,
   formatRelativeTimeLabel,
   stripWorkspacePrefix
 } from '../../model/OrbitTypes';
+import {
+  OrbitLiveSegmentModel,
+  OrbitStageTurnModel,
+  OrbitTimelineItemModel
+} from '../../model/viewmodels/OrbitStageModels';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
@@ -106,9 +108,9 @@ function cleanLegacyPromptText(rawText: string): CleanedPromptText {
   return { body: working, inferredSlash: '' };
 }
 
-function isBareCompactionPrompt(prompt: TimelineItemDto): boolean {
-  const cleaned = cleanLegacyPromptText(prompt.text ?? '');
-  const badges = prompt.badges ?? [];
+function isBareCompactionPrompt(prompt: OrbitTimelineItemModel): boolean {
+  const cleaned = cleanLegacyPromptText(prompt.rawText);
+  const badges = prompt.badges;
   let hasCompactBadge = false;
   for (let i = 0; i < badges.length; i++) {
     if (badges[i].kind === 'slash' && badges[i].label.toLowerCase() === '/compact') {
@@ -119,7 +121,7 @@ function isBareCompactionPrompt(prompt: TimelineItemDto): boolean {
   if (hasCompactBadge && cleaned.body.length === 0) {
     return true;
   }
-  return (prompt.text ?? '').trim().toLowerCase() === '/compact';
+  return prompt.rawText.trim().toLowerCase() === '/compact';
 }
 
 function stepDescriptorSymbol(desc: ToolStepDescriptorDto | null): Resource {
@@ -153,45 +155,34 @@ function stepDescriptorSymbol(desc: ToolStepDescriptorDto | null): Resource {
   return $r('sys.symbol.wrench_and_screwdriver');
 }
 
-function stepStableKey(step: TimelineItemDto): string {
-  const uid = step.call_id ?? step.item_id ?? '';
-  return `${step.item_type}_${step.seq}_${uid}`;
-}
-
 @ComponentV2
 struct StepItemRow {
-  @Param item: TimelineItemDto = { item_type: 'tool_call', seq: 0 };
+  @Param item: OrbitTimelineItemModel = new OrbitTimelineItemModel({ item_type: 'tool_call', seq: 0 });
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
-
-  private stepKey(): string {
-    if (this.item.call_id !== undefined && this.item.call_id.length > 0) {
-      return this.item.call_id;
-    }
-    return `seq_${this.item.seq}`;
-  }
 
   private toggleExpanded(): void {
     this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-      this.store.toggleToolExpanded(this.stepKey());
+      this.item.detailExpanded = !this.item.detailExpanded;
     });
+    this.store.triggerHaptic(6);
   }
 
   private hasStepDiffFiles(): boolean {
-    return this.item.diff_files !== undefined && this.item.diff_files.length > 0;
+    return this.item.diffFiles.length > 0;
   }
 
   private firstDiffFilePath(): string {
-    if (this.item.diff_files !== undefined && this.item.diff_files.length > 0) {
-      return this.item.diff_files[0].path;
+    if (this.item.diffFiles.length > 0) {
+      return this.item.diffFiles[0].path;
     }
-    if (this.item.detail !== undefined && (this.item.detail.path ?? '').length > 0) {
+    if (this.item.detail !== null && (this.item.detail.path ?? '').length > 0) {
       return this.item.detail.path ?? '';
     }
     return '';
   }
 
   private miniDiffPreviewRows(): MiniDiffPreviewRow[] {
-    const files = this.item.diff_files ?? [];
+    const files = this.item.diffFiles;
     const rows: MiniDiffPreviewRow[] = [];
     const multiFile = files.length > 1;
     let diffLineCount = 0;
@@ -221,7 +212,7 @@ struct StepItemRow {
   private buildFullStepSnippet(desc: ToolStepDescriptorDto | null): string {
     const det = this.item.detail;
     const parts: string[] = [];
-    if (det !== undefined) {
+    if (det !== null) {
       if ((det.command ?? '').trim().length > 0) {
         parts.push(`$ ${(det.command ?? '').trim()}`);
       }
@@ -279,14 +270,14 @@ struct StepItemRow {
         }
         return header;
       }
-      return (this.item.summary_title ?? this.item.text ?? 'Tool call completed').trim();
+      return (this.item.title.length > 0 ? this.item.title : (this.item.rawText || 'Tool call completed')).trim();
     }
     return parts.join('\n');
   }
 
   build() {
-    if (this.item.item_type === 'assistant_thinking') {
-      if ((this.item.text ?? '').trim().length > 0) {
+    if (this.item.itemType === 'assistant_thinking') {
+      if (this.item.rawText.trim().length > 0) {
         Column({ space: OrbitTokens.SPACE_XS }) {
           Row({ space: OrbitTokens.SPACE_XS }) {
             SymbolGlyph($r('sys.symbol.wand_and_stars'))
@@ -295,7 +286,7 @@ struct StepItemRow {
             Text('Thought')
               .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
             SymbolGlyph(
-              this.store.isToolExpanded(this.stepKey())
+              this.item.detailExpanded
                 ? $r('sys.symbol.chevron_down')
                 : $r('sys.symbol.chevron_right')
             )
@@ -308,9 +299,9 @@ struct StepItemRow {
             this.toggleExpanded();
           })
 
-          if (this.store.isToolExpanded(this.stepKey())) {
+          if (this.item.detailExpanded) {
             Column() {
-              Text((this.item.text ?? '').trim())
+              Text(this.item.rawText.trim())
                 .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
                 .copyOption(CopyOptions.LocalDevice)
                 .padding({ bottom: OrbitTokens.SPACE_XS })
@@ -323,20 +314,20 @@ struct StepItemRow {
         .alignItems(HorizontalAlign.Start)
         .width('100%')
       }
-    } else if (this.item.item_type === 'assistant_message') {
-      if ((this.item.text ?? '').trim().length > 0) {
+    } else if (this.item.itemType === 'assistant_message') {
+      if (this.item.rawText.trim().length > 0) {
         RichMarkdownView({
-          blocks: this.item.blocks ?? [],
-          fallbackText: this.item.text ?? ''
+          blocks: this.item.rawBlocks,
+          fallbackText: this.item.rawText
         })
       }
-    } else if (this.item.item_type === 'tool_call') {
+    } else if (this.item.itemType === 'tool_call') {
       Column({ space: OrbitTokens.SPACE_XS }) {
-        this.renderDescriptorRow(this.store.describeToolStepFallback(this.item))
+        this.renderDescriptorRow(this.item.stepDescriptor)
 
-        if (this.store.isToolExpanded(this.stepKey())) {
+        if (this.item.detailExpanded) {
           Column() {
-            this.renderExpandedToolDetail(this.store.describeToolStepFallback(this.item))
+            this.renderExpandedToolDetail(this.item.stepDescriptor)
           }
           .width('100%')
           .clip(true)
@@ -414,7 +405,7 @@ struct StepItemRow {
         }
 
         SymbolGlyph(
-          this.store.isToolExpanded(this.stepKey())
+          this.item.detailExpanded
             ? $r('sys.symbol.chevron_down')
             : $r('sys.symbol.chevron_right')
         )
@@ -433,13 +424,13 @@ struct StepItemRow {
         SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
           .fontSize(13)
           .fontColor([this.store.palette.fgMuted])
-        Text(this.item.summary_title ?? 'Tool step')
+        Text(this.item.title.length > 0 ? this.item.title : 'Tool step')
           .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         SymbolGlyph(
-          this.store.isToolExpanded(this.stepKey())
+          this.item.detailExpanded
             ? $r('sys.symbol.chevron_down')
             : $r('sys.symbol.chevron_right')
         )
@@ -501,7 +492,7 @@ struct StepItemRow {
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
               }
             },
-            (row: MiniDiffPreviewRow) => row.key
+            (row: MiniDiffPreviewRow): string => row.key
           )
         }
         .width('100%')
@@ -591,51 +582,10 @@ struct StepItemRow {
 
 @ComponentV2
 export struct StageTurnView {
-  @Param turn: StageTurnDto = {
-    key: '',
-    turn_index: 0,
-    anchor_seq: 0,
-    user_prompt: null,
-    is_compaction_command: false,
-    folded_steps: [],
-    work_counts: {
-      edited_file_count: 0,
-      created_file_count: 0,
-      command_count: 0,
-      read_file_count: 0,
-      search_count: 0,
-      subagent_count: 0,
-      mcp_server_count: 0,
-      other_tool_count: 0,
-      thought_count: 0,
-      narration_count: 0,
-      action_steps: 0,
-      total_steps: 0,
-      failed_count: 0,
-      denied_count: 0,
-      unrecovered_failure_count: 0,
-      additions: 0,
-      deletions: 0
-    },
-    work_summary_label: '',
-    work_summary_live_label: '',
-    work_summary_includes_failure: false,
-    thought_duration_ms: null,
-    turn_duration_ms: null,
-    terminal_reply: null,
-    notices: [],
-    live_segments: [],
-    turn_diffs: [],
-    has_error: false,
-    has_unrecovered_error: false,
-    has_active_item: false,
-    started_at_ms: null,
-    completed_at_ms: null
-  };
+  @Param turn: OrbitStageTurnModel = new OrbitStageTurnModel();
   @Param isTurnActive: boolean = false;
 
   @Local userPromptExpanded: boolean = false;
-  @Local changesExpanded: boolean = false;
   @Local elapsedSeconds: number = 0;
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
@@ -643,7 +593,7 @@ export struct StageTurnView {
 
   @Computed
   get cleanedUserPrompt(): CleanedPromptText {
-    return cleanLegacyPromptText(this.turn.user_prompt?.text ?? '');
+    return cleanLegacyPromptText(this.turn.userPrompt !== null ? this.turn.userPrompt.rawText : '');
   }
 
   aboutToAppear(): void {
@@ -667,7 +617,7 @@ export struct StageTurnView {
   }
 
   private syncElapsedTimer(): void {
-    const active = this.isTurnActive || this.turn.has_active_item;
+    const active = this.isTurnActive || this.turn.hasActiveItem;
     if (!active) {
       this.clearElapsedTimer();
       return;
@@ -675,8 +625,8 @@ export struct StageTurnView {
     if (this.timerHandle >= 0) {
       return;
     }
-    const updateTick = () => {
-      const startMs = this.turn.started_at_ms ?? Date.now();
+    const updateTick = (): void => {
+      const startMs = this.turn.startedAtMs > 0 ? this.turn.startedAtMs : Date.now();
       this.elapsedSeconds = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
     };
     updateTick();
@@ -686,25 +636,25 @@ export struct StageTurnView {
   }
 
   private isEffectiveActive(): boolean {
-    return this.isTurnActive || this.turn.has_active_item;
+    return this.isTurnActive || this.turn.hasActiveItem;
   }
 
   private isCompactionOnly(): boolean {
-    if (this.turn.is_compaction_command) {
+    if (this.turn.isCompactionCommand) {
       return true;
     }
-    if (this.turn.user_prompt !== null) {
-      return isBareCompactionPrompt(this.turn.user_prompt);
+    if (this.turn.userPrompt !== null) {
+      return isBareCompactionPrompt(this.turn.userPrompt);
     }
     return false;
   }
 
-  private extractReplyText(reply: TimelineItemDto): string {
-    const direct = (reply.text ?? '').trim();
+  private extractReplyText(reply: OrbitTimelineItemModel): string {
+    const direct = reply.rawText.trim();
     if (direct.length > 0) {
       return direct;
     }
-    const blocks: RichBlockDto[] = reply.blocks ?? [];
+    const blocks: RichBlockDto[] = reply.rawBlocks;
     if (blocks.length === 0) {
       return '';
     }
@@ -769,15 +719,15 @@ export struct StageTurnView {
   }
 
   @Builder
-  private renderUserBubble(prompt: TimelineItemDto) {
+  private renderUserBubble(prompt: OrbitTimelineItemModel) {
     Row() {
       Blank()
       Column({ space: OrbitTokens.SPACE_XS }) {
         // Non-slash Context Badges
-        if (prompt.badges !== undefined && prompt.badges.some((b: PromptBadgeDto) => b.kind !== 'slash')) {
+        if (prompt.badges.some((b: PromptBadgeDto): boolean => b.kind !== 'slash')) {
           Flex({ wrap: FlexWrap.Wrap }) {
             ForEach(
-              prompt.badges.filter((b: PromptBadgeDto) => b.kind !== 'slash'),
+              prompt.badges.filter((b: PromptBadgeDto): boolean => b.kind !== 'slash'),
               (badge: PromptBadgeDto) => {
                 Row({ space: 4 }) {
                   SymbolGlyph(this.badgeSymbol(badge))
@@ -793,7 +743,7 @@ export struct StageTurnView {
                 .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
                 .alignItems(VerticalAlign.Center)
               },
-              (badge: PromptBadgeDto, bIdx: number) => `ub_${badge.kind}_${badge.label}_${bIdx}`
+              (badge: PromptBadgeDto, bIdx: number): string => `ub_${badge.kind}_${badge.label}_${bIdx}`
             )
           }
         }
@@ -801,11 +751,11 @@ export struct StageTurnView {
         // Cleaned Body + Inline Leading Slash Prefix (natively selectable!)
         Row({ space: 6 }) {
           if (
-            (prompt.badges !== undefined && prompt.badges.some((b: PromptBadgeDto) => b.kind === 'slash')) ||
+            prompt.badges.some((b: PromptBadgeDto): boolean => b.kind === 'slash') ||
             this.cleanedUserPrompt.inferredSlash.length > 0
           ) {
             Text(
-              prompt.badges?.find((b: PromptBadgeDto) => b.kind === 'slash')?.label ??
+              prompt.badges.find((b: PromptBadgeDto): boolean => b.kind === 'slash')?.label ??
                 this.cleanedUserPrompt.inferredSlash
             )
               .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Medium))
@@ -891,18 +841,18 @@ export struct StageTurnView {
     return this.store.palette.statusDirectSoft;
   }
 
-  private agentMessageSenderLabel(item: TimelineItemDto): string {
-    if (item.source_title !== undefined && item.source_title !== null && item.source_title.trim().length > 0) {
-      return item.source_title.trim();
+  private agentMessageSenderLabel(item: OrbitTimelineItemModel): string {
+    if (item.sourceTitle.trim().length > 0) {
+      return item.sourceTitle.trim();
     }
-    if (item.kind !== undefined && item.kind.length > 0) {
+    if (item.kind.length > 0) {
       return item.kind.replace(/_/g, ' ');
     }
     return 'Agent message';
   }
 
   @Builder
-  private renderAgentMessageCard(item: TimelineItemDto) {
+  private renderAgentMessageCard(item: OrbitTimelineItemModel) {
     Column({ space: OrbitTokens.SPACE_XS }) {
       Row({ space: OrbitTokens.SPACE_SM }) {
         SymbolGlyph($r('sys.symbol.person_2'))
@@ -915,13 +865,13 @@ export struct StageTurnView {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
 
-        if (item.delivery_status !== undefined && item.delivery_status !== null) {
-          Text(this.deliveryPillLabel(item.delivery_status))
+        if (item.deliveryStatus.length > 0) {
+          Text(this.deliveryPillLabel(item.deliveryStatus))
             .attributeModifier(
-              orbitTextMeta(this.deliveryPillTextColor(item.delivery_status), FontWeight.Medium)
+              orbitTextMeta(this.deliveryPillTextColor(item.deliveryStatus), FontWeight.Medium)
             )
             .padding({ left: 8, right: 8, top: 2, bottom: 2 })
-            .backgroundColor(this.deliveryPillBgColor(item.delivery_status))
+            .backgroundColor(this.deliveryPillBgColor(item.deliveryStatus))
             .borderRadius(999)
         }
       }
@@ -929,12 +879,12 @@ export struct StageTurnView {
       .alignItems(VerticalAlign.Center)
 
       RichMarkdownView({
-        blocks: item.blocks ?? [],
-        fallbackText: item.text ?? '',
-        turnIndex: this.turn.turn_index
+        blocks: item.rawBlocks,
+        fallbackText: item.rawText,
+        turnIndex: this.turn.turnIndex
       })
 
-      if (item.delivery_status === 'queued' && this.store.isActiveAgentRunning()) {
+      if (item.deliveryStatus === 'queued' && this.store.isActiveAgentRunning()) {
         Row() {
           Blank()
           Button($r('app.string.stage_interrupt_and_deliver'), { type: ButtonType.Capsule, stateEffect: true })
@@ -981,19 +931,19 @@ export struct StageTurnView {
             })
         }
       } else {
-        if (this.turn.terminal_reply !== null && this.extractReplyText(this.turn.terminal_reply).length > 0) {
+        if (this.turn.terminalReply !== null && this.extractReplyText(this.turn.terminalReply).length > 0) {
           OrbitCopyIconButton({
-            content: this.extractReplyText(this.turn.terminal_reply),
+            content: this.extractReplyText(this.turn.terminalReply),
             toastLabel: 'Copied reply to clipboard',
             accessibilityLabel: 'Copy response',
             buttonSize: OrbitTokens.HIT_COMPACT
           })
         }
 
-        if ((this.turn.completed_at_ms ?? this.turn.started_at_ms ?? 0) > 0) {
+        if ((this.turn.completedAtMs > 0 ? this.turn.completedAtMs : this.turn.startedAtMs) > 0) {
           Text(
             formatRelativeTimeLabel(
-              Math.floor((this.turn.completed_at_ms ?? this.turn.started_at_ms ?? 0) / 1000)
+              Math.floor((this.turn.completedAtMs > 0 ? this.turn.completedAtMs : this.turn.startedAtMs) / 1000)
             )
           )
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
@@ -1006,28 +956,28 @@ export struct StageTurnView {
   }
 
   private settledSummaryLabel(): string {
-    const base = this.turn.work_summary_label.length > 0
-      ? this.turn.work_summary_label
-      : `${this.turn.folded_steps.length} steps`;
-    if (this.turn.thought_duration_ms !== null && this.turn.thought_duration_ms >= 1000) {
-      return `${base} · Thought ${Math.floor(this.turn.thought_duration_ms / 1000)}s`;
+    const base = this.turn.workSummaryLabel.length > 0
+      ? this.turn.workSummaryLabel
+      : `${this.turn.foldedSteps.length} steps`;
+    if (this.turn.thoughtDurationMs >= 1000) {
+      return `${base} · Thought ${Math.floor(this.turn.thoughtDurationMs / 1000)}s`;
     }
     return base;
   }
 
   @Builder
   private renderSettledSummaryAndRail() {
-    if (this.turn.folded_steps.length > 0) {
+    if (this.turn.foldedSteps.length > 0) {
       Column({ space: OrbitTokens.SPACE_XS }) {
         Row({ space: OrbitTokens.SPACE_XS }) {
           SymbolGlyph(
-            this.store.isTurnExpanded(this.turn.key)
+            this.turn.stepsExpanded
               ? $r('sys.symbol.chevron_down')
               : $r('sys.symbol.chevron_right')
           )
             .fontSize(13)
             .fontColor([
-              this.turn.work_summary_includes_failure
+              this.turn.workSummaryIncludesFailure
                 ? this.store.palette.statusDanger
                 : this.store.palette.fgMuted
             ])
@@ -1035,7 +985,7 @@ export struct StageTurnView {
           Text(this.settledSummaryLabel())
             .attributeModifier(
               orbitTextSubhead(
-                this.turn.work_summary_includes_failure
+                this.turn.workSummaryIncludesFailure
                   ? this.store.palette.statusDanger
                   : this.store.palette.fgSecondary,
                 FontWeight.Medium
@@ -1050,18 +1000,19 @@ export struct StageTurnView {
         .alignItems(VerticalAlign.Center)
         .onClick(() => {
           this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-            this.store.toggleTurnExpanded(this.turn.key);
+            this.turn.stepsExpanded = !this.turn.stepsExpanded;
           });
+          this.store.triggerHaptic(8);
         })
 
-        if (this.store.isTurnExpanded(this.turn.key)) {
+        if (this.turn.stepsExpanded) {
           Column({ space: OrbitTokens.SPACE_XS }) {
             ForEach(
-              this.turn.folded_steps,
-              (step: TimelineItemDto) => {
+              this.turn.foldedSteps,
+              (step: OrbitTimelineItemModel) => {
                 StepItemRow({ item: step })
               },
-              (step: TimelineItemDto) => stepStableKey(step)
+              (step: OrbitTimelineItemModel): string => step.itemKey
             )
           }
           .width('100%')
@@ -1082,19 +1033,19 @@ export struct StageTurnView {
   private renderLiveSegments() {
     Column({ space: OrbitTokens.SPACE_MD }) {
       ForEach(
-        this.turn.live_segments,
-        (seg: TurnLiveSegmentDto) => {
-          if (seg.kind === 'step_group' && seg.items !== undefined) {
+        this.turn.liveSegments,
+        (seg: OrbitLiveSegmentModel) => {
+          if (seg.kind === 'step_group' && seg.items.length > 0) {
             Column({ space: OrbitTokens.SPACE_XS }) {
               Row({ space: OrbitTokens.SPACE_XS }) {
-                if (seg.has_running_step === true) {
+                if (seg.isRunning) {
                   LoadingProgress()
                     .width(14)
                     .height(14)
                     .color(this.store.palette.accentPrimary)
                 } else {
                   SymbolGlyph(
-                    this.store.isTurnExpanded(seg.key) || (seg.items.length < 5 && seg.has_following_content !== true)
+                    seg.stepsExpanded || (seg.items.length < 5 && !seg.hasFollowingContent)
                       ? $r('sys.symbol.chevron_down')
                       : $r('sys.symbol.chevron_right')
                   )
@@ -1103,13 +1054,13 @@ export struct StageTurnView {
                 }
 
                 Text(
-                  seg.has_running_step === true
-                    ? (seg.summary?.live_label ?? 'Working…')
-                    : (seg.summary?.label ?? 'Completed steps')
+                  seg.isRunning
+                    ? (seg.liveSummaryLabel.length > 0 ? seg.liveSummaryLabel : 'Working…')
+                    : (seg.summary.length > 0 ? seg.summary : 'Completed steps')
                 )
                   .attributeModifier(
                     orbitTextSubhead(
-                      seg.summary?.label_includes_failure === true
+                      seg.summaryIncludesFailure
                         ? this.store.palette.statusDanger
                         : this.store.palette.fgSecondary,
                       FontWeight.Medium
@@ -1124,19 +1075,19 @@ export struct StageTurnView {
               .alignItems(VerticalAlign.Center)
               .onClick(() => {
                 this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-                  this.store.toggleTurnExpanded(seg.key);
+                  seg.stepsExpanded = !seg.stepsExpanded;
                 });
+                this.store.triggerHaptic(8);
               })
 
-              // Roll up automatically when >= 5 steps unless expanded, while keeping latest running step visible
-              if (this.store.isTurnExpanded(seg.key) || (seg.items.length < 5 && (seg.has_running_step === true || seg.has_following_content !== true))) {
+              if (seg.stepsExpanded || (seg.items.length < 5 && (seg.isRunning || !seg.hasFollowingContent))) {
                 Column({ space: OrbitTokens.SPACE_XS }) {
                   ForEach(
                     seg.items,
-                    (step: TimelineItemDto) => {
+                    (step: OrbitTimelineItemModel) => {
                       StepItemRow({ item: step })
                     },
-                    (step: TimelineItemDto) => stepStableKey(step)
+                    (step: OrbitTimelineItemModel): string => step.itemKey
                   )
                 }
                 .width('100%')
@@ -1161,21 +1112,22 @@ export struct StageTurnView {
               }
             }
             .width('100%')
-          } else if (seg.kind === 'assistant_message' && seg.item !== undefined) {
+          } else if (seg.kind === 'assistant_message' && seg.item !== null) {
             RichMarkdownView({
-              blocks: seg.item.blocks ?? [],
-              fallbackText: seg.item.text ?? '',
-              turnIndex: this.turn.turn_index
+              blocks: seg.item.rawBlocks,
+              fallbackText: seg.item.rawText,
+              turnIndex: this.turn.turnIndex
             })
-          } else if (seg.kind === 'agent_message' && seg.item !== undefined) {
+          } else if (seg.kind === 'agent_message' && seg.item !== null) {
             this.renderAgentMessageCard(seg.item)
           } else if (seg.kind === 'compaction') {
-            this.renderCompactionDivider(seg.label ?? 'Context compacted')
+            this.renderCompactionDivider(seg.label.length > 0 ? seg.label : 'Context compacted')
           } else if (seg.kind === 'wakeup') {
-            this.renderCompactionDivider(seg.label ?? 'Resumed')
+            this.renderCompactionDivider(seg.label.length > 0 ? seg.label : 'Resumed')
           }
         },
-        (seg: TurnLiveSegmentDto) => `${seg.key}_${seg.has_running_step ? '1' : '0'}_${seg.items?.length ?? 0}`
+        // Strictly stable key from core — never append item count or running flag.
+        (seg: OrbitLiveSegmentModel): string => seg.segKey
       )
     }
     .width('100%')
@@ -1185,8 +1137,8 @@ export struct StageTurnView {
   @Computed
   get totalTurnAdditions(): number {
     let total = 0;
-    for (let i = 0; i < this.turn.turn_diffs.length; i++) {
-      total += this.turn.turn_diffs[i].additions;
+    for (let i = 0; i < this.turn.turnDiffs.length; i++) {
+      total += this.turn.turnDiffs[i].additions;
     }
     return total;
   }
@@ -1194,15 +1146,15 @@ export struct StageTurnView {
   @Computed
   get totalTurnDeletions(): number {
     let total = 0;
-    for (let i = 0; i < this.turn.turn_diffs.length; i++) {
-      total += this.turn.turn_diffs[i].deletions;
+    for (let i = 0; i < this.turn.turnDiffs.length; i++) {
+      total += this.turn.turnDiffs[i].deletions;
     }
     return total;
   }
 
   @Builder
   private renderTurnChangesBar() {
-    if (this.turn.turn_diffs.length > 0) {
+    if (this.turn.turnDiffs.length > 0) {
       Column({ space: OrbitTokens.SPACE_XS }) {
         Button({ type: ButtonType.Normal, stateEffect: true }) {
           Row({ space: OrbitTokens.SPACE_XS }) {
@@ -1210,9 +1162,9 @@ export struct StageTurnView {
               .fontSize(14)
               .fontColor([this.store.palette.iconSecondary])
             Text(
-              this.turn.turn_diffs.length === 1
-                ? stripWorkspacePrefix(this.turn.turn_diffs[0].path, this.store.activeCwd)
-                : `${this.turn.turn_diffs.length} files changed`
+              this.turn.turnDiffs.length === 1
+                ? stripWorkspacePrefix(this.turn.turnDiffs[0].path, this.store.activeCwd)
+                : `${this.turn.turnDiffs.length} files changed`
             )
               .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
               .maxLines(1)
@@ -1228,9 +1180,9 @@ export struct StageTurnView {
               Text(`-${this.totalTurnDeletions}`)
                 .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
             }
-            if (this.turn.turn_diffs.length > 1) {
+            if (this.turn.turnDiffs.length > 1) {
               SymbolGlyph(
-                this.changesExpanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right')
+                this.turn.changesExpanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right')
               )
                 .fontSize(12)
                 .fontColor([this.store.palette.fgMuted])
@@ -1244,19 +1196,19 @@ export struct StageTurnView {
         .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS })
         .backgroundColor(Color.Transparent)
         .onClick(() => {
-          if (this.turn.turn_diffs.length === 1) {
-            this.store.openGitInspector(this.turn.turn_diffs[0].path);
+          if (this.turn.turnDiffs.length === 1) {
+            this.store.openGitInspector(this.turn.turnDiffs[0].path);
           } else {
             this.getUIContext().animateTo({ duration: 160, curve: Curve.EaseInOut }, () => {
-              this.changesExpanded = !this.changesExpanded;
+              this.turn.changesExpanded = !this.turn.changesExpanded;
             });
           }
         })
 
-        if (this.turn.turn_diffs.length > 1 && this.changesExpanded) {
+        if (this.turn.turnDiffs.length > 1 && this.turn.changesExpanded) {
           Flex({ wrap: FlexWrap.Wrap }) {
             ForEach(
-              this.turn.turn_diffs,
+              this.turn.turnDiffs,
               (df: TurnFileDiffSummaryDto) => {
                 Button({ type: ButtonType.Capsule, stateEffect: true }) {
                   Row({ space: 4 }) {
@@ -1281,7 +1233,7 @@ export struct StageTurnView {
                   this.store.openGitInspector(df.path);
                 })
               },
-              (df: TurnFileDiffSummaryDto) => df.path
+              (df: TurnFileDiffSummaryDto): string => df.path
             )
           }
           .clip(true)
@@ -1299,10 +1251,10 @@ export struct StageTurnView {
     Column({ space: OrbitTokens.SPACE_MD }) {
       if (this.isCompactionOnly()) {
         this.renderCompactionDivider('Context compacted')
-      } else if (this.turn.user_prompt !== null) {
-        this.renderUserBubble(this.turn.user_prompt)
-      } else if (this.turn.agent_message !== undefined && this.turn.agent_message !== null) {
-        this.renderAgentMessageCard(this.turn.agent_message)
+      } else if (this.turn.userPrompt !== null) {
+        this.renderUserBubble(this.turn.userPrompt)
+      } else if (this.turn.agentMessage !== null) {
+        this.renderAgentMessageCard(this.turn.agentMessage)
       }
 
       if (this.isEffectiveActive()) {
@@ -1314,7 +1266,7 @@ export struct StageTurnView {
           Column({ space: OrbitTokens.SPACE_XS }) {
             ForEach(
               this.turn.notices,
-              (notice: TimelineItemDto) => {
+              (notice: OrbitTimelineItemModel) => {
                 Row({ space: OrbitTokens.SPACE_SM }) {
                   SymbolGlyph($r('sys.symbol.warning'))
                     .fontSize(14)
@@ -1323,7 +1275,7 @@ export struct StageTurnView {
                         ? this.store.palette.statusDanger
                         : this.store.palette.fgSecondary
                     ])
-                  Text(notice.message ?? '')
+                  Text(notice.message.length > 0 ? notice.message : notice.rawText)
                     .attributeModifier(
                       orbitTextMeta(
                         notice.level === 'error'
@@ -1344,17 +1296,17 @@ export struct StageTurnView {
                 .borderRadius(OrbitTokens.RADIUS_SM)
                 .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
               },
-              (notice: TimelineItemDto) => `notice_${notice.seq}`
+              (notice: OrbitTimelineItemModel): string => notice.itemKey
             )
           }
           .width('100%')
         }
 
-        if (this.turn.terminal_reply !== null) {
+        if (this.turn.terminalReply !== null) {
           RichMarkdownView({
-            blocks: this.turn.terminal_reply.blocks ?? [],
-            fallbackText: this.turn.terminal_reply.text ?? '',
-            turnIndex: this.turn.turn_index
+            blocks: this.turn.terminalReply.rawBlocks,
+            fallbackText: this.turn.terminalReply.rawText,
+            turnIndex: this.turn.turnIndex
           })
         }
       }
@@ -1364,9 +1316,9 @@ export struct StageTurnView {
       if (
         this.isEffectiveActive() ||
         (!this.isCompactionOnly() &&
-          (this.turn.terminal_reply !== null ||
-            this.turn.folded_steps.length > 0 ||
-            this.turn.completed_at_ms !== null))
+          (this.turn.terminalReply !== null ||
+            this.turn.foldedSteps.length > 0 ||
+            this.turn.completedAtMs > 0))
       ) {
         this.renderTurnFooter()
       }

@@ -1,9 +1,11 @@
-import { ConfigurationConstant, common } from '@kit.AbilityKit';
+import { common } from '@kit.AbilityKit';
+import { UIContext } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import {
   AgentCardDto,
   AgentStageDeltaDto,
   AskSideQuestionRequestDto,
+  BriefingDecisionDto,
   CancelWorkflowRunRequestDto,
   ClientProjectDto,
   CloudSyncResultDto,
@@ -17,7 +19,6 @@ import {
   ConnectedHostSummaryDto,
   ControlGoalRunRequestDto,
   ConversationSearchHitDto,
-  CoreNotificationDto,
   CreateSchedulePayloadDto,
   CreateSessionRequestDto,
   CreateWorkspaceEntryRequestDto,
@@ -29,7 +30,6 @@ import {
   ExportedTranscriptDto,
   FleetOverviewDto,
   FleetSidebarDto,
-  FleetSidebarRequestDto,
   ForkAgentRequestDto,
   ForkAgentResultDto,
   GitCommitResultDto,
@@ -54,9 +54,10 @@ import {
   ModelSelectionRequestDto,
   MonitorWatchRecordDto,
   OrbitMeshPeerRow,
-  OverviewPendingApprovalItem,
   PendingPlanApprovalDto,
   PermissionBatchItemDto,
+  PersonalAgentActivityEntryDto,
+  PersonalAgentBriefingDto,
   PersonalRouterConfigDto,
   PromptBadgeDto,
   ProviderModelCatalogDto,
@@ -83,7 +84,6 @@ import {
   SessionUsageDto,
   SlashCommandDto,
   SpawnWorkspacePeerRequestDto,
-  StageTurnDto,
   StagedAttachmentDto,
   StartDagWorkflowRequestDto,
   StartGoalRunRequestDto,
@@ -117,6 +117,33 @@ import { OrbitCoreBridge } from './OrbitCoreBridge';
 import { OrbitVoiceInputController } from './OrbitVoiceInput';
 import { orbitLogInfo, orbitLogWarn } from './OrbitLogger';
 import { OrbitPreferencesStore } from './OrbitPreferences';
+import { OrbitPerfProbe } from './OrbitPerfProbe';
+import {
+  OrbitEventFlushHandler,
+  OrbitEventFrameScheduler
+} from './OrbitEventFrameScheduler';
+import {
+  orbitApplySystemBarTheme,
+  orbitBindThemeApplicationContext,
+  orbitNormalizeThemeMode,
+  orbitSetThemeModePreference
+} from './OrbitWindowTheme';
+import {
+  OrbitStageDeltaAppliedCallback,
+  OrbitStageSession,
+  OrbitStageStore,
+  resolveStageTailLimit
+} from './stores/OrbitStageStore';
+import {
+  OrbitStageTurnModel,
+  OrbitTimelineItemModel
+} from './viewmodels/OrbitStageModels';
+import { OrbitFleetStore } from './stores/OrbitFleetStore';
+import { OrbitPersonalAgentStore } from './stores/OrbitPersonalAgentStore';
+import {
+  OrbitComposerStore,
+  OrbitComposerToastSink
+} from './stores/OrbitComposerStore';
 import {
   checkHarmonyNotificationEnabled,
   publishOrbitDeepLinkNotification,
@@ -128,6 +155,12 @@ import {
   triggerNativeHaptic,
   writeClipboardText
 } from './OrbitDeviceBridge';
+
+const EMPTY_STAGE_TURNS: OrbitStageTurnModel[] = [];
+const EMPTY_TIMELINE_MODELS: OrbitTimelineItemModel[] = [];
+const EMPTY_DIFF_FILES: DiffFileDto[] = [];
+const EMPTY_PLAN_STEPS: SessionPlanStepDto[] = [];
+const EMPTY_SUBAGENTS: SessionSubagentEntryDto[] = [];
 
 interface DraftModelSelection {
   model: string;
@@ -155,11 +188,115 @@ interface SideQuestionEnvelopeDto {
   error?: string | null;
 }
 
+class OrbitStoreEventFlushAdapter implements OrbitEventFlushHandler {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  getSelectedHostId(): string {
+    return this.owner.fleetStore.selectedHostId;
+  }
+
+  isStageScopeVisible(hostId: string, agentId: string): boolean {
+    return !this.owner.isNewSessionDraft &&
+      this.owner.fleetStore.selectedHostId === hostId &&
+      this.owner.selectedAgentId === agentId &&
+      hostId.length > 0 &&
+      agentId.length > 0;
+  }
+
+  isGitScopeVisible(hostId: string, cwd: string): boolean {
+    if (!this.owner.showGitDiffSheet && !this.owner.showInlineDiffInspector) {
+      return false;
+    }
+    if (this.owner.fleetStore.selectedHostId !== hostId || hostId.length === 0) {
+      return false;
+    }
+    return cwd.length === 0 || cwdPathsEquivalent(cwd, this.owner.activeCwd);
+  }
+
+  isTerminalScopeVisible(hostId: string, slot: number): boolean {
+    if (!this.owner.showPtySheet || this.owner.fleetStore.selectedHostId !== hostId || hostId.length === 0) {
+      return false;
+    }
+    const detail = this.owner.fleetStore.currentHostDetail;
+    const activeSlot = detail !== null && detail.active_terminal_slot > 0
+      ? detail.active_terminal_slot
+      : 1;
+    return slot === activeSlot;
+  }
+
+  onFleetDirty(): void {
+    this.owner.handleSchedulerFleetDirty();
+  }
+
+  onBriefingDirty(): void {
+    this.owner.personalAgentStore.refreshBriefing(false);
+  }
+
+  onSelectedHostDirty(hostId: string): void {
+    this.owner.handleSchedulerSelectedHostDirty(hostId);
+  }
+
+  onBackgroundHostDirty(_hostId: string): void {
+    this.owner.handleSchedulerBackgroundHostDirty();
+  }
+
+  onVisibleTimelineDirty(hostId: string, agentId: string): void {
+    this.owner.handleSchedulerVisibleTimelineDirty(hostId, agentId);
+  }
+
+  onBackgroundTimelineDirty(hostId: string, agentId: string): void {
+    this.owner.fleetStore.markConversationDirty(hostId, agentId);
+  }
+
+  onVisibleGitDirty(hostId: string, cwd: string): void {
+    this.owner.handleSchedulerVisibleGitDirty(hostId, cwd);
+  }
+
+  onBackgroundGitDirty(hostId: string, cwd: string): void {
+    this.owner.handleSchedulerBackgroundGitDirty(hostId, cwd);
+  }
+
+  onVisibleTerminalDirty(hostId: string, slot: number): void {
+    this.owner.handleSchedulerVisibleTerminalDirty(hostId, slot);
+  }
+
+  onResync(): void {
+    this.owner.handleSchedulerResync();
+  }
+}
+
+class OrbitStoreStageDeltaAdapter implements OrbitStageDeltaAppliedCallback {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  onDeltaApplied(session: OrbitStageSession, delta: AgentStageDeltaDto): void {
+    this.owner.handleStageDeltaAppliedFromStore(session, delta);
+  }
+}
+
+class OrbitStoreComposerToastAdapter implements OrbitComposerToastSink {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  onDraftToast(message: string, isError: boolean): void {
+    this.owner.showToast(message, isError);
+  }
+}
+
 @ObservedV2
 export class OrbitHarmonyStore {
   private static instance: OrbitHarmonyStore | null = null;
   private bridge: OrbitCoreBridge | null = null;
-  private appContext: common.ApplicationContext | null = null;
   private prefsStore: OrbitPreferencesStore = new OrbitPreferencesStore();
   private voiceController: OrbitVoiceInputController = new OrbitVoiceInputController();
   private voiceTimerId: number = -1;
@@ -168,8 +305,21 @@ export class OrbitHarmonyStore {
   private pendingOpenHostId: string = '';
   private pendingOpenAgentId: string = '';
   private pendingOpenEventKind: string = '';
+  private pendingReplayHostId: string = '';
+  private pendingReplayAgentId: string = '';
+  private pendingReplayFramesJson: string = '';
+  private replayFinishTimerId: number = -1;
+  private gitDirty: boolean = false;
   private automationsRefreshSeq: number = 0;
   private sideQuestionGen: number = 0;
+
+  // Domain Stores (PR-1 composition root)
+  public readonly stageStore: OrbitStageStore = new OrbitStageStore();
+  public readonly fleetStore: OrbitFleetStore = new OrbitFleetStore();
+  public readonly personalAgentStore: OrbitPersonalAgentStore = new OrbitPersonalAgentStore();
+  public readonly composerStore: OrbitComposerStore = new OrbitComposerStore();
+  public readonly eventScheduler: OrbitEventFrameScheduler;
+
   @Trace public isNewSessionDraft: boolean = false;
   @Trace public keyProtectionMode: string = 'huks_hardware';
   @Trace public isFoldableDevice: boolean = false;
@@ -209,12 +359,6 @@ export class OrbitHarmonyStore {
   @Trace public showRouterMeshSheet: boolean = false;
   @Trace public showExportTranscriptSheet: boolean = false;
   @Trace public showSubagentSheet: boolean = false;
-  @Trace public overviewPendingApprovals: OverviewPendingApprovalItem[] = [];
-  @Trace public stagePendingPlanApproval: PendingPlanApprovalDto | null = null;
-  @Trace public stagePlanSteps: SessionPlanStepDto[] = [];
-  @Trace public stageSubagents: SessionSubagentEntryDto[] = [];
-  @Trace public stageHasOlderHistory: boolean = false;
-  @Trace public stageLoadingOlder: boolean = false;
   @Trace public activeSessionUsage: SessionUsageDto | null = null;
   @Trace public inspectedSubagentId: string = '';
   @Trace public inspectedSubagentTitle: string = '';
@@ -236,11 +380,6 @@ export class OrbitHarmonyStore {
   @Trace public globalSearchBusy: boolean = false;
   @Trace public globalSearchRemoteQueried: number = 0;
   @Trace public globalSearchRemoteFailed: number = 0;
-  @Trace public routerHosts: RouterHostCapabilitiesDto[] = [];
-  @Trace public activeRouterStatus: RouterStatusSnapshotDto | null = null;
-  @Trace public primaryRouterHostId: string = '';
-  @Trace public fleetMeshPeers: OrbitMeshPeerRow[] = [];
-  @Trace public routerMeshBusy: boolean = false;
   @Trace public deviceLinkUri: string = '';
   @Trace public githubDeviceFlow: GithubDeviceFlowStartDto | null = null;
   @Trace public pushSyncedHostIds: string[] = [];
@@ -254,19 +393,13 @@ export class OrbitHarmonyStore {
     include_message_preview: false
   };
   @Trace public scheduleRunsById: Record<string, ScheduleRunRecordDto[]> = {};
-  @Trace public sidebarProjectSort: string = 'recent';
-  @Trace public sidebarThreadFilter: string = 'all';
-  @Trace public sidebarSearchQuery: string = '';
   @Trace public collapsedProjectIds: string[] = [];
-  @Trace public sidebarView: FleetSidebarDto | null = null;
   @Trace public slashCommands: SlashCommandDto[] = [];
   private cachedFallbackCatalogs: ProviderModelCatalogDto[] = [];
   private diagramRenderCache: Map<string, RenderDiagramViewDto> = new Map<string, RenderDiagramViewDto>();
   private diagramRenderOrder: string[] = [];
   private pinnedThreadsFilePath: string = '';
   private draftPrefsFilePath: string = '';
-  private stageHostId: string = '';
-  private stageAgentId: string = '';
   @Trace public draftUseWorktree: boolean = false;
   @Trace public sideQuestionActive: boolean = false;
   @Trace public sideQuestionStreaming: boolean = false;
@@ -293,33 +426,17 @@ export class OrbitHarmonyStore {
   @Trace public pushStatusMessage: string = '';
   @Trace public notificationsEnabled: boolean = false;
 
-  // Multi-Host Fleet & Workspace State
+  // Multi-Host Fleet & Workspace Facade State
   @Trace public nativeAvailable: boolean = false;
-  @Trace public hosts: HostCardDto[] = [];
-  @Trace public projects: ClientProjectDto[] = [];
-  @Trace public totalPendingApprovals: number = 0;
-  @Trace public selectedHostId: string = '';
-  @Trace public currentHostDetail: HostDetailDto | null = null;
   @Trace public selectedAgentId: string = '';
   @Trace public currentAgent: AgentCardDto | null = null;
   @Trace public activeCwd: string = '~';
 
-  // Semantic Stage & Decision Dock State
-  @Trace public stageRevision: number = 0;
-  @Trace public stageTurns: StageTurnDto[] = [];
-  @Trace public pendingPermissions: TimelineItemDto[] = [];
-  @Trace public pendingQuestions: TimelineItemDto[] = [];
-  @Trace public sessionDiffs: DiffFileDto[] = [];
-  @Trace public expandedTurnKeys: string[] = [];
-  @Trace public expandedToolIds: string[] = [];
-
-  // OmniComposer & Context State
-  @Trace public composerText: string = '';
+  // OmniComposer & Context State (draft text & slash directive delegated to OrbitComposerStore)
   @Trace public composerProvider: string = 'antigravity';
   @Trace public composerModel: string = '';
   @Trace public composerEffort: string = '';
   @Trace public composerMode: string = 'accept_edits';
-  @Trace public activeSlashDirective: string = '';
   @Trace public composerBadges: PromptBadgeDto[] = [];
   @Trace public stagedAttachments: ComposerAttachmentItem[] = [];
   @Trace public inlineMentions: InlineMentionRegistration[] = [];
@@ -352,6 +469,243 @@ export class OrbitHarmonyStore {
   @Trace public toastRevision: number = 0;
   private toastTimerId: number = -1;
 
+  constructor() {
+    this.eventScheduler = new OrbitEventFrameScheduler(new OrbitStoreEventFlushAdapter(this));
+    this.stageStore.setDeltaAppliedCallback(new OrbitStoreStageDeltaAdapter(this));
+    this.composerStore.setToastSink(new OrbitStoreComposerToastAdapter(this));
+  }
+
+  public handleSchedulerFleetDirty(): void {
+    this.reloadFleetAsync();
+  }
+
+  public handleSchedulerSelectedHostDirty(hostId: string): void {
+    this.reloadHostAsync(hostId);
+    this.reloadWorkspaceFiles();
+  }
+
+  public handleSchedulerBackgroundHostDirty(): void {
+    this.refreshSidebarAsync();
+  }
+
+  public handleSchedulerVisibleTimelineDirty(hostId: string, agentId: string): void {
+    const session = this.stageStore.getOrCreateSession(hostId, agentId);
+    this.stageStore.fetchIncremental(session, this.stageTailLimit()).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'Incremental stage fetch failed', err);
+    });
+  }
+
+  public handleSchedulerVisibleGitDirty(_hostId: string, _cwd: string): void {
+    this.gitDirty = false;
+    this.reloadGitDiff(this.activeCwd);
+    this.reloadWorkspaceFiles();
+  }
+
+  public handleSchedulerBackgroundGitDirty(_hostId: string, _cwd: string): void {
+    this.gitDirty = true;
+  }
+
+  public handleSchedulerVisibleTerminalDirty(_hostId: string, _slot: number): void {
+    this.reloadTerminal();
+  }
+
+  public handleSchedulerResync(): void {
+    this.handleFullResync();
+  }
+
+  public handleStageDeltaAppliedFromStore(session: OrbitStageSession, delta: AgentStageDeltaDto): void {
+    this.onStageDeltaApplied(session, delta);
+  }
+
+  // Facade accessors delegating cleanly to domain sub-stores
+
+  public get hosts(): HostCardDto[] {
+    return this.fleetStore.hosts;
+  }
+
+  public get projects(): ClientProjectDto[] {
+    return this.fleetStore.projects;
+  }
+
+  public get totalPendingApprovals(): number {
+    return this.fleetStore.totalPendingApprovals;
+  }
+
+  public get selectedHostId(): string {
+    return this.fleetStore.selectedHostId;
+  }
+
+  public get currentHostDetail(): HostDetailDto | null {
+    return this.fleetStore.currentHostDetail;
+  }
+
+  public get sidebarView(): FleetSidebarDto | null {
+    return this.fleetStore.sidebarView;
+  }
+
+  public get sidebarProjectSort(): string {
+    return this.fleetStore.sidebarProjectSort;
+  }
+
+  public set sidebarProjectSort(val: string) {
+    this.fleetStore.sidebarProjectSort = val;
+  }
+
+  public get sidebarThreadFilter(): string {
+    return this.fleetStore.sidebarThreadFilter;
+  }
+
+  public set sidebarThreadFilter(val: string) {
+    this.fleetStore.sidebarThreadFilter = val;
+  }
+
+  public get sidebarSearchQuery(): string {
+    return this.fleetStore.sidebarSearchQuery;
+  }
+
+  public set sidebarSearchQuery(val: string) {
+    this.fleetStore.sidebarSearchQuery = val;
+  }
+
+  public get stageRevision(): number {
+    return this.stageStore.activeRevision;
+  }
+
+  public get activeStageTurnKey(): string {
+    return this.stageStore.activeTurnKey;
+  }
+
+  public get stageTurns(): OrbitStageTurnModel[] {
+    return this.stageStore.activeSession !== null
+      ? this.stageStore.activeSession.turns
+      : EMPTY_STAGE_TURNS;
+  }
+
+  public get pendingPermissions(): OrbitTimelineItemModel[] {
+    return this.stageStore.activeSession !== null
+      ? this.stageStore.activeSession.pendingPermissions
+      : EMPTY_TIMELINE_MODELS;
+  }
+
+  public get pendingQuestions(): OrbitTimelineItemModel[] {
+    return this.stageStore.activeSession !== null
+      ? this.stageStore.activeSession.pendingQuestions
+      : EMPTY_TIMELINE_MODELS;
+  }
+
+  public get stagePendingPlanApproval(): PendingPlanApprovalDto | null {
+    return this.stageStore.activePendingPlanApproval;
+  }
+
+  public get stagePlanSteps(): SessionPlanStepDto[] {
+    const insights = this.stageStore.activeSession?.insights ?? null;
+    return insights !== null && insights.plan_steps !== undefined
+      ? insights.plan_steps
+      : EMPTY_PLAN_STEPS;
+  }
+
+  public get stageSubagents(): SessionSubagentEntryDto[] {
+    const insights = this.stageStore.activeSession?.insights ?? null;
+    return insights !== null && insights.subagents !== undefined
+      ? insights.subagents
+      : EMPTY_SUBAGENTS;
+  }
+
+  public get stageHasOlderHistory(): boolean {
+    const sess = this.stageStore.activeSession;
+    return sess !== null ? (sess.hasOlderTurns || sess.hasOlderHistory) : false;
+  }
+
+  public get stageLoadingOlder(): boolean {
+    return this.stageStore.activeSession !== null ? this.stageStore.activeSession.loadingOlder : false;
+  }
+
+  public get sessionDiffs(): DiffFileDto[] {
+    return this.stageStore.activeSession !== null
+      ? this.stageStore.activeSession.sessionDiffs
+      : EMPTY_DIFF_FILES;
+  }
+
+  public get briefing(): PersonalAgentBriefingDto | null {
+    return this.personalAgentStore.briefing;
+  }
+
+  public get briefingNeedsYou(): BriefingDecisionDto[] {
+    return this.personalAgentStore.needsYou;
+  }
+
+  public get personalAgentActivity(): PersonalAgentActivityEntryDto[] {
+    return this.personalAgentStore.activity;
+  }
+
+  public get routerHosts(): RouterHostCapabilitiesDto[] {
+    return this.personalAgentStore.routerHosts;
+  }
+
+  public set routerHosts(val: RouterHostCapabilitiesDto[]) {
+    this.personalAgentStore.setRouterHosts(val);
+  }
+
+  public get activeRouterStatus(): RouterStatusSnapshotDto | null {
+    return this.personalAgentStore.activeRouterStatus;
+  }
+
+  public set activeRouterStatus(val: RouterStatusSnapshotDto | null) {
+    this.personalAgentStore.activeRouterStatus = val;
+  }
+
+  public get primaryRouterHostId(): string {
+    return this.personalAgentStore.primaryRouterHostId;
+  }
+
+  public set primaryRouterHostId(val: string) {
+    this.personalAgentStore.primaryRouterHostId = val;
+  }
+
+  public get fleetMeshPeers(): OrbitMeshPeerRow[] {
+    return this.personalAgentStore.fleetMeshPeers;
+  }
+
+  public set fleetMeshPeers(val: OrbitMeshPeerRow[]) {
+    this.personalAgentStore.fleetMeshPeers = val;
+  }
+
+  public get routerMeshBusy(): boolean {
+    return this.personalAgentStore.busy;
+  }
+
+  public set routerMeshBusy(val: boolean) {
+    this.personalAgentStore.busy = val;
+  }
+
+  public get composerText(): string {
+    return this.composerStore.text;
+  }
+
+  public set composerText(val: string) {
+    this.composerStore.setText(val);
+  }
+
+  public get activeSlashDirective(): string {
+    return this.composerStore.slashDirective;
+  }
+
+  public set activeSlashDirective(val: string) {
+    this.composerStore.setSlashDirective(val);
+  }
+
+  public flushComposerDraftNow(): void {
+    this.composerStore.flushNow();
+  }
+
+  public stageTailLimit(): number {
+    return resolveStageTailLimit(this.windowWidthVp);
+  }
+
+  public bindUIContext(ctx: UIContext | null): void {
+    this.eventScheduler.bindUIContext(ctx);
+  }
+
   public static getInstance(): OrbitHarmonyStore {
     if (OrbitHarmonyStore.instance === null) {
       OrbitHarmonyStore.instance = new OrbitHarmonyStore();
@@ -380,6 +734,12 @@ export class OrbitHarmonyStore {
     try {
       this.bridge = OrbitCoreBridge.openWithMasterKeyOrFallback(dbPath, masterKeyB64);
       this.nativeAvailable = true;
+      this.stageStore.bindBridge(this.bridge);
+      this.stageStore.setTailLimit(this.stageTailLimit());
+      this.fleetStore.bindBridge(this.bridge);
+      this.personalAgentStore.bindBridge(this.bridge);
+      this.composerStore.bindBridge(this.bridge);
+      this.composerStore.hydrate();
 
       if (!this.prefsStore.hasMigratedThreadPrefsV1()) {
         const legacyPinned = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
@@ -426,10 +786,11 @@ export class OrbitHarmonyStore {
         if (err !== null || payloadJson.length === 0) {
           return;
         }
-        this.handleCoreEvent(payloadJson);
+        this.eventScheduler.enqueue(payloadJson);
       });
       this.reloadFleet();
       this.refreshSidebar();
+      this.personalAgentStore.refreshBriefing(true);
       this.refreshCloudSyncStatus();
       this.bridge.connectAllHosts();
       if (this.pushToken.length > 0) {
@@ -441,6 +802,15 @@ export class OrbitHarmonyStore {
         this.pendingDeepLink = '';
         this.pendingDeepLinkEventKind = '';
         this.handleDeepLinkUri(uri, evKind);
+      }
+      if (this.pendingReplayFramesJson.length > 0) {
+        const rHost = this.pendingReplayHostId;
+        const rAgent = this.pendingReplayAgentId;
+        const rFrames = this.pendingReplayFramesJson;
+        this.pendingReplayHostId = '';
+        this.pendingReplayAgentId = '';
+        this.pendingReplayFramesJson = '';
+        this.startDebugStageReplay(rHost, rAgent, rFrames);
       }
     } catch (e) {
       this.nativeAvailable = false;
@@ -458,40 +828,24 @@ export class OrbitHarmonyStore {
   }
 
   public bindApplicationContext(ctx: common.ApplicationContext): void {
-    this.appContext = ctx;
+    orbitBindThemeApplicationContext(ctx);
   }
 
   public applyPersistedThemeMode(): void {
-    const saved = this.prefsStore.getThemeMode();
+    const saved = orbitNormalizeThemeMode(this.prefsStore.getThemeMode());
     this.themeMode = saved;
     this.palette = resolveOrbitPalette(this.themeMode, this.systemIsDark);
-    this.syncAppColorMode(saved);
-  }
-
-  private syncAppColorMode(normalized: string): void {
-    if (this.appContext === null) {
-      return;
-    }
-    try {
-      const targetMode = normalized === 'light'
-        ? ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT
-        : (normalized === 'dark'
-          ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
-          : ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
-      this.appContext.setColorMode(targetMode);
-    } catch (err) {
-      orbitLogWarn('OrbitStore', 'Failed to apply color mode', err as Object);
-    }
+    orbitSetThemeModePreference(saved);
+    orbitApplySystemBarTheme(this.palette.isDark);
   }
 
   public setThemeMode(mode: string): void {
-    const normalized = mode === 'light'
-      ? 'light'
-      : (mode === 'dark' || mode === 'graphite' || mode === 'oled' ? 'dark' : 'system');
+    const normalized = orbitNormalizeThemeMode(mode);
     this.themeMode = normalized;
     this.palette = resolveOrbitPalette(this.themeMode, this.systemIsDark);
     this.prefsStore.setThemeMode(normalized);
-    this.syncAppColorMode(normalized);
+    orbitSetThemeModePreference(normalized);
+    orbitApplySystemBarTheme(this.palette.isDark);
     this.triggerHaptic(8);
   }
 
@@ -524,6 +878,7 @@ export class OrbitHarmonyStore {
   }
 
   public onMemoryPressure(): void {
+    this.stageStore.trimBackgroundCaches();
     if (!this.showGitDiffSheet && !this.showInlineDiffInspector) {
       this.gitDiffFiles = [];
     }
@@ -541,7 +896,14 @@ export class OrbitHarmonyStore {
       clearInterval(this.voiceTimerId);
       this.voiceTimerId = -1;
     }
+    if (this.replayFinishTimerId !== -1) {
+      clearTimeout(this.replayFinishTimerId);
+      this.replayFinishTimerId = -1;
+    }
     this.voiceController.cancel();
+    this.composerStore.dispose();
+    this.personalAgentStore.dispose();
+    this.eventScheduler.dispose();
   }
 
   public updateFoldPosture(isFoldable: boolean, posture: string): void {
@@ -593,38 +955,24 @@ export class OrbitHarmonyStore {
   }
 
   public otherHostsPendingApprovals(): number {
-    let total = 0;
-    for (let i = 0; i < this.hosts.length; i++) {
-      if (this.hosts[i].host_id !== this.selectedHostId) {
-        total += this.hosts[i].pending_approval_count;
-      }
-    }
-    return total;
+    return this.fleetStore.otherHostsPendingApprovals();
   }
 
   public refreshSidebar(): void {
+    this.refreshSidebarAsync();
+  }
+
+  public refreshSidebarAsync(): void {
     if (this.bridge === null) {
       return;
     }
-    try {
-      const req: FleetSidebarRequestDto = {
-        sort: (this.sidebarProjectSort === 'name' || this.sidebarProjectSort === 'alphabetical')
-          ? 'alphabetical'
-          : 'recent',
-        filter: this.sidebarThreadFilter === 'active_unread' ? 'active_unread' : 'all',
-        query: this.sidebarSearchQuery,
-        active_host_id: this.selectedHostId.length > 0 ? this.selectedHostId : null,
-        active_agent_id: (!this.isNewSessionDraft && this.selectedAgentId.length > 0)
-          ? this.selectedAgentId
-          : null,
-        active_cwd: this.activeCwd.length > 0 ? this.activeCwd : null
-      };
-      this.sidebarView = JSON.parse(
-        this.bridge.fleetSidebarByRequestJson(JSON.stringify(req))
-      ) as FleetSidebarDto;
-    } catch (err) {
-      orbitLogWarn('OrbitStore', 'refreshSidebar failed', err as Object);
-    }
+    const activeAgent = (!this.isNewSessionDraft && this.selectedAgentId.length > 0)
+      ? this.selectedAgentId
+      : null;
+    const activeCwdArg = this.activeCwd.length > 0 ? this.activeCwd : null;
+    this.fleetStore.refreshSidebarAsync(activeAgent, activeCwdArg).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'refreshSidebarAsync failed', err);
+    });
   }
 
   public setSidebarSearchQuery(query: string): void {
@@ -792,6 +1140,7 @@ export class OrbitHarmonyStore {
     const prevWasExpanded = this.windowWidthVp >= OrbitTokens.BP_EXPANDED_MIN;
     const nextIsExpanded = widthVp >= OrbitTokens.BP_EXPANDED_MIN;
     this.windowWidthVp = widthVp;
+    this.stageStore.setTailLimit(resolveStageTailLimit(widthVp));
     if (prevWasPhone && !nextIsPhone) {
       this.sidebarOpen = !this.isSidebarCollapsed;
     } else if (!prevWasPhone && nextIsPhone) {
@@ -831,11 +1180,12 @@ export class OrbitHarmonyStore {
     if (this.bridge !== null) {
       try {
         this.bridge.onAppForeground();
-        this.reloadFleet();
+        this.reloadFleetAsync();
+        this.personalAgentStore.refreshBriefing(false);
         if (this.selectedHostId.length > 0) {
-          this.reloadHost(this.selectedHostId);
+          this.reloadHostAsync(this.selectedHostId);
         }
-        if (this.selectedAgentId.length > 0) {
+        if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
           this.reloadStage();
         }
       } catch (err) {
@@ -845,6 +1195,7 @@ export class OrbitHarmonyStore {
   }
 
   public onAppBackground(): void {
+    this.composerStore.flushNow();
     if (this.bridge !== null) {
       try {
         this.bridge.onAppBackground();
@@ -1066,44 +1417,68 @@ export class OrbitHarmonyStore {
     });
   }
 
-  // Core Event Loop
+  // Core Event Loop & Performance Replay Hooks
 
-  private handleCoreEvent(payloadJson: string): void {
+  private handleFullResync(): void {
+    this.reloadFleetAsync();
+    this.personalAgentStore.refreshBriefing(true);
+    if (this.selectedHostId.length > 0) {
+      this.reloadHostAsync(this.selectedHostId);
+    }
+    if (!this.isNewSessionDraft && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0) {
+      const session = this.stageStore.getOrCreateSession(this.selectedHostId, this.selectedAgentId);
+      this.stageStore.reloadFull(session, { limit: this.stageTailLimit() }, 'resync').catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'Resync stage reload failed', err);
+      });
+    }
+    if (this.showGitDiffSheet || this.showInlineDiffInspector) {
+      this.reloadGitDiff(this.activeCwd);
+    }
+    if (this.showPtySheet) {
+      this.reloadTerminal();
+    }
+  }
+
+  public scheduleDebugStageReplay(hostId: string, agentId: string, framesJson: string): void {
+    if (this.bridge === null) {
+      this.pendingReplayHostId = hostId;
+      this.pendingReplayAgentId = agentId;
+      this.pendingReplayFramesJson = framesJson;
+      return;
+    }
+    this.startDebugStageReplay(hostId, agentId, framesJson);
+  }
+
+  public startDebugStageReplay(hostId: string, agentId: string, framesJson: string): void {
+    if (this.bridge === null || hostId.length === 0 || agentId.length === 0) {
+      return;
+    }
+    if (this.replayFinishTimerId !== -1) {
+      clearTimeout(this.replayFinishTimerId);
+      this.replayFinishTimerId = -1;
+    }
+    this.fleetStore.injectSyntheticHostIfEmpty(hostId, 'Perf Replay');
+    this.fleetStore.setSelectedHostId(hostId);
+    this.showGlobalOverview = false;
+    this.isNewSessionDraft = false;
+    this.selectedAgentId = agentId;
+    this.stageStore.activateSession(hostId, agentId);
     try {
-      const ev = JSON.parse(payloadJson) as CoreNotificationDto;
-      if (ev.kind === 'fleet_changed') {
-        this.reloadFleet();
-        if (this.selectedHostId.length > 0) {
-          this.reloadHost(this.selectedHostId);
+      OrbitPerfProbe.mark('perf.replay_started');
+      this.bridge.debugReplayStageDeltasJson(hostId, agentId, framesJson);
+      // 500 frames @ 40 fps = 12.5s; flush OrbitPerf metrics and release replay state after 15.5s.
+      this.replayFinishTimerId = setTimeout((): void => {
+        this.replayFinishTimerId = -1;
+        OrbitPerfProbe.mark('perf.replay_finished');
+        OrbitPerfProbe.flushNow();
+        try {
+          this.bridge?.debugReplayStageDeltasJson(hostId, agentId, '[]');
+        } catch (_cleanupErr) {
+          // Ignore cleanup errors on shutdown
         }
-      } else if (ev.kind === 'host_changed') {
-        this.reloadFleet();
-        if (ev.host_id === this.selectedHostId && this.selectedHostId.length > 0) {
-          this.reloadHost(this.selectedHostId);
-          this.reloadWorkspaceFiles();
-        }
-      } else if (
-        ev.kind === 'timeline_changed' &&
-        ev.host_id === this.selectedHostId &&
-        ev.agent_id === this.selectedAgentId
-      ) {
-        this.reloadStage();
-      } else if (
-        ev.kind === 'git_changed' &&
-        ev.host_id === this.selectedHostId &&
-        this.selectedHostId.length > 0
-      ) {
-        this.reloadGitDiff(this.activeCwd);
-        this.reloadWorkspaceFiles();
-      } else if (
-        ev.kind === 'terminal_changed' &&
-        ev.host_id === this.selectedHostId &&
-        this.showPtySheet
-      ) {
-        this.reloadTerminal();
-      }
+      }, 15500);
     } catch (err) {
-      orbitLogWarn('OrbitStore', 'Malformed core notification payload', err as Object);
+      orbitLogWarn('OrbitStore', 'debugReplayStageDeltasJson failed', err as Object);
     }
   }
 
@@ -1113,39 +1488,51 @@ export class OrbitHarmonyStore {
     if (this.bridge === null) {
       return;
     }
-    try {
-      const snap = JSON.parse(this.bridge.fleetOverviewJson()) as FleetOverviewDto;
-      this.hosts = snap.hosts;
-      this.projects = snap.projects;
-      this.totalPendingApprovals = snap.total_pending_approvals;
-      if (this.pendingOpenHostId.length > 0) {
-        const targetHost = this.pendingOpenHostId;
-        const targetAgent = this.pendingOpenAgentId;
-        const targetEvent = this.pendingOpenEventKind;
-        this.pendingOpenHostId = '';
-        this.pendingOpenAgentId = '';
-        this.pendingOpenEventKind = '';
-        if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
-          this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent);
-        } else {
-          this.showToast('Host not found', true);
-          if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
-            this.selectHost(snap.hosts[0].host_id);
-          } else {
-            this.refreshSidebar();
-          }
-        }
-      } else if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
-        this.selectHost(snap.hosts[0].host_id);
+    const snap = this.fleetStore.reloadFleetSync();
+    if (snap !== null) {
+      this.onFleetOverviewLoaded(snap);
+    }
+  }
+
+  public reloadFleetAsync(): void {
+    if (this.bridge === null) {
+      return;
+    }
+    this.fleetStore.reloadFleetAsync().then((snap: FleetOverviewDto | null): void => {
+      if (snap !== null) {
+        this.onFleetOverviewLoaded(snap);
+      }
+    }).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'reloadFleetAsync failed', err);
+    });
+  }
+
+  private onFleetOverviewLoaded(snap: FleetOverviewDto): void {
+    if (this.pendingOpenHostId.length > 0) {
+      const targetHost = this.pendingOpenHostId;
+      const targetAgent = this.pendingOpenAgentId;
+      const targetEvent = this.pendingOpenEventKind;
+      this.pendingOpenHostId = '';
+      this.pendingOpenAgentId = '';
+      this.pendingOpenEventKind = '';
+      if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
+        this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent);
       } else {
-        this.refreshSidebar();
+        this.showToast('Host not found', true);
+        if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
+          this.selectHost(snap.hosts[0].host_id);
+        } else {
+          this.refreshSidebarAsync();
+        }
       }
-      this.refreshOverviewApprovals();
-      if (this.pushToken.length > 0) {
-        this.syncPushTokenToAllHosts(false);
-      }
-    } catch (e) {
-      this.lastError = (e as Error).message;
+    } else if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
+      this.selectHost(snap.hosts[0].host_id);
+    } else {
+      this.refreshSidebarAsync();
+    }
+    this.personalAgentStore.refreshBriefing(false);
+    if (this.pushToken.length > 0) {
+      this.syncPushTokenToAllHosts(false);
     }
   }
 
@@ -1344,21 +1731,15 @@ export class OrbitHarmonyStore {
     if (hostId.length === 0) {
       return;
     }
-    const changed = this.selectedHostId !== hostId;
-    this.selectedHostId = hostId;
+    const changed = this.fleetStore.setSelectedHostId(hostId);
     if (changed) {
       this.automationsRefreshSeq += 1;
       this.sideQuestionGen += 1;
       this.sideQuestionStreaming = false;
       this.selectedAgentId = '';
       this.currentAgent = null;
-      this.stageRevision = 0;
-      this.stageHostId = '';
-      this.stageAgentId = '';
-      this.stageTurns = [];
-      this.pendingPermissions = [];
-      this.pendingQuestions = [];
-      this.sessionDiffs = [];
+      this.stageStore.clearActiveSession();
+      this.composerStore.setActiveScope(hostId, '');
       this.schedules = [];
       this.conditionalTimers = [];
       this.goalRuns = [];
@@ -1368,8 +1749,8 @@ export class OrbitHarmonyStore {
       this.resetWorkspaceBoardState();
       this.syncActiveQueuedPrompts();
     }
-    this.reloadHost(hostId);
-    this.refreshSidebar();
+    this.reloadHostAsync(hostId);
+    this.refreshSidebarAsync();
     if (this.bridge !== null) {
       this.bridge.connectHost(hostId);
       this.bridge.refreshHost(hostId);
@@ -1382,12 +1763,30 @@ export class OrbitHarmonyStore {
     if (this.bridge === null || hostId.length === 0) {
       return;
     }
-    try {
-      const detail = JSON.parse(this.bridge.hostDetailJson(hostId)) as HostDetailDto | null;
-      this.currentHostDetail = detail;
-      if (detail === null) {
-        return;
+    const detail = this.fleetStore.reloadHostSync(hostId);
+    if (detail !== null) {
+      this.onHostDetailLoaded(hostId, detail);
+    }
+  }
+
+  public reloadHostAsync(hostId: string): void {
+    if (this.bridge === null || hostId.length === 0) {
+      return;
+    }
+    this.fleetStore.reloadHostAsync(hostId).then((detail: HostDetailDto | null): void => {
+      if (detail !== null && hostId === this.selectedHostId) {
+        this.onHostDetailLoaded(hostId, detail);
       }
+    }).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'reloadHostAsync failed', err);
+    });
+  }
+
+  private onHostDetailLoaded(hostId: string, detail: HostDetailDto): void {
+    if (this.bridge === null) {
+      return;
+    }
+    try {
       this.schedules = detail.schedules ?? [];
       this.conditionalTimers = detail.conditional_timers ?? [];
       this.goalRuns = detail.goal_runs ?? [];
@@ -1402,7 +1801,8 @@ export class OrbitHarmonyStore {
       if (this.selectedAgentId.startsWith('opt_') && replacedId !== null && replacedId.length > 0) {
         const stillHasOpt = detail.agents.some((a: AgentCardDto) => a.agent_id === this.selectedAgentId);
         if (!stillHasOpt) {
-          const oldKey = this.agentQueueKey(hostId, this.selectedAgentId);
+          const oldOptId = this.selectedAgentId;
+          const oldKey = this.agentQueueKey(hostId, oldOptId);
           const newAgentId = replacedId;
           const newKey = this.agentQueueKey(hostId, newAgentId);
           const pendingQueue = this.queuedPromptsByAgent.get(oldKey);
@@ -1411,8 +1811,11 @@ export class OrbitHarmonyStore {
             this.queuedPromptsByAgent.delete(oldKey);
             this.queuedPromptsByAgent.set(newKey, existing.concat(pendingQueue));
           }
+          this.composerStore.remapScope(hostId, oldOptId, hostId, newAgentId);
+          this.stageStore.dropSession(hostId, oldOptId);
           this.selectedAgentId = newAgentId;
           this.isNewSessionDraft = false;
+          this.stageStore.activateSession(hostId, newAgentId);
           this.syncActiveQueuedPrompts();
           this.bridge.openAgentTimeline(hostId, this.selectedAgentId);
           this.reloadStage();
@@ -1465,13 +1868,13 @@ export class OrbitHarmonyStore {
           }
         }
       }
-      this.refreshSidebar();
+      this.refreshSidebarAsync();
 
       for (let i = 0; i < detail.agents.length; i++) {
         this.drainQueuedPromptsForAgentIfIdle(hostId, detail.agents[i]);
       }
     } catch (e) {
-      orbitLogWarn('OrbitStore', 'reloadHost failed', e as Object);
+      orbitLogWarn('OrbitStore', 'onHostDetailLoaded failed', e as Object);
     }
   }
 
@@ -1507,21 +1910,9 @@ export class OrbitHarmonyStore {
     this.isNewSessionDraft = true;
     this.selectedAgentId = '';
     this.currentAgent = null;
-    this.stageRevision = 0;
-    this.stageHostId = '';
-    this.stageAgentId = '';
-    this.stageTurns = [];
-    this.pendingPermissions = [];
-    this.pendingQuestions = [];
-    this.stagePendingPlanApproval = null;
-    this.stagePlanSteps = [];
-    this.stageSubagents = [];
-    this.stageHasOlderHistory = false;
-    this.stageLoadingOlder = false;
+    this.stageStore.clearActiveSession();
+    this.composerStore.setActiveScope(this.selectedHostId, '');
     this.activeSessionUsage = null;
-    this.sessionDiffs = [];
-    this.expandedTurnKeys = [];
-    this.expandedToolIds = [];
     this.syncDefaultModelAndEffort(this.composerProvider);
     this.syncActiveQueuedPrompts();
     if (cwd !== undefined && cwd.length > 0) {
@@ -1531,7 +1922,7 @@ export class OrbitHarmonyStore {
     } else {
       this.resetWorkspaceBoardState();
     }
-    this.refreshSidebar();
+    this.refreshSidebarAsync();
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
@@ -1545,13 +1936,12 @@ export class OrbitHarmonyStore {
     this.showGlobalOverview = false;
     this.isNewSessionDraft = false;
     this.selectedAgentId = agentId;
-    this.expandedTurnKeys = [];
-    this.expandedToolIds = [];
-    this.stagePendingPlanApproval = null;
-    this.stagePlanSteps = [];
-    this.stageSubagents = [];
-    this.stageHasOlderHistory = false;
     this.activeSessionUsage = null;
+    if (this.selectedHostId.length > 0) {
+      this.fleetStore.clearConversationDirty(this.selectedHostId, agentId);
+      this.composerStore.setActiveScope(this.selectedHostId, agentId);
+      this.stageStore.activateSession(this.selectedHostId, agentId);
+    }
     if (this.bridge !== null && this.selectedHostId.length > 0) {
       const agents = this.currentHostDetail?.agents ?? [];
       let matchedSeq = 0;
@@ -1577,154 +1967,101 @@ export class OrbitHarmonyStore {
       } else {
         this.resetWorkspaceBoardState();
       }
-      this.refreshSidebar();
+      this.refreshSidebarAsync();
     }
     this.triggerHaptic(8);
   }
 
-  public reloadStage(): void {
+  public reloadStage(forceFull: boolean = false): void {
     if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
-    try {
-      const sameStage =
-        this.stageHostId === this.selectedHostId &&
-        this.stageAgentId === this.selectedAgentId;
-      const sinceRev = sameStage ? this.stageRevision : 0;
-      let delta = JSON.parse(
-        this.bridge.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, sinceRev)
-      ) as AgentStageDeltaDto;
-      if (
-        !delta.reset &&
-        sinceRev > 0 &&
-        delta.replace_from_turn_index > this.stageTurns.length
-      ) {
-        delta = JSON.parse(
-          this.bridge.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, 0)
-        ) as AgentStageDeltaDto;
-      }
+    const session = this.stageStore.activateSession(this.selectedHostId, this.selectedAgentId);
+    if (session === null) {
+      return;
+    }
+    const limit = this.stageTailLimit();
+    if (forceFull) {
+      this.stageStore.reloadFull(session, { limit: limit }, 'reload').catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'reloadStage full failed', err);
+      });
+    } else {
+      this.stageStore.fetchIncremental(session, limit).catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'reloadStage incremental failed', err);
+      });
+    }
+  }
 
-      if (delta.reset || !sameStage || delta.replace_from_turn_index === 0) {
-        this.stageTurns = delta.changed_turns;
-      } else {
-        const prefix = this.stageTurns.slice(0, delta.replace_from_turn_index);
-        this.stageTurns = prefix.concat(delta.changed_turns);
+  private onStageDeltaApplied(session: OrbitStageSession, delta: AgentStageDeltaDto): void {
+    if (
+      this.bridge === null ||
+      session.hostId !== this.selectedHostId ||
+      session.agentId !== this.selectedAgentId
+    ) {
+      return;
+    }
+    if (delta.agent !== null) {
+      const prevAgent = this.currentAgent;
+      const modelChanged =
+        prevAgent === null ||
+        prevAgent.agent_id !== delta.agent.agent_id ||
+        prevAgent.provider !== delta.agent.provider ||
+        prevAgent.model !== delta.agent.model ||
+        prevAgent.effort !== delta.agent.effort;
+      this.currentAgent = delta.agent;
+      if (this.activeCwd !== delta.agent.cwd) {
+        this.activeCwd = delta.agent.cwd;
       }
-
-      this.stageHostId = delta.host_id;
-      this.stageAgentId = delta.agent !== null ? delta.agent.agent_id : this.selectedAgentId;
-      this.stageRevision = delta.revision;
-      this.pendingPermissions = delta.pending_permissions;
-      this.pendingQuestions = delta.pending_questions;
-      this.stagePendingPlanApproval = delta.pending_plan_approval ?? null;
-      this.stageHasOlderHistory = delta.has_older_history === true || delta.has_older_turns === true;
-      this.stageLoadingOlder = false;
-      if (!delta.aux_unchanged) {
-        this.sessionDiffs = delta.session_turn_diffs;
-        if (delta.insights !== undefined) {
-          this.stagePlanSteps = delta.insights.plan_steps ?? [];
-          this.stageSubagents = delta.insights.subagents ?? [];
-        } else {
-          this.stagePlanSteps = [];
-          this.stageSubagents = [];
+      if (modelChanged) {
+        this.composerProvider = delta.agent.provider;
+        const resolved = this.resolveDefaultModelAndEffort(
+          delta.agent.provider,
+          delta.agent.model ?? '',
+          delta.agent.effort ?? ''
+        );
+        this.composerModel = (
+          delta.agent.model !== null &&
+          delta.agent.model !== undefined &&
+          delta.agent.model.trim().length > 0 &&
+          resolved.model.length === 0
+        )
+          ? delta.agent.model
+          : resolved.model;
+        this.composerEffort = (
+          delta.agent.effort !== null &&
+          delta.agent.effort !== undefined &&
+          delta.agent.effort.trim().length > 0 &&
+          resolved.effort.length === 0
+        )
+          ? delta.agent.effort
+          : resolved.effort;
+      }
+      const nextMode = normalizeModeSlug(delta.agent.mode);
+      if (this.composerMode !== nextMode) {
+        this.composerMode = nextMode;
+      }
+      const nextFast = delta.agent.fast_mode === true;
+      if (this.composerFastMode !== nextFast) {
+        this.composerFastMode = nextFast;
+      }
+      if (!this.isNewSessionDraft && this.selectedAgentId === delta.agent.agent_id) {
+        this.bridge.markAgentSeen(
+          this.selectedHostId,
+          delta.agent.agent_id,
+          Math.max(delta.agent.latest_seq, delta.latest_seq)
+        );
+        if (!delta.agent.is_running) {
+          this.refreshSidebarAsync();
         }
       }
-
-      if (delta.agent !== null) {
-        const prevAgent = this.currentAgent;
-        const modelChanged =
-          prevAgent === null ||
-          prevAgent.agent_id !== delta.agent.agent_id ||
-          prevAgent.provider !== delta.agent.provider ||
-          prevAgent.model !== delta.agent.model ||
-          prevAgent.effort !== delta.agent.effort;
-        this.currentAgent = delta.agent;
-        if (this.activeCwd !== delta.agent.cwd) {
-          this.activeCwd = delta.agent.cwd;
-        }
-        if (modelChanged) {
-          this.composerProvider = delta.agent.provider;
-          const resolved = this.resolveDefaultModelAndEffort(
-            delta.agent.provider,
-            delta.agent.model ?? '',
-            delta.agent.effort ?? ''
-          );
-          this.composerModel = (
-            delta.agent.model !== null &&
-            delta.agent.model !== undefined &&
-            delta.agent.model.trim().length > 0 &&
-            resolved.model.length === 0
-          )
-            ? delta.agent.model
-            : resolved.model;
-          this.composerEffort = (
-            delta.agent.effort !== null &&
-            delta.agent.effort !== undefined &&
-            delta.agent.effort.trim().length > 0 &&
-            resolved.effort.length === 0
-          )
-            ? delta.agent.effort
-            : resolved.effort;
-        }
-        const nextMode = normalizeModeSlug(delta.agent.mode);
-        if (this.composerMode !== nextMode) {
-          this.composerMode = nextMode;
-        }
-        const nextFast = delta.agent.fast_mode === true;
-        if (this.composerFastMode !== nextFast) {
-          this.composerFastMode = nextFast;
-        }
-        if (!this.isNewSessionDraft && this.selectedAgentId === delta.agent.agent_id) {
-          this.bridge.markAgentSeen(
-            this.selectedHostId,
-            delta.agent.agent_id,
-            Math.max(delta.agent.latest_seq, delta.latest_seq)
-          );
-          if (!delta.agent.is_running) {
-            this.refreshSidebar();
-          }
-        }
-        this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, delta.agent);
-      } else if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
-        this.bridge.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
-      }
-    } catch (e) {
-      orbitLogWarn('OrbitStore', 'reloadStage failed', e as Object);
+      this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, delta.agent);
+    } else if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
+      this.bridge.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
     }
   }
 
   public describeToolStepFallback(item: TimelineItemDto): ToolStepDescriptorDto | null {
     return item.step_descriptor ?? null;
-  }
-
-  // Turn & Step Fold Toggles
-
-  public isTurnExpanded(turnKey: string): boolean {
-    return this.expandedTurnKeys.indexOf(turnKey) >= 0;
-  }
-
-  public toggleTurnExpanded(turnKey: string): void {
-    const idx = this.expandedTurnKeys.indexOf(turnKey);
-    if (idx >= 0) {
-      this.expandedTurnKeys = this.expandedTurnKeys.filter((k: string) => k !== turnKey);
-    } else {
-      this.expandedTurnKeys = this.expandedTurnKeys.concat([turnKey]);
-    }
-    this.triggerHaptic(8);
-  }
-
-  public isToolExpanded(callId: string): boolean {
-    return this.expandedToolIds.indexOf(callId) >= 0;
-  }
-
-  public toggleToolExpanded(callId: string): void {
-    const idx = this.expandedToolIds.indexOf(callId);
-    if (idx >= 0) {
-      this.expandedToolIds = this.expandedToolIds.filter((k: string) => k !== callId);
-    } else {
-      this.expandedToolIds = this.expandedToolIds.concat([callId]);
-    }
-    this.triggerHaptic(6);
   }
 
   // Pairing, Host Configuration & Projects
@@ -1849,12 +2186,13 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.removeHost(hostId);
+      this.fleetStore.removeCachedHost(hostId);
       if (this.selectedHostId === hostId) {
-        this.selectedHostId = '';
-        this.currentHostDetail = null;
+        this.fleetStore.setSelectedHostId('');
         this.selectedAgentId = '';
         this.currentAgent = null;
-        this.stageTurns = [];
+        this.stageStore.clearActiveSession();
+        this.composerStore.setActiveScope('', '');
       }
       this.reloadFleet();
     } catch (e) {
@@ -2609,9 +2947,14 @@ export class OrbitHarmonyStore {
     if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
       return false;
     }
-    const turnActive = this.stageTurns.some((t: StageTurnDto) => t.has_active_item);
-    if (turnActive) {
+    if (this.stageStore.activeTurnKey.length > 0) {
       return true;
+    }
+    const turns = this.stageTurns;
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i].hasActiveItem) {
+        return true;
+      }
     }
     if (this.currentAgent === null) {
       return false;
@@ -2924,8 +3267,7 @@ export class OrbitHarmonyStore {
     }
     this.syncActiveQueuedPrompts();
 
-    this.composerText = '';
-    this.activeSlashDirective = '';
+    this.composerStore.clearActiveDraft(true);
     this.composerBadges = [];
     this.stagedAttachments = [];
     this.inlineMentions = [];
@@ -3221,15 +3563,17 @@ export class OrbitHarmonyStore {
           auto_cluster: null
         };
         const optId = this.bridge.createSessionJson(JSON.stringify(createReq));
+        this.composerStore.clearActiveDraft(true);
         this.selectedAgentId = optId;
         this.isNewSessionDraft = false;
+        this.composerStore.setActiveScope(this.selectedHostId, optId);
+        this.stageStore.activateSession(this.selectedHostId, optId);
         this.syncActiveQueuedPrompts();
-        this.reloadHost(this.selectedHostId);
+        this.reloadHostAsync(this.selectedHostId);
         this.reloadStage();
       }
       if (overridePrompt === undefined) {
-        this.composerText = '';
-        this.activeSlashDirective = '';
+        this.composerStore.clearActiveDraft(true);
         this.composerBadges = [];
         this.stagedAttachments = [];
         this.inlineMentions = [];
@@ -4899,122 +5243,50 @@ export class OrbitHarmonyStore {
     }
   }
 
-  // 8. Global Personal Agent Overview & Safe Batch Approval
+  // 8. Global Personal Agent Briefing & Safe Batch Approval
 
   public openGlobalOverview(): void {
     this.showGlobalOverview = true;
-    this.refreshOverviewApprovals();
+    this.personalAgentStore.refreshBriefing(true);
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
     this.triggerHaptic(6);
   }
 
-  private isLowRiskPermissionItem(item: TimelineItemDto): boolean {
-    const det = item.detail;
-    if (det === undefined) {
-      return false;
-    }
-    const kind = det.kind.toLowerCase();
-    if (kind === 'file_read' || kind === 'read' || kind === 'search' || kind === 'glob' || kind === 'grep') {
-      return true;
-    }
-    if (kind === 'shell' && (det.command ?? '').length > 0) {
-      const cmd = (det.command ?? '').trim().toLowerCase();
-      if (
-        cmd.indexOf('rm ') >= 0 ||
-        cmd.indexOf('sudo ') >= 0 ||
-        cmd.indexOf('git push') >= 0 ||
-        cmd.indexOf('git reset') >= 0 ||
-        cmd.indexOf('curl ') >= 0 ||
-        cmd.indexOf('chmod ') >= 0
-      ) {
-        return false;
-      }
-      return cmd.startsWith('git status') ||
-        cmd.startsWith('git diff') ||
-        cmd.startsWith('ls') ||
-        cmd.startsWith('cat ') ||
-        cmd.startsWith('cargo test') ||
-        cmd.startsWith('npm test');
-    }
-    return false;
+  public refreshPersonalAgentBriefing(force: boolean = false): void {
+    this.personalAgentStore.refreshBriefing(force);
   }
 
-  public refreshOverviewApprovals(): void {
-    if (this.bridge === null) {
-      this.overviewPendingApprovals = [];
+  public async refreshPersonalAgentActivity(
+    hostId?: string,
+    limit: number = 50,
+    sinceMs: number | null = null,
+    force: boolean = false
+  ): Promise<void> {
+    const targetHost = (hostId !== undefined && hostId.trim().length > 0)
+      ? hostId.trim()
+      : (this.primaryRouterHostId.length > 0 ? this.primaryRouterHostId : this.selectedHostId);
+    if (targetHost.length === 0) {
       return;
     }
-    const collected: OverviewPendingApprovalItem[] = [];
-    for (let hIdx = 0; hIdx < this.hosts.length; hIdx++) {
-      const host = this.hosts[hIdx];
-      if (host.pending_approval_count <= 0) {
-        continue;
-      }
-      try {
-        const detail = JSON.parse(this.bridge.hostDetailJson(host.host_id)) as HostDetailDto;
-        for (let aIdx = 0; aIdx < detail.agents.length; aIdx++) {
-          const ag = detail.agents[aIdx];
-          if (!ag.is_awaiting_permission) {
-            continue;
-          }
-          try {
-            const stage = JSON.parse(
-              this.bridge.agentStageDeltaJson(host.host_id, ag.agent_id, 0)
-            ) as AgentStageDeltaDto;
-            for (let pIdx = 0; pIdx < stage.pending_permissions.length; pIdx++) {
-              const perm = stage.pending_permissions[pIdx];
-              const reqId = perm.request_id ?? '';
-              if (reqId.length === 0) {
-                continue;
-              }
-              let preview = perm.title ?? 'Tool approval';
-              if (perm.detail !== undefined) {
-                if ((perm.detail.command ?? '').length > 0) {
-                  preview = `$ ${perm.detail.command ?? ''}`;
-                } else if ((perm.detail.path ?? '').length > 0) {
-                  preview = perm.detail.path ?? '';
-                } else if ((perm.detail.tool_name ?? '').length > 0) {
-                  preview = perm.detail.tool_name ?? '';
-                }
-              }
-              collected.push({
-                key: `${host.host_id}::${ag.agent_id}::${reqId}`,
-                host_id: host.host_id,
-                host_name: host.display_name,
-                agent_id: ag.agent_id,
-                agent_title: ag.title.trim().length > 0 ? ag.title.trim() : ag.provider_label,
-                request_id: reqId,
-                title: perm.title ?? 'Approval Required',
-                target_preview: preview,
-                is_low_risk: this.isLowRiskPermissionItem(perm)
-              });
-            }
-          } catch (_stageErr) {
-            // Skip unloaded agent stage gracefully
-          }
-        }
-      } catch (_hostErr) {
-        // Skip host detail error
-      }
-    }
-    this.overviewPendingApprovals = collected;
+    await this.personalAgentStore.refreshActivity(targetHost, limit, sinceMs, force);
   }
 
-  public resolveSingleOverviewApproval(item: OverviewPendingApprovalItem, decision: string): void {
-    if (this.bridge === null) {
+  public resolveBriefingDecision(item: BriefingDecisionDto, decision: string): void {
+    if (this.bridge === null || item.request_id === null || item.request_id.length === 0) {
       return;
     }
     try {
       this.bridge.resolvePermission(item.host_id, item.agent_id, item.request_id, decision);
       this.triggerHaptic(10);
-      this.reloadFleet();
+      this.reloadFleetAsync();
+      this.personalAgentStore.refreshBriefing(true);
       if (this.selectedHostId === item.host_id && this.selectedAgentId === item.agent_id) {
         this.reloadStage();
       }
     } catch (err) {
-      orbitLogWarn('OrbitStore', 'resolveSingleOverviewApproval failed', err as Object);
+      orbitLogWarn('OrbitStore', 'resolveBriefingDecision failed', err as Object);
       this.showToast((err as Error).message || 'Approval failed', true);
     }
   }
@@ -5023,10 +5295,11 @@ export class OrbitHarmonyStore {
     if (this.bridge === null) {
       return;
     }
+    const decisions = this.personalAgentStore.needsYou;
     const byHost: Map<string, PermissionBatchItemDto[]> = new Map<string, PermissionBatchItemDto[]>();
-    for (let i = 0; i < this.overviewPendingApprovals.length; i++) {
-      const item = this.overviewPendingApprovals[i];
-      if (!item.is_low_risk) {
+    for (let i = 0; i < decisions.length; i++) {
+      const item = decisions[i];
+      if (!item.batch_eligible || item.human_only || item.request_id === null || item.request_id.length === 0) {
         continue;
       }
       const existing = byHost.get(item.host_id) ?? [];
@@ -5037,7 +5310,7 @@ export class OrbitHarmonyStore {
       byHost.set(item.host_id, existing);
     }
     if (byHost.size === 0) {
-      this.showToast('No low-risk approvals eligible for batch approve', false);
+      this.showToast('No batch-eligible approvals available', false);
       return;
     }
     let resolvedTotal = 0;
@@ -5055,7 +5328,8 @@ export class OrbitHarmonyStore {
         orbitLogWarn('OrbitStore', `resolvePermissionsBatchJson failed on ${hid}`, err as Object);
       }
     }
-    this.reloadFleet();
+    this.reloadFleetAsync();
+    this.personalAgentStore.refreshBriefing(true);
     if (this.selectedAgentId.length > 0) {
       this.reloadStage();
     }
@@ -5174,32 +5448,16 @@ export class OrbitHarmonyStore {
 
   // 10. Stage Tail Pagination, Plan Approval, Subagents, Stall Recovery & Usage
 
-  public loadOlderHistory(): void {
-    if (
-      this.bridge === null ||
-      this.selectedHostId.length === 0 ||
-      this.selectedAgentId.length === 0 ||
-      this.stageLoadingOlder
-    ) {
-      return;
+  public loadOlderHistory(): number {
+    const active = this.stageStore.activeSession;
+    if (active === null || active.loadingOlder) {
+      return 0;
     }
-    this.stageLoadingOlder = true;
-    try {
-      const requested = this.bridge.loadOlderAgentTimeline(
-        this.selectedHostId,
-        this.selectedAgentId,
-        120
-      );
-      if (!requested) {
-        this.stageLoadingOlder = false;
-        this.stageHasOlderHistory = false;
-      } else {
-        this.triggerHaptic(6);
-      }
-    } catch (err) {
-      this.stageLoadingOlder = false;
-      orbitLogWarn('OrbitStore', 'loadOlderAgentTimeline failed', err as Object);
+    const inserted = this.stageStore.loadOlder(active);
+    if (inserted > 0) {
+      this.triggerHaptic(6);
     }
+    return inserted;
   }
 
   public async resolvePlanApproval(
@@ -5226,7 +5484,10 @@ export class OrbitHarmonyStore {
         feedback,
         JSON.stringify(targetMode)
       );
-      this.stagePendingPlanApproval = null;
+      if (this.stageStore.activeSession !== null) {
+        this.stageStore.activeSession.pendingPlanApproval = null;
+      }
+      this.stageStore.activePendingPlanApproval = null;
       this.reloadStage();
       this.showToast(
         action === 'approve_and_build'

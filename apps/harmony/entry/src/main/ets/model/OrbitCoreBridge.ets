@@ -8,13 +8,49 @@ export interface OrbitBridgeOpenOutcome {
   usedMasterKey: boolean;
 }
 
+export interface OrbitStageBridge {
+  agentStageDeltaByRequestJsonAsync(reqJson: string): Promise<string>;
+  agentStageTurnsSliceJson(
+    hostId: string,
+    agentId: string,
+    startTurnIndex: number,
+    count: number
+  ): string;
+  loadOlderAgentTimeline(hostId: string, agentId: string, limitEvents: number): boolean;
+}
+
+export interface OrbitFleetBridge {
+  fleetOverviewJson(): string;
+  fleetOverviewJsonAsync(): Promise<string>;
+  hostDetailJson(hostId: string): string;
+  hostDetailJsonAsync(hostId: string): Promise<string>;
+  fleetSidebarByRequestJson(reqJson: string): string;
+  fleetSidebarByRequestJsonAsync(reqJson: string): Promise<string>;
+}
+
+export interface OrbitPersonalAgentBridge {
+  personalAgentBriefingJson(primaryRouterHostId?: string | null): string;
+  listPersonalAgentActivityJson(
+    hostId: string,
+    limit: number,
+    sinceMs?: number | null
+  ): Promise<string>;
+}
+
+export interface OrbitComposerDraftBridge {
+  getComposerDraftJson(draftKey: string): string | null;
+  setComposerDraft(draftKey: string, draftJson: string): void;
+  deleteComposerDraft(draftKey: string): void;
+}
+
 /**
  * Thin ArkTS V2 bridge around the N-API exports in `liborbit_ohos.so`.
  * Keeps FFI lifecycle, UTF-8 byte encoding, HUKS-backed database opening, and
  * `OrbitPerfProbe` instrumentation centralized in a single boundary layer while
  * keeping Rust `orbit-client-core` as the single ViewModel layer.
  */
-export class OrbitCoreBridge {
+export class OrbitCoreBridge
+  implements OrbitStageBridge, OrbitFleetBridge, OrbitPersonalAgentBridge, OrbitComposerDraftBridge {
   private readonly core: OrbitHarmonyCore;
   public readonly usedMasterKey: boolean;
 
@@ -168,15 +204,33 @@ export class OrbitCoreBridge {
     });
   }
 
+  public async fleetOverviewJsonAsync(): Promise<string> {
+    return await this.traceJsonAsync('fleetOverviewJsonAsync', async (): Promise<string> => {
+      return await this.core.fleetOverviewJsonAsync();
+    });
+  }
+
   public hostDetailJson(hostId: string): string {
     return this.traceJsonSync('hostDetailJson', (): string => {
       return this.core.hostDetailJson(hostId);
     });
   }
 
+  public async hostDetailJsonAsync(hostId: string): Promise<string> {
+    return await this.traceJsonAsync('hostDetailJsonAsync', async (): Promise<string> => {
+      return await this.core.hostDetailJsonAsync(hostId);
+    });
+  }
+
   public fleetSidebarByRequestJson(reqJson: string): string {
     return this.traceJsonSync('fleetSidebarByRequestJson', (): string => {
       return this.core.fleetSidebarByRequestJson(reqJson);
+    });
+  }
+
+  public async fleetSidebarByRequestJsonAsync(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('fleetSidebarByRequestJsonAsync', async (): Promise<string> => {
+      return await this.core.fleetSidebarByRequestJsonAsync(reqJson);
     });
   }
 
@@ -202,6 +256,57 @@ export class OrbitCoreBridge {
   public agentStageDeltaByRequestJson(reqJson: string): string {
     return this.traceJsonSync('agentStageDeltaByRequestJson', (): string => {
       return this.core.agentStageDeltaByRequestJson(reqJson);
+    });
+  }
+
+  public async agentStageDeltaByRequestJsonAsync(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('agentStageDeltaByRequestJsonAsync', async (): Promise<string> => {
+      return await this.core.agentStageDeltaByRequestJsonAsync(reqJson);
+    });
+  }
+
+  public agentStageTurnsSliceJson(
+    hostId: string,
+    agentId: string,
+    startTurnIndex: number,
+    count: number
+  ): string {
+    return this.traceJsonSync('agentStageTurnsSliceJson', (): string => {
+      return this.core.agentStageTurnsSliceJson(hostId, agentId, startTurnIndex, count);
+    });
+  }
+
+  public personalAgentBriefingJson(primaryRouterHostId?: string | null): string {
+    return this.traceJsonSync('personalAgentBriefingJson', (): string => {
+      return this.core.personalAgentBriefingJson(primaryRouterHostId ?? null);
+    });
+  }
+
+  public async listPersonalAgentActivityJson(
+    hostId: string,
+    limit: number,
+    sinceMs?: number | null
+  ): Promise<string> {
+    return await this.traceJsonAsync('listPersonalAgentActivityJson', async (): Promise<string> => {
+      return await this.core.listPersonalAgentActivityJson(hostId, limit, sinceMs ?? null);
+    });
+  }
+
+  public getComposerDraftJson(draftKey: string): string | null {
+    return this.traceNullableStringSync('getComposerDraftJson', (): string | null => {
+      return this.core.getComposerDraftJson(draftKey);
+    });
+  }
+
+  public setComposerDraft(draftKey: string, draftJson: string): void {
+    this.traceVoidSync('setComposerDraft', draftJson.length, (): void => {
+      this.core.setComposerDraft(draftKey, draftJson);
+    });
+  }
+
+  public deleteComposerDraft(draftKey: string): void {
+    this.traceVoidSync('deleteComposerDraft', 0, (): void => {
+      this.core.deleteComposerDraft(draftKey);
     });
   }
 

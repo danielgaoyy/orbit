@@ -1,11 +1,17 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { display, FrameCallback, KeyboardAvoidMode, ThemeControl, window } from '@kit.ArkUI';
+import { fileIo } from '@kit.CoreFileKit';
 import { connection } from '@kit.NetworkKit';
 import { OrbitHarmonyStore } from '../model/OrbitHarmonyStore';
 import { OrbitHuksMasterKey, OrbitMasterKeyResult } from '../model/OrbitHuksMasterKey';
 import { orbitLogError, orbitLogInfo, orbitLogWarn } from '../model/OrbitLogger';
 import { OrbitPerfProbe } from '../model/OrbitPerfProbe';
 import { OrbitPreferencesStore } from '../model/OrbitPreferences';
+import {
+  orbitApplySystemBarTheme,
+  orbitBindThemeApplicationContext,
+  orbitBindThemeWindow
+} from '../model/OrbitWindowTheme';
 import { ORBIT_DEFAULT_THEME } from '../theme/OrbitTokens';
 
 class OrbitFirstFrameCallback extends FrameCallback {
@@ -129,6 +135,7 @@ export default class EntryAbility extends UIAbility {
     try {
       store.bindContext(this.context);
       const appCtx = this.context.getApplicationContext();
+      orbitBindThemeApplicationContext(appCtx);
       store.bindApplicationContext(appCtx);
       const mode = this.context.config?.colorMode;
       if (mode !== undefined) {
@@ -220,6 +227,23 @@ export default class EntryAbility extends UIAbility {
       }
     }
 
+    const replayPathRaw = readParamString(params, 'orbit_perf_replay_path');
+    if (replayPathRaw.length > 0) {
+      const replayHost = readParamString(params, 'orbit_perf_replay_host') || 'replay-host';
+      const replayAgent = readParamString(params, 'orbit_perf_replay_agent') || 'replay-agent';
+      const resolvedPath = replayPathRaw.startsWith('files://')
+        ? `${this.context.filesDir}/${replayPathRaw.substring('files://'.length)}`
+        : replayPathRaw;
+      try {
+        const framesJson = fileIo.readTextSync(resolvedPath);
+        store.scheduleDebugStageReplay(replayHost, replayAgent, framesJson);
+        orbitLogInfo('OrbitEntry', `Scheduled stage perf replay from ${resolvedPath}`);
+      } catch (err) {
+        orbitLogError('OrbitEntry', `Failed to read perf replay fixture at ${resolvedPath}`, err as Object);
+      }
+      return;
+    }
+
     if (hostId.length > 0) {
       store.openSessionFromDeepLink(hostId, agentId, eventKind);
       return;
@@ -233,7 +257,7 @@ export default class EntryAbility extends UIAbility {
     if (newConfig.colorMode !== undefined) {
       const store = OrbitHarmonyStore.getInstance();
       store.setSystemDark(newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
-      this.applySystemBarTheme();
+      orbitApplySystemBarTheme(store.palette.isDark);
     }
   }
 
@@ -337,6 +361,8 @@ export default class EntryAbility extends UIAbility {
       this.avoidAreaHandler = null;
       this.windowSizeHandler = null;
       this.mainWin = null;
+      orbitBindThemeWindow(null);
+      OrbitHarmonyStore.getInstance().bindUIContext(null);
     }
   }
 
@@ -368,26 +394,6 @@ export default class EntryAbility extends UIAbility {
       }
     } catch (err) {
       orbitLogWarn('OrbitEntry', 'Foldable display observer unavailable', err as Object);
-    }
-  }
-
-  private applySystemBarTheme(): void {
-    if (this.mainWin === null) {
-      return;
-    }
-    try {
-      const palette = OrbitHarmonyStore.getInstance().palette;
-      const barProps: window.SystemBarProperties = {
-        statusBarColor: '#00000000',
-        navigationBarColor: '#00000000',
-        statusBarContentColor: palette.statusBarContentHex,
-        navigationBarContentColor: palette.statusBarContentHex
-      };
-      this.mainWin.setWindowSystemBarProperties(barProps).catch((err: Object) => {
-        orbitLogWarn('OrbitEntry', 'setWindowSystemBarProperties failed', err);
-      });
-    } catch (err) {
-      orbitLogWarn('OrbitEntry', 'System bar theme sync unavailable', err as Object);
     }
   }
 
@@ -487,13 +493,14 @@ export default class EntryAbility extends UIAbility {
     try {
       const mainWin = windowStage.getMainWindowSync();
       this.mainWin = mainWin;
+      orbitBindThemeWindow(mainWin);
       try {
         await mainWin.setWindowLayoutFullScreen(true);
       } catch (err) {
         orbitLogWarn('OrbitEntry', 'setWindowLayoutFullScreen not applied', err as Object);
       }
 
-      this.applySystemBarTheme();
+      orbitApplySystemBarTheme(OrbitHarmonyStore.getInstance().palette.isDark);
 
       try {
         await mainWin.setFloatNavigationAvoidAreaEnabled(true);
@@ -502,6 +509,7 @@ export default class EntryAbility extends UIAbility {
       }
 
       const uiCtx = mainWin.getUIContext();
+      OrbitHarmonyStore.getInstance().bindUIContext(uiCtx);
       uiCtx.setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
 
       this.queryAndPublishAllAvoidAreas(mainWin, uiCtx);

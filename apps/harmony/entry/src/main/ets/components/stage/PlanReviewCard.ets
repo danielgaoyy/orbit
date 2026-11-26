@@ -1,5 +1,6 @@
 import { PendingPlanApprovalDto, stripWorkspacePrefix } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { OrbitStageStore } from '../../model/stores/OrbitStageStore';
 import {
   OrbitTokens,
   orbitButtonMeta,
@@ -17,13 +18,14 @@ import { RichMarkdownView } from './RichMarkdownView';
 @ComponentV2
 export struct PlanReviewCard {
   @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private stageStore: OrbitStageStore = OrbitHarmonyStore.getInstance().stageStore;
   @Local private isEditingPlan: boolean = false;
   @Local private editedMarkdown: string = '';
   @Local private feedbackText: string = '';
   @Local private isResolving: boolean = false;
   @Local private activeRequestId: string = '';
 
-  @Monitor('store.stagePendingPlanApproval')
+  @Monitor('stageStore.activePendingPlanApproval')
   onPlanChanged(_mon: IMonitor): void {
     const pending = this.store.stagePendingPlanApproval;
     if (pending === null) {

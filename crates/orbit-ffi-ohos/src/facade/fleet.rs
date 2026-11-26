@@ -4,6 +4,27 @@ use orbit_client_core::app_core::ClientThreadPref;
 use orbit_client_core::contract::FleetSidebarRequest;
 
 impl OhosCoreFacade {
+    pub fn personal_agent_briefing_json(
+        &self,
+        primary_router_host_id: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.personal_agent_briefing(primary_router_host_id))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_personal_agent_activity_json(
+        &self,
+        host_id: &str,
+        limit: u32,
+        since_ms: Option<i64>,
+    ) -> Result<String, String> {
+        let entries = self.inner.run_mobile_rpc(
+            self.inner
+                .list_personal_agent_activity(host_id, limit, since_ms),
+        )?;
+        serde_json::to_string(&entries).map_err(|error| error.to_string())
+    }
+
     pub fn discover_local_daemon_uri(&self) -> Option<String> {
         self.inner.discover_local_daemon_uri()
     }

@@ -5,12 +5,12 @@ import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { orbitLogWarn } from './OrbitLogger';
 
 const PREFS_NAME: string = 'orbit_harmony_prefs';
-const KEY_THEME_MODE: string = 'theme_mode';
-const KEY_PINNED_THREADS: string = 'pinned_threads_json';
-const KEY_MIGRATED_THREAD_PREFS_V1: string = 'migrated_thread_prefs_v1';
-const KEY_DRAFT_PREFS: string = 'draft_prefs_v1';
-const KEY_DEVICE_ID: string = 'orbit_harmony_device_id_v1';
-const KEY_PRIMARY_ROUTER_HOST: string = 'primary_router_host_id_v1';
+const KEY_THEME_MODE: string = 'orbit.harmony.v2.theme_mode';
+const KEY_PINNED_THREADS: string = 'orbit.harmony.v2.pinned_threads_json';
+const KEY_MIGRATED_THREAD_PREFS_V1: string = 'orbit.harmony.v2.migrated_thread_prefs';
+const KEY_DRAFT_PREFS: string = 'orbit.harmony.v2.draft_prefs';
+const KEY_DEVICE_ID: string = 'orbit.harmony.v2.device_id';
+const KEY_PRIMARY_ROUTER_HOST: string = 'orbit.harmony.v2.primary_router_host_id';
 
 export interface OrbitDraftPrefs {
   provider: string;

@@ -20,3 +20,5 @@
    export OHOS_NDK_HOME="$DEVECO_SDK_HOME/default/openharmony"
    export PATH="$JAVA_HOME/bin:$DEVECO/tools/ohpm/bin:$DEVECO/tools/node/bin:$DEVECO/sdk/default/openharmony/toolchains:$PATH"
    ```
+
+8. **状态拉取与恢复**。Fleet、Host、Sidebar 和 Stage 的大载荷使用异步 N-API。Stage 按 `(host_id, agent_id)` 保存两个 revision 与窗口起点，`aux_unchanged` 时复用五个辅助字段。普通 `fleet_changed` 只刷新 Fleet 与 Briefing；收到 `resync_required` 时按可见 scope 重新拉取。SQLite 以单键 `orbit.drafts.v1` 保存整个草稿包，包内使用会话键 `${hostId}::${agentId}` 或新会话键 `draft::${hostId}`。详见[客户端桥接契约](../../docs/CLIENT_BRIDGE_ARCHITECTURE.md#harmonyos-n-api)。

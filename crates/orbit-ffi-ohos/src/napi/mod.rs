@@ -3,6 +3,7 @@ pub mod core;
 pub mod fleet_stage;
 pub mod git_files_terminal;
 pub mod settings_sync;
+pub mod state;
 pub mod workspace_auto;
 
 use crate::OhosCoreFacade;

@@ -4,11 +4,12 @@ import {
   HostCardDto,
   LaunchpadProjectDto,
   SessionSubagentEntryDto,
-  StageTurnDto,
   basenameOfPath,
   cwdPathsEquivalent,
   formatCompactTopBarConnectionLabel
 } from '../../model/OrbitTypes';
+import { OrbitStageTurnModel } from '../../model/viewmodels/OrbitStageModels';
+import { OrbitStageStore } from '../../model/stores/OrbitStageStore';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
@@ -38,6 +39,7 @@ export struct StreamStage {
   @Local isRefreshing: boolean = false;
 
   @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private stageStore: OrbitStageStore = OrbitHarmonyStore.getInstance().stageStore;
   private listScroller: Scroller = new Scroller();
   private isAutoAnchoringResize: boolean = false;
   private refreshTimerId: number = -1;
@@ -110,7 +112,7 @@ export struct StreamStage {
     }, 450);
   }
 
-  @Monitor('store.stageRevision')
+  @Monitor('stageStore.activeRevision')
   onStageUpdated(_mon: IMonitor): void {
     const totalItems = this.store.stageTurns.length;
     if (this.atBottomEdge && totalItems > 0) {
@@ -784,13 +786,16 @@ export struct StreamStage {
                 }
               }
 
-              Repeat<StageTurnDto>(this.store.stageTurns)
-                .each((ri: RepeatItem<StageTurnDto>) => {
+              Repeat<OrbitStageTurnModel>(this.store.stageTurns)
+                .each((ri: RepeatItem<OrbitStageTurnModel>) => {
                   ListItem() {
                     Column() {
                       StageTurnView({
                         turn: ri.item,
-                        isTurnActive: ri.item.has_active_item ||
+                        isTurnActive:
+                          (this.store.stageStore.activeTurnKey.length > 0 &&
+                            ri.item.turnKey === this.store.stageStore.activeTurnKey) ||
+                          ri.item.hasActiveItem ||
                           (this.store.isActiveAgentRunning() && ri.index === this.store.stageTurns.length - 1)
                       })
                         .constraintSize({ maxWidth: OrbitTokens.STAGE_MAX_READING_WIDTH })
@@ -799,7 +804,7 @@ export struct StreamStage {
                     .alignItems(HorizontalAlign.Center)
                   }
                 })
-                .key((t: StageTurnDto) => t.key)
+                .key((t: OrbitStageTurnModel): string => t.turnKey)
                 .virtualScroll()
             }
             .width('100%')

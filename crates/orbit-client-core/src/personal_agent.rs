@@ -1198,6 +1198,48 @@ mod tests {
     }
 
     #[test]
+    fn briefing_needs_you_counts_pending_permissions() {
+        let agent = make_agent("worker", "Worker", AgentStatus::Idle, 1_000);
+        let permissions = ["first", "second"].map(|id| PendingPermissionSummary {
+            agent_id: agent.agent_id.clone(),
+            agent_title: agent.title.clone(),
+            workspace_id: agent.workspace_id.clone(),
+            request_id: id.into(),
+            title: "Review".into(),
+            detail: ToolCallDetail::Generic {
+                tool_name: "edit".into(),
+                arguments_json: "{}".into(),
+            },
+            allowed_decisions: vec!["allow_once".into()],
+            guardian_assessment: None,
+            plan_approval: None,
+            human_only: true,
+            router_recommendation: None,
+            created_at: Utc::now(),
+        });
+        let host = BriefingHostInput {
+            host_id: "host",
+            host_name: "Host",
+            online: true,
+            agents: std::slice::from_ref(&agent),
+            pending_permissions: &permissions,
+            conditional_timers: &[],
+            goal_runs: &[],
+            agent_read_at_ms: &HashMap::new(),
+            step_previews: &HashMap::new(),
+        };
+        let briefing = build_personal_agent_briefing(&[host], None, 2_000);
+        assert_eq!(briefing.counts.needs_you, 2);
+        let mut ids: Vec<_> = briefing
+            .needs_you
+            .iter()
+            .map(|item| item.request_id.as_deref())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, [Some("first"), Some("second")]);
+    }
+
+    #[test]
     fn resolves_personal_agent_priority_primary_host_and_excludes_archived() {
         let mut archived_pa =
             make_agent("ag_archived", "Personal Router", AgentStatus::Idle, 9_000);

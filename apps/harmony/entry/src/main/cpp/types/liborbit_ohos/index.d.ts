@@ -228,5 +228,15 @@ export class OrbitHarmonyCore {
   subscribe(callback: (err: Error | null, payloadJson: string) => void): void;
   subscribeCoalesced(minIntervalMs: number, callback: (err: Error | null, payloadJson: string) => void): void;
   debugReplayStageDeltasJson(hostId: string, agentId: string, framesJson: string): void;
+  personalAgentBriefingJson(primaryRouterHostId?: string | null): string;
+  agentStageTurnsSliceJson(hostId: string, agentId: string, startTurnIndex: number, count: number): string;
+  listPersonalAgentActivityJson(hostId: string, limit: number, sinceMs?: number | null): Promise<string>;
+  fleetOverviewJsonAsync(): Promise<string>;
+  hostDetailJsonAsync(hostId: string): Promise<string>;
+  fleetSidebarByRequestJsonAsync(reqJson: string): Promise<string>;
+  agentStageDeltaByRequestJsonAsync(reqJson: string): Promise<string>;
+  getComposerDraftJson(draftKey: string): string | null;
+  setComposerDraft(draftKey: string, draftJson: string): void;
+  deleteComposerDraft(draftKey: string): void;
 }
 export { OrbitHarmonyCore as OhosOrbitCore };

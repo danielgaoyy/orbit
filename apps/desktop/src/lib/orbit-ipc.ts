@@ -7136,7 +7136,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!transport()) return "0.11.9";
+    if (!transport()) return "0.11.10";
     return invoke<string>("get_app_version");
   },
 

@@ -45,6 +45,7 @@ apps/harmony/.hvigor/
 apps/harmony/oh_modules/
 apps/harmony/build/
 apps/harmony/entry/.preview/
+apps/harmony/entry/.test/
 apps/harmony/entry/build/
 apps/harmony/entry/oh_modules/
 apps/harmony/entry/libs/

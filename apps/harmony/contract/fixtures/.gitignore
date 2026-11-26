@@ -1,0 +1,2 @@
+# Contract snapshots are versioned even when a developer ignores JSON fixtures globally.
+!*.json

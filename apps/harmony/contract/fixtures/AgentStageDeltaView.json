@@ -1,0 +1,161 @@
+{
+  "agent": null,
+  "aux_revision": 1,
+  "aux_unchanged": false,
+  "changed_turns": [
+    {
+      "agent_message": null,
+      "anchor_seq": 1,
+      "compactions": [],
+      "completed_at_ms": 50,
+      "folded_steps": [],
+      "has_active_item": false,
+      "has_error": false,
+      "has_unrecovered_error": false,
+      "is_compaction_command": false,
+      "key": "turn-prompt-1",
+      "last_assistant_reply": {
+        "blocks": [],
+        "item_id": "reply-0",
+        "item_type": "assistant_message",
+        "seq": 2,
+        "streaming": false,
+        "text": "Finished.",
+        "timestamp_ms": 50
+      },
+      "latest_activity_ms": 50,
+      "latest_visible_progress_ms": 50,
+      "live_segments": [
+        {
+          "item": {
+            "blocks": [
+              {
+                "kind": "paragraph",
+                "spans": [
+                  {
+                    "bold": false,
+                    "inline_code": false,
+                    "italic": false,
+                    "link_url": null,
+                    "strikethrough": false,
+                    "text": "Finished."
+                  }
+                ]
+              }
+            ],
+            "item_id": "reply-0",
+            "item_type": "assistant_message",
+            "seq": 2,
+            "streaming": false,
+            "text": "Finished.",
+            "timestamp_ms": 50
+          },
+          "key": "msg-reply-0",
+          "kind": "assistant_message"
+        }
+      ],
+      "notices": [],
+      "started_at_ms": 25,
+      "terminal_reply": {
+        "blocks": [
+          {
+            "kind": "paragraph",
+            "spans": [
+              {
+                "bold": false,
+                "inline_code": false,
+                "italic": false,
+                "link_url": null,
+                "strikethrough": false,
+                "text": "Finished."
+              }
+            ]
+          }
+        ],
+        "item_id": "reply-0",
+        "item_type": "assistant_message",
+        "seq": 2,
+        "streaming": false,
+        "text": "Finished.",
+        "timestamp_ms": 50
+      },
+      "thought_duration_ms": null,
+      "turn_diffs": [],
+      "turn_duration_ms": 25,
+      "turn_index": 0,
+      "user_prompt": {
+        "badges": [],
+        "blocks": [
+          {
+            "kind": "paragraph",
+            "spans": [
+              {
+                "bold": false,
+                "inline_code": false,
+                "italic": false,
+                "link_url": null,
+                "strikethrough": false,
+                "text": "Show the result."
+              }
+            ]
+          }
+        ],
+        "item_type": "user_prompt",
+        "message_id": "prompt-1",
+        "seq": 1,
+        "text": "Show the result.",
+        "timestamp_ms": 25
+      },
+      "work_counts": {
+        "action_steps": 0,
+        "additions": 0,
+        "command_count": 0,
+        "created_file_count": 0,
+        "deletions": 0,
+        "denied_count": 0,
+        "edited_file_count": 0,
+        "failed_count": 0,
+        "mcp_server_count": 0,
+        "narration_count": 0,
+        "other_tool_count": 0,
+        "read_file_count": 0,
+        "search_count": 0,
+        "subagent_count": 0,
+        "thought_count": 0,
+        "total_steps": 0,
+        "unrecovered_failure_count": 0
+      },
+      "work_duration_ms": null,
+      "work_summary_includes_failure": false,
+      "work_summary_label": "Completed steps",
+      "work_summary_live_detail": null,
+      "work_summary_live_label": "Working…"
+    }
+  ],
+  "has_older_history": false,
+  "has_older_turns": false,
+  "host_id": "replay-host",
+  "insights": {
+    "background_tasks": [],
+    "detected_local_urls": [],
+    "subagents": [],
+    "touched_files": []
+  },
+  "latest_seq": 2,
+  "oldest_loaded_seq": 1,
+  "pending_permissions": [],
+  "pending_plan_approval": {
+    "plan_markdown": "Read file",
+    "request_id": "approval",
+    "seq": 2,
+    "timestamp_ms": 50,
+    "title": "Review"
+  },
+  "pending_questions": [],
+  "replace_from_turn_index": 0,
+  "reset": true,
+  "revision": 2,
+  "session_turn_diffs": [],
+  "total_turn_count": 1,
+  "window_start_turn_index": 0
+}

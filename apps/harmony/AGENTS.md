@@ -9,3 +9,14 @@
    ```bash
    ./apps/harmony/scripts/build-rust-ohos.sh
    ```
+
+5. **声明与 DTO**。运行 `bash scripts/check-ohos-dts-sync.sh --print-count` 检查 N-API 声明（既有导出顺序由脚本内的 `legacy_core_order` 固定，新导出自动追加在末尾，勿手工改写该列表）。运行 `cargo run -p orbit-ffi-ohos --bin export_dto_fixtures` 从 Rust view 生成样本，再运行 `node scripts/check-harmony-dto-contract.mjs` 核对 ArkTS 顶层字段。迁移期间支持 `model/OrbitTypes.ets` 和 `model/dto/*.ets`。
+6. **流式性能回放**。仅 perf 构建可用，使用 `./apps/harmony/scripts/build-rust-ohos.sh --arch arm64 --features perf-hooks`。先订阅事件，再调用 `debugReplayStageDeltasJson(hostId, agentId, framesJson)`。录制数组上限 8 MiB、5000 帧，内置 `scripts/perf/fixtures/stream-500.json` 包含 100 轮、500 帧。回放按 40 帧/秒发出 `timeline_changed`，通过同一 host/agent 的常规 stage delta 接口拉取。回放结束后传入 `[]` 释放该会话的录制状态。普通构建调用返回 `perf hooks disabled`。
+7. **本机 Hvigor 打包与 JRE 兜底**：macOS 本机未配置全局 JDK 时，`hvigorw` 的 `PackageHap` 需要 DevEco 内置 JBR：
+   ```bash
+   export DEVECO="/Applications/DevEco-Studio.app/Contents"
+   export JAVA_HOME="${JAVA_HOME:-$DEVECO/jbr/Contents/Home}"
+   export DEVECO_SDK_HOME="$DEVECO/sdk"
+   export OHOS_NDK_HOME="$DEVECO_SDK_HOME/default/openharmony"
+   export PATH="$JAVA_HOME/bin:$DEVECO/tools/ohpm/bin:$DEVECO/tools/node/bin:$DEVECO/sdk/default/openharmony/toolchains:$PATH"
+   ```

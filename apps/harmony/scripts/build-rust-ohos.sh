@@ -5,6 +5,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
+arch=both
+features=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --arch) arch="${2:?--arch requires arm64, x86_64 or both}"; shift 2 ;;
+    --features) features="${2:?--features requires a Cargo feature list}"; shift 2 ;;
+    *) echo "Usage: $0 [--arch arm64|x86_64|both] [--features perf-hooks]" >&2; exit 2 ;;
+  esac
+done
+case "$arch" in
+  arm64) targets=(aarch64) ;;
+  x86_64) targets=(x86_64) ;;
+  both) targets=(aarch64 x86_64) ;;
+  *) echo "Unknown architecture: $arch" >&2; exit 2 ;;
+esac
+
 resolve_ohos_root() {
   local candidates=()
   if [ -n "${OHOS_NDK_HOME:-}" ]; then
@@ -44,7 +60,6 @@ NATIVE_DIR="$OHOS_ROOT/native"
 LLVM_BIN="$NATIVE_DIR/llvm/bin"
 SYSROOT="$NATIVE_DIR/sysroot"
 
-rustup target add aarch64-unknown-linux-ohos x86_64-unknown-linux-ohos
 
 WRAPPER_DIR="$(mktemp -d)"
 trap 'rm -rf "$WRAPPER_DIR"' EXIT
@@ -89,15 +104,13 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_OHOS_LINKER="$X86_64_CC"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_OHOS_RUSTFLAGS="-C link-arg=--sysroot=$SYSROOT -C link-arg=-Wl,-z,max-page-size=16384"
 
 cd "$REPO_ROOT"
-cargo build --release -p orbit-ffi-ohos --target aarch64-unknown-linux-ohos
-cargo build --release -p orbit-ffi-ohos --target x86_64-unknown-linux-ohos
-
-mkdir -p "$REPO_ROOT/apps/harmony/entry/libs/arm64-v8a"
-mkdir -p "$REPO_ROOT/apps/harmony/entry/libs/x86_64"
-
-cp -f "$REPO_ROOT/target/aarch64-unknown-linux-ohos/release/liborbit_ohos.so" \
-  "$REPO_ROOT/apps/harmony/entry/libs/arm64-v8a/"
-cp -f "$REPO_ROOT/target/x86_64-unknown-linux-ohos/release/liborbit_ohos.so" \
-  "$REPO_ROOT/apps/harmony/entry/libs/x86_64/"
-
-echo "Built HarmonyOS NEXT 7.0+ native N-API libraries (arm64-v8a + x86_64) into apps/harmony/entry/libs/"
+for cpu in "${targets[@]}"; do
+  triple="$cpu-unknown-linux-ohos"
+  abi="$cpu"
+  [[ $cpu != aarch64 ]] || abi=arm64-v8a
+  rustup target add "$triple"
+  cargo build --lib --release --features "$features" -p orbit-ffi-ohos --target "$triple"
+  mkdir -p "apps/harmony/entry/libs/$abi"
+  cp "${CARGO_TARGET_DIR:-target}/$triple/release/liborbit_ohos.so" "apps/harmony/entry/libs/$abi/"
+  echo "Built apps/harmony/entry/libs/$abi/liborbit_ohos.so"
+done

@@ -1,0 +1,66 @@
+name: HarmonyOS PR Build
+on:
+  pull_request:
+    paths:
+      - "apps/harmony/**"
+      - "crates/orbit-ffi-ohos/**"
+      - "crates/orbit-client-core/**"
+      - "crates/orbit-protocol/**"
+      - "scripts/check-ohos-dts-sync.sh"
+      - "scripts/check-harmony-*"
+      - "scripts/gen-harmony-strings.mjs"
+      - "scripts/gen-harmony-avatars.mjs"
+      - "apps/desktop/src/lib/subagent-avatar.ts"
+      - "apps/desktop/src/lib/i18n/locales/**"
+      - ".github/workflows/harmony-ci.yml"
+concurrency:
+  group: harmony-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  harmony-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install HarmonyOS Headless Graphics Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libgles2 libglx0 libglib2.0-0 \
+            libx11-6 libxext6 libxrender1 libxrandr2 libxfixes3 libxi6 libxcursor1 \
+            libxcomposite1 libxdamage1 libxtst6 libxkbcommon0 \
+            libgbm1 libdrm2 fontconfig fonts-dejavu-core jq
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup HarmonyOS Command Line Tools (API 26)
+        uses: ErBWs/setup-ohos@v2
+        with:
+          version: "26.0.0.821"
+          cache: false
+      - name: Configure HarmonyOS SDK & Package Registries
+        run: |
+          echo "DEVECO_SDK_HOME=$HOS_SDK_HOME" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$HOS_SDK_HOME/default/openharmony" >> "$GITHUB_ENV"
+          echo "@ohos:registry=https://repo.harmonyos.com/npm/" >> "$HOME/.npmrc"
+          ohpm config set registry https://repo.harmonyos.com/ohpm/
+          hvigorw --version || true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-ohos
+      - name: Contract gates
+        run: |
+          bash scripts/check-ohos-dts-sync.sh --print-count
+          cargo run -p orbit-ffi-ohos --bin export_dto_fixtures -- --check
+          node scripts/check-harmony-dto-contract.mjs
+          cargo test -p orbit-ffi-ohos --features perf-hooks --test stage_replay
+      - name: Build .so (x86_64 only)
+        run: ./apps/harmony/scripts/build-rust-ohos.sh --arch x86_64
+      - name: Build HAP (debug)
+        working-directory: apps/harmony
+        run: |
+          ohpm install
+          hvigorw assembleHap --mode module -p module=entry@default -p product=default -p buildMode=debug --no-daemon

@@ -21,7 +21,7 @@ Desktop, Web PWA, iOS, Android and HarmonyOS share the Rust presentation model i
 3. **Standardized Contract v2 Across All 3 Bridges**:
    - **Desktop**: Tauri IPC commands & typed Channel events (`apps/desktop/src-tauri/src/lib.rs` -> `apps/desktop/src/lib/orbit-ipc.ts`)
    - **iOS & Android**: UniFFI v2 typed records/enums & `MobileCoreListener` (`crates/orbit-ffi-uniffi/src/lib.rs` -> `apps/ios/Generated/*` & `apps/android/.../uniffi/orbit_ffi_uniffi/orbit_ffi_uniffi.kt`)
-   - **HarmonyOS**: N-API Contract v2 JSON DTO endpoints & `subscribeEvents` (`crates/orbit-ffi-ohos/src/lib.rs` -> `apps/harmony/entry/src/main/cpp/types/liborbit_ohos/index.d.ts`)
+   - **HarmonyOS** exposes Contract v2 JSON DTOs and `subscribeEvents` through `crates/orbit-ffi-ohos/src/napi/`. ArkTS consumes the declarations in `apps/harmony/entry/src/main/cpp/types/liborbit_ohos/index.d.ts`.
 
 ---
 
@@ -102,6 +102,14 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 
 Plugin discovery, operation results and UI trees are host-local correlated wire replies. A client renders the typed JSON tree and routes button actions back to the originating host and plugin. The ABI, limits and supported slots are specified in the [plugin SDK](architecture/plugins.md).
 
+### HarmonyOS N-API
+
+In `crates/orbit-ffi-ohos/src/`, `facade/*` groups the host-testable Rust methods by domain. `napi/*` binds them to `OrbitHarmonyCore` and compiles only for HarmonyOS. `events.rs` translates core notifications into JSON for subscribers, and `dto.rs` defines HarmonyOS request payloads.
+
+PR-0 preserved all 227 existing declarations byte-for-byte and added one performance hook, bringing the total to **228 exports**. With `--features perf-hooks`, `debug_replay_stage_deltas_json` is callable from ArkTS as `debugReplayStageDeltasJson(hostId, agentId, framesJson)`. The hook replays recorded stage deltas in memory for that host and agent. Subscribers receive `timeline_changed` and pull each update through the normal stage API. In a standard build the same call returns `perf hooks disabled`.
+
+`bash scripts/check-ohos-dts-sync.sh --print-count` scans `lib.rs` first, then `napi/**/*.rs` in lexical path order. It rejects duplicate method names on the same class and compares the generated declarations with the checked-in `index.d.ts`. For the JSON payload contract, `node scripts/check-harmony-dto-contract.mjs` compares the top-level keys of Rust-generated fixtures in `apps/harmony/contract/fixtures/` with ArkTS interfaces in `model/OrbitTypes.ets` and `model/dto/*.ets`. Missing and extra fields both fail the check.
+
 ## 4. Thread Preferences Persistence & Legacy Migration
 
 Thread metadata (`seen_seq`, `is_pinned`, `pinned_order`, `updated_at_ms`) is persisted in the SQLite table `client_thread_prefs` inside `crates/orbit-store/src/lib.rs`, with cascade cleanup when a replica agent or host is removed:
@@ -138,7 +146,7 @@ Pass a platform-protected 32-byte key through `OrbitMobileCore.newWithMasterKey`
 
 ## 6. Binding Synchronization & Verification Workflow
 
-Whenever Rust FFI types in `crates/orbit-client-core` or `crates/orbit-ffi-uniffi` change, regenerate Swift and Kotlin bindings and run the workspace checks:
+Use `bash scripts/sync-bindings.sh --check` to generate Swift and Kotlin bindings in a temporary directory and compare them with the checked-in bindings. A difference on either platform fails the check. When FFI types change, regenerate the affected bindings before running the workspace checks.
 
 ```bash
 # 1. Regenerate iOS (Swift) and Android (Kotlin) UniFFI bindings

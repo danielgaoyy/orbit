@@ -76,6 +76,7 @@ export interface FleetOverviewDto {
   total_pending_approvals: number;
   hosts: HostCardDto[];
   projects: ClientProjectDto[];
+  project_order?: string[];
 }
 
 export interface CustomSessionModeDto {
@@ -513,6 +514,217 @@ export interface CloudSyncResultDto {
   gist_html_url: string | null;
 }
 
+export interface McpToolPolicyDto {
+  enabled: boolean;
+  disabled_tools: string[];
+  enabled_packs?: string[] | null;
+  disabled_packs?: string[];
+}
+
+export interface AgentProfileDto {
+  profile_id: string;
+  name: string;
+  provider: string;
+  acp_agent_id?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  fast_mode: boolean;
+  mode: string | CustomSessionModeDto;
+  when_to_use: string;
+  system_prompt_append?: string | null;
+  mcp_policy: McpToolPolicyDto;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrchestrationConfigDto {
+  mcp_inject_enabled: boolean;
+  idle_cleanup_enabled: boolean;
+  idle_timeout_secs: number;
+  resume_on_startup: boolean;
+  resume_prompt: string;
+  installed_skills: string[];
+  auto_cluster_enabled: boolean;
+  keep_awake_while_running: boolean;
+}
+
+export interface OrchestrationSkillInfoDto {
+  id: string;
+  name: string;
+  slash_command: string;
+  description: string;
+  installed: boolean;
+  installed_targets: string[];
+  outdated: boolean;
+}
+
+export interface ManagedSkillRecordDto {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  source: string;
+  path: string;
+  enabled: boolean;
+  editable: boolean;
+  triggers: string[];
+  allowed_tools: string[];
+  has_scripts: boolean;
+  has_references: boolean;
+  approx_tokens: number;
+  updated_at_ms: number;
+  argument_hint?: string | null;
+  is_command: boolean;
+}
+
+export interface KeepAwakeStatusDto {
+  enabled: boolean;
+  active: boolean;
+  active_agents: number;
+  backend: string;
+}
+
+export interface WorkspaceScriptInfoDto {
+  workspace_id: string;
+  name: string;
+  command: string;
+  kind: string;
+  status: string;
+  terminal_id?: string | null;
+  port?: number | null;
+  proxy_url?: string | null;
+  last_error?: string | null;
+}
+
+export interface RouterRecommendationDto {
+  decision: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface GuardianAssessmentDto {
+  risk_level: string;
+  decision: string;
+  confidence: number;
+  classifier_tier: string;
+  reason: string;
+  signals: string[];
+  latency_ms: number;
+}
+
+export interface PlanApprovalPayloadDto {
+  plan_markdown: string;
+  plan_title?: string | null;
+  plan_file_path?: string | null;
+  summary?: string | null;
+  plan_file_backed?: boolean;
+  allowed_prompts?: string[];
+  source?: string | null;
+}
+
+export interface PendingPermissionSummaryDto {
+  agent_id: string;
+  agent_title: string;
+  workspace_id: string;
+  request_id: string;
+  title: string;
+  detail: ToolCallDetailDto;
+  allowed_decisions: string[];
+  guardian_assessment?: GuardianAssessmentDto | null;
+  plan_approval?: PlanApprovalPayloadDto | null;
+  human_only: boolean;
+  router_recommendation?: RouterRecommendationDto | null;
+  created_at: string;
+}
+
+export interface ProviderSubagentDescriptorDto {
+  subagent_id: string;
+  parent_agent_id: string;
+  parent_subagent_id?: string | null;
+  title: string;
+  subtitle?: string | null;
+  model?: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NestedGitRepoDto {
+  path: string;
+  relative_path: string;
+  name: string;
+  git_branch?: string | null;
+}
+
+export interface GitReposInspectionDto {
+  path: string;
+  is_git_repo: boolean;
+  git_branch?: string | null;
+  nested_git_repos: NestedGitRepoDto[];
+}
+
+export interface WorkspaceOrganizeEventDto {
+  request_id?: string | null;
+  project_root: string;
+  phase: string;
+  message: string;
+  created_workspaces: number;
+  grouped_agents: number;
+  summarized_agents: number;
+}
+
+export interface HostProjectEntryDto {
+  project_id: string;
+  name: string;
+  directories: string[];
+  sort_order: number;
+  hidden: boolean;
+  updated_at_ms: number;
+}
+
+export interface HostSyncStateDto {
+  projects: HostProjectEntryDto[];
+  project_order: string[];
+  project_sort_mode?: string | null;
+  updated_at_ms: number;
+}
+
+export interface AcpAgentSpecDto {
+  id: string;
+  name: string;
+  description: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  install_hint?: string | null;
+  homepage?: string | null;
+  version?: string | null;
+  source: string;
+  enabled: boolean;
+}
+
+export interface AcpAgentAvailabilityDto {
+  spec: AcpAgentSpecDto;
+  installed: boolean;
+  resolved_path?: string | null;
+}
+
+export interface ArtifactSummaryDto {
+  artifact_id: string;
+  workspace_id: string;
+  agent_id?: string | null;
+  title: string;
+  kind: string;
+  language?: string | null;
+  mime_type?: string | null;
+  resource_uri?: string | null;
+  mcp_server_name?: string | null;
+  version: number;
+  byte_len: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface HostDetailDto {
   revision: number;
   host: HostCardDto;
@@ -528,13 +740,27 @@ export interface HostDetailDto {
   terminals: TerminalSummaryDto[];
   active_terminal_id: string | null;
   active_terminal_slot: number;
+  profiles?: AgentProfileDto[];
   schedules?: ScheduleSpecDto[];
   conditional_timers?: ConditionalTimerRecordDto[];
+  connected_hosts?: ConnectedHostSummaryDto[];
+  orchestration_config?: OrchestrationConfigDto;
+  orchestration_skills?: OrchestrationSkillInfoDto[];
+  managed_skills?: ManagedSkillRecordDto[];
+  keep_awake_status?: KeepAwakeStatusDto | null;
+  workspace_scripts?: Record<string, WorkspaceScriptInfoDto[]>;
+  pending_permissions?: PendingPermissionSummaryDto[];
+  provider_subagents?: Record<string, ProviderSubagentDescriptorDto[]>;
+  git_repos_by_cwd?: Record<string, GitReposInspectionDto>;
+  workspace_boards?: Record<string, WorkspaceBoardSnapshotDto>;
+  workspace_events?: Record<string, WorkspaceEventRecordDto[]>;
+  workspace_organize_status?: Record<string, WorkspaceOrganizeEventDto>;
+  host_sync_state?: HostSyncStateDto;
+  acp_agents?: AcpAgentAvailabilityDto[];
+  artifacts?: ArtifactSummaryDto[];
   goal_runs?: GoalRunRecordDto[];
   monitor_watches?: MonitorWatchRecordDto[];
   workflow_runs?: WorkflowRunRecordDto[];
-  workspace_boards?: Record<string, WorkspaceBoardSnapshotDto>;
-  workspace_events?: Record<string, WorkspaceEventRecordDto[]>;
 }
 
 export interface PromptBadgeDto {
@@ -643,6 +869,21 @@ export interface QuestionItemDto {
   is_multi_select: boolean;
 }
 
+export interface BackgroundTaskInfoDto {
+  task_id?: string | null;
+  label?: string | null;
+  log_path?: string | null;
+}
+
+export interface PermissionCheckpointRefDto {
+  agent_id: string;
+  host_id?: string | null;
+  request_id: string;
+  title: string;
+  detail: ToolCallDetailDto;
+  allowed_decisions: string[];
+}
+
 export interface TimelineItemDto {
   item_type: string;
   seq: number;
@@ -657,12 +898,15 @@ export interface TimelineItemDto {
   status?: string;
   summary_title?: string;
   detail?: ToolCallDetailDto;
+  background_task?: BackgroundTaskInfoDto | null;
   step_descriptor?: ToolStepDescriptorDto | null;
   diff_files?: DiffFileDto[];
   request_id?: string;
   title?: string;
   allowed_decisions?: string[];
   resolved_decision?: string | null;
+  guardian_assessment?: GuardianAssessmentDto | null;
+  plan_approval?: PlanApprovalPayloadDto | null;
   questions?: QuestionItemDto[];
   resolved_answers?: string[][] | null;
   level?: string;
@@ -672,6 +916,7 @@ export interface TimelineItemDto {
   source_host_id?: string | null;
   source_title?: string | null;
   event?: string | null;
+  permission_context?: PermissionCheckpointRefDto | null;
   delivery_status?: 'queued' | 'dispatched' | 'settled' | 'dropped' | null;
   delivery_turn_id?: string | null;
   blocking_turn_id?: string | null;
@@ -752,6 +997,7 @@ export interface StageTurnDto {
   work_duration_ms?: number | null;
   turn_duration_ms: number | null;
   terminal_reply: TimelineItemDto | null;
+  last_assistant_reply?: TimelineItemDto | null;
   notices: TimelineItemDto[];
   compactions?: TurnCompactionItemDto[];
   live_segments: TurnLiveSegmentDto[];
@@ -1083,7 +1329,6 @@ export interface TerminalScreenDto {
   rows: number;
   cursor_row: number;
   cursor_col: number;
-  cursor_visible?: boolean;
   rows_data: TerminalRowDto[];
 }
 
@@ -1918,4 +2163,96 @@ export interface StartDagWorkflowRequestDto {
 export interface ProviderSubagentTimelineDto {
   subagent_id: string;
   items: TimelineItemDto[];
+}
+
+export interface BriefingAgentRefDto {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  title: string;
+  provider: string;
+  status_label: string;
+  is_busy: boolean;
+  is_awaiting: boolean;
+}
+
+export interface BriefingDecisionDto {
+  key: string;
+  kind: string; // 'plan' | 'permission' | 'awaiting' | 'error'
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  agent_title: string;
+  request_id: string | null;
+  summary: string;
+  risk_level: string | null;
+  human_only: boolean;
+  batch_eligible: boolean;
+  router_recommendation: RouterRecommendationDto | null;
+  dispatched_by_personal_agent: boolean;
+  updated_at_ms: number;
+}
+
+export interface BriefingWorkerDto {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  title: string;
+  provider: string;
+  state: string; // 'running' | 'awaiting' | 'error' | 'done' | 'idle'
+  step_preview: string;
+  worktree_branch: string | null;
+  updated_at_ms: number;
+}
+
+export interface BriefingMissionDto {
+  key: string;
+  root: BriefingWorkerDto;
+  workers: BriefingWorkerDto[];
+  host_names: string[];
+  done: number;
+  total: number;
+  state: string; // 'running' | 'awaiting' | 'error' | 'done'
+  updated_at_ms: number;
+}
+
+export interface BriefingWaitItemDto {
+  key: string;
+  kind: string; // 'timer' | 'goal' | 'background'
+  host_id: string;
+  agent_id: string;
+  title: string;
+  detail: string;
+  due_at_ms: number | null;
+}
+
+export interface BriefingHostDto {
+  host_id: string;
+  name: string;
+  online: boolean;
+  is_personal_agent_host: boolean;
+}
+
+export interface BriefingCountsDto {
+  needs_you: number;
+  running: number;
+  done_recent: number;
+  hosts_online: number;
+  hosts_total: number;
+}
+
+export interface BriefingSinceLastVisitDto {
+  completed: number;
+  auto_handled: number;
+}
+
+export interface PersonalAgentBriefingDto {
+  personal_agent: BriefingAgentRefDto | null;
+  needs_you: BriefingDecisionDto[];
+  missions: BriefingMissionDto[];
+  other_active: BriefingWorkerDto[];
+  waiting: BriefingWaitItemDto[];
+  hosts: BriefingHostDto[];
+  counts: BriefingCountsDto;
+  since_last_visit: BriefingSinceLastVisitDto;
 }

@@ -1199,6 +1199,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func terminalScreenSlot(hostId: String, slot: UInt8)  -> FfiTerminalScreen?
     
+    func terminalScrollback(hostId: String)  -> [String]
+    
     func testAcpAgent(hostId: String, agentId: String, cwd: String?) throws  -> FfiAcpProbeResult
     
     func togglePinAgent(hostId: String, agentId: String)  -> Bool
@@ -3076,6 +3078,16 @@ open func terminalScreenSlot(hostId: String, slot: UInt8) -> FfiTerminalScreen? 
             self.uniffiCloneHandle(),
         FfiConverterString.lower(hostId),
         FfiConverterUInt8.lower(slot),uniffiCallStatus
+    )
+})
+}
+    
+open func terminalScrollback(hostId: String) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_terminal_scrollback(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),uniffiCallStatus
     )
 })
 }
@@ -7188,6 +7200,7 @@ public func FfiConverterTypeFfiDiscoveredProject_lower(_ value: FfiDiscoveredPro
 public struct FfiExecuteWorktreeHandoffRequest: Equatable, Hashable {
     public var hostId: String
     public var workspaceId: String
+    public var sourceAgentId: String?
     public var direction: FfiWorktreeHandoffDirection
     public var mode: FfiWorktreeHandoffMode
     public var targetWorkspaceId: String?
@@ -7197,9 +7210,10 @@ public struct FfiExecuteWorktreeHandoffRequest: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostId: String, workspaceId: String, direction: FfiWorktreeHandoffDirection, mode: FfiWorktreeHandoffMode, targetWorkspaceId: String?, includeCommitted: Bool, branch: String?, allowThreeWayConflicts: Bool) {
+    public init(hostId: String, workspaceId: String, sourceAgentId: String?, direction: FfiWorktreeHandoffDirection, mode: FfiWorktreeHandoffMode, targetWorkspaceId: String?, includeCommitted: Bool, branch: String?, allowThreeWayConflicts: Bool) {
         self.hostId = hostId
         self.workspaceId = workspaceId
+        self.sourceAgentId = sourceAgentId
         self.direction = direction
         self.mode = mode
         self.targetWorkspaceId = targetWorkspaceId
@@ -7226,6 +7240,7 @@ public struct FfiConverterTypeFfiExecuteWorktreeHandoffRequest: FfiConverterRust
             try FfiExecuteWorktreeHandoffRequest(
                 hostId: FfiConverterString.read(from: &buf), 
                 workspaceId: FfiConverterString.read(from: &buf), 
+                sourceAgentId: FfiConverterOptionString.read(from: &buf), 
                 direction: FfiConverterTypeFfiWorktreeHandoffDirection.read(from: &buf), 
                 mode: FfiConverterTypeFfiWorktreeHandoffMode.read(from: &buf), 
                 targetWorkspaceId: FfiConverterOptionString.read(from: &buf), 
@@ -7238,6 +7253,7 @@ public struct FfiConverterTypeFfiExecuteWorktreeHandoffRequest: FfiConverterRust
     public static func write(_ value: FfiExecuteWorktreeHandoffRequest, into buf: inout [UInt8]) {
         FfiConverterString.write(value.hostId, into: &buf)
         FfiConverterString.write(value.workspaceId, into: &buf)
+        FfiConverterOptionString.write(value.sourceAgentId, into: &buf)
         FfiConverterTypeFfiWorktreeHandoffDirection.write(value.direction, into: &buf)
         FfiConverterTypeFfiWorktreeHandoffMode.write(value.mode, into: &buf)
         FfiConverterOptionString.write(value.targetWorkspaceId, into: &buf)
@@ -9362,15 +9378,17 @@ public func FfiConverterTypeFfiPermissionRequestId_lower(_ value: FfiPermissionR
 public struct FfiPreviewWorktreeHandoffRequest: Equatable, Hashable {
     public var hostId: String
     public var workspaceId: String
+    public var sourceAgentId: String?
     public var direction: FfiWorktreeHandoffDirection
     public var targetWorkspaceId: String?
     public var includeCommitted: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostId: String, workspaceId: String, direction: FfiWorktreeHandoffDirection, targetWorkspaceId: String?, includeCommitted: Bool) {
+    public init(hostId: String, workspaceId: String, sourceAgentId: String?, direction: FfiWorktreeHandoffDirection, targetWorkspaceId: String?, includeCommitted: Bool) {
         self.hostId = hostId
         self.workspaceId = workspaceId
+        self.sourceAgentId = sourceAgentId
         self.direction = direction
         self.targetWorkspaceId = targetWorkspaceId
         self.includeCommitted = includeCommitted
@@ -9394,6 +9412,7 @@ public struct FfiConverterTypeFfiPreviewWorktreeHandoffRequest: FfiConverterRust
             try FfiPreviewWorktreeHandoffRequest(
                 hostId: FfiConverterString.read(from: &buf), 
                 workspaceId: FfiConverterString.read(from: &buf), 
+                sourceAgentId: FfiConverterOptionString.read(from: &buf), 
                 direction: FfiConverterTypeFfiWorktreeHandoffDirection.read(from: &buf), 
                 targetWorkspaceId: FfiConverterOptionString.read(from: &buf), 
                 includeCommitted: FfiConverterBool.read(from: &buf)
@@ -9403,6 +9422,7 @@ public struct FfiConverterTypeFfiPreviewWorktreeHandoffRequest: FfiConverterRust
     public static func write(_ value: FfiPreviewWorktreeHandoffRequest, into buf: inout [UInt8]) {
         FfiConverterString.write(value.hostId, into: &buf)
         FfiConverterString.write(value.workspaceId, into: &buf)
+        FfiConverterOptionString.write(value.sourceAgentId, into: &buf)
         FfiConverterTypeFfiWorktreeHandoffDirection.write(value.direction, into: &buf)
         FfiConverterOptionString.write(value.targetWorkspaceId, into: &buf)
         FfiConverterBool.write(value.includeCommitted, into: &buf)
@@ -27795,6 +27815,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_terminal_screen_slot() != 26006) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_terminal_scrollback() != 37246) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_test_acp_agent() != 46040) {

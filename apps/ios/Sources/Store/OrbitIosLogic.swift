@@ -1685,3 +1685,496 @@ public enum OrbitVoiceCommandLogic {
     }
 }
 
+// MARK: - Humanized Error Formatting
+
+public enum OrbitErrorFormatter {
+    public static func humanize(_ error: Error) -> String {
+        let reflected = String(reflecting: error)
+        if let extracted = extractCoreDetail(from: reflected) {
+            return humanize(extracted)
+        }
+        let localized = error.localizedDescription
+        if let extracted = extractCoreDetail(from: localized) {
+            return humanize(extracted)
+        }
+        return humanize(localized)
+    }
+
+    public static func humanize(_ raw: String) -> String {
+        let stripped = extractCoreDetail(from: raw) ?? raw
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "An unexpected error occurred."
+        }
+        let lower = trimmed.lowercased()
+        if lower.contains("invalid pairing") || lower.contains("base64 decode") || lower.contains("qr") && lower.contains("uri") {
+            return "Invalid pairing URI. Check the link and try again."
+        }
+        if lower.contains("connection refused") || lower.contains("unreachable") {
+            return "Host unreachable. Check that the Orbit daemon is running and reachable."
+        }
+        if lower.contains("timed out") || lower.contains("timeout") {
+            return "Request timed out. Please check your connection and try again."
+        }
+        if lower.contains("always allow") || lower.contains("compound") || lower.contains("destructive") {
+            return trimmed
+        }
+        let prefixes = [
+            "core error: ",
+            "crypto error: ",
+            "handshake failed: ",
+            "handshake error: ",
+            "rpc error: "
+        ]
+        var result = trimmed
+        for prefix in prefixes where result.lowercased().hasPrefix(prefix) {
+            result = String(result.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            break
+        }
+        if let first = result.first, first.isLowercase {
+            result = first.uppercased() + result.dropFirst()
+        }
+        return result
+    }
+
+    private static func extractCoreDetail(from text: String) -> String? {
+        guard let marker = text.range(of: "FfiOrbitError.Core(detail: ") else {
+            return nil
+        }
+        let after = text[marker.upperBound...]
+        if after.hasPrefix("\""), let endQuote = after.dropFirst().lastIndex(of: "\"") {
+            let inner = String(after[after.index(after: after.startIndex)..<endQuote])
+            return inner
+                .replacingOccurrences(of: "\\\"", with: "\"")
+                .replacingOccurrences(of: "\\n", with: "\n")
+        }
+        if let close = after.lastIndex(of: ")") {
+            return String(after[..<close])
+        }
+        return String(after)
+    }
+}
+
+// MARK: - Permission Safety & Endpoint / Highlight / Cron Logic
+
+public enum OrbitPermissionSafetyLogic {
+    private static let compoundOperators = ["&&", "||", ";", "|", "`", "$(", "\n"]
+    private static let dangerousTokens = [
+        "rm ", "sudo ", "mkfs", "dd ", "chmod ", "chown ",
+        "git reset --hard", "git push --force", "git push -f",
+        "shutdown", "reboot", ":(){", ">/dev/"
+    ]
+
+    /// Matches Desktop `StickyDecisionDock` safety rules: never allow "Always Allow" for
+    /// compound/piped shell commands, destructive binaries, or explicit plan approvals.
+    public static func shouldAllowAlwaysPermission(
+        title: String,
+        commandOrPath: String,
+        toolName: String?,
+        argumentsJson: String?,
+        allowedDecisions: [String]
+    ) -> Bool {
+        guard allowedDecisions.contains("allow_always") else { return false }
+        if OrbitPlanApprovalLogic.isPlanApprovalPermission(
+            title: title,
+            commandOrPath: commandOrPath,
+            toolName: toolName,
+            argumentsJson: argumentsJson
+        ) {
+            return false
+        }
+        let combined = [commandOrPath, title, argumentsJson ?? ""]
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = " " + combined.lowercased()
+        for op in compoundOperators where combined.contains(op) {
+            return false
+        }
+        for tok in dangerousTokens where lower.contains(" " + tok) || lower.contains("/" + tok) {
+            return false
+        }
+        return true
+    }
+}
+
+public enum OrbitCronLogic {
+    private static let standardMacros: Set<String> = [
+        "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly"
+    ]
+
+    /// Validates standard 5-field cron expressions (`min hour dom month dow`) or macros.
+    /// Returns a human-readable validation error when invalid, or `nil` when valid.
+    public static func validate(_ rawExpr: String) -> String? {
+        let trimmed = rawExpr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Cron expression is required."
+        }
+        let lower = trimmed.lowercased()
+        if standardMacros.contains(lower) {
+            return nil
+        }
+        // Accept Orbit schedule preset shorthands: "<N>[smhd]" / "daily HH:MM" / "weekdays HH:MM"
+        if isIntervalShorthand(lower) || isDailyClockShorthand(lower) {
+            return nil
+        }
+        let fields = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard fields.count == 5 else {
+            return "Use 5 cron fields (e.g. */30 * * * *) or shorthand (e.g. 15m, daily 09:00)."
+        }
+        let ranges: [(ClosedRange<Int>, String)] = [
+            (0...59, "minute (0–59)"),
+            (0...23, "hour (0–23)"),
+            (1...31, "day of month (1–31)"),
+            (1...12, "month (1–12)"),
+            (0...7, "day of week (0–7)")
+        ]
+        for (idx, field) in fields.enumerated() {
+            if !isValidCronField(field, bounds: ranges[idx].0) {
+                return "Invalid \(ranges[idx].1) value: \(field)."
+            }
+        }
+        return nil
+    }
+
+    private static func isIntervalShorthand(_ lower: String) -> Bool {
+        guard lower.count >= 2, let unit = lower.last, "smhd".contains(unit) else {
+            return false
+        }
+        guard let amount = Int(lower.dropLast()), amount >= 1 else {
+            return false
+        }
+        return true
+    }
+
+    private static func isDailyClockShorthand(_ lower: String) -> Bool {
+        let parts = lower.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard parts.count == 2, parts[0] == "daily" || parts[0] == "weekdays" else {
+            return false
+        }
+        let hm = parts[1].split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard hm.count == 2,
+              let hour = Int(hm[0]), (0...23).contains(hour),
+              let minute = Int(hm[1]), (0...59).contains(minute) else {
+            return false
+        }
+        return true
+    }
+
+    private static func isValidCronField(_ field: String, bounds: ClosedRange<Int>) -> Bool {
+        guard !field.isEmpty else { return false }
+        let parts = field.split(separator: ",", omittingEmptySubsequences: false)
+        for partSub in parts {
+            let part = String(partSub)
+            guard !part.isEmpty else { return false }
+            let stepSplit = part.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard stepSplit.count <= 2 else { return false }
+            if stepSplit.count == 2 {
+                guard let step = Int(stepSplit[1]), step >= 1 else { return false }
+            }
+            let base = stepSplit[0]
+            if base == "*" { continue }
+            let rangeSplit = base.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            if rangeSplit.count == 1 {
+                guard let val = Int(rangeSplit[0]), bounds.contains(val) else { return false }
+            } else if rangeSplit.count == 2 {
+                guard let lo = Int(rangeSplit[0]), let hi = Int(rangeSplit[1]),
+                      bounds.contains(lo), bounds.contains(hi), lo <= hi else {
+                    return false
+                }
+            } else {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+public enum OrbitSearchHighlightLogic {
+    public struct Segment: Equatable, Sendable {
+        public let text: String
+        public let highlighted: Bool
+        public init(text: String, highlighted: Bool) {
+            self.text = text
+            self.highlighted = highlighted
+        }
+    }
+
+    /// Parses `<mark>...</mark>` HTML highlight tags returned by SQLite FTS5 `snippet()`.
+    public static func segments(from raw: String) -> [Segment] {
+        guard raw.contains("<mark>") else {
+            return raw.isEmpty ? [] : [Segment(text: raw, highlighted: false)]
+        }
+        var out: [Segment] = []
+        var idx = raw.startIndex
+        while idx < raw.endIndex {
+            if let openRange = raw.range(of: "<mark>", range: idx..<raw.endIndex) {
+                if openRange.lowerBound > idx {
+                    out.append(Segment(text: String(raw[idx..<openRange.lowerBound]), highlighted: false))
+                }
+                if let closeRange = raw.range(of: "</mark>", range: openRange.upperBound..<raw.endIndex) {
+                    let hit = String(raw[openRange.upperBound..<closeRange.lowerBound])
+                    if !hit.isEmpty {
+                        out.append(Segment(text: hit, highlighted: true))
+                    }
+                    idx = closeRange.upperBound
+                } else {
+                    let rest = String(raw[openRange.upperBound..<raw.endIndex])
+                        .replacingOccurrences(of: "</mark>", with: "")
+                    if !rest.isEmpty {
+                        out.append(Segment(text: rest, highlighted: true))
+                    }
+                    break
+                }
+            } else {
+                let tail = String(raw[idx..<raw.endIndex])
+                    .replacingOccurrences(of: "</mark>", with: "")
+                if !tail.isEmpty {
+                    out.append(Segment(text: tail, highlighted: false))
+                }
+                break
+            }
+        }
+        return out
+    }
+}
+
+public enum OrbitEndpointLogic {
+    /// Strips Clash/Surge RFC 2544 fake-IP TUN (`198.18.*` / `198.19.*`) and link-local `169.254.*`
+    /// endpoints when genuine LAN endpoints exist.
+    public static func sanitizeDirectEndpoints(_ endpoints: [String]) -> [String] {
+        let cleaned = endpoints.filter { ep in
+            let lower = ep.lowercased()
+            return !lower.contains("198.18.")
+                && !lower.contains("198.19.")
+                && !lower.contains("169.254.")
+        }
+        return cleaned.isEmpty ? endpoints : cleaned
+    }
+
+    /// Extracts compact host:port disambiguation label when multiple hosts share the same displayName.
+    public static func disambiguationSuffix(
+        hostId: String,
+        remotePort: UInt16,
+        directEndpoints: [String]
+    ) -> String {
+        if let first = sanitizeDirectEndpoints(directEndpoints).first,
+           let url = URL(string: first),
+           let h = url.host, !h.isEmpty {
+            let p = url.port ?? Int(remotePort)
+            return "\(h):\(p)"
+        }
+        return ":\(remotePort) · \(String(hostId.prefix(6)))"
+    }
+}
+
+public enum OrbitTerminalScrollbackLogic {
+    public static let defaultMaxLines = 5000
+
+    /// Merges newly visible terminal screen rows into bounded scrollback history, preserving scrolled-off prefix
+    /// lines and clamping the buffer to `maxLines` lines.
+    public static func merge(
+        history: [String],
+        visibleLines: [String],
+        windowRows: Int,
+        maxLines: Int = defaultMaxLines
+    ) -> [String] {
+        guard !visibleLines.isEmpty else { return history }
+        var next = history
+        if next.isEmpty {
+            next = visibleLines
+        } else {
+            let maxOverlap = min(next.count, visibleLines.count)
+            var matchedOverlap = 0
+            if maxOverlap > 0 {
+                for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+                    if next.suffix(overlap).elementsEqual(visibleLines.prefix(overlap)) {
+                        matchedOverlap = overlap
+                        break
+                    }
+                }
+            }
+            if matchedOverlap > 0 {
+                next.append(contentsOf: visibleLines.dropFirst(matchedOverlap))
+            } else if next.count > windowRows {
+                let prefixCount = next.count - windowRows
+                let prefix = Array(next.prefix(prefixCount))
+                let prevScreen = Array(next.suffix(windowRows))
+                if let firstNew = visibleLines.first,
+                   !firstNew.isEmpty,
+                   let shiftIdx = prevScreen.firstIndex(of: firstNew),
+                   shiftIdx > 0 {
+                    var combined = prefix
+                    combined.append(contentsOf: prevScreen.prefix(shiftIdx))
+                    combined.append(contentsOf: visibleLines)
+                    next = combined
+                } else if prevScreen != visibleLines {
+                    next = prefix + visibleLines
+                }
+            } else if next != visibleLines {
+                next = visibleLines
+            }
+        }
+        let effectiveLimit = max(1, maxLines)
+        if next.count > effectiveLimit {
+            next = Array(next.suffix(effectiveLimit))
+        }
+        return next
+    }
+}
+
+public enum OrbitMathFormatter {
+    private static let symbolReplacements: [(String, String)] = [
+        ("\\infty", "∞"), ("\\partial", "∂"), ("\\nabla", "∇"),
+        ("\\sum", "∑"), ("\\prod", "∏"), ("\\int", "∫"),
+        ("\\sqrt", "√"), ("\\pm", "±"), ("\\mp", "∓"),
+        ("\\times", "×"), ("\\cdot", "·"), ("\\div", "÷"),
+        ("\\leq", "≤"), ("\\le", "≤"), ("\\geq", "≥"), ("\\ge", "≥"),
+        ("\\neq", "≠"), ("\\ne", "≠"), ("\\approx", "≈"), ("\\equiv", "≡"),
+        ("\\propto", "∝"), ("\\rightarrow", "→"), ("\\leftarrow", "←"),
+        ("\\leftrightarrow", "↔"), ("\\Rightarrow", "⇒"), ("\\Leftrightarrow", "⇔"),
+        ("\\to", "→"), ("\\in", "∈"), ("\\notin", "∉"),
+        ("\\subset", "⊂"), ("\\subseteq", "⊆"), ("\\cup", "∪"), ("\\cap", "∩"),
+        ("\\forall", "∀"), ("\\exists", "∃"),
+        ("\\alpha", "α"), ("\\beta", "β"), ("\\gamma", "γ"), ("\\delta", "δ"),
+        ("\\epsilon", "ε"), ("\\varepsilon", "ε"), ("\\zeta", "ζ"), ("\\eta", "η"),
+        ("\\theta", "θ"), ("\\lambda", "λ"), ("\\mu", "μ"), ("\\nu", "ν"),
+        ("\\xi", "ξ"), ("\\pi", "π"), ("\\rho", "ρ"), ("\\sigma", "σ"),
+        ("\\tau", "τ"), ("\\phi", "φ"), ("\\varphi", "φ"), ("\\chi", "χ"),
+        ("\\psi", "ψ"), ("\\omega", "ω"),
+        ("\\Gamma", "Γ"), ("\\Delta", "Δ"), ("\\Theta", "Θ"), ("\\Lambda", "Λ"),
+        ("\\Sigma", "∑"), ("\\Phi", "Φ"), ("\\Psi", "Ψ"), ("\\Omega", "Ω"),
+        ("\\left", ""), ("\\right", ""), ("\\,", " "), ("\\;", " "), ("\\quad", "  ")
+    ]
+
+    private static let superscripts: [Character: Character] = [
+        "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+        "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+        "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾",
+        "n": "ⁿ", "i": "ⁱ", "x": "ˣ", "k": "ᵏ", "T": "ᵀ"
+    ]
+
+    private static let subscripts: [Character: Character] = [
+        "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+        "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+        "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+        "i": "ᵢ", "j": "ⱼ", "k": "ₖ", "n": "ₙ", "x": "ₓ"
+    ]
+
+    /// Converts common LaTeX inline/display formulas into clean Unicode math typography
+    /// without rendering raw backslashes or brace noise.
+    public static func format(_ rawTex: String) -> String {
+        var text = rawTex.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return text }
+
+        // Expand \frac{num}{den} and \sqrt{arg} before replacing single tokens
+        text = replaceFrac(text)
+        text = text.replacingOccurrences(of: "\\sqrt{", with: "√(")
+
+        for (latex, unicode) in symbolReplacements {
+            text = text.replacingOccurrences(of: latex, with: unicode)
+        }
+
+        text = replaceScripts(text, marker: "^", table: superscripts)
+        text = replaceScripts(text, marker: "_", table: subscripts)
+        text = text.replacingOccurrences(of: "{", with: "(")
+        text = text.replacingOccurrences(of: "}", with: ")")
+        // Simplify trivial "(x)" single-char groups left from _{i} / ^{2}
+        while let range = text.range(of: "  ") {
+            text.replaceSubrange(range, with: " ")
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func replaceFrac(_ input: String) -> String {
+        var out = input
+        while let fracRange = out.range(of: "\\frac") {
+            var idx = fracRange.upperBound
+            while idx < out.endIndex && out[idx].isWhitespace {
+                idx = out.index(after: idx)
+            }
+            guard let num = extractBracedGroup(in: out, from: idx),
+                  let den = extractBracedGroup(in: out, from: num.nextIndex) else {
+                out.replaceSubrange(fracRange, with: "")
+                continue
+            }
+            let numStr = num.content.count <= 3 ? num.content : "(\(num.content))"
+            let denStr = den.content.count <= 3 ? den.content : "(\(den.content))"
+            out.replaceSubrange(fracRange.lowerBound..<den.nextIndex, with: "\(numStr)/\(denStr)")
+        }
+        return out
+    }
+
+    private static func extractBracedGroup(in text: String, from start: String.Index) -> (content: String, nextIndex: String.Index)? {
+        var idx = start
+        while idx < text.endIndex && text[idx].isWhitespace {
+            idx = text.index(after: idx)
+        }
+        guard idx < text.endIndex else { return nil }
+        if text[idx] != "{" {
+            let next = text.index(after: idx)
+            return (String(text[idx]), next)
+        }
+        var depth = 0
+        let contentStart = text.index(after: idx)
+        var cursor = idx
+        while cursor < text.endIndex {
+            let ch = text[cursor]
+            if ch == "{" { depth += 1 }
+            else if ch == "}" {
+                depth -= 1
+                if depth == 0 {
+                    let next = text.index(after: cursor)
+                    return (String(text[contentStart..<cursor]), next)
+                }
+            }
+            cursor = text.index(after: cursor)
+        }
+        return nil
+    }
+
+    private static func replaceScripts(_ input: String, marker: Character, table: [Character: Character]) -> String {
+        let scriptValues = Set(table.values)
+        var out = ""
+        var i = input.startIndex
+        while i < input.endIndex {
+            let ch = input[i]
+            if ch == marker {
+                let nextIdx = input.index(after: i)
+                if nextIdx < input.endIndex {
+                    if input[nextIdx] == "{" {
+                        if let grp = extractBracedGroup(in: input, from: nextIdx) {
+                            let inner = replaceScripts(grp.content, marker: marker, table: table)
+                            let converted: [Character?] = inner.map { c in
+                                if let m = table[c] { return m }
+                                if scriptValues.contains(c) { return c }
+                                return nil
+                            }
+                            if converted.allSatisfy({ $0 != nil }) {
+                                out.append(contentsOf: converted.compactMap { $0 })
+                                i = grp.nextIndex
+                                continue
+                            } else {
+                                out.append(ch)
+                                out.append(contentsOf: inner.map { c in
+                                    if let m = table[c] { return m }
+                                    return c
+                                })
+                                i = grp.nextIndex
+                                continue
+                            }
+                        }
+                    } else if let mapped = table[input[nextIdx]] {
+                        out.append(mapped)
+                        i = input.index(after: nextIdx)
+                        continue
+                    }
+                }
+            }
+            out.append(ch)
+            i = input.index(after: i)
+        }
+        return out
+    }
+}
+
+

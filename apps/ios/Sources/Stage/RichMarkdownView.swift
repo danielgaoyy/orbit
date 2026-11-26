@@ -12,7 +12,7 @@ private enum MarkdownRenderCache {
 
     static let textMeasurements: NSCache<NSString, NSValue> = {
         let cache = NSCache<NSString, NSValue>()
-        cache.countLimit = 512
+        cache.countLimit = 1024
         return cache
     }()
 
@@ -108,22 +108,25 @@ struct OrbitSelectableTextView: UIViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
         context.coordinator.parent = self
 
-        let widthBucket = proposal.width.map { Int(max(1, $0).rounded()) } ?? -1
+        let widthBucket = proposal.width.flatMap { $0.isFinite && $0 > 1 ? Int(($0 / 4.0).rounded()) * 4 : nil } ?? -1
         let measureKey = "\(attributedText.length):\(attributedText.string.hashValue):\(isDarkAppearance ? 1 : 0):\(maxLines):\(stretchesToProposedWidth ? 1 : 0):\(widthBucket)" as NSString
         if let cachedVal = MarkdownRenderCache.textMeasurements.object(forKey: measureKey) {
             return cachedVal.cgSizeValue
         }
 
         let result: CGSize
-        if let proposedWidth = proposal.width {
-            let safeProposed = max(1, proposedWidth)
+        if let proposedWidth = proposal.width, proposedWidth.isFinite, proposedWidth > 1 {
+            let safeProposed = proposedWidth
             if stretchesToProposedWidth {
                 let measured = attributedText.boundingRect(
                     with: CGSize(width: safeProposed, height: .greatestFiniteMagnitude),
                     options: [.usesLineFragmentOrigin, .usesFontLeading],
                     context: nil
                 )
-                result = CGSize(width: safeProposed, height: max(1, ceil(measured.height) + 4))
+                let cappedHeight = maxLines > 0
+                    ? min(ceil(measured.height) + 4, ceil(CGFloat(maxLines) * 24.0) + 8)
+                    : ceil(measured.height) + 4
+                result = CGSize(width: safeProposed, height: max(1, cappedHeight))
             } else {
                 let measured = attributedText.boundingRect(
                     with: CGSize(width: safeProposed, height: .greatestFiniteMagnitude),
@@ -136,7 +139,10 @@ struct OrbitSelectableTextView: UIViewRepresentable {
                     options: [.usesLineFragmentOrigin, .usesFontLeading],
                     context: nil
                 )
-                result = CGSize(width: tightWidth, height: max(1, ceil(tightMeasured.height) + 4))
+                let cappedHeight = maxLines > 0
+                    ? min(ceil(tightMeasured.height) + 4, ceil(CGFloat(maxLines) * 24.0) + 8)
+                    : ceil(tightMeasured.height) + 4
+                result = CGSize(width: tightWidth, height: max(1, cappedHeight))
             }
         } else {
             let measured = attributedText.boundingRect(
@@ -144,7 +150,10 @@ struct OrbitSelectableTextView: UIViewRepresentable {
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 context: nil
             )
-            result = CGSize(width: max(1, ceil(measured.width) + 2), height: max(1, ceil(measured.height) + 4))
+            let cappedHeight = maxLines > 0
+                ? min(ceil(measured.height) + 4, ceil(CGFloat(maxLines) * 24.0) + 8)
+                : ceil(measured.height) + 4
+            result = CGSize(width: max(1, ceil(measured.width) + 2), height: max(1, cappedHeight))
         }
         MarkdownRenderCache.textMeasurements.setObject(NSValue(cgSize: result), forKey: measureKey)
         return result
@@ -173,7 +182,6 @@ struct OrbitSelectableTextView: UIViewRepresentable {
         if !unchanged {
             uiView.attributedText = attributedText
             coordinator.lastAttributedText = attributedText
-            uiView.invalidateIntrinsicContentSize()
         }
     }
 
@@ -253,6 +261,7 @@ private enum MarkdownRenderSegment {
     case checkListItem(checked: Bool, depth: UInt8, spans: [FfiInlineSpan])
     case blockQuote([FfiInlineSpan])
     case horizontalRule
+    case mathBlock(tex: String)
     case codeBlock(language: String, rawCode: String, lines: [FfiHighlightedLine])
     case table(MarkdownTableModel)
 }
@@ -336,10 +345,15 @@ struct RichMarkdownView: View {
                 out.append(.horizontalRule)
             case let .codeBlock(language, rawCode, lines):
                 flushProseBuffer()
-                out.append(.codeBlock(language: language, rawCode: rawCode, lines: lines))
+                let lowerLang = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if lowerLang == "math" || lowerLang == "latex" || lowerLang == "tex" {
+                    out.append(.mathBlock(tex: rawCode))
+                } else {
+                    out.append(.codeBlock(language: language, rawCode: rawCode, lines: lines))
+                }
             case let .mathBlock(tex, _):
                 flushProseBuffer()
-                out.append(.codeBlock(language: "math", rawCode: tex, lines: []))
+                out.append(.mathBlock(tex: tex))
             case .table:
                 break
             }
@@ -431,6 +445,9 @@ struct RichMarkdownView: View {
         case .horizontalRule:
             OrbitHairline()
                 .padding(.vertical, OrbitSpacing.xs)
+
+        case let .mathBlock(tex):
+            MathFormulaBlockView(tex: tex)
 
         case let .codeBlock(language, rawCode, lines):
             if let diagramKind = detectDiagramKind(language: language, source: rawCode) {
@@ -703,10 +720,14 @@ struct RichMarkdownView: View {
 
             case let .listItem(ordered, index, _, depth, spans):
                 let nestedIndent = CGFloat(min(depth, 6)) * 16
+                let markerText = ordered ? "\(index)." : ""
+                let markerGutter: CGFloat = ordered
+                    ? max(28, CGFloat(markerText.count) * 8.5 + 4)
+                    : 18
                 let p = NSMutableParagraphStyle()
                 p.firstLineHeadIndent = 4 + nestedIndent
-                p.headIndent = 20 + nestedIndent
-                p.tabStops = [NSTextTab(textAlignment: .left, location: 20 + nestedIndent)]
+                p.headIndent = 4 + nestedIndent + markerGutter
+                p.tabStops = [NSTextTab(textAlignment: .left, location: 4 + nestedIndent + markerGutter)]
                 p.lineSpacing = OrbitTypography.bodyLineSpacing
                 p.paragraphSpacing = isLast ? 0 : 6
 
@@ -715,7 +736,7 @@ struct RichMarkdownView: View {
                 case 2: "▪"
                 default: "•"
                 }
-                let marker = ordered ? "\(index).\t" : "\(bulletGlyph)\t"
+                let marker = ordered ? "\(markerText)\t" : "\(bulletGlyph)\t"
                 let markerFont = ordered
                     ? uiFont(size: 13, weight: .medium)
                     : uiFont(size: 15, weight: .semibold)
@@ -754,11 +775,16 @@ struct RichMarkdownView: View {
         let uiCodeFill = UIColor(inlineCodeFill)
         let uiLink = UIColor(palette.primary)
 
-        for span in spans {
+        let cleanedSpans = splitInlineMathSpans(spans)
+        for span in cleanedSpans {
             var attrs: [NSAttributedString.Key: Any] = [
                 .paragraphStyle: paragraphStyle
             ]
-            if span.inlineCode {
+            if span.mathMl != nil {
+                attrs[.font] = uiFont(size: max(13, baseSize - 0.5), weight: .regular, italic: true)
+                attrs[.foregroundColor] = UIColor(palette.accentSky)
+                attrs[.backgroundColor] = UIColor(palette.accentSky.opacity(0.10))
+            } else if span.inlineCode {
                 attrs[.font] = uiFont(size: 13, weight: .regular, monospaced: true)
                 attrs[.foregroundColor] = uiPrimary
                 attrs[.backgroundColor] = uiCodeFill
@@ -782,9 +808,80 @@ struct RichMarkdownView: View {
                 attrs[.foregroundColor] = uiLink
                 attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
             }
-            out.append(NSAttributedString(string: span.text, attributes: attrs))
+            let renderedText: String
+            if span.mathMl != nil && !span.inlineCode {
+                let formatted = OrbitMathFormatter.format(span.text)
+                let leading = span.text.hasPrefix(" ") ? " " : ""
+                let trailing = (span.text.hasSuffix(" ") && span.text.count > 1) ? " " : ""
+                renderedText = formatted.isEmpty ? span.text : "\(leading)\(formatted)\(trailing)"
+            } else {
+                renderedText = span.text
+            }
+            out.append(NSAttributedString(string: renderedText, attributes: attrs))
         }
         return out
+    }
+
+    private func splitInlineMathSpans(_ spans: [FfiInlineSpan]) -> [FfiInlineSpan] {
+        var result: [FfiInlineSpan] = []
+        for span in spans {
+            if span.inlineCode || span.linkUrl != nil || !span.text.contains("$") {
+                result.append(span)
+                continue
+            }
+            let text = span.text
+            var cursor = text.startIndex
+            while cursor < text.endIndex {
+                guard let openIdx = text[cursor...].firstIndex(of: "$") else {
+                    let rem = String(text[cursor...])
+                    if !rem.isEmpty {
+                        result.append(FfiInlineSpan(text: rem, bold: span.bold, italic: span.italic, strikethrough: span.strikethrough, inlineCode: false, linkUrl: nil, mathMl: span.mathMl))
+                    }
+                    break
+                }
+                let afterOpen = text.index(after: openIdx)
+                if afterOpen < text.endIndex && text[afterOpen] == "$" {
+                    let afterDoubleOpen = text.index(after: afterOpen)
+                    if afterDoubleOpen < text.endIndex,
+                       let closeDoubleRange = text.range(of: "$$", range: afterDoubleOpen..<text.endIndex) {
+                        let inner = String(text[afterDoubleOpen..<closeDoubleRange.lowerBound])
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !inner.isEmpty {
+                            let prefix = String(text[cursor..<openIdx])
+                            if !prefix.isEmpty {
+                                result.append(FfiInlineSpan(text: prefix, bold: span.bold, italic: span.italic, strikethrough: span.strikethrough, inlineCode: false, linkUrl: nil, mathMl: span.mathMl))
+                            }
+                            result.append(FfiInlineSpan(text: " \(OrbitMathFormatter.format(inner)) ", bold: false, italic: true, strikethrough: false, inlineCode: false, linkUrl: nil, mathMl: inner))
+                            cursor = closeDoubleRange.upperBound
+                            continue
+                        }
+                    }
+                }
+                if afterOpen < text.endIndex,
+                   let closeIdx = text[afterOpen...].firstIndex(of: "$"),
+                   openIdx != closeIdx {
+                    let inner = String(text[afterOpen..<closeIdx])
+                    let looksLikeFormula = !inner.trimmingCharacters(in: .whitespaces).isEmpty
+                        && !inner.contains("\n")
+                        && (inner.rangeOfCharacter(from: CharacterSet(charactersIn: "+=*/^_{}\\<>αβγπ∑√")) != nil || inner.count <= 24)
+                        && !(inner.first?.isNumber == true && !inner.contains("=") && !inner.contains("^") && !inner.contains("\\"))
+                    if looksLikeFormula {
+                        let prefix = String(text[cursor..<openIdx])
+                        if !prefix.isEmpty {
+                            result.append(FfiInlineSpan(text: prefix, bold: span.bold, italic: span.italic, strikethrough: span.strikethrough, inlineCode: false, linkUrl: nil, mathMl: span.mathMl))
+                        }
+                        result.append(FfiInlineSpan(text: " \(OrbitMathFormatter.format(inner)) ", bold: false, italic: true, strikethrough: false, inlineCode: false, linkUrl: nil, mathMl: inner))
+                        cursor = text.index(after: closeIdx)
+                        continue
+                    }
+                }
+                let nextCursor = text.index(after: openIdx)
+                let slice = String(text[cursor..<nextCursor])
+                result.append(FfiInlineSpan(text: slice, bold: span.bold, italic: span.italic, strikethrough: span.strikethrough, inlineCode: false, linkUrl: nil, mathMl: span.mathMl))
+                cursor = nextCursor
+            }
+        }
+        return result
     }
 
     // MARK: - SwiftUI AttributedString Builder for Tables
@@ -796,7 +893,8 @@ struct RichMarkdownView: View {
     ) -> AttributedString {
         var result = AttributedString()
         for span in spans {
-            var part = AttributedString(span.text)
+            let cellText = (span.mathMl != nil && !span.inlineCode) ? OrbitMathFormatter.format(span.text) : span.text
+            var part = AttributedString(cellText)
             if span.inlineCode {
                 part.font = .system(size: 13, weight: .regular, design: .monospaced)
                 part.foregroundColor = palette.fgPrimary
@@ -848,50 +946,140 @@ private struct MarkdownTableView: View {
     var body: some View {
         let colCount = max(1, model.columnCount)
 
-        ScrollView(.horizontal, showsIndicators: true) {
-            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow {
-                    ForEach(0..<colCount, id: \.self) { col in
-                        HStack(spacing: 0) {
-                            if col > 0 {
-                                OrbitHairline(axis: .vertical)
-                            }
+        ZStack(alignment: .trailing) {
+            ScrollView(.horizontal, showsIndicators: true) {
+                Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+                    GridRow {
+                        ForEach(0..<colCount, id: \.self) { col in
                             Text(buildAttributed(cellSpans(in: model.headers, at: col), palette.fgPrimary, true))
                                 .font(OrbitTypography.subhead(.semibold))
                                 .foregroundStyle(palette.fgPrimary)
+                                .multilineTextAlignment(.leading)
                                 .padding(.horizontal, OrbitSpacing.md)
                                 .padding(.vertical, OrbitSpacing.sm)
-                                .fixedSize(horizontal: true, vertical: false)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .overlay(alignment: .leading) {
+                                    if col > 0 { OrbitHairline(axis: .vertical) }
+                                }
                         }
                     }
-                }
-                .background(palette.subtleFill)
+                    .background(palette.subtleFill)
 
-                ForEach(Array(model.rows.enumerated()), id: \.offset) { rowIdx, row in
-                    OrbitHairline()
-                        .gridCellUnsizedAxes(.horizontal)
+                    ForEach(Array(model.rows.enumerated()), id: \.offset) { rowIdx, row in
+                        OrbitHairline()
+                            .gridCellUnsizedAxes(.horizontal)
 
-                    GridRow {
-                        ForEach(0..<colCount, id: \.self) { col in
-                            HStack(spacing: 0) {
-                                if col > 0 {
-                                    OrbitHairline(axis: .vertical)
-                                }
+                        GridRow {
+                            ForEach(0..<colCount, id: \.self) { col in
                                 Text(buildAttributed(cellSpans(in: row, at: col), palette.fgPrimary, false))
                                     .font(OrbitTypography.subhead(.regular))
                                     .foregroundStyle(palette.fgPrimary)
+                                    .multilineTextAlignment(.leading)
                                     .padding(.horizontal, OrbitSpacing.md)
                                     .padding(.vertical, OrbitSpacing.sm)
-                                    .fixedSize(horizontal: true, vertical: false)
                                     .frame(maxWidth: .infinity, alignment: .leading)
+                                    .overlay(alignment: .leading) {
+                                        if col > 0 { OrbitHairline(axis: .vertical) }
+                                    }
                             }
                         }
+                        .background(rowIdx % 2 == 1 ? palette.subtleFill.opacity(0.45) : Color.clear)
                     }
-                    .background(rowIdx % 2 == 1 ? palette.subtleFill.opacity(0.45) : Color.clear)
                 }
+                .textSelection(.enabled)
             }
-            .textSelection(.enabled)
+
+            if colCount > 3 {
+                LinearGradient(
+                    colors: [Color.clear, palette.code.opacity(0.85)],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: 18)
+                .allowsHitTesting(false)
+            }
+        }
+        .background(palette.code)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        )
+    }
+}
+
+private struct MathFormulaBlockView: View {
+    let tex: String
+
+    @Environment(\.orbitPalette) private var palette
+    @State private var copied = false
+    @State private var showSourceTex = false
+
+    private var cleanedTex: String {
+        tex.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var renderedMath: String {
+        showSourceTex ? cleanedTex : OrbitMathFormatter.format(cleanedTex)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                HStack(spacing: 5) {
+                    Image(systemName: "function")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(palette.accentSky)
+                    Text("math")
+                        .font(OrbitTypography.code(.medium))
+                        .foregroundStyle(palette.fgMuted)
+                }
+                Spacer()
+                Button {
+                    showSourceTex.toggle()
+                } label: {
+                    Text(showSourceTex ? OrbitL10n.tr("Formatted") : "TeX")
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgSecondary)
+                        .padding(.horizontal, 8)
+                        .frame(height: 24)
+                        .background(palette.subtleFill, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                Button {
+                    UIPasteboard.general.string = cleanedTex
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    copied = true
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        copied = false
+                    }
+                } label: {
+                    Image(systemName: copied ? "checkmark" : "square.on.square")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(copied ? palette.direct : palette.fgMuted)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Copy Math Formula")
+            }
+            .padding(.leading, OrbitSpacing.md)
+            .padding(.trailing, OrbitSpacing.xs)
+            .frame(height: 32)
+            .background(palette.isDark ? Color.white.opacity(0.025) : Color.black.opacity(0.022))
+
+            OrbitHairline()
+
+            ScrollView(.horizontal, showsIndicators: true) {
+                Text(renderedMath)
+                    .font(showSourceTex ? OrbitTypography.code(.regular) : .system(size: 15.5, weight: .medium, design: .serif).italic())
+                    .foregroundStyle(palette.fgPrimary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, OrbitSpacing.lg)
+                    .padding(.vertical, OrbitSpacing.md)
+            }
         }
         .background(palette.code)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -992,7 +1180,31 @@ struct CodeBlockView: View {
             OrbitHairline()
 
             ScrollView(.horizontal, showsIndicators: true) {
-                if lines.isEmpty {
+                if displayLanguage == "diff" || displayLanguage == "patch" {
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        ForEach(Array(fallbackLines.enumerated()), id: \.offset) { idx, rawLine in
+                            let isAdd = rawLine.hasPrefix("+") && !rawLine.hasPrefix("+++")
+                            let isRem = rawLine.hasPrefix("-") && !rawLine.hasPrefix("---")
+                            let isHunk = rawLine.hasPrefix("@@")
+                            let lineColor: Color = isAdd ? palette.added : (isRem ? palette.removed : (isHunk ? palette.primary : palette.fgPrimary))
+                            HStack(alignment: .firstTextBaseline, spacing: OrbitSpacing.md) {
+                                if showLineNumbers {
+                                    Text("\(idx + 1)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                        .frame(minWidth: lineNumberGutterWidth, alignment: .trailing)
+                                }
+                                Text(rawLine.isEmpty ? " " : rawLine)
+                                    .font(OrbitTypography.code(.regular))
+                                    .foregroundStyle(lineColor)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(isAdd ? palette.added.opacity(0.10) : (isRem ? palette.removed.opacity(0.10) : Color.clear))
+                        }
+                    }
+                    .padding(OrbitSpacing.md)
+                } else if lines.isEmpty {
                     if showLineNumbers {
                         VStack(alignment: .leading, spacing: 2) {
                             ForEach(Array(fallbackLines.enumerated()), id: \.offset) { idx, rawLine in

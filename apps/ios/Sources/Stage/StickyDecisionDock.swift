@@ -2,18 +2,26 @@ import SwiftUI
 
 struct StickyDecisionDock: View {
     @ObservedObject var store: OrbitIosStore
+    @ObservedObject private var stageState: OrbitStageStreamState
 
     @Environment(\.orbitPalette) private var palette
     @State private var focusedIndex: Int = 0
     @State private var submittingRequestIds: Set<String> = []
+    @State private var transitionGuardUntil: CFTimeInterval = 0
+    @State private var lastFrontRequestId: String? = nil
+
+    init(store: OrbitIosStore) {
+        self.store = store
+        self._stageState = ObservedObject(wrappedValue: store.stageState)
+    }
 
     private var pendingPermissions: [FfiTimelineItem] {
-        let live = store.agentStage?.pendingPermissions ?? []
+        let live = stageState.agentStage?.pendingPermissions ?? []
         return live.isEmpty ? store.demoPendingPermissions : live
     }
 
     private var pendingQuestions: [FfiTimelineItem] {
-        let live = store.agentStage?.pendingQuestions ?? []
+        let live = stageState.agentStage?.pendingQuestions ?? []
         return live.isEmpty ? store.demoPendingQuestions : live
     }
 
@@ -129,6 +137,7 @@ struct StickyDecisionDock: View {
                             onResolvePlan: { action, editedMd, feedback, mode in
                                 guard !submittingRequestIds.contains(requestId) else { return }
                                 submittingRequestIds.insert(requestId)
+                                scheduleSafetyUnlock(requestId: requestId)
                                 store.resolvePlanApproval(
                                     requestId: requestId,
                                     action: action,
@@ -148,11 +157,19 @@ struct StickyDecisionDock: View {
                             allowedDecisions: allowedDecisions,
                             queuePosition: currentIdx + 1,
                             totalQueued: totalCount,
-                            isSubmitting: submittingRequestIds.contains(requestId),
+                            isSubmitting: submittingRequestIds.contains(requestId)
+                                || CFAbsoluteTimeGetCurrent() < transitionGuardUntil,
                             onResolve: { decision in
+                                guard CFAbsoluteTimeGetCurrent() >= transitionGuardUntil else { return }
                                 guard !submittingRequestIds.contains(requestId) else { return }
                                 submittingRequestIds.insert(requestId)
-                                store.resolvePermission(requestId: requestId, decision: decision)
+                                scheduleSafetyUnlock(requestId: requestId)
+                                store.resolvePermission(requestId: requestId, decision: decision) { _, errMsg in
+                                    submittingRequestIds.remove(requestId)
+                                    if let errMsg, !errMsg.isEmpty {
+                                        store.showToast(OrbitErrorFormatter.humanize(errMsg))
+                                    }
+                                }
                             },
                             onStepQueue: { delta in
                                 stepQueue(by: delta, total: totalCount)
@@ -167,6 +184,9 @@ struct StickyDecisionDock: View {
                         questions: questions,
                         queuePosition: currentIdx + 1,
                         totalQueued: totalCount,
+                        onDidSubmit: {
+                            transitionGuardUntil = CFAbsoluteTimeGetCurrent() + 0.35
+                        },
                         onStepQueue: { delta in
                             stepQueue(by: delta, total: totalCount)
                         }
@@ -183,7 +203,23 @@ struct StickyDecisionDock: View {
                 if focusedIndex >= newCount {
                     focusedIndex = max(0, newCount - 1)
                 }
+                let activeIds = Set(combinedQueue.compactMap { item -> String? in
+                    switch item {
+                    case let .permissionRequest(_, rid, _, _, _, _, _, _),
+                         let .questionRequest(_, rid, _, _, _):
+                        return rid
+                    default:
+                        return nil
+                    }
+                })
+                submittingRequestIds = submittingRequestIds.intersection(activeIds)
             }
+        }
+    }
+
+    private func scheduleSafetyUnlock(requestId: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            submittingRequestIds.remove(requestId)
         }
     }
 
@@ -265,13 +301,48 @@ private struct PermissionApprovalCard: View {
     @State private var showDetails: Bool = false
 
     private var decisions: [String] {
-        allowedDecisions.isEmpty ? ["deny", "allow_always", "allow"] : allowedDecisions
+        let base = allowedDecisions.isEmpty ? ["deny", "allow_always", "allow"] : allowedDecisions
+        let (toolName, argsJson): (String?, String?) = {
+            if case let .generic(tn, args) = detail { return (tn, args) }
+            return (nil, nil)
+        }()
+        let canAlwaysAllow = OrbitPermissionSafetyLogic.shouldAllowAlwaysPermission(
+            title: title,
+            commandOrPath: commandOrPath.isEmpty ? targetPreview : commandOrPath,
+            toolName: toolName,
+            argumentsJson: argsJson,
+            allowedDecisions: base
+        )
+        let filtered = base.filter { canAlwaysAllow || OrbitDecisionLogic.classify($0) != .allowAlways }
+        // Unify button order across Live & Demo modes: Deny | Always Allow | Allow
+        return filtered.sorted { lhs, rhs in
+            decisionOrderRank(lhs) < decisionOrderRank(rhs)
+        }
+    }
+
+    private func decisionOrderRank(_ raw: String) -> Int {
+        switch OrbitDecisionLogic.classify(raw) {
+        case .decline, .cancel: return 0
+        case .allowAlways, .allowSession: return 1
+        case .allowOnce, .custom: return 2
+        }
     }
 
     private var inspectPayload: OrbitInspectableDecisionPayload {
         switch detail {
-        case let .shell(command, _, _, _):
-            return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: command, diff: nil, path: nil)
+        case let .shell(command, cwd, exitCode, outputPreview):
+            var meta: [String] = []
+            if let cwd, !cwd.isEmpty { meta.append("cwd: \(cwd)") }
+            if let exitCode { meta.append("exit: \(exitCode)") }
+            let body = [meta.joined(separator: "  ·  "), outputPreview ?? ""]
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .joined(separator: "\n\n")
+            return OrbitDecisionLogic.inspectablePayload(
+                rawArgsJson: nil,
+                command: command,
+                diff: body.isEmpty ? nil : body,
+                path: cwd
+            )
         case let .fileEdit(path, unifiedDiff):
             return OrbitDecisionLogic.inspectablePayload(rawArgsJson: nil, command: nil, diff: unifiedDiff, path: path)
         case let .fileRead(path, _, _):
@@ -379,22 +450,34 @@ private struct PermissionApprovalCard: View {
 
     @ViewBuilder
     private var inspectDetailBox: some View {
-        ScrollView([.vertical, .horizontal], showsIndicators: true) {
+        ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 6) {
-                if let path = inspectPayload.path {
+                if !targetPreview.isEmpty {
+                    Text(targetPreview)
+                        .font(OrbitTypography.code(.semibold))
+                        .foregroundStyle(palette.fgPrimary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let path = inspectPayload.path, !path.isEmpty {
                     Text("Path: \(path)")
                         .font(OrbitTypography.code(.medium))
                         .foregroundStyle(palette.fgSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                if let diff = inspectPayload.diff {
+                if let diff = inspectPayload.diff, !diff.isEmpty {
                     Text(diff)
                         .orbitCodeStyle()
                         .foregroundStyle(palette.fgPrimary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                if let json = inspectPayload.formattedArgsJson {
+                if let json = inspectPayload.formattedArgsJson, !json.isEmpty {
                     Text(json)
                         .orbitCodeStyle()
                         .foregroundStyle(palette.fgSecondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -455,6 +538,7 @@ private struct QuestionDecisionCard: View {
     let questions: [FfiQuestionItem]
     let queuePosition: Int
     let totalQueued: Int
+    let onDidSubmit: () -> Void
     let onStepQueue: (Int) -> Void
 
     @Environment(\.orbitPalette) private var palette
@@ -671,6 +755,7 @@ private struct QuestionDecisionCard: View {
             }
             return list
         }
+        onDidSubmit()
         store.answerQuestion(requestId: requestId, answers: payload)
     }
 }

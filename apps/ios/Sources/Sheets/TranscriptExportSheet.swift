@@ -15,6 +15,7 @@ struct TranscriptExportSheet: View {
     @State private var exportedURL: URL? = nil
     @State private var exportedInfo: FfiExportedTranscript? = nil
     @State private var exportError: String? = nil
+    @State private var showCopiedBanner: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -74,7 +75,7 @@ struct TranscriptExportSheet: View {
                                         .font(OrbitTypography.code(.semibold))
                                         .foregroundStyle(palette.fgPrimary)
                                         .lineLimit(1)
-                                    Text("\(info.turnCount) turns · \(ByteCountFormatter.string(fromByteCount: Int64(info.byteLen), countStyle: .file))")
+                                    Text("\(info.turnCount) \(info.turnCount == 1 ? "turn" : "turns") · \(ByteCountFormatter.string(fromByteCount: Int64(info.byteLen), countStyle: .file))")
                                         .font(OrbitTypography.meta(.regular))
                                         .foregroundStyle(palette.fgMuted)
                                 }
@@ -92,19 +93,50 @@ struct TranscriptExportSheet: View {
                                 .background(palette.primary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                             }
                             .buttonStyle(.plain)
+                            .contentShape(Rectangle())
 
                             Button {
                                 UIPasteboard.general.string = info.content
                                 store.hapticSuccess()
-                                store.showToast("Copied transcript to clipboard")
+                                store.showToast(OrbitL10n.tr("Copied transcript to clipboard"))
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    showCopiedBanner = true
+                                }
+                                Task { @MainActor in
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    withAnimation(.easeIn(duration: 0.2)) {
+                                        showCopiedBanner = false
+                                    }
+                                }
                             } label: {
-                                Text(OrbitL10n.tr("Copy"))
-                                    .font(OrbitTypography.subhead(.medium))
-                                    .foregroundStyle(palette.fgPrimary)
-                                    .frame(maxWidth: .infinity, minHeight: 40)
-                                    .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                HStack(spacing: 6) {
+                                    Image(systemName: showCopiedBanner ? "checkmark.circle.fill" : "square.on.square")
+                                    Text(showCopiedBanner ? OrbitL10n.tr("Copied") : OrbitL10n.tr("Copy"))
+                                        .font(OrbitTypography.subhead(.medium))
+                                }
+                                .foregroundStyle(showCopiedBanner ? palette.direct : palette.fgPrimary)
+                                .frame(maxWidth: .infinity, minHeight: 40)
+                                .background(
+                                    showCopiedBanner ? palette.direct.opacity(0.12) : palette.subtleFill,
+                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                )
                             }
                             .buttonStyle(.plain)
+
+                            if showCopiedBanner {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(palette.direct)
+                                    Text(OrbitL10n.tr("Copied transcript to clipboard"))
+                                        .font(OrbitTypography.meta(.medium))
+                                        .foregroundStyle(palette.fgPrimary)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(palette.direct.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            }
                         }
                         .padding(OrbitSpacing.md)
                         .background(palette.elevated)
@@ -136,7 +168,7 @@ struct TranscriptExportSheet: View {
                         .background(palette.primary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    .disabled(isExporting || store.selectedAgentId == nil)
+                    .disabled(isExporting || (store.selectedAgentId == nil && !store.hasDemoStageOverlay && !store.isDemoChatMode))
                 }
                 .padding(.horizontal, OrbitSpacing.lg)
                 .padding(.vertical, OrbitSpacing.md)
@@ -177,6 +209,27 @@ struct TranscriptExportSheet: View {
     }
 
     private func runExport() {
+        if store.selectedAgentId == nil && (store.hasDemoStageOverlay || store.isDemoChatMode) {
+            isExporting = true
+            exportError = nil
+            let demoText = buildDemoTranscriptExport()
+            let ext = format == .json ? "json" : (format == .html ? "html" : "md")
+            let filename = "orbit-demo-transcript.\(ext)"
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("orbit-exports", isDirectory: true)
+            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let url = tempDir.appendingPathComponent(filename)
+            try? Data(demoText.utf8).write(to: url, options: [.atomic])
+            exportedInfo = FfiExportedTranscript(
+                suggestedFilename: filename,
+                mimeType: format == .json ? "application/json" : (format == .html ? "text/html" : "text/markdown"),
+                content: demoText,
+                turnCount: UInt64(max(1, store.stageState.agentStage?.turns.count ?? 1)),
+                byteLen: UInt64(demoText.utf8.count)
+            )
+            exportedURL = url
+            isExporting = false
+            return
+        }
         guard store.selectedAgentId != nil else { return }
         isExporting = true
         exportError = nil
@@ -192,9 +245,30 @@ struct TranscriptExportSheet: View {
                 exportedURL = result.fileURL
                 isExporting = false
             } catch {
-                exportError = error.localizedDescription
+                exportError = OrbitErrorFormatter.humanize(error)
                 isExporting = false
             }
         }
+    }
+
+    private func buildDemoTranscriptExport() -> String {
+        let turns = store.stageState.agentStage?.turns ?? []
+        if format == .json {
+            let items = turns.map { ["turn": $0.key] }
+            let data = (try? JSONSerialization.data(withJSONObject: ["demo": true, "turns": items], options: [.prettyPrinted])) ?? Data("{}".utf8)
+            return String(decoding: data, as: UTF8.self)
+        }
+        var lines: [String] = ["# Orbit Demo Transcript", ""]
+        for turn in turns {
+            if let prompt = turn.userPrompt,
+               case let .userPrompt(_, _, text, _, _, _) = prompt {
+                lines.append("## User\n\(text)\n")
+            }
+            if let reply = turn.terminalReply ?? turn.lastAssistantReply,
+               case let .assistantMessage(_, _, text, _, _, _) = reply {
+                lines.append("## Assistant\n\(text)\n")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 }

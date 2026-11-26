@@ -2422,13 +2422,14 @@ async fn run_claude_actor(
                                             } else {
                                                 bg_tool_uses.remove(call_id)
                                             };
-                                            let cached_detail = if keep_running_bg {
-                                                tool_cache.get(call_id).cloned()
-                                            } else {
-                                                tool_cache.remove(call_id)
-                                            };
+                                            let cached_detail = tool_cache.get(call_id).cloned();
                                             let detail = match cached_detail {
-                                                Some(ToolCallDetail::Shell { command, cwd, .. }) => {
+                                                Some(ToolCallDetail::Shell { command, cwd, output_preview, .. }) => {
+                                                    let merged_output = if !out_text.trim().is_empty() {
+                                                        Some(out_text)
+                                                    } else {
+                                                        output_preview
+                                                    };
                                                     ToolCallDetail::Shell {
                                                         command,
                                                         cwd,
@@ -2437,7 +2438,7 @@ async fn run_claude_actor(
                                                         } else {
                                                             Some(if is_err { 1 } else { 0 })
                                                         },
-                                                        output_preview: Some(out_text),
+                                                        output_preview: merged_output,
                                                     }
                                                 }
                                                 Some(detail) if managed_dispatches.remove(call_id) => {
@@ -2446,12 +2447,17 @@ async fn run_claude_actor(
                                                 Some(other) => other,
                                                 None => ToolCallDetail::Generic {
                                                     tool_name: "tool".into(),
-                                                    arguments_json: "{}".into(),
+                                                    arguments_json: if out_text.trim().is_empty() {
+                                                        "{}".into()
+                                                    } else {
+                                                        serde_json::json!({ "output_preview": out_text }).to_string()
+                                                    },
                                                 },
                                             };
-                                            if keep_running_bg {
-                                                tool_cache.insert(call_id.to_string(), detail.clone());
+                                            if tool_cache.len() > 512 && !keep_running_bg {
+                                                tool_cache.clear();
                                             }
+                                            tool_cache.insert(call_id.to_string(), detail.clone());
                                             let _ = evt_tx
                                                 .send(DriverEvent::ToolCall {
                                                     call_id: call_id.to_string(),

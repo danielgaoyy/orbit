@@ -17,6 +17,7 @@ private enum OrbitPtyInputMode: String, CaseIterable, Identifiable {
 
 struct NativePtySheet: View {
     @ObservedObject var store: OrbitIosStore
+    @ObservedObject private var terminalState: OrbitTerminalState
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
 
@@ -27,7 +28,13 @@ struct NativePtySheet: View {
     @State private var isAltArmed = false
     @State private var hasInitializedPty = false
     @State private var copiedSnapshot = false
+    @State private var killConfirmTerminalId: String? = nil
     @FocusState private var isInputFocused: Bool
+
+    init(store: OrbitIosStore) {
+        self.store = store
+        self._terminalState = ObservedObject(wrappedValue: store.terminalState)
+    }
 
     private let terminalSurfaceBg = Color(hex: "#121318")
     private let terminalDefaultFg = Color(hex: "#F1F2F7")
@@ -43,9 +50,10 @@ struct NativePtySheet: View {
     var body: some View {
         GeometryReader { rootGeo in
             let isCompactHeight = rootGeo.size.height > 0 && rootGeo.size.height < 430
+            let isCompactWidth = rootGeo.size.width > 0 && rootGeo.size.width < 460
 
             VStack(spacing: 0) {
-                sheetHeader(isCompactHeight: isCompactHeight)
+                sheetHeader(isCompactHeight: isCompactHeight, isCompactWidth: isCompactWidth)
                 if !isCompactHeight {
                     terminalTabsBar
                 }
@@ -59,7 +67,7 @@ struct NativePtySheet: View {
                     commandInputBar(isCompactHeight: isCompactHeight)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(width: max(1, rootGeo.size.width), height: max(1, rootGeo.size.height))
             .background(alignment: .bottom) {
                 if inputMode == .raw {
                     RawPtyInputView(
@@ -85,17 +93,37 @@ struct NativePtySheet: View {
                 isInputFocused = true
             }
         }
+        .confirmationDialog(
+            OrbitL10n.tr("Kill this terminal session?"),
+            isPresented: Binding(
+                get: { killConfirmTerminalId != nil },
+                set: { if !$0 { killConfirmTerminalId = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let tid = killConfirmTerminalId {
+                Button(OrbitL10n.tr("Kill Terminal"), role: .destructive) {
+                    killConfirmTerminalId = nil
+                    store.killTerminal(tid)
+                }
+            }
+            Button(OrbitL10n.tr("Cancel"), role: .cancel) {
+                killConfirmTerminalId = nil
+            }
+        }
     }
 
     // MARK: - Header
 
-    private func sheetHeader(isCompactHeight: Bool) -> some View {
+    private func sheetHeader(isCompactHeight: Bool, isCompactWidth: Bool) -> some View {
         HStack(spacing: OrbitSpacing.xs) {
-            Text("Terminal")
+            Text(OrbitL10n.tr("Terminal"))
                 .font(isCompactHeight ? OrbitTypography.body(.semibold) : OrbitTypography.title)
                 .foregroundStyle(palette.fgPrimary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
 
-            if let screen = store.terminalScreen {
+            if !isCompactWidth, !terminals.isEmpty, let screen = terminalState.terminalScreen {
                 Text("\(screen.cols)×\(screen.rows)")
                     .font(OrbitTypography.meta(.medium))
                     .foregroundStyle(palette.fgMuted)
@@ -106,7 +134,7 @@ struct NativePtySheet: View {
                     .fixedSize(horizontal: true, vertical: false)
             }
 
-            // Crisp Raw / Line mode toggle
+            // Crisp Raw / Line mode toggle (icon + compact label so Portrait header never truncates to ellipses)
             HStack(spacing: 2) {
                 ForEach(OrbitPtyInputMode.allCases) { mode in
                     let selected = inputMode == mode
@@ -116,19 +144,24 @@ struct NativePtySheet: View {
                             inputMode = mode
                         }
                     } label: {
-                        Text(mode.label)
+                        Text(mode == .raw ? OrbitL10n.tr("Raw") : OrbitL10n.tr("Line"))
                             .font(OrbitTypography.meta(selected ? .semibold : .medium))
                             .foregroundStyle(selected ? palette.fgPrimary : palette.fgMuted)
-                            .padding(.horizontal, 8)
-                            .frame(height: 24)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, 7)
+                            .frame(height: 26)
                             .background(selected ? palette.elevated : Color.clear, in: Capsule())
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(mode.label)
                 }
             }
             .padding(2)
             .background(palette.subtleFill, in: Capsule())
             .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
+            .fixedSize(horizontal: true, vertical: false)
 
             if isCompactHeight && !terminals.isEmpty {
                 inlineCompactTabsStrip
@@ -137,41 +170,58 @@ struct NativePtySheet: View {
             }
 
             HStack(spacing: 0) {
-                Button {
-                    if store.copyTerminalOutput() {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            copiedSnapshot = true
-                        }
-                        Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 1_500_000_000)
-                            withAnimation(.easeIn(duration: 0.2)) {
-                                copiedSnapshot = false
+                if isCompactWidth {
+                    Menu {
+                        Button {
+                            if store.copyTerminalOutput() {
+                                triggerCopiedIndicator()
                             }
+                        } label: {
+                            Label(OrbitL10n.tr("Copy Terminal Output"), systemImage: copiedSnapshot ? "checkmark" : "square.on.square")
                         }
+                        Button {
+                            store.quoteTerminalOutputToComposer()
+                            dismiss()
+                        } label: {
+                            Label(OrbitL10n.tr("Quote Terminal Output"), systemImage: "text.quote")
+                        }
+                    } label: {
+                        Image(systemName: copiedSnapshot ? "checkmark" : "ellipsis.circle")
+                            .font(OrbitTypography.iconSmall)
+                            .foregroundStyle(copiedSnapshot ? palette.direct : palette.fgSecondary)
+                            .frame(width: 36, height: OrbitSpacing.hitTarget)
+                            .contentShape(Rectangle())
                     }
-                } label: {
-                    Image(systemName: copiedSnapshot ? "checkmark" : "square.on.square")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(copiedSnapshot ? palette.direct : palette.fgSecondary)
-                        .orbitSymbolReplaceTransition()
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Copy Terminal Output")
+                    .accessibilityLabel("Terminal Actions")
+                } else {
+                    Button {
+                        if store.copyTerminalOutput() {
+                            triggerCopiedIndicator()
+                        }
+                    } label: {
+                        Image(systemName: copiedSnapshot ? "checkmark" : "square.on.square")
+                            .font(OrbitTypography.iconSmall)
+                            .foregroundStyle(copiedSnapshot ? palette.direct : palette.fgSecondary)
+                            .orbitSymbolReplaceTransition()
+                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Copy Terminal Output")
 
-                Button {
-                    store.quoteTerminalOutputToComposer()
-                    dismiss()
-                } label: {
-                    Image(systemName: "text.quote")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(palette.primary)
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
-                        .contentShape(Rectangle())
+                    Button {
+                        store.quoteTerminalOutputToComposer()
+                        dismiss()
+                    } label: {
+                        Image(systemName: "text.quote")
+                            .font(OrbitTypography.iconSmall)
+                            .foregroundStyle(palette.primary)
+                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Quote Terminal Output into Composer")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Quote Terminal Output into Composer")
 
                 Button {
                     store.startNewTerminal()
@@ -179,7 +229,7 @@ struct NativePtySheet: View {
                     Image(systemName: "plus")
                         .font(OrbitTypography.iconSmall)
                         .foregroundStyle(palette.fgPrimary)
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .frame(width: isCompactWidth ? 36 : OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -187,12 +237,12 @@ struct NativePtySheet: View {
 
                 if let tid = activeTerminalId {
                     Button {
-                        store.killTerminal(tid)
+                        killConfirmTerminalId = tid
                     } label: {
                         Image(systemName: "trash")
                             .font(OrbitTypography.iconSmall)
                             .foregroundStyle(palette.danger)
-                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                            .frame(width: isCompactWidth ? 36 : OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -202,19 +252,33 @@ struct NativePtySheet: View {
                 Button {
                     dismiss()
                 } label: {
-                    Text("Done")
+                    Text(OrbitL10n.tr("Done"))
                         .font(OrbitTypography.subhead(.semibold))
                         .foregroundStyle(palette.primary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .padding(.leading, OrbitSpacing.xs)
-                        .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget, alignment: .trailing)
+                        .frame(minHeight: OrbitSpacing.hitTarget, alignment: .trailing)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close Terminal")
             }
         }
-        .padding(.horizontal, OrbitSpacing.lg)
+        .padding(.horizontal, isCompactWidth ? OrbitSpacing.md : OrbitSpacing.lg)
         .frame(height: isCompactHeight ? OrbitSpacing.hitTarget : 52)
+    }
+
+    private func triggerCopiedIndicator() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            copiedSnapshot = true
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            withAnimation(.easeIn(duration: 0.2)) {
+                copiedSnapshot = false
+            }
+        }
     }
 
     private var inlineCompactTabsStrip: some View {
@@ -314,29 +378,62 @@ struct NativePtySheet: View {
             let availW = max(120, geo.size.width - insetPad)
             let availH = max(80, geo.size.height - insetPad)
 
-            ScrollView([.vertical, .horizontal], showsIndicators: false) {
-                VStack(alignment: .leading, spacing: OrbitTypography.metaLineSpacing) {
-                    if let screen = store.terminalScreen, !screen.rowsData.isEmpty {
-                        ForEach(screen.rowsData, id: \.rowIndex) { row in
-                            Text(
-                                renderTerminalRow(
-                                    row: row,
-                                    cursorRow: screen.cursorRow,
-                                    cursorCol: screen.cursorCol
+            ScrollViewReader { proxy in
+                ScrollView([.vertical, .horizontal], showsIndicators: true) {
+                    LazyVStack(alignment: .leading, spacing: OrbitTypography.metaLineSpacing) {
+                        if !terminals.isEmpty, let screen = terminalState.terminalScreen, !screen.rowsData.isEmpty {
+                            let activeTid = store.currentHostDetail?.activeTerminalId ?? store.currentHostDetail?.terminals.first?.terminalId
+                            let allHistory = terminalState.scrollbackLines(for: activeTid)
+                            let screenCount = min(screen.rowsData.count, allHistory.count)
+                            let olderPrefixCount = max(0, allHistory.count - screenCount)
+                            if olderPrefixCount > 0 {
+                                ForEach(0..<olderPrefixCount, id: \.self) { idx in
+                                    Text(allHistory[idx])
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(terminalDefaultFg.opacity(0.86))
+                                        .fixedSize(horizontal: true, vertical: false)
+                                }
+                            }
+                            ForEach(screen.rowsData, id: \.rowIndex) { row in
+                                Text(
+                                    renderTerminalRow(
+                                        row: row,
+                                        cursorRow: screen.cursorRow,
+                                        cursorCol: screen.cursorCol
+                                    )
                                 )
-                            )
-                            .font(OrbitTypography.code(.regular))
-                            .fixedSize(horizontal: true, vertical: false)
+                                .font(OrbitTypography.code(.regular))
+                                .fixedSize(horizontal: true, vertical: false)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("pty-bottom")
+                        } else if terminals.isEmpty {
+                            Text("No active terminal session in \(OrbitFormatters.compactPath(store.activeCwd)). Tap + to start one.")
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(terminalDefaultFg.opacity(0.65))
+                                .frame(maxWidth: max(200, geo.size.width - OrbitSpacing.sm * 2), alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Connecting to remote PTY in \(OrbitFormatters.compactPath(store.activeCwd))…")
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(terminalDefaultFg.opacity(0.6))
+                                .frame(maxWidth: max(200, geo.size.width - OrbitSpacing.sm * 2), alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                    } else {
-                        Text("Connecting to remote PTY in \(OrbitFormatters.compactPath(store.activeCwd))…")
-                            .font(OrbitTypography.code(.regular))
-                            .foregroundStyle(terminalDefaultFg.opacity(0.6))
                     }
+                    .padding(OrbitSpacing.sm)
+                    .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
                 }
-                .padding(OrbitSpacing.sm)
-                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
+                .onChange(of: terminalState.terminalScreen) { _ in
+                    proxy.scrollTo("pty-bottom", anchor: .bottom)
+                }
+                .onAppear {
+                    proxy.scrollTo("pty-bottom", anchor: .bottom)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
             .background(terminalSurfaceBg)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -564,13 +661,19 @@ struct NativePtySheet: View {
 
             Button {
                 store.hapticLight()
-                isRawKeyboardFocused.toggle()
+                if isRawKeyboardFocused {
+                    isRawKeyboardFocused = false
+                } else {
+                    isRawKeyboardFocused = true
+                }
             } label: {
                 Image(systemName: isRawKeyboardFocused ? "keyboard.chevron.compact.down" : "keyboard")
                     .font(OrbitTypography.iconSmall)
                     .foregroundStyle(palette.fgPrimary)
                     .frame(width: 36, height: 34)
                     .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(isRawKeyboardFocused ? "Hide Keyboard" : "Show Keyboard")
@@ -593,6 +696,7 @@ struct NativePtySheet: View {
             )
             .font(OrbitTypography.code(.regular))
             .foregroundStyle(palette.fgPrimary)
+            .frame(minWidth: 0, maxWidth: .infinity)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
             .focused($isInputFocused)

@@ -11,6 +11,7 @@ struct FleetDrawerView: View {
     @State private var expandedMoreProjectIds: Set<String> = []
     @State private var isSortFilterPopoverPresented: Bool = false
     @State private var isHostPickerPresented: Bool = false
+    @State private var confirmArchiveWorkspace: (workspace: FfiSidebarWorkspaceGroup, keepUnclassified: Bool)? = nil
 
     private var trimmedSearchQuery: String {
         store.drawerSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -902,16 +903,42 @@ struct FleetDrawerView: View {
             Divider()
 
             Button {
-                store.archiveWorkspace(workspace.workspaceId, keepAgentsUnclassified: true)
+                confirmArchiveWorkspace = (workspace: workspace, keepUnclassified: true)
             } label: {
                 Label("Dissolve (Keep Sessions)", systemImage: "tray")
             }
 
             Button(role: .destructive) {
-                store.archiveWorkspace(workspace.workspaceId, keepAgentsUnclassified: false)
+                confirmArchiveWorkspace = (workspace: workspace, keepUnclassified: false)
             } label: {
                 Label("Archive Workspace & Sessions", systemImage: "archivebox")
             }
+        }
+        .confirmationDialog(
+            confirmArchiveWorkspace?.keepUnclassified == true
+                ? "Dissolve \"\(confirmArchiveWorkspace?.workspace.title ?? "")\"?"
+                : "Archive \"\(confirmArchiveWorkspace?.workspace.title ?? "")\"?",
+            isPresented: Binding(
+                get: { confirmArchiveWorkspace != nil },
+                set: { if !$0 { confirmArchiveWorkspace = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let req = confirmArchiveWorkspace {
+                Button(req.keepUnclassified ? "Dissolve Workspace" : "Archive Workspace & Sessions", role: .destructive) {
+                    confirmArchiveWorkspace = nil
+                    store.archiveWorkspace(req.workspace.workspaceId, keepAgentsUnclassified: req.keepUnclassified)
+                }
+            }
+            Button(OrbitL10n.tr("Cancel"), role: .cancel) {
+                confirmArchiveWorkspace = nil
+            }
+        } message: {
+            Text(
+                confirmArchiveWorkspace?.keepUnclassified == true
+                    ? "Conversations will be kept in Unassigned."
+                    : "All conversations in this workspace will be archived."
+            )
         }
         .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 1, trailing: 8))
         .listRowBackground(Color.clear)
@@ -1160,7 +1187,13 @@ struct FleetDrawerView: View {
                     store.toggleProjectCollapsed(project.id)
                 }
             } label: {
-                HStack(spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(palette.fgMuted)
+                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                        .frame(width: 10)
+
                     Image(systemName: isCollapsed ? "folder" : "folder.fill")
                         .font(.system(size: 13.5, weight: .medium))
                         .foregroundStyle(palette.fgSecondary)
@@ -1170,6 +1203,18 @@ struct FleetDrawerView: View {
                         .font(OrbitTypography.body(.medium))
                         .foregroundStyle(palette.fgPrimary.opacity(0.92))
                         .lineLimit(1)
+
+                    if store.hosts.count > 1,
+                       let hostLabel = store.hosts.first(where: { $0.hostId == hostId })?.displayName,
+                       !hostLabel.isEmpty {
+                        Text(hostLabel)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(palette.fgMuted)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(palette.subtleFill, in: Capsule())
+                            .lineLimit(1)
+                    }
 
                     Spacer(minLength: 4)
                 }
@@ -1595,6 +1640,30 @@ struct FleetDrawerView: View {
                 Label("Delete Permanently", systemImage: "trash")
             }
         }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                store.togglePinThread(hostId: hostId, agentId: agent.agentId)
+            } label: {
+                Label(isPinned ? "Unpin" : "Pin", systemImage: isPinned ? "pin.slash" : "pin")
+            }
+            .tint(palette.primary)
+
+            if isUnread {
+                Button {
+                    store.markAgentRead(hostId: hostId, agentId: agent.agentId)
+                } label: {
+                    Label("Mark Read", systemImage: "envelope.open")
+                }
+                .tint(palette.accentSky)
+            } else if !isSelected {
+                Button {
+                    store.markAgentUnread(hostId: hostId, agentId: agent.agentId)
+                } label: {
+                    Label("Mark Unread", systemImage: "envelope.badge")
+                }
+                .tint(palette.accentSky)
+            }
+        }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button(role: .destructive) {
                 store.archiveSession(agent.agentId, hostId: hostId)
@@ -1816,7 +1885,7 @@ struct FleetDrawerView: View {
         }
         .padding(.horizontal, OrbitSpacing.lg)
         .padding(.top, 6)
-        .padding(.bottom, OrbitSpacing.sm)
+        .padding(.bottom, OrbitSpacing.sm + 4)
     }
 
     private func hostCompactDetailLabel(for host: FfiHostCard) -> String {
@@ -1854,18 +1923,16 @@ struct OrbitHostPickerPopover: View {
     @Environment(\.orbitPalette) private var palette
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            OrbitPopoverSectionHeader(title: "Hosts")
+        let hostCount = max(1, store.hosts.count)
+        let listHeight = min(CGFloat(hostCount) * 48 + 8, 220)
+        return VStack(alignment: .leading, spacing: 6) {
+            OrbitPopoverSectionHeader(title: OrbitL10n.tr("Hosts"))
                 .padding(.horizontal, 10)
 
-            ViewThatFits(in: .vertical) {
+            ScrollView(.vertical, showsIndicators: true) {
                 hostRowsStack
-                ScrollView(.vertical, showsIndicators: true) {
-                    hostRowsStack
-                }
-                .frame(height: 220)
             }
-            .frame(maxHeight: 220)
+            .frame(height: listHeight)
 
             if showPairingActions {
                 OrbitHairline()
@@ -1874,7 +1941,7 @@ struct OrbitHostPickerPopover: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     OrbitPopoverActionRow(
-                        title: "Pair New Host",
+                        title: OrbitL10n.tr("Pair New Host"),
                         systemImage: "qrcode.viewfinder"
                     ) {
                         onPairNewHost?()
@@ -1882,7 +1949,7 @@ struct OrbitHostPickerPopover: View {
 
                     if store.localDaemonUri != nil {
                         OrbitPopoverActionRow(
-                            title: "Connect Local Host",
+                            title: OrbitL10n.tr("Connect Local Host"),
                             systemImage: "bolt.horizontal.circle"
                         ) {
                             onConnectLocalHost?()
@@ -1893,14 +1960,30 @@ struct OrbitHostPickerPopover: View {
             }
         }
         .padding(.vertical, 10)
-        .frame(width: 264)
+        .frame(width: 268)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var duplicateDisplayNames: Set<String> {
+        var counts: [String: Int] = [:]
+        for h in store.hosts { counts[h.displayName, default: 0] += 1 }
+        return Set(counts.filter { $0.value > 1 }.keys)
     }
 
     private var hostRowsStack: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let dupNames = duplicateDisplayNames
+        return VStack(alignment: .leading, spacing: 2) {
             ForEach(store.hosts, id: \.hostId) { h in
                 let route = OrbitFormatters.compactTopBarConnectionLabel(for: h)
-                let detail = h.lastPingMs.map { "\(route) · \($0)ms" } ?? route
+                let baseDetail = h.lastPingMs.map { "\(route) · \($0)ms" } ?? route
+                let disambig = dupNames.contains(h.displayName)
+                    ? OrbitEndpointLogic.disambiguationSuffix(
+                        hostId: h.hostId,
+                        remotePort: h.remoteDaemonPort,
+                        directEndpoints: h.directEndpoints
+                    )
+                    : ""
+                let detail = disambig.isEmpty ? baseDetail : "\(baseDetail) · \(disambig)"
                 let isSelected = h.hostId == store.selectedHostId
 
                 OrbitPopoverOptionRow(

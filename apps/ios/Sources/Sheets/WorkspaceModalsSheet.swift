@@ -398,14 +398,310 @@ struct CreateWorkspaceSheet: View {
                 .padding(.horizontal, OrbitSpacing.lg)
                 .padding(.vertical, OrbitSpacing.md)
             }
+        .scrollDismissesKeyboard(.interactively)
+        .background((palette.isDark ? palette.canvas : palette.drawer).ignoresSafeArea())
+        .navigationTitle("New Workspace")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Cancel") { dismiss() }
+                    .foregroundStyle(palette.fgSecondary)
+            }
+        }
+        }
+    }
+}
+
+struct WorktreeHandoffSheet: View {
+    @ObservedObject var store: OrbitIosStore
+    let workspaceId: String
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.orbitPalette) private var palette
+
+    @State private var direction: FfiWorktreeHandoffDirection = .worktreeToLocal
+    @State private var mode: FfiWorktreeHandoffMode = .apply
+    @State private var includeCommitted: Bool = true
+    @State private var selectedSourceAgentId: String? = nil
+    @State private var preview: FfiWorktreeHandoffPreview? = nil
+    @State private var isLoading: Bool = false
+    @State private var isExecuting: Bool = false
+    @State private var errorMessage: String? = nil
+
+    private var workspace: FfiWorkspaceSummary? {
+        store.currentHostDetail?.workspaces.first(where: { $0.workspaceId == workspaceId })
+    }
+
+    private var worktreePeers: [FfiAgentCard] {
+        (store.currentHostDetail?.agents ?? []).filter {
+            $0.workspaceId == workspaceId
+                && !($0.worktreeBranch?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        }
+    }
+
+    private var effectiveSourceAgentId: String? {
+        guard direction == .worktreeToLocal else { return nil }
+        if let selected = selectedSourceAgentId,
+           worktreePeers.contains(where: { $0.agentId == selected }) {
+            return selected
+        }
+        if workspace?.isWorktree != true {
+            return worktreePeers.first?.agentId
+        }
+        return nil
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: OrbitSpacing.lg) {
+                    VStack(spacing: 0) {
+                        Picker("Direction", selection: $direction) {
+                            Text("Worktree → Local").tag(FfiWorktreeHandoffDirection.worktreeToLocal)
+                            Text("Local → Worktree").tag(FfiWorktreeHandoffDirection.localToWorktree)
+                        }
+                        .pickerStyle(.segmented)
+                        .padding(OrbitSpacing.md)
+
+                        if direction == .worktreeToLocal,
+                           !worktreePeers.isEmpty,
+                           (workspace?.isWorktree != true || worktreePeers.count > 1) {
+                            sourceWorktreePickerRow
+                        }
+
+                        OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                        Picker("Mode", selection: $mode) {
+                            Text("Apply Copy").tag(FfiWorktreeHandoffMode.apply)
+                            Text("Move & Clean").tag(FfiWorktreeHandoffMode.move)
+                        }
+                        .pickerStyle(.segmented)
+                        .padding(OrbitSpacing.md)
+
+                        OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                        Toggle("Include Committed Branch Changes", isOn: $includeCommitted)
+                            .font(OrbitTypography.subhead(.regular))
+                            .tint(palette.direct)
+                            .padding(OrbitSpacing.md)
+                    }
+                    .background(palette.elevated)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+
+                    if let err = errorMessage {
+                        Text(err)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.danger)
+                            .padding(OrbitSpacing.md)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(palette.danger.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+
+                    if isLoading {
+                        HStack(spacing: OrbitSpacing.sm) {
+                            OrbitSpinnerRingView(color: palette.primary, size: 15)
+                            Text("Analyzing git worktree changes…")
+                                .font(OrbitTypography.subhead(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, OrbitSpacing.lg)
+                    } else if let preview {
+                        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                            HStack {
+                                let count = preview.files.count
+                                Text("\(count) \(count == 1 ? "file" : "files") · +\(preview.totalInsertions) -\(preview.totalDeletions)")
+                                    .font(OrbitTypography.subhead(.semibold))
+                                    .foregroundStyle(palette.fgPrimary)
+                                Spacer()
+                                if let srcBr = preview.sourceBranch, let dstBr = preview.targetBranch {
+                                    Text("\(srcBr) → \(dstBr)")
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                }
+                            }
+
+                            if let warn = preview.warning, !warn.isEmpty {
+                                Text(warn)
+                                    .font(OrbitTypography.meta(.medium))
+                                    .foregroundStyle(palette.warning)
+                            }
+
+                            if !preview.conflicts.isEmpty {
+                                Text("Potential conflicts: \(preview.conflicts.joined(separator: ", "))")
+                                    .font(OrbitTypography.meta(.medium))
+                                    .foregroundStyle(palette.danger)
+                            }
+
+                            ForEach(preview.files.prefix(30), id: \.path) { file in
+                                HStack {
+                                    Text(file.path)
+                                        .font(OrbitTypography.code(.regular))
+                                        .foregroundStyle(palette.fgPrimary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer()
+                                    Text("+\(file.insertions) -\(file.deletions)")
+                                        .font(OrbitTypography.meta(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                }
+                                .padding(.vertical, 2)
+                            }
+                        }
+                        .padding(OrbitSpacing.md)
+                        .background(palette.elevated)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+                    }
+
+                    Button {
+                        runExecute()
+                    } label: {
+                        HStack {
+                            if isExecuting { ProgressView().tint(palette.onPrimary) }
+                            Text(mode == .move ? "Move Changes & Handoff" : "Apply Changes")
+                                .font(OrbitTypography.subhead(.semibold))
+                        }
+                        .foregroundStyle(palette.onPrimary)
+                        .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                        .background(
+                            (isExecuting || isLoading || (preview?.files.isEmpty ?? true))
+                                ? palette.fgMuted.opacity(0.4)
+                                : palette.primary,
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isExecuting || isLoading || (preview?.files.isEmpty ?? true))
+                }
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.vertical, OrbitSpacing.md)
+            }
             .background((palette.isDark ? palette.canvas : palette.drawer).ignoresSafeArea())
-            .navigationTitle("New Workspace")
+            .navigationTitle("Worktree Handoff")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { dismiss() }
-                        .foregroundStyle(palette.fgSecondary)
+                    Button(OrbitL10n.tr("Cancel")) { dismiss() }
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        loadPreview()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+            }
+            .onAppear {
+                if selectedSourceAgentId == nil {
+                    if let active = store.activeAgent,
+                       active.workspaceId == workspaceId,
+                       worktreePeers.contains(where: { $0.agentId == active.agentId }) {
+                        selectedSourceAgentId = active.agentId
+                    } else if workspace?.isWorktree != true {
+                        selectedSourceAgentId = worktreePeers.first?.agentId
+                    }
+                }
+                loadPreview()
+            }
+            .onChange(of: direction) { _ in loadPreview() }
+            .onChange(of: includeCommitted) { _ in loadPreview() }
+            .onChange(of: selectedSourceAgentId) { _ in loadPreview() }
+        }
+    }
+
+    @ViewBuilder
+    private var sourceWorktreePickerRow: some View {
+        let activePeer = worktreePeers.first(where: { $0.agentId == effectiveSourceAgentId }) ?? worktreePeers.first
+        OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+        HStack(spacing: OrbitSpacing.md) {
+            Text("Source Worktree")
+                .font(OrbitTypography.subhead(.regular))
+                .foregroundStyle(palette.fgPrimary)
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: OrbitSpacing.sm)
+            Menu {
+                Picker("Source Worktree", selection: sourceAgentBinding) {
+                    ForEach(worktreePeers, id: \.agentId) { peer in
+                        Text(peerSourceLabel(peer)).tag(peer.agentId)
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(activePeer.map(peerSourceLabel) ?? "Select worktree")
+                        .font(OrbitTypography.subhead(.regular))
+                        .foregroundStyle(palette.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(palette.primary)
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .contentShape(Rectangle())
+            }
+        }
+        .padding(.horizontal, OrbitSpacing.md)
+        .padding(.vertical, 10)
+    }
+
+    private var sourceAgentBinding: Binding<String> {
+        Binding<String>(
+            get: { effectiveSourceAgentId ?? "" },
+            set: { selectedSourceAgentId = $0.isEmpty ? nil : $0 }
+        )
+    }
+
+    private func peerSourceLabel(_ peer: FfiAgentCard) -> String {
+        let handle = peer.handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cleanHandle = handle.trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+        let titleFallback = peer.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = cleanHandle.isEmpty ? (titleFallback.isEmpty ? "Peer" : titleFallback) : "@\(cleanHandle)"
+        let branch = peer.worktreeBranch ?? "worktree"
+        return "\(prefix) · \(branch)"
+    }
+
+    private func loadPreview() {
+        isLoading = true
+        errorMessage = nil
+        let agentId = effectiveSourceAgentId
+        Task {
+            do {
+                let res = try await store.previewWorktreeHandoff(
+                    workspaceId: workspaceId,
+                    sourceAgentId: agentId,
+                    direction: direction,
+                    includeCommitted: includeCommitted
+                )
+                preview = res
+                isLoading = false
+            } catch {
+                errorMessage = OrbitErrorFormatter.humanize(error)
+                isLoading = false
+            }
+        }
+    }
+
+    private func runExecute() {
+        isExecuting = true
+        errorMessage = nil
+        let agentId = effectiveSourceAgentId
+        Task {
+            do {
+                _ = try await store.executeWorktreeHandoff(
+                    workspaceId: workspaceId,
+                    sourceAgentId: agentId,
+                    direction: direction,
+                    mode: mode,
+                    includeCommitted: includeCommitted
+                )
+                isExecuting = false
+                dismiss()
+            } catch {
+                errorMessage = OrbitErrorFormatter.humanize(error)
+                isExecuting = false
             }
         }
     }

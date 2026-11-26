@@ -2,6 +2,24 @@ import SwiftUI
 import UIKit
 import WebKit
 
+private enum OrbitDiagramRenderCache {
+    static let renderedViews = NSCache<NSString, RenderedBox>()
+
+    final class RenderedBox: NSObject {
+        let value: FfiRenderDiagramView
+        init(_ value: FfiRenderDiagramView) { self.value = value }
+    }
+
+    static func get(key: String) -> FfiRenderDiagramView? {
+        renderedViews.object(forKey: key as NSString)?.value
+    }
+
+    static func set(_ value: FfiRenderDiagramView, key: String) {
+        renderedViews.countLimit = 64
+        renderedViews.setObject(RenderedBox(value), forKey: key as NSString)
+    }
+}
+
 private struct OrbitDiagramRendererKey: EnvironmentKey {
     static let defaultValue: (@Sendable (FfiDiagramKind, String, Bool) async -> FfiRenderDiagramView?)? = nil
 }
@@ -275,8 +293,25 @@ struct DiagramBlockView: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 96)
             } else {
-                rawDiagramSourceBody
-                    .padding(OrbitSpacing.sm)
+                VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
+                    if let err = rendered?.error, !err.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(palette.warning)
+                            Text(err)
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.warning)
+                                .lineLimit(3)
+                        }
+                        .padding(.horizontal, OrbitSpacing.sm)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(palette.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    rawDiagramSourceBody
+                }
+                .padding(OrbitSpacing.sm)
             }
         }
         .background(palette.code)
@@ -290,34 +325,60 @@ struct DiagramBlockView: View {
                 isLoading = false
                 return
             }
+            if let cached = OrbitDiagramRenderCache.get(key: taskKey) {
+                rendered = cached
+                isLoading = false
+                return
+            }
             isLoading = true
             let result = await diagramRenderer?(kind, rawCode, palette.isDark)
             guard !Task.isCancelled else { return }
+            if let result {
+                OrbitDiagramRenderCache.set(result, key: taskKey)
+            }
             rendered = result
             isLoading = false
         }
         .fullScreenCover(isPresented: $showFullscreen) {
             if let svg = rendered?.svg {
                 NavigationStack {
-                    OrbitSvgWebCanvas(svg: svg, isDark: palette.isDark, allowZoomScroll: true)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(palette.canvas.ignoresSafeArea())
-                        .navigationTitle(headerTitle)
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarLeading) {
-                                Button("Done") {
-                                    showFullscreen = false
-                                }
+                    ZStack(alignment: .top) {
+                        OrbitSvgWebCanvas(svg: svg, isDark: palette.isDark, allowZoomScroll: true)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(palette.canvas.ignoresSafeArea())
+
+                        if copied {
+                            HStack(spacing: 6) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(palette.direct)
+                                Text(OrbitL10n.tr("Copied diagram source"))
+                                    .font(OrbitTypography.meta(.semibold))
+                                    .foregroundStyle(palette.fgPrimary)
                             }
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button {
-                                    copySource()
-                                } label: {
-                                    Image(systemName: copied ? "checkmark" : "square.on.square")
-                                }
+                            .padding(.horizontal, OrbitSpacing.md)
+                            .padding(.vertical, OrbitSpacing.xs + 2)
+                            .background(palette.elevated, in: Capsule())
+                            .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
+                            .padding(.top, OrbitSpacing.md)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                    }
+                    .navigationTitle(headerTitle)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") {
+                                showFullscreen = false
                             }
                         }
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button {
+                                copySource()
+                            } label: {
+                                Label(copied ? "Copied" : "Copy Source", systemImage: copied ? "checkmark" : "square.on.square")
+                            }
+                        }
+                    }
                 }
             }
         }

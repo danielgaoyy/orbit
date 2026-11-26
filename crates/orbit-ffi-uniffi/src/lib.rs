@@ -4803,6 +4803,7 @@ impl From<FfiForkAgentRequest> for ForkAgentRequest {
 pub struct FfiPreviewWorktreeHandoffRequest {
     pub host_id: String,
     pub workspace_id: String,
+    pub source_agent_id: Option<String>,
     pub direction: FfiWorktreeHandoffDirection,
     pub target_workspace_id: Option<String>,
     pub include_committed: bool,
@@ -4813,7 +4814,7 @@ impl From<FfiPreviewWorktreeHandoffRequest> for PreviewWorktreeHandoffRequest {
         Self {
             host_id: v.host_id,
             workspace_id: v.workspace_id,
-            source_agent_id: None,
+            source_agent_id: v.source_agent_id,
             direction: v.direction.into(),
             target_workspace_id: v.target_workspace_id,
             include_committed: v.include_committed,
@@ -4825,6 +4826,7 @@ impl From<FfiPreviewWorktreeHandoffRequest> for PreviewWorktreeHandoffRequest {
 pub struct FfiExecuteWorktreeHandoffRequest {
     pub host_id: String,
     pub workspace_id: String,
+    pub source_agent_id: Option<String>,
     pub direction: FfiWorktreeHandoffDirection,
     pub mode: FfiWorktreeHandoffMode,
     pub target_workspace_id: Option<String>,
@@ -4838,7 +4840,7 @@ impl From<FfiExecuteWorktreeHandoffRequest> for ExecuteWorktreeHandoffRequest {
         Self {
             host_id: v.host_id,
             workspace_id: v.workspace_id,
-            source_agent_id: None,
+            source_agent_id: v.source_agent_id,
             direction: v.direction.into(),
             mode: v.mode.into(),
             target_workspace_id: v.target_workspace_id,
@@ -5590,6 +5592,10 @@ impl OrbitMobileCore {
 
     pub fn terminal_screen(&self, host_id: String) -> Option<FfiTerminalScreen> {
         self.inner.terminal_screen(&host_id).map(Into::into)
+    }
+
+    pub fn terminal_scrollback(&self, host_id: String) -> Vec<String> {
+        self.inner.terminal_scrollback(&host_id)
     }
 
     pub fn terminal_screen_slot(&self, host_id: String, slot: u8) -> Option<FfiTerminalScreen> {

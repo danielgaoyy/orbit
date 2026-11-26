@@ -285,7 +285,7 @@ extension OrbitIosStore {
                 }
                 self.reloadAgentStage(hostId: hid, agentId: aid)
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -323,7 +323,7 @@ extension OrbitIosStore {
                         totalResolved += result.resolvedCount
                         totalSkipped += result.skippedCount
                     } catch {
-                        if firstError == nil { firstError = error.localizedDescription }
+                        if firstError == nil { firstError = OrbitErrorFormatter.humanize(error) }
                     }
                 }
                 return (totalResolved, totalSkipped, firstError)
@@ -367,7 +367,7 @@ extension OrbitIosStore {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, error in
             DispatchQueue.main.async { [weak self] in
                 if let error {
-                    self?.lastError = error.localizedDescription
+                    self?.lastError = OrbitErrorFormatter.humanize(error)
                     return
                 }
                 guard granted else {
@@ -389,7 +389,7 @@ extension OrbitIosStore {
 
     public func handleApnsRegistrationError(_ error: Error) {
         #if !targetEnvironment(simulator)
-        lastError = error.localizedDescription
+        lastError = OrbitErrorFormatter.humanize(error)
         #endif
     }
 
@@ -498,7 +498,7 @@ extension OrbitIosStore {
                 self.hapticLight()
             } catch {
                 self?.pushBusy = false
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -518,14 +518,21 @@ extension OrbitIosStore {
                 self.showToast("\(res.delivered)/\(res.attempted) · \(res.detail)")
             } catch {
                 self?.pushBusy = false
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
 
+    private static var lastLiveActivitySyncTime: CFTimeInterval = 0
+    private static var lastLiveActivitySignature: String = ""
+
     public func syncLiveActivityFromFleetState() {
+        let now = ProcessInfo.processInfo.systemUptime
         guard liveActivitiesEnabled else {
-            OrbitLiveActivityManager.shared.endAllActivities()
+            if Self.lastLiveActivitySignature != "off" {
+                Self.lastLiveActivitySignature = "off"
+                OrbitLiveActivityManager.shared.endAllActivities()
+            }
             return
         }
         let prioritySession: (host: FfiHostCard, agent: FfiAgentCard)? = {
@@ -535,6 +542,26 @@ extension OrbitIosStore {
             }
             return liveFleetSessions.first(where: { $0.agent.isAwaitingPermission || $0.agent.isForegroundRunning })
         }()
+
+        let signature: String = {
+            if let target = prioritySession {
+                let pending = Int(max(target.agent.isAwaitingPermission ? 1 : 0, Int(totalPendingApprovals)))
+                return "\(target.host.hostId)::\(target.agent.agentId)::\(target.agent.statusLabel)::\(target.agent.isForegroundRunning)::\(pending)"
+            }
+            if let host = activeHost, let agent = activeAgent {
+                return "idle::\(host.hostId)::\(agent.agentId)::\(agent.statusLabel)"
+            }
+            return "none"
+        }()
+
+        if signature == Self.lastLiveActivitySignature {
+            return
+        }
+        if (now - Self.lastLiveActivitySyncTime) < 1.0 && !signature.contains("::true::") {
+            return
+        }
+        Self.lastLiveActivitySyncTime = now
+        Self.lastLiveActivitySignature = signature
 
         guard let target = prioritySession else {
             if let host = activeHost, let agent = activeAgent {
@@ -720,7 +747,7 @@ extension OrbitIosStore {
                 self.refreshRouterAndMesh()
             } catch {
                 self?.routerBusy = false
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }
@@ -746,7 +773,7 @@ extension OrbitIosStore {
                 self.hapticLight()
                 self.refreshRouterAndMesh()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.lastError = OrbitErrorFormatter.humanize(error)
             }
         }
     }

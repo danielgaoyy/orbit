@@ -9,8 +9,10 @@ struct QrPairSheet: View {
 
     @State private var manualUri = ""
     @State private var detectedClipboardPairUri: String?
+    @State private var inlineErrorMessage: String?
     @State private var cameraState: QrCameraState = .checking
     @State private var scanGeneration: Int = 0
+    @FocusState private var isUriFieldFocused: Bool
 
     enum QrCameraState: Equatable {
         case checking
@@ -18,35 +20,154 @@ struct QrPairSheet: View {
         case unavailable(reason: String)
     }
 
+    private var trimmedManualUri: String {
+        manualUri.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             sheetHeader
             OrbitHairline()
 
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: OrbitSpacing.lg) {
-                    if store.cloudSyncStatus?.state != .ready {
-                        cloudSyncQuickCard
+            if let bannerError = inlineErrorMessage ?? store.lastError, !bannerError.isEmpty {
+                HStack(spacing: OrbitSpacing.sm) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(OrbitTypography.iconSmall)
+                        .foregroundStyle(palette.danger)
+                    Text(bannerError)
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(3)
+                    Spacer()
+                    Button {
+                        inlineErrorMessage = nil
+                        store.clearError()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(OrbitTypography.iconMicro)
+                            .foregroundStyle(palette.fgMuted)
+                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                            .contentShape(Rectangle())
                     }
-
-                    if let clipUri = detectedClipboardPairUri {
-                        clipboardPairBannerCard(clipUri)
-                    }
-
-                    if store.localDaemonUri != nil {
-                        localSimulatorDiscoveryCard
-                    }
-
-                    cameraScannerSection
-                    manualUriSection
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss Error")
                 }
-                .padding(OrbitSpacing.lg)
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.vertical, OrbitSpacing.xs)
+                .background(palette.danger.opacity(0.12))
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: OrbitSpacing.lg) {
+                        if store.cloudSyncStatus?.state != .ready {
+                            cloudSyncQuickCard
+                        }
+
+                        if let clipUri = detectedClipboardPairUri {
+                            clipboardPairBannerCard(clipUri)
+                        }
+
+                        if store.localDaemonUri != nil {
+                            localSimulatorDiscoveryCard
+                        }
+
+                        cameraScannerSection
+                        manualUriSection
+                            .id("manual-uri-section")
+
+                        pairHostSubmitButton
+                            .id("pair-submit-cta")
+                    }
+                    .padding(OrbitSpacing.lg)
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: isUriFieldFocused) { focused in
+                    if focused {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo("pair-submit-cta", anchor: .bottom)
+                            }
+                        }
+                    }
+                }
             }
         }
         .background(palette.canvas.ignoresSafeArea())
         .onAppear {
-            store.refreshPasteboardAvailability()
+            inlineErrorMessage = nil
             evaluateCameraAvailability()
+        }
+    }
+
+    private var pairHostSubmitButton: some View {
+        Button {
+            submitManualUri()
+        } label: {
+            Text(OrbitL10n.tr("Pair Host"))
+                .font(OrbitTypography.subhead(.semibold))
+                .foregroundStyle(trimmedManualUri.isEmpty ? palette.fgSecondary : palette.onPrimary)
+                .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                .background(
+                    trimmedManualUri.isEmpty
+                        ? palette.elevated
+                        : palette.primary
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(trimmedManualUri.isEmpty ? palette.hairline : Color.clear, lineWidth: 0.8)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(trimmedManualUri.isEmpty)
+        .padding(.top, OrbitSpacing.xs)
+    }
+
+    private func handlePastedUriString(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            inlineErrorMessage = "No orbit://pair or orbit://sync-login URI found in clipboard."
+            store.showToast("No orbit://pair or orbit://sync-login URI found in clipboard", isWarning: true)
+            return
+        }
+        if let range = trimmed.range(of: "orbit://(pair|sync-login)[^\\s\"']+", options: [.regularExpression, .caseInsensitive]) {
+            let extracted = String(trimmed[range])
+            manualUri = extracted
+            detectedClipboardPairUri = extracted
+            inlineErrorMessage = nil
+            store.hapticLight()
+            return
+        }
+        manualUri = trimmed
+        inlineErrorMessage = "Clipboard text does not start with orbit://pair or orbit://sync-login."
+    }
+
+    private func readValidOrRawClipboardUri() -> String? {
+        if let verified = store.readPairingUriFromClipboard() {
+            return verified
+        }
+        if let raw = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+           raw.lowercased().hasPrefix("orbit://") {
+            return raw
+        }
+        return nil
+    }
+
+    private func submitManualUri() {
+        let uri = trimmedManualUri
+        guard !uri.isEmpty else { return }
+        guard uri.lowercased().hasPrefix("orbit://pair") || uri.lowercased().hasPrefix("orbit://sync-login") else {
+            inlineErrorMessage = "Enter a valid orbit://pair or orbit://sync-login URI."
+            return
+        }
+        inlineErrorMessage = nil
+        if store.handleScannedOrPastedUri(uri) {
+            manualUri = ""
+            dismiss()
+        } else {
+            inlineErrorMessage = store.lastError ?? "Could not pair with this URI. Check host reachability and secret."
         }
     }
 
@@ -85,7 +206,7 @@ struct QrPairSheet: View {
                     .foregroundStyle(palette.accentSky)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("1-Scan Device Link / GitHub Sync")
+                    Text("One-Scan Device Link / GitHub Sync")
                         .font(OrbitTypography.body(.semibold))
                         .foregroundStyle(palette.fgPrimary)
                     Text("Scan a Device Link QR from Orbit Desktop — logs in, unlocks, and imports all machines + relays in 1 step.")
@@ -294,34 +415,28 @@ struct QrPairSheet: View {
 
                 Spacer()
 
-                Button {
-                    if let clip = store.readPairingUriFromClipboard() {
-                        manualUri = clip
-                        detectedClipboardPairUri = clip
-                        store.hapticLight()
-                    } else {
-                        store.showToast("No orbit://pair or orbit://sync-login URI found in clipboard")
+                PasteButton(payloadType: String.self) { strings in
+                    let raw = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    Task { @MainActor in
+                        handlePastedUriString(raw)
                     }
-                } label: {
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Image(systemName: "doc.on.clipboard")
-                            .font(OrbitTypography.iconMicro)
-                        Text("Paste URI")
-                            .font(OrbitTypography.meta(.semibold))
-                    }
-                    .foregroundStyle(palette.primary)
-                    .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget, alignment: .trailing)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .labelStyle(.titleAndIcon)
+                .buttonBorderShape(.capsule)
+                .tint(palette.primary)
                 .accessibilityLabel("Paste Pairing or Link URI from Clipboard")
             }
 
             TextField("orbit://pair/… or orbit://sync-login?…", text: $manualUri)
                 .font(OrbitTypography.code(.regular))
                 .foregroundStyle(palette.fgPrimary)
+                .focused($isUriFieldFocused)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .submitLabel(.go)
+                .onSubmit {
+                    submitManualUri()
+                }
                 .padding(.horizontal, OrbitSpacing.md)
                 .frame(minHeight: OrbitSpacing.hitTarget)
                 .background(palette.elevated)
@@ -330,27 +445,6 @@ struct QrPairSheet: View {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .strokeBorder(palette.hairline, lineWidth: 0.5)
                 )
-
-            Button {
-                if store.handleScannedOrPastedUri(manualUri) {
-                    manualUri = ""
-                    dismiss()
-                }
-            } label: {
-                Text("Pair Host")
-                    .font(OrbitTypography.subhead(.semibold))
-                    .foregroundStyle(manualUri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? palette.fgMuted : palette.onPrimary)
-                    .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
-                    .background(
-                        manualUri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? palette.subtleFill
-                            : palette.primary
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(manualUri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 

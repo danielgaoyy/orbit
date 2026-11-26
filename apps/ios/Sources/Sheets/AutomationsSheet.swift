@@ -448,6 +448,13 @@ struct AutomationsSheet: View {
                 }
                 compactActionPill(OrbitL10n.tr("Run Now"), icon: "bolt.fill", tint: palette.accentSky) {
                     store.runScheduleOnce(sched.scheduleId)
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        store.fetchScheduleRuns(sched.scheduleId)
+                        if let hid = store.selectedHostId {
+                            store.reloadHostDetail(hid)
+                        }
+                    }
                 }
                 Spacer()
                 Button {
@@ -1365,6 +1372,11 @@ private struct CreateAutomationSheet: View {
                         .font(OrbitTypography.code(.regular))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    if let cronErr = OrbitCronLogic.validate(cronExpr) {
+                        Text(cronErr)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.danger)
+                    }
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
                             ForEach(cronPresets, id: \.self) { preset in
@@ -1421,7 +1433,11 @@ private struct CreateAutomationSheet: View {
                         )
                         dismiss()
                     }
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(
+                        name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || OrbitCronLogic.validate(cronExpr) != nil
+                    )
                 }
             }
             .onAppear {

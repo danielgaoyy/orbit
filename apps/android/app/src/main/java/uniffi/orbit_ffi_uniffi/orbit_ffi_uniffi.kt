@@ -1049,6 +1049,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_terminal_screen_slot(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_terminal_scrollback(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_test_acp_agent(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_toggle_pin_agent(
@@ -1532,6 +1534,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_terminal_screen(`ptr`: Long,`hostId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_terminal_screen_slot(`ptr`: Long,`hostId`: RustBuffer.ByValue,`slot`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_terminal_scrollback(`ptr`: Long,`hostId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_test_acp_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -2289,6 +2293,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_terminal_screen_slot() and 0xFFFF) != 26006) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_terminal_scrollback() and 0xFFFF) != 37246) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_test_acp_agent() and 0xFFFF) != 46040) {
@@ -3685,6 +3692,8 @@ public interface OrbitMobileCoreInterface {
     fun `terminalScreen`(`hostId`: kotlin.String): FfiTerminalScreen?
     
     fun `terminalScreenSlot`(`hostId`: kotlin.String, `slot`: kotlin.UByte): FfiTerminalScreen?
+    
+    fun `terminalScrollback`(`hostId`: kotlin.String): List<kotlin.String>
     
     fun `testAcpAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String, `cwd`: kotlin.String?): FfiAcpProbeResult
     
@@ -6247,6 +6256,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         
         FfiConverterString.lower(`hostId`),
         FfiConverterUByte.lower(`slot`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `terminalScrollback`(`hostId`: kotlin.String): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_terminal_scrollback(
+        it,
+        
+        FfiConverterString.lower(`hostId`),_status)
 }
     }
     )
@@ -10450,6 +10473,8 @@ data class FfiExecuteWorktreeHandoffRequest (
     , 
     var `workspaceId`: kotlin.String
     , 
+    var `sourceAgentId`: kotlin.String?
+    , 
     var `direction`: FfiWorktreeHandoffDirection
     , 
     var `mode`: FfiWorktreeHandoffMode
@@ -10479,6 +10504,7 @@ public object FfiConverterTypeFfiExecuteWorktreeHandoffRequest: FfiConverterRust
         return FfiExecuteWorktreeHandoffRequest(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterTypeFfiWorktreeHandoffDirection.read(buf),
             FfiConverterTypeFfiWorktreeHandoffMode.read(buf),
             FfiConverterOptionalString.read(buf),
@@ -10491,6 +10517,7 @@ public object FfiConverterTypeFfiExecuteWorktreeHandoffRequest: FfiConverterRust
     override fun allocationSize(value: FfiExecuteWorktreeHandoffRequest) = (
             FfiConverterString.allocationSize(value.`hostId`) +
             FfiConverterString.allocationSize(value.`workspaceId`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceAgentId`) +
             FfiConverterTypeFfiWorktreeHandoffDirection.allocationSize(value.`direction`) +
             FfiConverterTypeFfiWorktreeHandoffMode.allocationSize(value.`mode`) +
             FfiConverterOptionalString.allocationSize(value.`targetWorkspaceId`) +
@@ -10502,6 +10529,7 @@ public object FfiConverterTypeFfiExecuteWorktreeHandoffRequest: FfiConverterRust
     override fun write(value: FfiExecuteWorktreeHandoffRequest, buf: ByteBuffer) {
             FfiConverterString.write(value.`hostId`, buf)
             FfiConverterString.write(value.`workspaceId`, buf)
+            FfiConverterOptionalString.write(value.`sourceAgentId`, buf)
             FfiConverterTypeFfiWorktreeHandoffDirection.write(value.`direction`, buf)
             FfiConverterTypeFfiWorktreeHandoffMode.write(value.`mode`, buf)
             FfiConverterOptionalString.write(value.`targetWorkspaceId`, buf)
@@ -12312,6 +12340,8 @@ data class FfiPreviewWorktreeHandoffRequest (
     , 
     var `workspaceId`: kotlin.String
     , 
+    var `sourceAgentId`: kotlin.String?
+    , 
     var `direction`: FfiWorktreeHandoffDirection
     , 
     var `targetWorkspaceId`: kotlin.String?
@@ -12335,6 +12365,7 @@ public object FfiConverterTypeFfiPreviewWorktreeHandoffRequest: FfiConverterRust
         return FfiPreviewWorktreeHandoffRequest(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterTypeFfiWorktreeHandoffDirection.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
@@ -12344,6 +12375,7 @@ public object FfiConverterTypeFfiPreviewWorktreeHandoffRequest: FfiConverterRust
     override fun allocationSize(value: FfiPreviewWorktreeHandoffRequest) = (
             FfiConverterString.allocationSize(value.`hostId`) +
             FfiConverterString.allocationSize(value.`workspaceId`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceAgentId`) +
             FfiConverterTypeFfiWorktreeHandoffDirection.allocationSize(value.`direction`) +
             FfiConverterOptionalString.allocationSize(value.`targetWorkspaceId`) +
             FfiConverterBoolean.allocationSize(value.`includeCommitted`)
@@ -12352,6 +12384,7 @@ public object FfiConverterTypeFfiPreviewWorktreeHandoffRequest: FfiConverterRust
     override fun write(value: FfiPreviewWorktreeHandoffRequest, buf: ByteBuffer) {
             FfiConverterString.write(value.`hostId`, buf)
             FfiConverterString.write(value.`workspaceId`, buf)
+            FfiConverterOptionalString.write(value.`sourceAgentId`, buf)
             FfiConverterTypeFfiWorktreeHandoffDirection.write(value.`direction`, buf)
             FfiConverterOptionalString.write(value.`targetWorkspaceId`, buf)
             FfiConverterBoolean.write(value.`includeCommitted`, buf)

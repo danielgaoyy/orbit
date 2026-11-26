@@ -8,6 +8,7 @@ struct PersonalRouterAndMeshSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
     @State private var selectedRouterHostId: String? = nil
+    @State private var pendingMeshPeerStates: [String: Bool] = [:]
 
     private var activeRouterHostId: String? {
         selectedRouterHostId
@@ -292,8 +293,9 @@ struct PersonalRouterAndMeshSheet: View {
                             Spacer(minLength: 4)
 
                             Toggle("", isOn: Binding(
-                                get: { peer.enabled },
+                                get: { pendingMeshPeerStates[peer.registrationId] ?? peer.enabled },
                                 set: { enabled in
+                                    pendingMeshPeerStates[peer.registrationId] = enabled
                                     store.updateFleetMeshPeer(
                                         hostId: hostId,
                                         registrationId: peer.registrationId,
@@ -303,6 +305,11 @@ struct PersonalRouterAndMeshSheet: View {
                             ))
                             .labelsHidden()
                             .tint(palette.direct)
+                            .onChange(of: peer.enabled) { confirmed in
+                                if pendingMeshPeerStates[peer.registrationId] == confirmed {
+                                    pendingMeshPeerStates.removeValue(forKey: peer.registrationId)
+                                }
+                            }
                         }
                         .padding(.horizontal, OrbitSpacing.md)
                         .padding(.vertical, 10)

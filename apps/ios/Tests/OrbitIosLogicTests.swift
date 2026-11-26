@@ -846,6 +846,108 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
         try checkEqual(first.key.count, 32)
         try checkEqual(first.key, second.key, "Repeated opens must return the identical persisted 32-byte master key")
         try checkFalse(second.newlyGenerated, "Second load must reuse existing key")
+
+        // Verify fallback key file reader also recovers the persisted 32-byte key directly.
+        if first.source == .protectedFileFallback {
+            let directFallback = kc.readExistingProtectedFallbackKey(in: tempDir)
+            try checkEqual(directFallback, first.key)
+        }
+    }
+
+    func testAuditP1AndP2LogicHelpersAndTerminalScrollbackRingBuffer() throws {
+        // 1. Humanized FFI error formatting
+        let rawErr = "FfiOrbitError.Core(detail: \"failed to reach ws://192.168.1.5:6868: Connection refused (os error 61)\")"
+        let friendly = OrbitErrorFormatter.humanize(rawErr)
+        try checkFalse(friendly.contains("FfiOrbitError"), "Raw UniFFI wrapper must be stripped")
+        try checkTrue(friendly.lowercased().contains("reach") || friendly.lowercased().contains("offline") || friendly.lowercased().contains("connection"))
+
+        // 2. Plan / dangerous allow_always suppression
+        try checkFalse(OrbitPermissionSafetyLogic.shouldAllowAlwaysPermission(
+            title: "Approve execution plan",
+            commandOrPath: "",
+            toolName: "ExitPlanMode",
+            argumentsJson: nil,
+            allowedDecisions: ["allow_once", "allow_always", "deny"]
+        ))
+        try checkFalse(OrbitPermissionSafetyLogic.shouldAllowAlwaysPermission(
+            title: "Run shell command",
+            commandOrPath: "rm -rf /tmp/foo",
+            toolName: "shell",
+            argumentsJson: nil,
+            allowedDecisions: ["allow_once", "allow_always", "deny"]
+        ))
+        try checkTrue(OrbitPermissionSafetyLogic.shouldAllowAlwaysPermission(
+            title: "Edit README",
+            commandOrPath: "README.md",
+            toolName: "file_edit",
+            argumentsJson: nil,
+            allowedDecisions: ["allow_once", "allow_always", "deny"]
+        ))
+
+        // 3. Cron expression & preset validation
+        try checkTrue(OrbitCronLogic.validate("daily 09:00") == nil)
+        try checkTrue(OrbitCronLogic.validate("weekdays 09:00") == nil)
+        try checkTrue(OrbitCronLogic.validate("*/15 * * * *") == nil)
+        try checkTrue(OrbitCronLogic.validate("15m") == nil)
+        try checkFalse(OrbitCronLogic.validate("not-a-cron") == nil)
+        try checkFalse(OrbitCronLogic.validate("99 99 * * *") == nil)
+        try checkFalse(OrbitCronLogic.validate("daily 25:00") == nil)
+
+        // 4. Global search <mark> highlight parsing
+        let segments = OrbitSearchHighlightLogic.segments(from: "hello <mark>orbit</mark> world")
+        try checkEqual(segments.count, 3)
+        try checkEqual(segments[0].text, "hello ")
+        try checkFalse(segments[0].highlighted)
+        try checkEqual(segments[1].text, "orbit")
+        try checkTrue(segments[1].highlighted)
+        try checkEqual(segments[2].text, " world")
+
+        // 5. Endpoint TUN & link-local sanitization
+        let filtered = OrbitEndpointLogic.sanitizeDirectEndpoints([
+            "http://198.18.0.1:6868",
+            "http://192.168.1.10:6868",
+            "169.254.1.2:6868"
+        ])
+        try checkEqual(filtered, ["http://192.168.1.10:6868"])
+
+        // 6. Terminal 5000-line scrollback ring buffer
+        var scrollback: [String] = []
+        let initialScreen = (0..<24).map { "line-\($0)" }
+        scrollback = OrbitTerminalScrollbackLogic.merge(
+            history: scrollback,
+            visibleLines: initialScreen,
+            windowRows: 24
+        )
+        for batchStart in stride(from: 24, to: 5200, by: 20) {
+            let visible = (max(0, batchStart - 4)..<min(5200, batchStart + 20)).map { "line-\($0)" }
+            scrollback = OrbitTerminalScrollbackLogic.merge(
+                history: scrollback,
+                visibleLines: visible,
+                windowRows: 24
+            )
+        }
+        try checkEqual(scrollback.count, OrbitTerminalScrollbackLogic.defaultMaxLines)
+        try checkEqual(scrollback.last, "line-5199")
+    }
+
+    func testMathFormatterAndLatexUnicode() throws {
+        try checkEqual(OrbitMathFormatter.format("E=mc^2"), "E=mc²")
+        try checkEqual(OrbitMathFormatter.format("e^{-x^2}"), "e⁻ˣ²")
+        try checkEqual(OrbitMathFormatter.format("x^{n+1}"), "xⁿ⁺¹")
+        let integral = OrbitMathFormatter.format("\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}")
+        try checkTrue(integral.contains("∫"))
+        try checkTrue(integral.contains("∞"))
+        try checkTrue(integral.contains("π"))
+        try checkTrue(integral.contains("√"))
+        try checkTrue(integral.contains("e⁻ˣ²"))
+        try checkFalse(integral.contains("^-"))
+        try checkFalse(integral.contains("\\frac"))
+        try checkFalse(integral.contains("\\int"))
+
+        let sum = OrbitMathFormatter.format("\\sum_{i=1}^{n} x_i^2 \\ge 0")
+        try checkTrue(sum.contains("∑"))
+        try checkTrue(sum.contains("≥"))
+        try checkTrue(sum.contains("²"))
     }
 }
 
@@ -898,6 +1000,8 @@ enum OrbitLogicCliMain {
             ("testPushNotificationDeepLinkAndUserInfoRouting", suite.testPushNotificationDeepLinkAndUserInfoRouting),
             ("testVoiceDictationTranscriptMergeAndIntentClassification", suite.testVoiceDictationTranscriptMergeAndIntentClassification),
             ("testKeychainCsprngAndProtectedFallbackPersistence", suite.testKeychainCsprngAndProtectedFallbackPersistence),
+            ("testAuditP1AndP2LogicHelpersAndTerminalScrollbackRingBuffer", suite.testAuditP1AndP2LogicHelpersAndTerminalScrollbackRingBuffer),
+            ("testMathFormatterAndLatexUnicode", suite.testMathFormatterAndLatexUnicode),
         ]
 
         var passed = 0

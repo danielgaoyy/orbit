@@ -73,6 +73,7 @@ private enum GitDiffHeuristics {
 
 private struct GitDiffWorkspacePanel: View {
     @ObservedObject var store: OrbitIosStore
+    @ObservedObject private var stageState: OrbitStageStreamState
     let isModalSheet: Bool
     let onClose: () -> Void
 
@@ -83,19 +84,21 @@ private struct GitDiffWorkspacePanel: View {
     @State private var isStashSheetPresented: Bool = false
     @State private var isBranchAlertPresented: Bool = false
     @State private var newBranchName: String = ""
+    @State private var discardConfirmFilePath: String? = nil
+
+    init(store: OrbitIosStore, isModalSheet: Bool, onClose: @escaping () -> Void) {
+        self.store = store
+        self._stageState = ObservedObject(wrappedValue: store.stageState)
+        self.isModalSheet = isModalSheet
+        self.onClose = onClose
+    }
 
     private var review: FfiGitReview? {
         store.gitReview
     }
 
     private var effectiveDiffFiles: [FfiDiffFile] {
-        if let files = review?.diffFiles, !files.isEmpty {
-            return files
-        }
-        if store.gitReviewScope != .staged, let sessionDiffs = store.agentStage?.sessionTurnDiffs, !sessionDiffs.isEmpty {
-            return sessionDiffs
-        }
-        return []
+        store.effectiveGitDiffFiles(for: store.gitReviewScope)
     }
 
     private var trimmedFilterQuery: String {
@@ -215,13 +218,36 @@ private struct GitDiffWorkspacePanel: View {
             }
             Button(OrbitL10n.tr("Cancel"), role: .cancel) { newBranchName = "" }
         }
+        .confirmationDialog(
+            OrbitL10n.tr("Discard changes to this file?"),
+            isPresented: Binding(
+                get: { discardConfirmFilePath != nil },
+                set: { if !$0 { discardConfirmFilePath = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let path = discardConfirmFilePath {
+                Button(OrbitL10n.tr("Discard Changes"), role: .destructive) {
+                    discardConfirmFilePath = nil
+                    let escaped = path.replacingOccurrences(of: "'", with: "'\\''")
+                    store.runGitCommandInTerminal("git checkout -- '\(escaped)' || rm -f '\(escaped)'")
+                }
+            }
+            Button(OrbitL10n.tr("Cancel"), role: .cancel) {
+                discardConfirmFilePath = nil
+            }
+        } message: {
+            if let path = discardConfirmFilePath {
+                Text(OrbitFormatters.shortPath(path))
+            }
+        }
     }
 
     // MARK: - Header
 
     private var headerBar: some View {
         HStack(spacing: OrbitSpacing.sm) {
-            Text("Git Diff")
+            Text(OrbitL10n.tr("Git Diff"))
                 .font(OrbitTypography.title)
                 .foregroundStyle(palette.fgPrimary)
 
@@ -240,23 +266,17 @@ private struct GitDiffWorkspacePanel: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Refresh Git Diff")
 
-            Button(action: onClose) {
-                if isModalSheet {
-                    Text("Done")
+            if isModalSheet {
+                Button(action: onClose) {
+                    Text(OrbitL10n.tr("Done"))
                         .font(OrbitTypography.subhead(.semibold))
                         .foregroundStyle(palette.primary)
                         .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
-                } else {
-                    Image(systemName: "xmark")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(palette.fgSecondary)
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
-                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close Git Diff")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(isModalSheet ? "Close Git Diff" : "Hide Git Diff Inspector")
         }
         .padding(.horizontal, OrbitSpacing.lg)
         .frame(height: 52)
@@ -434,32 +454,55 @@ private struct GitDiffWorkspacePanel: View {
                     isCommitSheetPresented = true
                 }
 
-                gitActionChip(OrbitL10n.tr("Push"), icon: "arrow.up.circle") {
-                    onClose()
-                    store.runGitCommandInTerminal("git push")
-                }
+                    gitActionChip(OrbitL10n.tr("Push"), icon: "arrow.up.circle") {
+                        onClose()
+                        store.runGitCommandInTerminal("git push")
+                    }
 
-                gitActionChip("Branch", icon: "arrow.triangle.branch") {
-                    isBranchAlertPresented = true
-                }
+                    Menu {
+                        Button(OrbitL10n.tr("New Branch…")) {
+                            isBranchAlertPresented = true
+                        }
+                        Button(OrbitL10n.tr("Checkout main")) {
+                            store.runGitCommandInTerminal("git checkout main")
+                        }
+                        Button(OrbitL10n.tr("Diff vs main")) {
+                            onClose()
+                            store.runGitCommandInTerminal("git --no-pager diff main...HEAD")
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text(OrbitL10n.tr("Branch"))
+                                .font(OrbitTypography.meta(.semibold))
+                        }
+                        .foregroundStyle(palette.fgPrimary)
+                        .padding(.horizontal, 11)
+                        .frame(minHeight: 36)
+                        .background(palette.subtleFill, in: Capsule())
+                        .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
+                        .frame(minHeight: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
+                    }
 
-                gitActionChip(
-                    store.gitStashes.isEmpty ? OrbitL10n.tr("Stash") : "\(OrbitL10n.tr("Stash")) (\(store.gitStashes.count))",
-                    icon: "tray.and.arrow.down"
-                ) {
-                    isStashSheetPresented = true
-                }
+                    gitActionChip(
+                        store.gitStashes.isEmpty ? OrbitL10n.tr("Stash") : "\(OrbitL10n.tr("Stash")) (\(store.gitStashes.count))",
+                        icon: "tray.and.arrow.down"
+                    ) {
+                        isStashSheetPresented = true
+                    }
 
-                gitActionChip(OrbitL10n.tr("Create PR"), icon: "arrow.triangle.pull") {
-                    isPrSheetPresented = true
+                    gitActionChip(OrbitL10n.tr("Create PR"), icon: "arrow.triangle.pull") {
+                        isPrSheetPresented = true
+                    }
                 }
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.bottom, OrbitSpacing.sm)
             }
-            .padding(.horizontal, OrbitSpacing.lg)
-            .padding(.bottom, OrbitSpacing.sm)
+            .disabled(store.gitWriteBusy)
+            .opacity(store.gitWriteBusy ? 0.65 : 1.0)
         }
-        .disabled(store.gitWriteBusy)
-        .opacity(store.gitWriteBusy ? 0.65 : 1.0)
-    }
 
     private func gitActionChip(_ title: String, icon: String, prominent: Bool = false, action: @escaping () -> Void) -> some View {
         Button {
@@ -474,11 +517,13 @@ private struct GitDiffWorkspacePanel: View {
             }
             .foregroundStyle(prominent ? palette.onPrimary : palette.fgPrimary)
             .padding(.horizontal, 11)
-            .frame(height: 30)
+            .frame(minHeight: 36)
             .background(prominent ? palette.primary : palette.subtleFill, in: Capsule())
             .overlay(
                 Capsule().strokeBorder(prominent ? Color.clear : palette.hairline, lineWidth: 0.5)
             )
+            .frame(minHeight: OrbitSpacing.hitTarget)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -656,7 +701,10 @@ private struct GitDiffWorkspacePanel: View {
                                         withAnimation(.easeInOut(duration: 0.2)) {
                                             proxy.scrollTo("diff-hunk-\(file.path)-\(hunkOffset)", anchor: .top)
                                         }
-                                    }
+                                    },
+                                    onRequestDiscard: store.gitReviewScope == .workingTree ? {
+                                        discardConfirmFilePath = file.path
+                                    } : nil
                                 )
                                 .id("diff-file-\(file.path)")
                             }
@@ -731,9 +779,7 @@ private struct GitDiffWorkspacePanel: View {
                     Text("Working tree clean")
                         .font(OrbitTypography.body(.medium))
                         .foregroundStyle(palette.fgPrimary)
-                    Text(store.gitStagedMode
-                         ? "No staged changes in \(OrbitFormatters.compactPath(store.activeCwd))."
-                         : "No unstaged modifications in \(OrbitFormatters.compactPath(store.activeCwd)).")
+                    Text(cleanTreeSubtitle)
                         .orbitSubheadStyle()
                         .foregroundStyle(palette.fgMuted)
                         .multilineTextAlignment(.center)
@@ -747,6 +793,15 @@ private struct GitDiffWorkspacePanel: View {
             }
         }
     }
+
+    private var cleanTreeSubtitle: String {
+        let dir = OrbitFormatters.compactPath(store.activeCwd)
+        switch store.gitReviewScope {
+        case .staged: return "No staged changes in \(dir)."
+        case .workingTree: return "No unstaged modifications in \(dir)."
+        case .all: return "No pending changes in \(dir)."
+        }
+    }
 }
 
 // MARK: - Virtualized & Collapsible File Diff Card (120-Line Cap)
@@ -758,6 +813,7 @@ private struct DiffFileSectionCard: View {
     let isAutoCollapsedKind: Bool
     let onToggleExpand: () -> Void
     let onJumpToHunk: (Int) -> Void
+    var onRequestDiscard: (() -> Void)? = nil
 
     @Environment(\.orbitPalette) private var palette
     @State private var showAllLines = false
@@ -825,11 +881,25 @@ private struct DiffFileSectionCard: View {
                         }
                     }
                     .padding(.leading, OrbitSpacing.md)
-                    .padding(.trailing, hunkOffsets.count > 1 ? OrbitSpacing.xs : OrbitSpacing.md)
+                    .padding(.trailing, OrbitSpacing.xs)
                     .frame(minHeight: OrbitSpacing.hitTarget)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+
+                // Jump to File Preview
+                Button {
+                    store.hapticLight()
+                    store.openWorkspaceFiles(initialPath: file.path)
+                } label: {
+                    Image(systemName: "doc.text")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(palette.fgSecondary)
+                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open \(OrbitFormatters.shortPath(file.path)) in Files")
 
                 // Per-file Stage / Unstage button
                 Button {
@@ -842,11 +912,23 @@ private struct DiffFileSectionCard: View {
                     Image(systemName: store.gitReviewScope == .staged ? "minus.circle" : "plus.circle")
                         .font(.system(size: 13.5, weight: .medium))
                         .foregroundStyle(store.gitReviewScope == .staged ? palette.warning : palette.direct)
-                        .frame(width: 34, height: OrbitSpacing.hitTarget)
+                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(store.gitReviewScope == .staged ? OrbitL10n.tr("Unstage") : OrbitL10n.tr("Stage"))
+
+                if let onRequestDiscard, store.gitReviewScope == .workingTree {
+                    Button(action: onRequestDiscard) {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(palette.danger)
+                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Discard changes to \(OrbitFormatters.shortPath(file.path))")
+                }
 
                 if hunkOffsets.count > 1 {
                     Button {
@@ -930,14 +1012,18 @@ private struct DiffFileSectionCard: View {
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: OrbitSpacing.xs + 2) {
                 Text(line.oldLine.map(String.init) ?? "")
-                    .font(OrbitTypography.code(.regular))
+                    .font(OrbitTypography.code(.regular).monospacedDigit())
                     .foregroundStyle(palette.fgMuted)
-                    .frame(width: 28, alignment: .trailing)
+                    .lineLimit(1)
+                    .frame(minWidth: 38, alignment: .trailing)
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Text(line.newLine.map(String.init) ?? "")
-                    .font(OrbitTypography.code(.regular))
+                    .font(OrbitTypography.code(.regular).monospacedDigit())
                     .foregroundStyle(palette.fgMuted)
-                    .frame(width: 28, alignment: .trailing)
+                    .lineLimit(1)
+                    .frame(minWidth: 38, alignment: .trailing)
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Text(linePrefix(line.kind))
                     .font(OrbitTypography.code(.semibold))
@@ -1108,10 +1194,31 @@ private struct GitStashManagerSheet: View {
 
     @State private var stashMessage: String = ""
     @State private var includeUntracked: Bool = true
+    @State private var dropConfirmEntry: GitStashEntry? = nil
 
     var body: some View {
         NavigationStack {
             List {
+                if let err = store.gitWriteError, !err.isEmpty {
+                    Section {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(palette.danger)
+                            Text(err)
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.danger)
+                            Spacer()
+                            Button { store.gitWriteError = nil } label: {
+                                Image(systemName: "xmark")
+                                    .foregroundStyle(palette.fgMuted)
+                                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
                 Section(OrbitL10n.tr("Save Stash")) {
                     TextField("Optional stash message", text: $stashMessage)
                     Toggle("Include untracked files", isOn: $includeUntracked)
@@ -1119,6 +1226,7 @@ private struct GitStashManagerSheet: View {
                         store.saveGitStash(message: stashMessage, includeUntracked: includeUntracked)
                         stashMessage = ""
                     }
+                    .frame(minHeight: OrbitSpacing.hitTarget)
                     .disabled(store.gitWriteBusy)
                 }
 
@@ -1134,14 +1242,20 @@ private struct GitStashManagerSheet: View {
                                 Text("\(entry.stashRef) · \(entry.branch ?? "")")
                                     .font(OrbitTypography.code(.regular))
                                     .foregroundStyle(palette.fgMuted)
-                                HStack(spacing: 14) {
+                                HStack(spacing: 10) {
                                     Button(OrbitL10n.tr("Pop")) { store.applyGitStash(entry, pop: true) }
                                         .font(OrbitTypography.meta(.semibold))
+                                        .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                                        .contentShape(Rectangle())
                                     Button(OrbitL10n.tr("Apply")) { store.applyGitStash(entry, pop: false) }
                                         .font(OrbitTypography.meta(.medium))
+                                        .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                                        .contentShape(Rectangle())
                                     Spacer()
-                                    Button(OrbitL10n.tr("Drop"), role: .destructive) { store.dropGitStash(entry) }
+                                    Button(OrbitL10n.tr("Drop"), role: .destructive) { dropConfirmEntry = entry }
                                         .font(OrbitTypography.meta(.medium))
+                                        .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                                        .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.borderless)
                             }
@@ -1157,6 +1271,28 @@ private struct GitStashManagerSheet: View {
             }
             .onAppear {
                 store.refreshGitWriteMetadata()
+            }
+            .confirmationDialog(
+                OrbitL10n.tr("Drop this stash permanently?"),
+                isPresented: Binding(
+                    get: { dropConfirmEntry != nil },
+                    set: { if !$0 { dropConfirmEntry = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                if let entry = dropConfirmEntry {
+                    Button(OrbitL10n.tr("Drop Stash"), role: .destructive) {
+                        dropConfirmEntry = nil
+                        store.dropGitStash(entry)
+                    }
+                }
+                Button(OrbitL10n.tr("Cancel"), role: .cancel) {
+                    dropConfirmEntry = nil
+                }
+            } message: {
+                if let entry = dropConfirmEntry {
+                    Text(entry.message.isEmpty ? entry.stashRef : "\(entry.stashRef): \(entry.message)")
+                }
             }
         }
     }

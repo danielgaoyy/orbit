@@ -2661,21 +2661,45 @@ struct TurnNoticeRow: View {
 
     @Environment(\.orbitPalette) private var palette
 
+    private var trimmedMessage: String {
+        message.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var lowerLevel: String {
+        level.lowercased()
+    }
+
+    private var isErrorLevel: Bool {
+        lowerLevel.contains("err") || lowerLevel.contains("fail")
+    }
+
+    private var isWarningLevel: Bool {
+        lowerLevel.contains("warn")
+    }
+
     private var accentColor: Color {
-        let lower = level.lowercased()
-        if lower.contains("err") || lower.contains("fail") {
+        if isErrorLevel {
             return palette.danger
-        } else if lower.contains("warn") {
+        } else if isWarningLevel {
             return palette.warning
         }
         return palette.fgSecondary
+    }
+
+    private var iconName: String {
+        if isErrorLevel {
+            return "exclamationmark.circle"
+        } else if isWarningLevel {
+            return "exclamationmark.triangle"
+        }
+        return "info.circle"
     }
 
     private var noticeAttributedText: NSAttributedString {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = OrbitTypography.subheadLineSpacing
         return NSAttributedString(
-            string: message,
+            string: trimmedMessage,
             attributes: [
                 .font: UIFont.systemFont(ofSize: 13, weight: .regular),
                 .foregroundColor: UIColor(accentColor),
@@ -2685,27 +2709,29 @@ struct TurnNoticeRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: OrbitSpacing.sm) {
-            Image(systemName: level.lowercased().contains("err") ? "exclamationmark.circle" : "exclamationmark.triangle")
-                .font(OrbitTypography.iconSmall)
-                .foregroundStyle(accentColor)
-                .padding(.top, 2)
+        if !trimmedMessage.isEmpty {
+            HStack(alignment: .top, spacing: OrbitSpacing.sm) {
+                Image(systemName: iconName)
+                    .font(OrbitTypography.iconSmall)
+                    .foregroundStyle(accentColor)
+                    .padding(.top, 2)
 
-            OrbitSelectableTextView(
-                attributedText: noticeAttributedText,
-                stretchesToProposedWidth: true,
-                isDarkAppearance: palette.isDark,
-                linkColor: UIColor(palette.primary)
+                OrbitSelectableTextView(
+                    attributedText: noticeAttributedText,
+                    stretchesToProposedWidth: true,
+                    isDarkAppearance: palette.isDark,
+                    linkColor: UIColor(palette.primary)
+                )
+            }
+            .padding(.horizontal, OrbitSpacing.md)
+            .padding(.vertical, OrbitSpacing.sm)
+            .background(accentColor.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(accentColor.opacity(0.22), lineWidth: 0.5)
             )
         }
-        .padding(.horizontal, OrbitSpacing.md)
-        .padding(.vertical, OrbitSpacing.sm)
-        .background(accentColor.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(accentColor.opacity(0.22), lineWidth: 0.5)
-        )
     }
 }
 
@@ -2888,14 +2914,33 @@ struct AgentMessageCardView: View {
                                 .foregroundStyle(palette.fgSecondary)
                         }
                     } else {
-                        let decisions = perm.allowedDecisions.isEmpty
+                        let baseDecisions = perm.allowedDecisions.isEmpty
                             ? ["deny", "allow_always", "allow"]
                             : perm.allowedDecisions
+                        let canAlways = OrbitPermissionSafetyLogic.shouldAllowAlwaysPermission(
+                            title: headerTitle,
+                            commandOrPath: text,
+                            toolName: nil,
+                            argumentsJson: nil,
+                            allowedDecisions: baseDecisions
+                        )
+                        let decisions = baseDecisions
+                            .filter { canAlways || OrbitDecisionLogic.classify($0) != .allowAlways }
+                            .sorted { lhs, rhs in
+                                let rank: (String) -> Int = { raw in
+                                    switch OrbitDecisionLogic.classify(raw) {
+                                    case .decline, .cancel: return 0
+                                    case .allowAlways, .allowSession: return 1
+                                    case .allowOnce, .custom: return 2
+                                    }
+                                }
+                                return rank(lhs) < rank(rhs)
+                            }
                         HStack(spacing: OrbitSpacing.sm) {
                             ForEach(decisions, id: \.self) { dec in
-                                let lower = dec.lowercased()
-                                let isDeny = lower.contains("deny") || lower.contains("reject")
-                                let isPrimary = !isDeny && !lower.contains("always")
+                                let kind = OrbitDecisionLogic.classify(dec)
+                                let isDeny = (kind == .decline || kind == .cancel)
+                                let isPrimary = (kind == .allowOnce)
                                 Button {
                                     resolvedChildDecision = dec
                                     actions.resolveChildPermission(
@@ -2905,7 +2950,7 @@ struct AgentMessageCardView: View {
                                         decision: dec
                                     )
                                 } label: {
-                                    Text(OrbitFormatters.decisionLabel(dec))
+                                    Text(OrbitDecisionLogic.decisionLabel(dec))
                                         .font(OrbitTypography.meta(.semibold))
                                         .foregroundStyle(
                                             isDeny ? palette.danger :

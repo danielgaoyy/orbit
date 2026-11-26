@@ -45,7 +45,7 @@ struct GlobalOverviewView: View {
             parts.append(OrbitL10n.fmt("%d running", runningCount))
         }
         if onlineHostCount > 0 {
-            parts.append(OrbitL10n.fmt("%d hosts online", onlineHostCount))
+            parts.append(OrbitL10n.fmt(onlineHostCount == 1 ? "%d host online" : "%d hosts online", onlineHostCount))
         }
         if parts.isEmpty {
             return OrbitL10n.tr("All clear")
@@ -372,12 +372,15 @@ struct GlobalOverviewView: View {
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                             .lineLimit(1)
-                        Text("·")
-                            .foregroundStyle(palette.fgFaint)
-                        Text(OrbitFormatters.shortPath(agent.cwd))
-                            .font(OrbitTypography.meta(.regular))
-                            .foregroundStyle(palette.fgMuted)
-                            .lineLimit(1)
+                        let cleanCwd = agent.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !cleanCwd.isEmpty && cleanCwd != "~" {
+                            Text("·")
+                                .foregroundStyle(palette.fgFaint)
+                            Text(OrbitFormatters.shortPath(cleanCwd))
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                                .lineLimit(1)
+                        }
                     }
                 }
 

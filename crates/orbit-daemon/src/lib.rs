@@ -422,7 +422,10 @@ pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
         && let Ok(local) = sock.local_addr()
         && !local.ip().is_loopback()
     {
-        ips.push(local.ip().to_string());
+        let ip = local.ip().to_string();
+        if !ip.starts_with("198.18.") && !ip.starts_with("198.19.") && !ip.starts_with("169.254.") {
+            ips.push(ip);
+        }
     }
 
     // 2. Also scan `ip -4 -o addr show` (Linux) or `ifconfig` (macOS) for Tailscale (`100.x`) / secondary LANs
@@ -443,6 +446,7 @@ pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
                     && let Some(ip) = ip_cidr.split('/').next()
                     && !ip.starts_with("127.")
                     && !ip.starts_with("198.18.")
+                    && !ip.starts_with("198.19.")
                     && !ips.contains(&ip.to_string())
                 {
                     ips.push(ip.to_string());
@@ -460,6 +464,7 @@ pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
                 && !ip.starts_with("127.")
                 && !ip.starts_with("169.254.")
                 && !ip.starts_with("198.18.")
+                && !ip.starts_with("198.19.")
                 && !ips.contains(&ip.to_string())
             {
                 ips.push(ip.to_string());

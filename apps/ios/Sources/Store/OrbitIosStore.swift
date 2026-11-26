@@ -19,6 +19,7 @@ public enum OrbitSheetDestination: Identifiable, Equatable {
     case archivedThreads
     case spawnPeer(workspaceId: String)
     case createWorkspace(projectRoot: String, projectName: String, isGitRepo: Bool, moveAgentId: String?)
+    case worktreeHandoff(workspaceId: String)
     case globalSearch
     case personalRouter
     case transcriptExport
@@ -38,6 +39,7 @@ public enum OrbitSheetDestination: Identifiable, Equatable {
         case .archivedThreads: return "archivedThreads"
         case let .spawnPeer(wsId): return "spawnPeer:\(wsId)"
         case let .createWorkspace(root, _, _, moveId): return "createWorkspace:\(root):\(moveId ?? "")"
+        case let .worktreeHandoff(wsId): return "worktreeHandoff:\(wsId)"
         case .globalSearch: return "globalSearch"
         case .personalRouter: return "personalRouter"
         case .transcriptExport: return "transcriptExport"
@@ -502,6 +504,40 @@ public struct QueuedPromptItem: Identifiable, Equatable {
     }
 }
 
+public enum OrbitBusySubmitMode: String, CaseIterable, Identifiable, Equatable {
+    case queue
+    case steer
+
+    public var id: String { rawValue }
+}
+
+private struct PersistedComposerContextDTO: Codable {
+    let kind: String
+    let id: String?
+    let label: String?
+    let secondary: String?
+    let content: String?
+    let staged: Bool?
+    let lineNumber: UInt32?
+    let sizeBytes: Int?
+    let lineCount: Int?
+}
+
+private struct PersistedQuotedDiffDTO: Codable {
+    let id: String
+    let path: String
+    let lineNumber: UInt32?
+    let kindTag: String
+    let content: String
+}
+
+private struct PersistedComposerDraftDTO: Codable {
+    let text: String
+    let slashDirectiveRaw: String?
+    let contexts: [PersistedComposerContextDTO]
+    let quotes: [PersistedQuotedDiffDTO]
+}
+
 public struct OrbitScopeComposerDraft: Equatable {
     public var text: String
     public var slashDirective: OrbitSlashDirective?
@@ -561,6 +597,10 @@ private final class WeakMobileListenerBridge: MobileCoreListener, @unchecked Sen
 
 @MainActor
 public final class OrbitIosStore: ObservableObject {
+    // High-frequency isolated observable slices (prevent stage/PTY ticks from invalidating unrelated UI)
+    public let stageState = OrbitStageStreamState()
+    public let terminalState = OrbitTerminalState()
+
     // Fleet & Host State
     @Published public private(set) var hosts: [FfiHostCard] = []
     @Published public private(set) var projects: [FfiClientProject] = []
@@ -569,12 +609,18 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var selectedHostId: String?
     @Published public private(set) var currentHostDetail: FfiHostDetail?
     @Published public private(set) var hostDetailsByHostId: [String: FfiHostDetail] = [:]
-    @Published public private(set) var agentStageHostId: String? = nil
+    public private(set) var agentStageHostId: String? {
+        get { stageState.agentStageHostId }
+        set { stageState.setAgentStageHostId(newValue) }
+    }
     private var agentStageScopeKey: String? = nil
 
     // Active Session & Stage (`selectedAgentId == nil` means New Session draft)
     @Published public var selectedAgentId: String?
-    @Published public private(set) var agentStage: FfiAgentStage?
+    public private(set) var agentStage: FfiAgentStage? {
+        get { stageState.agentStage }
+        set { stageState.setAgentStage(newValue) }
+    }
     @Published public private(set) var sidebarView: FfiFleetSidebar?
     @Published public private(set) var slashCommands: [FfiSlashCommand] = []
 
@@ -591,10 +637,18 @@ public final class OrbitIosStore: ObservableObject {
     @Published public private(set) var workspaceFileLoadingPath: String? = nil
     @Published public private(set) var workspaceFileError: String? = nil
     @Published public private(set) var gitReview: FfiGitReview?
+    @Published public private(set) var gitStagedDiffCache: [String: [FfiDiffFile]] = [:]
+    @Published public private(set) var gitUnstagedDiffCache: [String: [FfiDiffFile]] = [:]
     @Published public var gitStagedMode: Bool = false
     @Published public var gitReviewScope: OrbitGitReviewScope = .workingTree
     @Published public var jumpToDiffFilePath: String?
-    @Published public private(set) var terminalScreen: FfiTerminalScreen?
+    public private(set) var terminalScreen: FfiTerminalScreen? {
+        get { terminalState.terminalScreen }
+        set {
+            let tid = currentHostDetail?.activeTerminalId ?? currentHostDetail?.terminals.first?.terminalId
+            terminalState.setTerminalScreen(newValue, terminalId: tid)
+        }
+    }
     @Published public private(set) var localDaemonUri: String?
     @Published public private(set) var pasteboardHasStrings: Bool = false
 
@@ -610,6 +664,11 @@ public final class OrbitIosStore: ObservableObject {
     @Published public private(set) var isNetworkOffline: Bool = false
     @Published public var coalesceExploration: Bool = true
     @Published public var defaultPermissionModeRaw: String = "accept_edits"
+    @Published public var preferredLanguageCode: String = ""
+    public var preferredLocale: Locale {
+        preferredLanguageCode.isEmpty ? .autoupdatingCurrent : Locale(identifier: preferredLanguageCode)
+    }
+    @Published public var toastIsWarning: Bool = false
     @Published public var renameTarget: OrbitRenameTarget? = nil
     @Published public private(set) var subagentTimelinesCache: [String: [FfiProviderSubagentEvent]] = [:]
     @Published public private(set) var scheduleRunsCache: [String: [FfiScheduleRunRecord]] = [:]
@@ -617,11 +676,20 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var pendingArchiveUndo: OrbitPendingArchiveUndo? = nil
     @Published public var composerUploadStates: [String: OrbitComposerUploadState] = [:]
     @Published public var isGitRepoCache: [String: Bool] = [:]
-    @Published public var isStageHydrating: Bool = false
-    @Published public var activeStageLoadError: String? = nil
+    public var isStageHydrating: Bool {
+        get { stageState.isStageHydrating }
+        set { stageState.setIsStageHydrating(newValue) }
+    }
+    public var activeStageLoadError: String? {
+        get { stageState.activeStageLoadError }
+        set { stageState.setActiveStageLoadError(newValue) }
+    }
     @Published public var subagentInspectorTarget: OrbitSubagentInspectorTarget? = nil
     @Published public var pendingSheetDestination: OrbitSheetDestination? = nil
     @Published public var isDemoChatMode: Bool = false
+    @Published public var stageFindQuery: String = ""
+    @Published public var isStageFindBarVisible: Bool = false
+    @Published public var jumpToTurnKey: String? = nil
     private var activeSideQuestionRequestIds: Set<String> = []
     private var workspaceFileCacheOrder: [String] = []
     private var isApplyingCloudPrefs: Bool = false
@@ -630,12 +698,26 @@ public final class OrbitIosStore: ObservableObject {
     private var failedUploadPayloadsByContextId: [String: OrbitFailedAttachmentPayload] = [:]
 
     // Composer State & Live Queueing
-    @Published public var composerText: String = ""
+    @Published public var composerText: String = "" {
+        didSet {
+            if oldValue != composerText && !isRestoringDraft {
+                scheduleSaveAndPersistComposerDraft()
+            }
+        }
+    }
     @Published public var selectedProvider: FfiProviderKind = .claudeCode
     @Published public var selectedModel: String?
     @Published public var selectedEffort: FfiReasoningEffort?
+    @Published public var fastModeEnabled: Bool = false
     @Published public var selectedMode: FfiSessionMode = .acceptEdits
-    @Published public var slashDirective: OrbitSlashDirective?
+    @Published public var composerBusySubmitMode: OrbitBusySubmitMode = .queue
+    @Published public var slashDirective: OrbitSlashDirective? {
+        didSet {
+            if !isRestoringDraft && oldValue != slashDirective {
+                scheduleSaveAndPersistComposerDraft()
+            }
+        }
+    }
     private var hasUserCustomizedDraftModel: Bool = false
     private var draftSelectionsByHostProvider: [String: (modelId: String?, effort: FfiReasoningEffort?)] = [:]
     private var hasSyncedLiveCatalogDefault: Bool = false
@@ -731,16 +813,46 @@ public final class OrbitIosStore: ObservableObject {
     @Published public internal(set) var activeSessionUsage: SessionUsage? = nil
     @Published public internal(set) var personalAgentDraftPrompt: String = ""
 
-    // Windowed tail-first pagination & off-main-thread core read pipeline
-    @Published public private(set) var stageHasOlderTurns: Bool = false
-    @Published public private(set) var isLoadingOlderTurns: Bool = false
+    // Windowed tail-first pagination & off-main-thread core read/write pipeline
+    public private(set) var stageHasOlderTurns: Bool {
+        get { stageState.stageHasOlderTurns }
+        set { stageState.setStageHasOlderTurns(newValue) }
+    }
+    public private(set) var isLoadingOlderTurns: Bool {
+        get { stageState.isLoadingOlderTurns }
+        set { stageState.setIsLoadingOlderTurns(newValue) }
+    }
     private let coreReadQueue = DispatchQueue(label: "dev.orbit.ios.core-read", qos: .userInitiated)
+    private let coreWriteQueue = DispatchQueue(label: "dev.orbit.ios.core-write", qos: .userInitiated)
+    private let draftPersistQueue = DispatchQueue(label: "dev.orbit.ios.draft-persist", qos: .utility)
     private var stageFetchEpoch: UInt64 = 0
     private var stageAuxRevision: UInt64 = 0
     private var stageTurnLimit: UInt32 = 15
     private var stageWindowStartTurnIndex: UInt32? = nil
     private var pendingTimelineRefreshWorkItem: DispatchWorkItem?
     private var isTimelineRefreshCoalescing = false
+    private var isStageFetchInFlight = false
+    private var hasPendingStageFetch = false
+
+    private var fleetFetchEpoch: UInt64 = 0
+    private var sidebarFetchEpoch: UInt64 = 0
+    private var hostDetailFetchEpochs: [String: UInt64] = [:]
+    private var gitFetchEpoch: UInt64 = 0
+    private var terminalFetchEpoch: UInt64 = 0
+    private var pendingFleetHostCoalesceWorkItem: DispatchWorkItem?
+    private var pendingFleetReloadNeeded = false
+    private var pendingHostDetailRefreshIds: Set<String> = []
+    private var pendingCloudSyncRefreshNeeded = false
+    private var pendingGitRefreshWorkItem: DispatchWorkItem?
+    private var pendingTerminalRefreshWorkItem: DispatchWorkItem?
+    private var isGitReviewStale = false
+    private var isWorkspaceFilesStale = false
+    private var composerDraftFileURL: URL? = nil
+    private var pendingDraftPersistWorkItem: DispatchWorkItem?
+    private var isRestoringDraft = false
+    private var pendingArchiveUndoDismissTask: Task<Void, Never>?
+    private var pendingRestoreAgentId: String? = nil
+    private var didConsumeInitialSelection = false
 
     var core: OrbitMobileCore?
     private var listenerBridge: WeakMobileListenerBridge?
@@ -768,6 +880,9 @@ public final class OrbitIosStore: ObservableObject {
     private static let drawerFilterDefaultsKey = "orbit.ios.drawerFilter"
     private static let sidebarProjectSortDefaultsKey = "orbit.ios.sidebarProjectSort"
     private static let sidebarThreadFilterDefaultsKey = "orbit.ios.sidebarThreadFilter"
+    private static let lastSelectedHostIdDefaultsKey = "orbit.ios.lastSelectedHostId"
+    private static let lastSelectedAgentIdDefaultsKey = "orbit.ios.lastSelectedAgentId"
+    private static let preferredLanguageDefaultsKey = "orbit.ios.preferredLanguage"
 
     public init() {
         self.draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
@@ -793,29 +908,66 @@ public final class OrbitIosStore: ObservableObject {
            let tf = OrbitSidebarThreadFilter(rawValue: savedThreadFilter) {
             self.sidebarThreadFilter = tf
         }
+        if let savedLang = UserDefaults.standard.string(forKey: Self.preferredLanguageDefaultsKey) {
+            self.preferredLanguageCode = savedLang
+        }
         do {
             guard let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
                 throw OrbitStorageError.applicationSupportUnavailable
             }
             let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: appSupportDir)
+            if let draftURL = try? OrbitStorageProtection.prepareProtectedDatabaseURL(
+                in: appSupportDir,
+                fileName: "composer_drafts.json"
+            ) {
+                self.composerDraftFileURL = draftURL
+                self.loadPersistedComposerDrafts(from: draftURL)
+            }
             if UserDefaults.standard.object(forKey: "orbit.ios.liveActivitiesEnabled") != nil {
                 self.liveActivitiesEnabled = UserDefaults.standard.bool(forKey: "orbit.ios.liveActivitiesEnabled")
             }
             let instance: OrbitMobileCore
+            let storageDir = dbURL.deletingLastPathComponent()
             do {
                 let keyResult = try OrbitKeychain.shared.loadOrCreateMasterKey(
-                    fallbackDirectory: dbURL.deletingLastPathComponent()
+                    fallbackDirectory: storageDir
                 )
-                self.masterKeySource = keyResult.source
-                instance = try OrbitMobileCore.newWithMasterKey(
-                    dbPath: dbURL.path,
-                    masterKeyBytes: keyResult.key
-                )
-            } catch {
-                // Clean fallback exclusively for constrained sandbox environments where Keychain is unavailable.
-                instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: false)
+                do {
+                    instance = try OrbitMobileCore.newWithMasterKey(
+                        dbPath: dbURL.path,
+                        masterKeyBytes: keyResult.key
+                    )
+                    self.masterKeySource = keyResult.source
+                } catch {
+                    if let fallbackKey = OrbitKeychain.shared.readExistingProtectedFallbackKey(in: storageDir),
+                       fallbackKey != keyResult.key {
+                        instance = try OrbitMobileCore.newWithMasterKey(
+                            dbPath: dbURL.path,
+                            masterKeyBytes: fallbackKey
+                        )
+                        self.masterKeySource = .protectedFileFallback
+                    } else {
+                        throw error
+                    }
+                }
+            } catch let masterErr {
+                // Only fall back to unkeyed open for legacy unencrypted sandboxes without a fallback key file;
+                // otherwise preserve the exact vault error so callers know why decryption failed.
+                if OrbitKeychain.shared.readExistingProtectedFallbackKey(in: storageDir) == nil,
+                   let legacyCore = try? OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: false) {
+                    instance = legacyCore
+                } else {
+                    throw masterErr
+                }
             }
             self.core = instance
+
+            let savedHostId = UserDefaults.standard.string(forKey: Self.lastSelectedHostIdDefaultsKey)
+            let savedAgentId = UserDefaults.standard.string(forKey: Self.lastSelectedAgentIdDefaultsKey)
+            if let savedHostId, !savedHostId.isEmpty {
+                self.selectedHostId = savedHostId
+                self.pendingRestoreAgentId = (savedAgentId?.isEmpty == false) ? savedAgentId : nil
+            }
 
             if !UserDefaults.standard.bool(forKey: Self.migratedThreadPrefsDefaultsKey) {
                 let legacyPinned = UserDefaults.standard.stringArray(forKey: Self.legacyPinnedThreadKeysDefaultsKey) ?? []
@@ -843,24 +995,39 @@ public final class OrbitIosStore: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: Self.legacyPinnedThreadKeysDefaultsKey)
             }
 
-            self.cachedFallbackCatalogs = instance.fallbackProviderCatalogs()
-            self.slashCommands = instance.slashCommands(platform: .ios, query: nil)
-
             let bridge = WeakMobileListenerBridge(owner: self)
             self.listenerBridge = bridge
-            instance.subscribeThrottled(listener: bridge, intervalMs: 24)
+            instance.subscribeThrottled(listener: bridge, intervalMs: 40)
 
-            self.localDaemonUri = instance.discoverLocalDaemonUri()
-            self.cloudSyncStatus = instance.cloudSyncStatus()
-            self.refreshPasteboardAvailability()
-            self.hydrateCloudSyncPreferences()
-
-            reloadFleet()
-            refreshSidebar()
-            instance.connectAllHosts()
-            startNetworkMonitor()
+            self.reloadFleet()
+            self.refreshSidebar()
+            self.startNetworkMonitor()
+            coreReadQueue.async { [weak self] in
+                let catalogs = instance.fallbackProviderCatalogs()
+                let cmds = instance.slashCommands(platform: .ios, query: nil)
+                let localUri = instance.discoverLocalDaemonUri()
+                let syncStatus = instance.cloudSyncStatus()
+                instance.connectAllHosts()
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if self.cachedFallbackCatalogs.isEmpty {
+                        self.cachedFallbackCatalogs = catalogs
+                    }
+                    if self.slashCommands.isEmpty {
+                        self.slashCommands = cmds
+                    }
+                    self.refreshPasteboardAvailability()
+                    if self.localDaemonUri != localUri {
+                        self.localDaemonUri = localUri
+                    }
+                    if self.cloudSyncStatus != syncStatus {
+                        self.cloudSyncStatus = syncStatus
+                    }
+                    self.hydrateCloudSyncPreferences()
+                }
+            }
         } catch {
-            self.lastError = error.localizedDescription
+            self.lastError = OrbitErrorFormatter.humanize(error)
         }
     }
 
@@ -907,10 +1074,17 @@ public final class OrbitIosStore: ObservableObject {
         isActiveAgentTurnBusy
     }
 
-    /// True only while an active foreground turn or autonomous wakeup is actively executing.
+    /// True while an active foreground turn or autonomous wakeup is executing, OR while a pending
+    /// tool permission / clarifying question is blocking completion (so follow-ups enqueue safely).
     public var isActiveAgentTurnBusy: Bool {
+        if let stage = agentStage,
+           stage.hostId == selectedHostId,
+           stage.agent?.agentId == selectedAgentId,
+           (!stage.pendingPermissions.isEmpty || !stage.pendingQuestions.isEmpty) {
+            return true
+        }
         guard let agent = activeAgent else { return false }
-        return agent.isForegroundRunning
+        return agent.isForegroundRunning || agent.isAwaitingPermission
     }
 
     /// True when no foreground turn is active, yet the agent still has running background tasks.
@@ -935,22 +1109,41 @@ public final class OrbitIosStore: ObservableObject {
         return nil
     }
 
+    private static func canonicalizeSymlinkPath(_ path: String) -> String {
+        let norm = OrbitPathLogic.normalizePath(path)
+        if norm.hasPrefix("/private/var/") {
+            return "/var/" + norm.dropFirst("/private/var/".count)
+        }
+        if norm == "/private/var" { return "/var" }
+        if norm.hasPrefix("/private/tmp/") {
+            return "/tmp/" + norm.dropFirst("/private/tmp/".count)
+        }
+        if norm == "/private/tmp" { return "/tmp" }
+        return norm
+    }
+
     public func isActiveFolderGitRepo(hostId: String? = nil, cwd: String? = nil) -> Bool {
         let hid = hostId ?? selectedHostId ?? ""
-        let targetCwd = OrbitPathLogic.normalizePath(cwd ?? activeCwd)
-        if let cached = isGitRepoCache["\(hid)::\(targetCwd)"] {
+        let rawTarget = OrbitPathLogic.normalizePath(cwd ?? activeCwd)
+        let canonTarget = Self.canonicalizeSymlinkPath(rawTarget)
+        if let cached = isGitRepoCache["\(hid)::\(rawTarget)"] ?? isGitRepoCache["\(hid)::\(canonTarget)"] {
             return cached
         }
         if let detail = detail(forHostId: hid),
-           let inspected = detail.gitReposByCwd.first(where: { OrbitFormatters.arePathsEquivalent($0.key, targetCwd) })?.value {
+           let inspected = detail.gitReposByCwd.first(where: {
+               OrbitFormatters.arePathsEquivalent($0.key, rawTarget)
+                   || Self.canonicalizeSymlinkPath($0.key) == canonTarget
+           })?.value {
             return inspected.isGitRepo || !inspected.nestedGitRepos.isEmpty
         }
         if let review = gitReview,
-           OrbitFormatters.arePathsEquivalent(review.cwd, targetCwd) {
+           (OrbitFormatters.arePathsEquivalent(review.cwd, rawTarget)
+            || Self.canonicalizeSymlinkPath(review.cwd) == canonTarget) {
             return review.isGitRepo
         }
         if let repo = detail(forHostId: hid)?.discoveredProjects.first(where: {
-            OrbitFormatters.arePathsEquivalent($0.path, targetCwd)
+            OrbitFormatters.arePathsEquivalent($0.path, rawTarget)
+                || Self.canonicalizeSymlinkPath($0.path) == canonTarget
         }) {
             return (repo.gitBranch?.isEmpty == false)
         }
@@ -1070,6 +1263,8 @@ public final class OrbitIosStore: ObservableObject {
 
     public func refreshSidebar() {
         guard let core else { return }
+        sidebarFetchEpoch &+= 1
+        let epoch = sidebarFetchEpoch
         let req = FfiFleetSidebarRequest(
             sort: sidebarProjectSort.ffiValue,
             filter: sidebarThreadFilter.ffiValue,
@@ -1078,7 +1273,15 @@ public final class OrbitIosStore: ObservableObject {
             activeAgentId: isDraftNewSession ? nil : selectedAgentId,
             activeCwd: activeCwd
         )
-        sidebarView = core.fleetSidebarRequest(req: req)
+        coreReadQueue.async { [weak self] in
+            let nextSidebar = core.fleetSidebarRequest(req: req)
+            Task { @MainActor [weak self] in
+                guard let self, self.sidebarFetchEpoch == epoch else { return }
+                if self.sidebarView != nextSidebar {
+                    self.sidebarView = nextSidebar
+                }
+            }
+        }
     }
 
     public var otherHostsPendingApprovals: UInt32 {
@@ -1282,7 +1485,11 @@ public final class OrbitIosStore: ObservableObject {
                     self.isNetworkOffline = isOffline
                 }
                 if let previous = self.lastNetworkSignature, previous != sig {
-                    self.core?.onNetworkChanged()
+                    if let core = self.core {
+                        self.coreWriteQueue.async {
+                            core.onNetworkChanged()
+                        }
+                    }
                 }
                 self.lastNetworkSignature = sig
             }
@@ -1291,20 +1498,36 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func onForeground() {
-        core?.onAppForeground()
-        localDaemonUri = core?.discoverLocalDaemonUri()
         refreshPasteboardAvailability()
-        reloadFleet()
-        if let hid = selectedHostId {
-            reloadHostDetail(hid)
-            if let aid = selectedAgentId {
-                reloadAgentStage(hostId: hid, agentId: aid)
+        if let core {
+            coreWriteQueue.async { [weak self] in
+                core.onAppForeground()
+                let localUri = core.discoverLocalDaemonUri()
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if self.localDaemonUri != localUri {
+                        self.localDaemonUri = localUri
+                    }
+                    self.reloadFleet()
+                    if let hid = self.selectedHostId {
+                        self.reloadHostDetail(hid)
+                        if let aid = self.selectedAgentId {
+                            self.reloadAgentStage(hostId: hid, agentId: aid)
+                        }
+                    }
+                }
             }
         }
     }
 
     public func onBackground() {
-        core?.onAppBackground()
+        saveCurrentComposerDraft()
+        flushPersistedComposerDraftsNow()
+        if let core {
+            coreWriteQueue.async {
+                core.onAppBackground()
+            }
+        }
     }
 
     public func refreshPasteboardAvailability() {
@@ -1348,14 +1571,27 @@ public final class OrbitIosStore: ObservableObject {
             case let .openSession(hostId, agentId):
                 navigateToSessionFromDeepLink(hostId: hostId, agentId: agentId)
                 return
-            case .pairHost, .syncLogin:
-                break
+            case let .pairHost(pairUri):
+                if pairHost(uri: pairUri) {
+                    if activeSheet == .qrPair {
+                        activeSheet = nil
+                    }
+                } else {
+                    showToast(lastError ?? "Invalid pairing link.")
+                }
+                return
+            case .syncLogin:
+                handleScannedOrPastedUri(raw)
+                if activeSheet == .qrPair {
+                    activeSheet = nil
+                }
+                return
             }
         }
-        handleScannedOrPastedUri(raw)
-        if activeSheet == .qrPair {
-            activeSheet = nil
-        }
+        hapticWarning()
+        let msg = "Unrecognized Orbit link."
+        lastError = msg
+        showToast(msg)
     }
 
     public func applyLaunchArguments(_ args: [String], setAppearance: (OrbitAppearanceMode) -> Void) {
@@ -1573,18 +1809,19 @@ public final class OrbitIosStore: ObservableObject {
     func handleCoreEvent(_ event: FfiCoreEvent) {
         switch event {
         case .fleetChanged:
-            reloadFleet()
-            cloudSyncStatus = core?.cloudSyncStatus()
-            if let hid = selectedHostId {
-                reloadHostDetail(hid)
-            }
+            scheduleCoalescedFleetHostReload(
+                fleet: true,
+                hostId: selectedHostId,
+                cloudSync: true
+            )
             syncLiveActivityFromFleetState()
 
         case let .hostChanged(_, hostId):
-            reloadFleet()
-            if hostId == selectedHostId {
-                reloadHostDetail(hostId)
-            }
+            scheduleCoalescedFleetHostReload(
+                fleet: true,
+                hostId: hostId == selectedHostId ? hostId : nil,
+                cloudSync: false
+            )
             syncLiveActivityFromFleetState()
 
         case let .timelineChanged(_, hostId, agentId):
@@ -1595,15 +1832,125 @@ public final class OrbitIosStore: ObservableObject {
 
         case let .gitChanged(_, hostId, _):
             if hostId == selectedHostId {
-                gitReview = core?.gitReview(hostId: hostId, cwd: activeCwd, path: nil)
-                workspaceFilesList = core?.workspaceFiles(hostId: hostId, cwd: activeCwd) ?? workspaceFilesList
+                scheduleCoalescedGitAndFilesRefresh(hostId: hostId)
             }
 
         case let .terminalChanged(_, hostId, _):
             if hostId == selectedHostId && activeSheet == .pty {
-                terminalScreen = core?.terminalScreen(hostId: hostId)
+                scheduleCoalescedTerminalRefresh(hostId: hostId)
             }
         }
+    }
+
+    private func scheduleCoalescedFleetHostReload(
+        fleet: Bool,
+        hostId: String?,
+        cloudSync: Bool
+    ) {
+        if fleet { pendingFleetReloadNeeded = true }
+        if let hid = hostId { pendingHostDetailRefreshIds.insert(hid) }
+        if cloudSync { pendingCloudSyncRefreshNeeded = true }
+        guard pendingFleetHostCoalesceWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pendingFleetHostCoalesceWorkItem = nil
+                let needFleet = self.pendingFleetReloadNeeded
+                let hostIds = self.pendingHostDetailRefreshIds
+                let needCloud = self.pendingCloudSyncRefreshNeeded
+                self.pendingFleetReloadNeeded = false
+                self.pendingHostDetailRefreshIds.removeAll()
+                self.pendingCloudSyncRefreshNeeded = false
+                if needFleet {
+                    self.reloadFleet()
+                }
+                for hid in hostIds {
+                    self.reloadHostDetail(hid)
+                }
+                if needCloud, let core = self.core {
+                    self.coreReadQueue.async { [weak self] in
+                        let nextSync = core.cloudSyncStatus()
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            if self.cloudSyncStatus != nextSync {
+                                self.cloudSyncStatus = nextSync
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pendingFleetHostCoalesceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(65), execute: work)
+    }
+
+    private func scheduleCoalescedGitAndFilesRefresh(hostId: String) {
+        let gitVisible = isPadDiffInspectorVisible || activeSheet == .gitDiff
+        let filesVisible = (isPadDiffInspectorVisible && padInspectorTab == .files)
+            || { if case .workspaceFiles = activeSheet { return true }; return false }()
+        if !gitVisible { isGitReviewStale = true }
+        if !filesVisible { isWorkspaceFilesStale = true }
+        guard gitVisible || filesVisible else { return }
+        guard pendingGitRefreshWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pendingGitRefreshWorkItem = nil
+                guard self.selectedHostId == hostId, let core = self.core else { return }
+                let cwd = self.activeCwd
+                let needGit = self.isPadDiffInspectorVisible || self.activeSheet == .gitDiff
+                let needFiles = (self.isPadDiffInspectorVisible && self.padInspectorTab == .files)
+                    || { if case .workspaceFiles = self.activeSheet { return true }; return false }()
+                self.gitFetchEpoch &+= 1
+                let epoch = self.gitFetchEpoch
+                self.coreReadQueue.async { [weak self] in
+                    let nextReview = needGit ? core.gitReview(hostId: hostId, cwd: cwd, path: nil) : nil
+                    let nextFiles = needFiles ? core.workspaceFiles(hostId: hostId, cwd: cwd) : nil
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.gitFetchEpoch == epoch,
+                              self.selectedHostId == hostId,
+                              self.activeCwd == cwd else { return }
+                        if let nextReview {
+                            self.applyGitReviewSnapshot(nextReview)
+                        }
+                        if let nextFiles, self.workspaceFilesList != nextFiles {
+                            self.workspaceFilesList = nextFiles
+                        }
+                    }
+                }
+            }
+        }
+        pendingGitRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80), execute: work)
+    }
+
+    private func scheduleCoalescedTerminalRefresh(hostId: String) {
+        guard pendingTerminalRefreshWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pendingTerminalRefreshWorkItem = nil
+                guard self.selectedHostId == hostId,
+                      self.activeSheet == .pty,
+                      let core = self.core else { return }
+                self.terminalFetchEpoch &+= 1
+                let epoch = self.terminalFetchEpoch
+                self.coreReadQueue.async { [weak self] in
+                    let nextScreen = core.terminalScreen(hostId: hostId)
+                    let scrollback = core.terminalScrollback(hostId: hostId)
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.terminalFetchEpoch == epoch,
+                              self.selectedHostId == hostId else { return }
+                        let tid = self.currentHostDetail?.activeTerminalId ?? self.currentHostDetail?.terminals.first?.terminalId
+                        self.terminalState.setTerminalScreen(nextScreen, terminalId: tid, coreScrollback: scrollback)
+                    }
+                }
+            }
+        }
+        pendingTerminalRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
     }
 
     // MARK: - Fleet, Host & Session Selection
@@ -1775,33 +2122,43 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func reloadFleet() {
-        guard let snap = core?.fleetOverview() else { return }
-        if isDemoChatMode {
-            return
-        }
-        hosts = snap.hosts
-        projects = snap.projects
-        projectOrder = snap.projectOrder
-        totalPendingApprovals = snap.totalPendingApprovals
+        guard let core, !isDemoChatMode else { return }
+        fleetFetchEpoch &+= 1
+        let epoch = fleetFetchEpoch
+        coreReadQueue.async { [weak self] in
+            let snap = core.fleetOverview()
+            Task { @MainActor [weak self] in
+                guard let self, self.fleetFetchEpoch == epoch, !self.isDemoChatMode else { return }
+                if self.hosts != snap.hosts { self.hosts = snap.hosts }
+                if self.projects != snap.projects { self.projects = snap.projects }
+                if self.projectOrder != snap.projectOrder { self.projectOrder = snap.projectOrder }
+                if self.totalPendingApprovals != snap.totalPendingApprovals {
+                    self.totalPendingApprovals = snap.totalPendingApprovals
+                }
 
-        if selectedHostId == nil, let firstHost = snap.hosts.first {
-            selectHost(firstHost.hostId)
-        } else if let hid = selectedHostId, !snap.hosts.contains(where: { $0.hostId == hid }) {
-            if let nextId = snap.hosts.first?.hostId {
-                selectHost(nextId)
-            } else {
-                selectedHostId = nil
-                currentHostDetail = nil
-                selectedAgentId = nil
-                agentStage = nil
-                agentStageHostId = nil
-                agentStageScopeKey = nil
-                activeCwd = "~"
-                draftWorkspaceId = nil
-                workspaceFilesList = []
+                if self.selectedHostId == nil, let firstHost = snap.hosts.first {
+                    self.selectHost(firstHost.hostId)
+                } else if let hid = self.selectedHostId, !snap.hosts.contains(where: { $0.hostId == hid }) {
+                    if let nextId = snap.hosts.first?.hostId {
+                        self.selectHost(nextId)
+                    } else {
+                        self.selectedHostId = nil
+                        self.currentHostDetail = nil
+                        self.selectedAgentId = nil
+                        self.agentStage = nil
+                        self.agentStageHostId = nil
+                        self.agentStageScopeKey = nil
+                        self.activeCwd = "~"
+                        self.draftWorkspaceId = nil
+                        self.workspaceFilesList = []
+                    }
+                } else if !self.didConsumeInitialSelection, let hid = self.selectedHostId {
+                    self.didConsumeInitialSelection = true
+                    self.selectHost(hid)
+                }
+                self.refreshSidebar()
             }
         }
-        refreshSidebar()
     }
 
     private func currentComposerScopeKey() -> String {
@@ -1811,6 +2168,18 @@ public final class OrbitIosStore: ObservableObject {
             draftWorkspaceId: draftWorkspaceId,
             draftCwd: activeCwd
         )
+    }
+
+    private func scheduleSaveAndPersistComposerDraft() {
+        saveCurrentComposerDraft()
+        pendingDraftPersistWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.flushPersistedComposerDraftsNow()
+            }
+        }
+        pendingDraftPersistWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300), execute: work)
     }
 
     private func saveCurrentComposerDraft() {
@@ -1836,6 +2205,8 @@ public final class OrbitIosStore: ObservableObject {
     private func restoreComposerDraftForCurrentScope() {
         let nextKey = currentComposerScopeKey()
         activeComposerScopeKey = nextKey
+        isRestoringDraft = true
+        defer { isRestoringDraft = false }
         if let saved = composerDraftsByScope[nextKey] {
             composerText = saved.text
             slashDirective = saved.slashDirective
@@ -1851,15 +2222,117 @@ public final class OrbitIosStore: ObservableObject {
         }
     }
 
+    private func flushPersistedComposerDraftsNow() {
+        guard let draftURL = composerDraftFileURL else { return }
+        pendingDraftPersistWorkItem?.cancel()
+        pendingDraftPersistWorkItem = nil
+        var encodedMap: [String: PersistedComposerDraftDTO] = [:]
+        for (scopeKey, draft) in composerDraftsByScope {
+            let ctxs: [PersistedComposerContextDTO] = draft.attachedContexts.compactMap { item in
+                switch item {
+                case let .file(path):
+                    return PersistedComposerContextDTO(kind: "file", id: nil, label: path, secondary: nil, content: nil, staged: nil, lineNumber: nil, sizeBytes: nil, lineCount: nil)
+                case let .gitDiff(staged, label):
+                    return PersistedComposerContextDTO(kind: "gitDiff", id: nil, label: label, secondary: nil, content: nil, staged: staged, lineNumber: nil, sizeBytes: nil, lineCount: nil)
+                case let .terminalOutput(label, content):
+                    return PersistedComposerContextDTO(kind: "terminalOutput", id: nil, label: label, secondary: nil, content: content, staged: nil, lineNumber: nil, sizeBytes: nil, lineCount: nil)
+                case let .assistantQuote(id, label, excerpt):
+                    return PersistedComposerContextDTO(kind: "assistantQuote", id: id, label: label, secondary: nil, content: excerpt, staged: nil, lineNumber: nil, sizeBytes: nil, lineCount: nil)
+                case let .stagedImage(id, filename, remotePath, _, sizeBytes, isUploading) where !isUploading && remotePath != nil:
+                    return PersistedComposerContextDTO(kind: "stagedImage", id: id, label: filename, secondary: remotePath, content: nil, staged: nil, lineNumber: nil, sizeBytes: sizeBytes, lineCount: nil)
+                case let .stagedFile(id, filename, remotePath, sizeBytes, isUploading) where !isUploading && remotePath != nil:
+                    return PersistedComposerContextDTO(kind: "stagedFile", id: id, label: filename, secondary: remotePath, content: nil, staged: nil, lineNumber: nil, sizeBytes: sizeBytes, lineCount: nil)
+                case let .inlineFile(id, filename, content, lineCount, sizeBytes):
+                    return PersistedComposerContextDTO(kind: "inlineFile", id: id, label: filename, secondary: nil, content: content, staged: nil, lineNumber: nil, sizeBytes: sizeBytes, lineCount: lineCount)
+                default:
+                    return nil
+                }
+            }
+            let quotes: [PersistedQuotedDiffDTO] = draft.quotedDiffSnippets.map { q in
+                let kindTag: String = switch q.kind {
+                case .added: "added"
+                case .removed: "removed"
+                case .context: "context"
+                case .hunkHeader: "hunkHeader"
+                case .meta: "meta"
+                }
+                return PersistedQuotedDiffDTO(id: q.id, path: q.path, lineNumber: q.lineNumber, kindTag: kindTag, content: q.content)
+            }
+            encodedMap[scopeKey] = PersistedComposerDraftDTO(
+                text: draft.text,
+                slashDirectiveRaw: draft.slashDirective?.rawValue,
+                contexts: ctxs,
+                quotes: quotes
+            )
+        }
+        draftPersistQueue.async {
+            guard let data = try? JSONEncoder().encode(encodedMap) else { return }
+            try? data.write(to: draftURL, options: [.atomic])
+        }
+    }
+
+    private func loadPersistedComposerDrafts(from url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode([String: PersistedComposerDraftDTO].self, from: data) else {
+            return
+        }
+        var restored: [String: OrbitScopeComposerDraft] = [:]
+        for (scopeKey, dto) in decoded {
+            let contexts: [ComposerContextItem] = dto.contexts.compactMap { c in
+                switch c.kind {
+                case "file":
+                    guard let path = c.label else { return nil }
+                    return .file(path: path)
+                case "gitDiff":
+                    guard let label = c.label else { return nil }
+                    return .gitDiff(staged: c.staged ?? false, label: label)
+                case "terminalOutput":
+                    return .terminalOutput(label: c.label ?? "@terminal", content: c.content ?? "")
+                case "assistantQuote":
+                    return .assistantQuote(id: c.id ?? UUID().uuidString, label: c.label ?? "Quote", excerpt: c.content ?? "")
+                case "stagedImage":
+                    return .stagedImage(id: c.id ?? UUID().uuidString, filename: c.label ?? "image.png", remotePath: c.secondary, previewData: Data(), sizeBytes: c.sizeBytes ?? 0, isUploading: false)
+                case "stagedFile":
+                    return .stagedFile(id: c.id ?? UUID().uuidString, filename: c.label ?? "file", remotePath: c.secondary, sizeBytes: c.sizeBytes ?? 0, isUploading: false)
+                case "inlineFile":
+                    return .inlineFile(id: c.id ?? UUID().uuidString, filename: c.label ?? "file", content: c.content ?? "", lineCount: c.lineCount ?? 0, sizeBytes: c.sizeBytes ?? 0)
+                default:
+                    return nil
+                }
+            }
+            let quotes: [QuotedDiffSnippet] = dto.quotes.map { q in
+                let kind: FfiDiffLineKind = switch q.kindTag {
+                case "added", "add": .added
+                case "removed", "remove": .removed
+                case "hunkHeader": .hunkHeader
+                case "meta": .meta
+                default: .context
+                }
+                return QuotedDiffSnippet(id: q.id, path: q.path, lineNumber: q.lineNumber, kind: kind, content: q.content)
+            }
+            restored[scopeKey] = OrbitScopeComposerDraft(
+                text: dto.text,
+                slashDirective: dto.slashDirectiveRaw.flatMap { OrbitSlashDirective(rawValue: $0) },
+                attachedContexts: contexts,
+                quotedDiffSnippets: quotes,
+                registeredInlineMentions: []
+            )
+        }
+        self.composerDraftsByScope = restored
+    }
+
     private func draftModelKey(hostId: String? = nil, for provider: FfiProviderKind) -> String {
         "\(hostId ?? selectedHostId ?? "")::\(provider)"
     }
 
     public func selectHost(_ hostId: String) {
+        didConsumeInitialSelection = true
         let changed = selectedHostId != hostId
         if changed {
             saveCurrentComposerDraft()
+            flushPersistedComposerDraftsNow()
             selectedAgentId = nil
+            UserDefaults.standard.removeObject(forKey: Self.lastSelectedAgentIdDefaultsKey)
             agentStage = nil
             agentStageHostId = nil
             agentStageScopeKey = nil
@@ -1867,7 +2340,7 @@ public final class OrbitIosStore: ObservableObject {
             isStageHydrating = false
             activeCwd = "~"
             activeExtraDirs = []
-            draftUseWorktree = false
+            draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
             draftWorkspaceId = nil
             draftWorktreeRepoPath = nil
             workspaceFilesList = []
@@ -1882,14 +2355,19 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
         selectedHostId = hostId
+        UserDefaults.standard.set(hostId, forKey: Self.lastSelectedHostIdDefaultsKey)
         if changed {
             currentHostDetail = hostDetailsByHostId[hostId]
             restoreComposerDraftForCurrentScope()
         }
-        core?.connectHost(hostId: hostId)
-        core?.refreshHost(hostId: hostId)
-        core?.refreshProviderModels(hostId: hostId, forceRefresh: false)
-        core?.refreshQuotas(hostId: hostId)
+        if let core {
+            coreWriteQueue.async {
+                core.connectHost(hostId: hostId)
+                core.refreshHost(hostId: hostId)
+                core.refreshProviderModels(hostId: hostId, forceRefresh: false)
+                core.refreshQuotas(hostId: hostId)
+            }
+        }
         reloadHostDetail(hostId)
         refreshSidebar()
     }
@@ -1898,8 +2376,22 @@ public final class OrbitIosStore: ObservableObject {
         if isDemoChatMode && hostId == "demo-host" {
             return
         }
-        guard let detail = core?.hostDetail(hostId: hostId) else { return }
-        hostDetailsByHostId[hostId] = detail
+        guard let core else { return }
+        let nextEpoch = (hostDetailFetchEpochs[hostId] ?? 0) &+ 1
+        hostDetailFetchEpochs[hostId] = nextEpoch
+        coreReadQueue.async { [weak self] in
+            guard let detail = core.hostDetail(hostId: hostId) else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.hostDetailFetchEpochs[hostId] == nextEpoch else { return }
+                self.applyReloadedHostDetail(hostId: hostId, detail: detail)
+            }
+        }
+    }
+
+    private func applyReloadedHostDetail(hostId: String, detail: FfiHostDetail) {
+        if hostDetailsByHostId[hostId] != detail {
+            hostDetailsByHostId[hostId] = detail
+        }
 
         // Migrate queued prompts and running state across optimistic -> permanent agent IDs
         for (oldAid, newAid) in detail.replacedOptimisticAgents {
@@ -1916,7 +2408,6 @@ public final class OrbitIosStore: ObservableObject {
         }
 
         // Invalidate cached seen-seq whenever the host reports an agent as unread
-        // (e.g. AttentionState::Finished / Error / ManualUnread synced from another device).
         for agent in detail.agents where agent.isUnread {
             lastMarkedSeenSeqByAgent.removeValue(forKey: "\(hostId)::\(agent.agentId)")
         }
@@ -1932,7 +2423,19 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
 
-        currentHostDetail = detail
+        if currentHostDetail != detail {
+            currentHostDetail = detail
+        }
+
+        // Restore previously active session after cold restart if valid and not overridden by launch args
+        if let pendingAid = pendingRestoreAgentId {
+            pendingRestoreAgentId = nil
+            if selectedAgentId == nil,
+               detail.agents.contains(where: { $0.agentId == pendingAid && $0.archivedAtRfc3339 == nil }) {
+                selectAgent(hostId: hostId, agentId: pendingAid)
+                return
+            }
+        }
 
         // Advance active thread's seen cursor if currently viewing it
         if let currentAid = selectedAgentId, !isDraftNewSession,
@@ -1950,7 +2453,12 @@ public final class OrbitIosStore: ObservableObject {
         if let currentAid = selectedAgentId,
            let replacementAid = detail.replacedOptimisticAgents[currentAid] {
             selectedAgentId = replacementAid
-            core?.openAgentTimeline(hostId: hostId, agentId: replacementAid)
+            UserDefaults.standard.set(replacementAid, forKey: Self.lastSelectedAgentIdDefaultsKey)
+            if let core {
+                coreWriteQueue.async {
+                    core.openAgentTimeline(hostId: hostId, agentId: replacementAid)
+                }
+            }
             reloadAgentStage(hostId: hostId, agentId: replacementAid)
         }
 
@@ -1987,8 +2495,16 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
 
-        if terminalScreen == nil, !detail.terminals.isEmpty {
-            terminalScreen = core?.terminalScreen(hostId: hostId)
+        if terminalScreen == nil, !detail.terminals.isEmpty, activeSheet == .pty, let core {
+            coreReadQueue.async { [weak self] in
+                let nextScreen = core.terminalScreen(hostId: hostId)
+                let scrollback = core.terminalScrollback(hostId: hostId)
+                Task { @MainActor [weak self] in
+                    guard let self, self.selectedHostId == hostId else { return }
+                    let tid = self.currentHostDetail?.activeTerminalId ?? self.currentHostDetail?.terminals.first?.terminalId
+                    self.terminalState.setTerminalScreen(nextScreen, terminalId: tid, coreScrollback: scrollback)
+                }
+            }
         }
 
         if autoSelectLatestAgentOnLoad, selectedAgentId == nil,
@@ -2033,25 +2549,35 @@ public final class OrbitIosStore: ObservableObject {
 
     public func selectAgent(hostId: String, agentId: String) {
         isShowingGlobalOverview = false
+        didConsumeInitialSelection = true
+        pendingRestoreAgentId = nil
         let hostChanged = selectedHostId != hostId
         let agentChanged = selectedAgentId != agentId || hostChanged
         if agentChanged {
             saveCurrentComposerDraft()
+            flushPersistedComposerDraftsNow()
         }
         if hostChanged {
             selectedHostId = hostId
+            UserDefaults.standard.set(hostId, forKey: Self.lastSelectedHostIdDefaultsKey)
             currentHostDetail = hostDetailsByHostId[hostId]
             gitReview = nil
             terminalScreen = nil
-            core?.connectHost(hostId: hostId)
-            core?.refreshHost(hostId: hostId)
-            core?.refreshProviderModels(hostId: hostId, forceRefresh: false)
-            core?.refreshQuotas(hostId: hostId)
+            if let core {
+                coreWriteQueue.async {
+                    core.connectHost(hostId: hostId)
+                    core.refreshHost(hostId: hostId)
+                    core.refreshProviderModels(hostId: hostId, forceRefresh: false)
+                    core.refreshQuotas(hostId: hostId)
+                }
+            }
             reloadHostDetail(hostId)
         }
         if agentChanged {
             pendingTimelineRefreshWorkItem?.cancel()
             pendingTimelineRefreshWorkItem = nil
+            isStageFetchInFlight = false
+            hasPendingStageFetch = false
             stageFetchEpoch &+= 1
             stageAuxRevision = 0
             stageTurnLimit = 15
@@ -2064,30 +2590,42 @@ public final class OrbitIosStore: ObservableObject {
             activeStageLoadError = nil
             isStageHydrating = true
             draftWorkspaceId = nil
-            draftUseWorktree = false
             draftWorktreeRepoPath = nil
             activeWorkspaceFilePath = nil
             activeWorkspaceFileLine = nil
         }
         selectedAgentId = agentId
+        UserDefaults.standard.set(agentId, forKey: Self.lastSelectedAgentIdDefaultsKey)
         isDrawerOpen = false
-        core?.openAgentTimeline(hostId: hostId, agentId: agentId)
-        core?.listProviderSubagents(hostId: hostId, parentAgentId: agentId)
+
+        let cardSnapshot = detail(forHostId: hostId)?.agents.first(where: { $0.agentId == agentId }) ?? activeAgent
+        let fetchWorkspaceId = cardSnapshot?.workspaceId
+        let shouldFetchBoard: Bool = fetchWorkspaceId.flatMap { wsId in
+            detail(forHostId: hostId)?.workspaces.first(where: { $0.workspaceId == wsId })
+                .map { $0.isCurated || $0.boardRevision > 0 }
+        } ?? false
+
+        if let core {
+            coreWriteQueue.async {
+                core.openAgentTimeline(hostId: hostId, agentId: agentId)
+                core.listProviderSubagents(hostId: hostId, parentAgentId: agentId)
+                if let wsId = fetchWorkspaceId, !wsId.isEmpty {
+                    core.fetchWorkspaceEvents(hostId: hostId, workspaceId: wsId, limit: 40)
+                    if shouldFetchBoard {
+                        core.fetchWorkspaceBoard(hostId: hostId, workspaceId: wsId)
+                    }
+                }
+            }
+        }
         reloadAgentStage(hostId: hostId, agentId: agentId)
 
-        if let card = detail(forHostId: hostId)?.agents.first(where: { $0.agentId == agentId }) ?? activeAgent {
+        if let card = cardSnapshot {
             selectedProvider = card.provider
             selectedModel = card.model
             selectedEffort = card.effort
+            fastModeEnabled = card.fastMode
             selectedMode = card.mode
             updateActiveWorkspaceCwd(card.cwd)
-            if !card.workspaceId.isEmpty {
-                core?.fetchWorkspaceEvents(hostId: hostId, workspaceId: card.workspaceId, limit: 40)
-                if let ws = detail(forHostId: hostId)?.workspaces.first(where: { $0.workspaceId == card.workspaceId }),
-                   ws.isCurated || ws.boardRevision > 0 {
-                    core?.fetchWorkspaceBoard(hostId: hostId, workspaceId: card.workspaceId)
-                }
-            }
             markAgentSeen(
                 hostId: hostId,
                 agentId: agentId,
@@ -2112,7 +2650,11 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     private func scheduleCoalescedStageReload(hostId: String, agentId: String) {
-        pendingTimelineRefreshWorkItem?.cancel()
+        if isStageFetchInFlight {
+            hasPendingStageFetch = true
+            return
+        }
+        guard pendingTimelineRefreshWorkItem == nil else { return }
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -2121,7 +2663,7 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
         pendingTimelineRefreshWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(33), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
     }
 
     public func loadOlderStageTurns() {
@@ -2182,6 +2724,8 @@ public final class OrbitIosStore: ObservableObject {
         let turnLimit = stageTurnLimit
         let sinceWindowStart: UInt32? = sameStage ? stageWindowStartTurnIndex : nil
         let epoch = stageFetchEpoch
+        isStageFetchInFlight = true
+        hasPendingStageFetch = false
 
         coreReadQueue.async { [weak self] in
             let fetchedDelta = core.agentStageDeltaRequest(
@@ -2195,11 +2739,17 @@ public final class OrbitIosStore: ObservableObject {
                 )
             )
             Task { @MainActor [weak self] in
-                guard let self,
-                      self.stageFetchEpoch == epoch,
+                guard let self else { return }
+                self.isStageFetchInFlight = false
+                let shouldFollowUp = self.hasPendingStageFetch
+                self.hasPendingStageFetch = false
+                guard self.stageFetchEpoch == epoch,
                       self.selectedHostId == hostId,
                       self.selectedAgentId == agentId else {
                     return
+                }
+                if shouldFollowUp {
+                    self.scheduleCoalescedStageReload(hostId: hostId, agentId: agentId)
                 }
                 var effectiveDelta = fetchedDelta
                 let currentSameStage = targetScope != nil
@@ -2308,8 +2858,11 @@ public final class OrbitIosStore: ObservableObject {
     ) {
         isShowingGlobalOverview = false
         saveCurrentComposerDraft()
+        flushPersistedComposerDraftsNow()
         let wasViewingAgent = selectedAgentId != nil
         selectedAgentId = nil
+        pendingRestoreAgentId = nil
+        UserDefaults.standard.removeObject(forKey: Self.lastSelectedAgentIdDefaultsKey)
         agentStage = nil
         agentStageHostId = nil
         agentStageScopeKey = nil
@@ -2318,9 +2871,13 @@ public final class OrbitIosStore: ObservableObject {
         activeWorkspaceFilePath = nil
         activeWorkspaceFileLine = nil
         isDrawerOpen = false
+        if isPadDiffInspectorVisible {
+            isPadDiffInspectorVisible = false
+        }
         activeExtraDirs = extraDirs
         draftWorkspaceId = workspaceId
         draftWorktreeRepoPath = nil
+        draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
         selectedMode = Self.sessionModeFromRaw(defaultPermissionModeRaw)
         if let provider = provider {
             selectedProvider = provider
@@ -2343,10 +2900,15 @@ public final class OrbitIosStore: ObservableObject {
                 syncDefaultModelAndEffort(for: selectedProvider)
             }
         }
+        activeComposerScopeKey = ""
         if let cwd = cwd, !cwd.isEmpty {
             updateActiveWorkspaceCwd(cwd)
-        } else if let hid = selectedHostId, !activeCwd.isEmpty, activeCwd != "~" {
-            core?.requestGitReposInspection(hostId: hid, path: activeCwd, extraDirs: activeExtraDirs)
+        } else if let hid = selectedHostId, !activeCwd.isEmpty, activeCwd != "~", let core {
+            let cwdSnapshot = activeCwd
+            let dirsSnapshot = activeExtraDirs
+            coreWriteQueue.async {
+                core.requestGitReposInspection(hostId: hid, path: cwdSnapshot, extraDirs: dirsSnapshot)
+            }
         }
         restoreComposerDraftForCurrentScope()
         refreshSidebar()
@@ -2412,14 +2974,32 @@ public final class OrbitIosStore: ObservableObject {
         if changed {
             draftWorktreeRepoPath = nil
         }
-        if changed, let hid = selectedHostId {
-            core?.fetchGitStatus(hostId: hid, cwd: cwd)
-            core?.fetchGitDiff(hostId: hid, cwd: cwd, path: nil, staged: gitStagedMode)
-            gitReview = core?.gitReview(hostId: hid, cwd: cwd, path: nil)
-            core?.fetchWorkspaceFiles(hostId: hid, cwd: cwd)
-            workspaceFilesList = core?.workspaceFiles(hostId: hid, cwd: cwd) ?? []
-            core?.requestGitReposInspection(hostId: hid, path: cwd, extraDirs: activeExtraDirs)
-            refreshSidebar()
+        if changed, let hid = selectedHostId, let core {
+            let staged = gitStagedMode
+            let dirs = activeExtraDirs
+            let loadGitNow = isPadDiffInspectorVisible || activeSheet == .gitDiff
+            let loadFilesNow = (isPadDiffInspectorVisible && padInspectorTab == .files)
+                || { if case .workspaceFiles = activeSheet { return true }; return false }()
+            if !loadGitNow { isGitReviewStale = true }
+            if !loadFilesNow { isWorkspaceFilesStale = true }
+            coreReadQueue.async { [weak self] in
+                core.fetchGitStatus(hostId: hid, cwd: cwd)
+                core.fetchGitDiff(hostId: hid, cwd: cwd, path: nil, staged: staged)
+                core.fetchWorkspaceFiles(hostId: hid, cwd: cwd)
+                core.requestGitReposInspection(hostId: hid, path: cwd, extraDirs: dirs)
+                let nextReview = loadGitNow ? core.gitReview(hostId: hid, cwd: cwd, path: nil) : nil
+                let nextFiles = loadFilesNow ? core.workspaceFiles(hostId: hid, cwd: cwd) : nil
+                Task { @MainActor [weak self] in
+                    guard let self, self.selectedHostId == hid, self.activeCwd == cwd else { return }
+                    if let nextReview {
+                        self.applyGitReviewSnapshot(nextReview)
+                    }
+                    if let nextFiles, self.workspaceFilesList != nextFiles {
+                        self.workspaceFilesList = nextFiles
+                    }
+                    self.refreshSidebar()
+                }
+            }
         }
     }
 
@@ -2428,14 +3008,25 @@ public final class OrbitIosStore: ObservableObject {
         let title = detail(forHostId: hid)?.agents.first(where: { $0.agentId == agentId })?.title
             ?? activeAgent?.title
             ?? "Conversation"
-        core?.archiveAgent(hostId: hid, agentId: agentId)
+        if let core {
+            coreWriteQueue.async {
+                core.archiveAgent(hostId: hid, agentId: agentId)
+            }
+        }
         if selectedAgentId == agentId && hid == selectedHostId {
             selectedAgentId = nil
+            UserDefaults.standard.removeObject(forKey: Self.lastSelectedAgentIdDefaultsKey)
             agentStage = nil
             agentStageHostId = nil
             agentStageScopeKey = nil
         }
+        pendingArchiveUndoDismissTask?.cancel()
         pendingArchiveUndo = OrbitPendingArchiveUndo(hostId: hid, agentId: agentId, title: title)
+        pendingArchiveUndoDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 4_500_000_000)
+            guard !Task.isCancelled else { return }
+            self?.pendingArchiveUndo = nil
+        }
         reloadHostDetail(hid)
         refreshSidebar()
         hapticLight()
@@ -2444,15 +3035,25 @@ public final class OrbitIosStore: ObservableObject {
 
     public func undoPendingArchive() {
         guard let undo = pendingArchiveUndo else { return }
+        pendingArchiveUndoDismissTask?.cancel()
+        pendingArchiveUndoDismissTask = nil
         pendingArchiveUndo = nil
-        core?.unarchiveAgent(hostId: undo.hostId, agentId: undo.agentId)
-        reloadHostDetail(undo.hostId)
-        refreshSidebar()
+        if let core {
+            coreWriteQueue.async { [weak self] in
+                core.unarchiveAgent(hostId: undo.hostId, agentId: undo.agentId)
+                Task { @MainActor [weak self] in
+                    self?.reloadHostDetail(undo.hostId)
+                    self?.refreshSidebar()
+                }
+            }
+        }
         hapticSuccess()
         showToast("Restored \(undo.title)")
     }
 
     public func dismissArchiveUndo() {
+        pendingArchiveUndoDismissTask?.cancel()
+        pendingArchiveUndoDismissTask = nil
         pendingArchiveUndo = nil
     }
 
@@ -2476,7 +3077,7 @@ public final class OrbitIosStore: ObservableObject {
             hapticSuccess()
             showToast("Added project \(cleanName)")
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
             hapticWarning()
         }
     }
@@ -2496,7 +3097,7 @@ public final class OrbitIosStore: ObservableObject {
             hapticLight()
             showToast("Renamed project to \(clean)")
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
             hapticWarning()
         }
     }
@@ -2610,7 +3211,7 @@ public final class OrbitIosStore: ObservableObject {
             hapticSuccess()
             showToast("Pinned \(name)")
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
         }
     }
 
@@ -2620,14 +3221,24 @@ public final class OrbitIosStore: ObservableObject {
             reloadFleet()
             hapticLight()
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
         }
     }
 
     public func refreshWorkspaceFiles() {
-        guard let hid = selectedHostId else { return }
-        core?.fetchWorkspaceFiles(hostId: hid, cwd: activeCwd)
-        workspaceFilesList = core?.workspaceFiles(hostId: hid, cwd: activeCwd) ?? []
+        guard let hid = selectedHostId, let core else { return }
+        let cwd = activeCwd
+        isWorkspaceFilesStale = false
+        coreReadQueue.async { [weak self] in
+            core.fetchWorkspaceFiles(hostId: hid, cwd: cwd)
+            let nextFiles = core.workspaceFiles(hostId: hid, cwd: cwd)
+            Task { @MainActor [weak self] in
+                guard let self, self.selectedHostId == hid, self.activeCwd == cwd else { return }
+                if self.workspaceFilesList != nextFiles {
+                    self.workspaceFilesList = nextFiles
+                }
+            }
+        }
     }
 
     // MARK: - Pairing & Host Config
@@ -2650,7 +3261,7 @@ public final class OrbitIosStore: ObservableObject {
             showToast("Connected to \(card.displayName)")
             return true
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
             hapticWarning()
             return false
         }
@@ -2675,27 +3286,37 @@ public final class OrbitIosStore: ObservableObject {
         let nextCustomName = customName.map { OrbitAgentLogic.hostConfigFieldValue(edited: $0, original: targetHost?.customName) } ?? nil
         let nextDirectEndpoint = customDirectEndpoint.map { OrbitAgentLogic.hostConfigFieldValue(edited: $0, original: targetHost?.customDirectEndpoint) } ?? nil
         let nextRelayUrl = relayUrl.map { OrbitAgentLogic.hostConfigFieldValue(edited: $0, original: targetHost?.relayUrl) } ?? nil
-        do {
-            _ = try core?.updateHostConfig(
-                hostId: hostId,
-                customName: nextCustomName,
-                routeMode: routeMode,
-                sshAlias: targetHost?.sshAlias,
-                remoteDaemonPort: targetHost?.remoteDaemonPort,
-                customDirectEndpoint: nextDirectEndpoint,
-                relayUrl: nextRelayUrl,
-                reconnect: true
-            )
-            lastError = nil
-            reloadFleet()
-            if hostId == selectedHostId {
-                reloadHostDetail(hostId)
+        guard let core else { return }
+        coreWriteQueue.async { [weak self] in
+            do {
+                _ = try core.updateHostConfig(
+                    hostId: hostId,
+                    customName: nextCustomName,
+                    routeMode: routeMode,
+                    sshAlias: targetHost?.sshAlias,
+                    remoteDaemonPort: targetHost?.remoteDaemonPort,
+                    customDirectEndpoint: nextDirectEndpoint,
+                    relayUrl: nextRelayUrl,
+                    reconnect: true
+                )
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.lastError = nil
+                    self.reloadFleet()
+                    if hostId == self.selectedHostId {
+                        self.reloadHostDetail(hostId)
+                    }
+                    self.hapticSuccess()
+                    self.showToast("Updated host route settings")
+                }
+            } catch {
+                let msg = OrbitErrorFormatter.humanize(error)
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.lastError = msg
+                    self.hapticWarning()
+                }
             }
-            hapticSuccess()
-            showToast("Updated host route settings")
-        } catch {
-            lastError = error.localizedDescription
-            hapticWarning()
         }
     }
 
@@ -2713,7 +3334,7 @@ public final class OrbitIosStore: ObservableObject {
                 self.hapticSuccess()
                 self.showToast("Shared relay across \(count) host\(count == 1 ? "" : "s")")
             } catch {
-                self.lastError = error.localizedDescription
+                self.lastError = OrbitErrorFormatter.humanize(error)
                 self.hapticWarning()
             }
         }
@@ -2726,7 +3347,7 @@ public final class OrbitIosStore: ObservableObject {
             hapticMedium()
             showToast("Removed host")
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
         }
     }
 
@@ -3070,7 +3691,7 @@ public final class OrbitIosStore: ObservableObject {
                 if case let FfiOrbitError.Core(detail) = error {
                     errorDetail = detail
                 } else {
-                    errorDetail = error.localizedDescription
+                    errorDetail = OrbitErrorFormatter.humanize(error)
                 }
                 guard let self else { return }
                 self.composerUploadStates[contextId] = .failed(errorDetail)
@@ -3423,7 +4044,9 @@ public final class OrbitIosStore: ObservableObject {
         removeQueuedPrompt(item, inKey: key)
         hapticLight()
         if useServerQueue, let core = core {
-            core.flushQueuedPromptNow(hostId: hid, agentId: aid, queueId: item.id)
+            coreWriteQueue.async {
+                core.flushQueuedPromptNow(hostId: hid, agentId: aid, queueId: item.id)
+            }
             return
         }
         lastKnownRunningByAgentKey[key] = true
@@ -3435,6 +4058,83 @@ public final class OrbitIosStore: ObservableObject {
             contexts: item.attachedContexts,
             quotes: item.quotedDiffSnippets
         )
+    }
+
+    public func flushAllQueuedPrompts() {
+        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
+        let items = activeQueuedPrompts
+        guard !items.isEmpty else { return }
+        let key = "\(hid)::\(aid)"
+        let useServerQueue = currentHostDetail?.host.supportsServerQueue == true
+        queuedPromptsByAgent.removeValue(forKey: key)
+        if useServerQueue, let core = core {
+            coreWriteQueue.async {
+                for item in items {
+                    core.flushQueuedPromptNow(hostId: hid, agentId: aid, queueId: item.id)
+                }
+            }
+        } else {
+            let combinedText = items.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n\n")
+            let firstDir = items.compactMap(\.slashDirective).first
+            var allContexts: [ComposerContextItem] = []
+            for item in items {
+                for ctx in item.attachedContexts where !allContexts.contains(where: { $0.id == ctx.id }) {
+                    allContexts.append(ctx)
+                }
+            }
+            var allQuotes: [QuotedDiffSnippet] = []
+            for item in items {
+                for q in item.quotedDiffSnippets where !allQuotes.contains(where: { $0.id == q.id }) {
+                    allQuotes.append(q)
+                }
+            }
+            lastKnownRunningByAgentKey[key] = true
+            dispatchPromptInputs(
+                hostId: hid,
+                agentId: aid,
+                rawInput: combinedText,
+                explicitDirective: firstDir,
+                contexts: allContexts,
+                quotes: allQuotes
+            )
+        }
+        hapticMedium()
+        showToast("Flushed all queued prompts")
+    }
+
+    public func setFastMode(_ enabled: Bool) {
+        fastModeEnabled = enabled
+        if let hid = selectedHostId, let aid = selectedAgentId, let core {
+            coreWriteQueue.async {
+                core.setAgentFastMode(hostId: hid, agentId: aid, fastMode: enabled)
+            }
+        }
+        hapticLight()
+        showToast(enabled ? "Fast Mode enabled" : "Fast Mode disabled")
+    }
+
+    public func setPreferredLanguage(_ code: String) {
+        preferredLanguageCode = code
+        UserDefaults.standard.set(code, forKey: Self.preferredLanguageDefaultsKey)
+        if code.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "AppleLanguages")
+        } else {
+            UserDefaults.standard.set([code], forKey: "AppleLanguages")
+        }
+        hapticLight()
+    }
+
+    public func addExtraDirectory(_ dir: String) {
+        let trimmed = OrbitPathLogic.normalizePath(dir)
+        guard !trimmed.isEmpty, !activeExtraDirs.contains(trimmed) else { return }
+        activeExtraDirs.append(trimmed)
+        requestGitReposInspection(for: activeCwd)
+        hapticLight()
+    }
+
+    public func removeExtraDirectory(_ dir: String) {
+        activeExtraDirs.removeAll { $0 == dir }
+        hapticLight()
     }
 
     private func removeQueuedPrompt(_ item: QueuedPromptItem, inKey key: String) {
@@ -3583,35 +4283,58 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
 
+        if composed.effectiveDirective == .plan, selectedMode != .plan {
+            applySessionMode(.plan)
+        }
+
         if composed.isCompact {
             guard let aid = agentId else {
+                hapticWarning()
                 showToast("Start a session first to compact context")
                 return
             }
-            core?.sendPromptWithMeta(
-                hostId: hid,
-                agentId: aid,
-                prompt: composed.wirePrompt,
-                displayPrompt: composed.displayPrompt,
-                badges: composed.badges
-            )
-            if aid == selectedAgentId {
-                reloadAgentStage(hostId: hid, agentId: aid)
+            if let core {
+                coreWriteQueue.async { [weak self] in
+                    core.sendPromptWithMeta(
+                        hostId: hid,
+                        agentId: aid,
+                        prompt: composed.wirePrompt,
+                        displayPrompt: composed.displayPrompt,
+                        badges: composed.badges
+                    )
+                    Task { @MainActor [weak self] in
+                        if aid == self?.selectedAgentId {
+                            self?.reloadAgentStage(hostId: hid, agentId: aid)
+                        }
+                    }
+                }
             }
             return
         }
 
         if let aid = agentId {
             lastKnownRunningByAgentKey["\(hid)::\(aid)"] = true
-            core?.sendPromptWithMeta(
+            appendOptimisticUserPromptIfNeeded(
                 hostId: hid,
                 agentId: aid,
-                prompt: composed.wirePrompt,
-                displayPrompt: composed.displayPrompt,
+                text: composed.displayPrompt,
                 badges: composed.badges
             )
-            if aid == selectedAgentId {
-                reloadAgentStage(hostId: hid, agentId: aid)
+            if let core {
+                coreWriteQueue.async { [weak self] in
+                    core.sendPromptWithMeta(
+                        hostId: hid,
+                        agentId: aid,
+                        prompt: composed.wirePrompt,
+                        displayPrompt: composed.displayPrompt,
+                        badges: composed.badges
+                    )
+                    Task { @MainActor [weak self] in
+                        if aid == self?.selectedAgentId {
+                            self?.reloadAgentStage(hostId: hid, agentId: aid)
+                        }
+                    }
+                }
             }
         } else {
             let canWorktree = OrbitComposerLogic.canCreateWorktreeSession(
@@ -3633,29 +4356,125 @@ public final class OrbitIosStore: ObservableObject {
                 acpAgentId: nil,
                 model: selectedModel,
                 effort: selectedEffort,
-                fastMode: nil,
+                fastMode: fastModeEnabled ? true : nil,
                 mode: selectedMode,
                 initialPrompt: composed.wirePrompt,
                 initialDisplayPrompt: composed.displayPrompt,
                 initialBadges: composed.badges,
                 worktreeBranch: (canWorktree && draftUseWorktree) ? "auto" : nil
             )
-            let createdId = core?.createSessionInWorkspace(
-                req: req,
-                workspaceId: draftWorkspaceId,
-                handle: nil,
-                autoCluster: false
-            )
-            if let newId = createdId, !newId.isEmpty {
-                draftWorkspaceId = nil
-                draftWorktreeRepoPath = nil
-                lastKnownRunningByAgentKey["\(hid)::\(newId)"] = true
-                selectedAgentId = newId
-                core?.openAgentTimeline(hostId: hid, agentId: newId)
-                reloadHostDetail(hid)
-                reloadAgentStage(hostId: hid, agentId: newId)
+            let targetWsId = draftWorkspaceId
+            isStageHydrating = true
+            if let core {
+                coreWriteQueue.async { [weak self] in
+                    let createdId = core.createSessionInWorkspace(
+                        req: req,
+                        workspaceId: targetWsId,
+                        handle: nil,
+                        autoCluster: false
+                    )
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let newId = createdId
+                        if !newId.isEmpty {
+                            self.draftWorkspaceId = nil
+                            self.draftWorktreeRepoPath = nil
+                            self.lastKnownRunningByAgentKey["\(hid)::\(newId)"] = true
+                            self.selectedAgentId = newId
+                            UserDefaults.standard.set(newId, forKey: Self.lastSelectedAgentIdDefaultsKey)
+                            self.appendOptimisticUserPromptIfNeeded(
+                                hostId: hid,
+                                agentId: newId,
+                                text: composed.displayPrompt,
+                                badges: composed.badges
+                            )
+                            self.coreWriteQueue.async {
+                                core.openAgentTimeline(hostId: hid, agentId: newId)
+                            }
+                            self.reloadHostDetail(hid)
+                            self.reloadAgentStage(hostId: hid, agentId: newId)
+                        } else {
+                            self.isStageHydrating = false
+                        }
+                    }
+                }
             }
         }
+    }
+
+    private func appendOptimisticUserPromptIfNeeded(
+        hostId: String,
+        agentId: String,
+        text: String,
+        badges: [FfiPromptBadge]
+    ) {
+        guard hostId == selectedHostId, agentId == selectedAgentId else { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let optSeq = (agentStage?.latestSeq ?? 0) + 1
+        let turnIdx = UInt32(agentStage?.turns.count ?? 0)
+        let promptItem = FfiTimelineItem.userPrompt(
+            seq: optSeq,
+            messageId: "opt-\(UUID().uuidString)",
+            text: text,
+            badges: badges,
+            blocks: [],
+            timestampMs: nowMs
+        )
+        let optTurn = FfiStageTurn(
+            key: "opt-turn-\(optSeq)",
+            turnIndex: turnIdx,
+            anchorSeq: optSeq,
+            userPrompt: promptItem,
+            agentMessage: nil,
+            isCompactionCommand: false,
+            foldedSteps: [],
+            workCounts: FfiTurnWorkCounts(
+                editedFileCount: 0, createdFileCount: 0, commandCount: 0, readFileCount: 0,
+                searchCount: 0, subagentCount: 0, mcpServerCount: 0, otherToolCount: 0,
+                thoughtCount: 0, narrationCount: 0, actionSteps: 0, totalSteps: 0,
+                failedCount: 0, deniedCount: 0, unrecoveredFailureCount: 0, additions: 0, deletions: 0
+            ),
+            workSummaryLabel: "",
+            workSummaryLiveLabel: "Thinking",
+            workSummaryLiveDetail: nil,
+            workSummaryIncludesFailure: false,
+            thoughtDurationMs: nil,
+            workDurationMs: nil,
+            turnDurationMs: nil,
+            terminalReply: nil,
+            lastAssistantReply: nil,
+            notices: [],
+            compactions: [],
+            liveSegments: [],
+            turnDiffs: [],
+            hasError: false,
+            hasUnrecoveredError: false,
+            hasActiveItem: true,
+            startedAtMs: nowMs,
+            completedAtMs: nil,
+            latestActivityMs: nowMs,
+            latestVisibleProgressMs: nowMs
+        )
+        if var cur = agentStage, cur.hostId == hostId, cur.agent?.agentId == agentId {
+            cur.turns.append(optTurn)
+            cur.latestSeq = optSeq
+            agentStage = cur
+        } else {
+            agentStage = FfiAgentStage(
+                revision: 0,
+                hostId: hostId,
+                agent: activeAgent,
+                turns: [optTurn],
+                pendingPermissions: [],
+                pendingQuestions: [],
+                sessionTurnDiffs: [],
+                insights: FfiSessionInsights(touchedFiles: [], backgroundTasks: [], subagents: [], detectedLocalUrls: []),
+                latestSeq: optSeq
+            )
+        }
+        agentStageHostId = hostId
+        agentStageScopeKey = OrbitAgentLogic.stageScopeKey(hostId: hostId, agentId: agentId)
+        isStageHydrating = false
     }
 
     public func interruptActiveAgent() {
@@ -3664,13 +4483,74 @@ public final class OrbitIosStore: ObservableObject {
 
     public func interruptAgent() {
         guard let hid = selectedHostId, let aid = selectedAgentId else { return }
-        core?.interruptAgent(hostId: hid, agentId: aid)
+        interruptAgent(agentId: aid, hostId: hid)
+    }
+
+    public func interruptAgent(agentId: String, hostId: String? = nil) {
+        guard let hid = hostId ?? selectedHostId, let core else { return }
+        coreWriteQueue.async {
+            core.interruptAgent(hostId: hid, agentId: agentId)
+        }
         hapticRigid()
     }
 
+    public func previewWorktreeHandoff(
+        workspaceId: String,
+        sourceAgentId: String? = nil,
+        direction: FfiWorktreeHandoffDirection,
+        includeCommitted: Bool
+    ) async throws -> FfiWorktreeHandoffPreview {
+        guard let core, let hid = selectedHostId else {
+            throw OrbitStorageError.applicationSupportUnavailable
+        }
+        let req = FfiPreviewWorktreeHandoffRequest(
+            hostId: hid,
+            workspaceId: workspaceId,
+            sourceAgentId: sourceAgentId,
+            direction: direction,
+            targetWorkspaceId: nil,
+            includeCommitted: includeCommitted
+        )
+        return try await Task.detached(priority: .userInitiated) {
+            try core.previewWorktreeHandoff(req: req)
+        }.value
+    }
+
+    public func executeWorktreeHandoff(
+        workspaceId: String,
+        sourceAgentId: String? = nil,
+        direction: FfiWorktreeHandoffDirection,
+        mode: FfiWorktreeHandoffMode,
+        includeCommitted: Bool
+    ) async throws -> FfiWorktreeHandoffOutcome {
+        guard let core, let hid = selectedHostId else {
+            throw OrbitStorageError.applicationSupportUnavailable
+        }
+        let req = FfiExecuteWorktreeHandoffRequest(
+            hostId: hid,
+            workspaceId: workspaceId,
+            sourceAgentId: sourceAgentId,
+            direction: direction,
+            mode: mode,
+            targetWorkspaceId: nil,
+            includeCommitted: includeCommitted,
+            branch: nil,
+            allowThreeWayConflicts: true
+        )
+        let outcome = try await Task.detached(priority: .userInitiated) {
+            try core.executeWorktreeHandoff(req: req)
+        }.value
+        hapticSuccess()
+        showToast(outcome.summary.isEmpty ? "Handoff completed" : outcome.summary)
+        refreshGitReview()
+        return outcome
+    }
+
     public func interruptAgentAndContinue() {
-        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
-        core?.interruptAgentAndContinue(hostId: hid, agentId: aid)
+        guard let hid = selectedHostId, let aid = selectedAgentId, let core else { return }
+        coreWriteQueue.async {
+            core.interruptAgentAndContinue(hostId: hid, agentId: aid)
+        }
         hapticRigid()
     }
 
@@ -3680,7 +4560,11 @@ public final class OrbitIosStore: ObservableObject {
         core?.describeToolItem(item: item, cwd: activeCwd)
     }
 
-    public func resolvePermission(requestId: String, decision: String) {
+    public func resolvePermission(
+        requestId: String,
+        decision: String,
+        onComplete: ((Bool, String?) -> Void)? = nil
+    ) {
         if requestId.hasPrefix("demo-perm-") {
             demoPendingPermissions.removeAll { item in
                 if case let .permissionRequest(_, rid, _, _, _, _, _, _) = item {
@@ -3690,20 +4574,38 @@ public final class OrbitIosStore: ObservableObject {
             }
             hapticMedium()
             showToast("Decision: \(OrbitFormatters.decisionLabel(decision))")
+            onComplete?(true, nil)
             return
         }
-        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
-        core?.resolvePermission(
-            hostId: hid,
-            agentId: aid,
-            permissionRequestId: requestId,
-            decision: decision
-        )
-        reloadAgentStage(hostId: hid, agentId: aid)
+        guard let hid = selectedHostId, let aid = selectedAgentId, let core else {
+            onComplete?(false, "Host or conversation is no longer active.")
+            return
+        }
         hapticMedium()
+        coreWriteQueue.async { [weak self] in
+            core.resolvePermission(
+                hostId: hid,
+                agentId: aid,
+                permissionRequestId: requestId,
+                decision: decision
+            )
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    onComplete?(false, nil)
+                    return
+                }
+                self.reloadAgentStage(hostId: hid, agentId: aid)
+                // If core returned an immediate error via lastError or rule rejection, still unlock UI
+                onComplete?(true, nil)
+            }
+        }
     }
 
-    public func answerQuestion(requestId: String, answers: [[String]]) {
+    public func answerQuestion(
+        requestId: String,
+        answers: [[String]],
+        onComplete: ((Bool, String?) -> Void)? = nil
+    ) {
         if requestId.hasPrefix("demo-question-") {
             demoPendingQuestions.removeAll { item in
                 if case let .questionRequest(_, rid, _, _, _) = item {
@@ -3713,17 +4615,30 @@ public final class OrbitIosStore: ObservableObject {
             }
             hapticMedium()
             showToast("Submitted response")
+            onComplete?(true, nil)
             return
         }
-        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
-        core?.answerQuestion(
-            hostId: hid,
-            agentId: aid,
-            questionRequestId: requestId,
-            answers: answers
-        )
-        reloadAgentStage(hostId: hid, agentId: aid)
+        guard let hid = selectedHostId, let aid = selectedAgentId, let core else {
+            onComplete?(false, "Host or conversation is no longer active.")
+            return
+        }
         hapticMedium()
+        coreWriteQueue.async { [weak self] in
+            core.answerQuestion(
+                hostId: hid,
+                agentId: aid,
+                questionRequestId: requestId,
+                answers: answers
+            )
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    onComplete?(false, nil)
+                    return
+                }
+                self.reloadAgentStage(hostId: hid, agentId: aid)
+                onComplete?(true, nil)
+            }
+        }
     }
 
     // MARK: - Responsive Geometry, Git Diff & Tap-to-Quote
@@ -3847,29 +4762,160 @@ public final class OrbitIosStore: ObservableObject {
         }
     }
 
+    private func gitDiffCacheKey(hostId: String, cwd: String) -> String {
+        "\(hostId)::\(OrbitPathLogic.normalizePath(cwd))"
+    }
+
+    func applyGitReviewSnapshot(_ snapshot: FfiGitReview, stagedHint: Bool? = nil) {
+        if gitReview != snapshot {
+            gitReview = snapshot
+        }
+        let cacheKey = gitDiffCacheKey(hostId: snapshot.hostId, cwd: snapshot.cwd)
+        let isStaged = stagedHint ?? gitStagedMode
+        if !snapshot.diffFiles.isEmpty {
+            if isStaged {
+                gitStagedDiffCache[cacheKey] = snapshot.diffFiles
+            } else {
+                gitUnstagedDiffCache[cacheKey] = snapshot.diffFiles
+            }
+        } else if snapshot.rawDiff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Clear only the active slot if its status list confirms zero entries in that slot
+            if isStaged && !snapshot.changedFiles.contains(where: { $0.staged }) {
+                gitStagedDiffCache[cacheKey] = []
+            } else if !isStaged && !snapshot.changedFiles.contains(where: { !$0.staged && !$0.untracked }) {
+                gitUnstagedDiffCache[cacheKey] = []
+            }
+        }
+    }
+
+    /// Merges staged, unstaged, and untracked changes accurately per `OrbitGitReviewScope`.
+    public func effectiveGitDiffFiles(for scope: OrbitGitReviewScope) -> [FfiDiffFile] {
+        guard let review = gitReview else {
+            if scope != .staged, let sessionDiffs = agentStage?.sessionTurnDiffs, !sessionDiffs.isEmpty {
+                return sessionDiffs
+            }
+            return []
+        }
+        let key = gitDiffCacheKey(hostId: review.hostId, cwd: review.cwd)
+        let stagedFiles = gitStagedDiffCache[key] ?? (gitStagedMode ? review.diffFiles : [])
+        let unstagedFiles = gitUnstagedDiffCache[key] ?? (!gitStagedMode ? review.diffFiles : [])
+
+        func syntheticEntry(for entry: FfiGitFileEntry) -> FfiDiffFile {
+            let label = entry.untracked ? "Untracked file — stage or open in Files to preview" : "Changed file (\(entry.status))"
+            return FfiDiffFile(
+                path: entry.path,
+                additions: entry.untracked ? 1 : 0,
+                deletions: 0,
+                lines: [
+                    FfiDiffLine(
+                        kind: .hunkHeader,
+                        oldLine: nil,
+                        newLine: nil,
+                        content: label
+                    )
+                ]
+            )
+        }
+
+        switch scope {
+        case .staged:
+            var seen = Set(stagedFiles.map(\.path))
+            var merged = stagedFiles
+            for entry in review.changedFiles where entry.staged && !seen.contains(entry.path) {
+                seen.insert(entry.path)
+                merged.append(syntheticEntry(for: entry))
+            }
+            return merged
+        case .workingTree:
+            var seen = Set(unstagedFiles.map(\.path))
+            var merged = unstagedFiles
+            for entry in review.changedFiles where (!entry.staged || entry.untracked) && !seen.contains(entry.path) {
+                seen.insert(entry.path)
+                merged.append(syntheticEntry(for: entry))
+            }
+            return merged
+        case .all:
+            var mergedByPath: [String: FfiDiffFile] = [:]
+            var orderedPaths: [String] = []
+            for file in unstagedFiles {
+                mergedByPath[file.path] = file
+                orderedPaths.append(file.path)
+            }
+            for file in stagedFiles {
+                if let existing = mergedByPath[file.path] {
+                    mergedByPath[file.path] = FfiDiffFile(
+                        path: file.path,
+                        additions: existing.additions + file.additions,
+                        deletions: existing.deletions + file.deletions,
+                        lines: existing.lines + file.lines
+                    )
+                } else {
+                    mergedByPath[file.path] = file
+                    orderedPaths.append(file.path)
+                }
+            }
+            for entry in review.changedFiles where mergedByPath[entry.path] == nil {
+                mergedByPath[entry.path] = syntheticEntry(for: entry)
+                orderedPaths.append(entry.path)
+            }
+            let out = orderedPaths.compactMap { mergedByPath[$0] }
+            if out.isEmpty, let sessionDiffs = agentStage?.sessionTurnDiffs, !sessionDiffs.isEmpty {
+                return sessionDiffs
+            }
+            return out
+        }
+    }
+
     public func pullToRefreshGitDiff() async {
         hapticLight()
         refreshGitReview()
-        try? await Task.sleep(nanoseconds: 220_000_000)
-        if let hid = selectedHostId {
-            gitReview = core?.gitReview(hostId: hid, cwd: activeCwd, path: nil)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        if let hid = selectedHostId, let core {
+            let cwd = activeCwd
+            let isStaged = gitStagedMode
+            coreReadQueue.async { [weak self] in
+                let nextReview = core.gitReview(hostId: hid, cwd: cwd, path: nil)
+                Task { @MainActor [weak self] in
+                    self?.applyGitReviewSnapshot(nextReview, stagedHint: isStaged)
+                }
+            }
         }
     }
 
     public func setGitStagedFilter(_ staged: Bool) {
         gitStagedMode = staged
-        guard let hid = selectedHostId else { return }
-        core?.fetchGitStatus(hostId: hid, cwd: activeCwd)
-        core?.fetchGitDiff(hostId: hid, cwd: activeCwd, path: nil, staged: staged)
-        gitReview = core?.gitReview(hostId: hid, cwd: activeCwd, path: nil)
+        refreshGitReview()
         hapticLight()
     }
 
     public func refreshGitReview() {
-        guard let hid = selectedHostId else { return }
-        core?.fetchGitStatus(hostId: hid, cwd: activeCwd)
-        core?.fetchGitDiff(hostId: hid, cwd: activeCwd, path: nil, staged: gitStagedMode)
-        gitReview = core?.gitReview(hostId: hid, cwd: activeCwd, path: nil)
+        guard let hid = selectedHostId, let core else { return }
+        isGitReviewStale = false
+        let cwd = activeCwd
+        let scope = gitReviewScope
+        let stagedFlag = gitStagedMode
+        coreReadQueue.async { [weak self] in
+            core.fetchGitStatus(hostId: hid, cwd: cwd)
+            if scope == .all {
+                // Fetch staged diff first to populate staged cache, then unstaged so workingTree stays warm
+                core.fetchGitDiff(hostId: hid, cwd: cwd, path: nil, staged: true)
+                let stagedReview = core.gitReview(hostId: hid, cwd: cwd, path: nil)
+                core.fetchGitDiff(hostId: hid, cwd: cwd, path: nil, staged: false)
+                let unstagedReview = core.gitReview(hostId: hid, cwd: cwd, path: nil)
+                Task { @MainActor [weak self] in
+                    guard let self, self.selectedHostId == hid, self.activeCwd == cwd else { return }
+                    self.applyGitReviewSnapshot(stagedReview, stagedHint: true)
+                    self.applyGitReviewSnapshot(unstagedReview, stagedHint: false)
+                }
+            } else {
+                core.fetchGitDiff(hostId: hid, cwd: cwd, path: nil, staged: stagedFlag)
+                let nextReview = core.gitReview(hostId: hid, cwd: cwd, path: nil)
+                Task { @MainActor [weak self] in
+                    guard let self, self.selectedHostId == hid, self.activeCwd == cwd else { return }
+                    self.applyGitReviewSnapshot(nextReview, stagedHint: stagedFlag)
+                }
+            }
+        }
     }
 
     public func quoteDiffLine(path: String, line: FfiDiffLine) {
@@ -3894,46 +4940,60 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Native PTY Terminal
 
     public func ensureTerminalReady(cols: UInt16, rows: UInt16) {
-        guard let hid = selectedHostId else { return }
+        guard let hid = selectedHostId, let core else { return }
         lastTerminalDimensions = (cols, rows)
         let targetCwd = activeCwd.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let detail = currentHostDetail, !detail.terminals.isEmpty {
-            let matchedTid: String? = {
-                if !targetCwd.isEmpty && targetCwd != "~" {
-                    if let activeTid = detail.activeTerminalId,
-                       let activeTerm = detail.terminals.first(where: { $0.terminalId == activeTid }),
-                       OrbitFormatters.arePathsEquivalent(activeTerm.cwd, targetCwd) {
-                        return activeTid
+        let detail = currentHostDetail
+        let pendingCmd = pendingLaunchPtyCommand
+        let shouldDispatchLaunchCmd = !ptyLaunchCmdDispatched && pendingCmd != nil
+        if shouldDispatchLaunchCmd { ptyLaunchCmdDispatched = true }
+
+        coreWriteQueue.async { [weak self] in
+            if let detail = detail, !detail.terminals.isEmpty {
+                let matchedTid: String? = {
+                    if !targetCwd.isEmpty && targetCwd != "~" {
+                        if let activeTid = detail.activeTerminalId,
+                           let activeTerm = detail.terminals.first(where: { $0.terminalId == activeTid }),
+                           OrbitFormatters.arePathsEquivalent(activeTerm.cwd, targetCwd) {
+                            return activeTid
+                        }
+                        return detail.terminals.first(where: {
+                            OrbitFormatters.arePathsEquivalent($0.cwd, targetCwd)
+                        })?.terminalId
+                    } else {
+                        return detail.activeTerminalId ?? detail.terminals.first?.terminalId
                     }
-                    return detail.terminals.first(where: {
-                        OrbitFormatters.arePathsEquivalent($0.cwd, targetCwd)
-                    })?.terminalId
+                }()
+                if let tid = matchedTid {
+                    core.attachTerminal(hostId: hid, terminalId: tid, slot: 1)
+                    core.resizeTerminal(hostId: hid, cols: cols, rows: rows)
                 } else {
-                    return detail.activeTerminalId ?? detail.terminals.first?.terminalId
+                    core.startTerminal(hostId: hid, cwd: targetCwd.isEmpty ? "~" : targetCwd, cols: cols, rows: rows)
                 }
-            }()
-            if let tid = matchedTid {
-                core?.attachTerminal(hostId: hid, terminalId: tid, slot: 1)
-                core?.resizeTerminal(hostId: hid, cols: cols, rows: rows)
             } else {
-                core?.startTerminal(hostId: hid, cwd: activeCwd, cols: cols, rows: rows)
+                core.startTerminal(hostId: hid, cwd: targetCwd.isEmpty ? "~" : targetCwd, cols: cols, rows: rows)
             }
-        } else {
-            core?.startTerminal(hostId: hid, cwd: activeCwd, cols: cols, rows: rows)
+            let screen = core.terminalScreen(hostId: hid)
+            let scrollback = core.terminalScrollback(hostId: hid)
+            Task { @MainActor [weak self] in
+                guard let self, self.selectedHostId == hid else { return }
+                let tid = self.currentHostDetail?.activeTerminalId ?? self.currentHostDetail?.terminals.first?.terminalId
+                self.terminalState.setTerminalScreen(screen, terminalId: tid, coreScrollback: scrollback)
+            }
         }
-        terminalScreen = core?.terminalScreen(hostId: hid)
 
         #if DEBUG
-        if let cmd = pendingLaunchPtyCommand, !ptyLaunchCmdDispatched {
-            ptyLaunchCmdDispatched = true
+        if let cmd = pendingCmd, shouldDispatchLaunchCmd {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 600_000_000)
-                guard let self = self else { return }
+                guard let self else { return }
                 if let hid = self.selectedHostId {
                     self.reloadHostDetail(hid)
                     if let detail = self.currentHostDetail,
                        let targetTid = detail.activeTerminalId ?? detail.terminals.first?.terminalId {
-                        self.core?.attachTerminal(hostId: hid, terminalId: targetTid, slot: 1)
+                        self.coreWriteQueue.async {
+                            core.attachTerminal(hostId: hid, terminalId: targetTid, slot: 1)
+                        }
                     }
                 }
                 if (self.currentHostDetail?.terminals.isEmpty ?? true) && self.terminalScreen == nil {
@@ -3942,7 +5002,9 @@ public final class OrbitIosStore: ObservableObject {
                         self.reloadHostDetail(hid)
                         if let detail = self.currentHostDetail,
                            let targetTid = detail.activeTerminalId ?? detail.terminals.first?.terminalId {
-                            self.core?.attachTerminal(hostId: hid, terminalId: targetTid, slot: 1)
+                            self.coreWriteQueue.async {
+                                core.attachTerminal(hostId: hid, terminalId: targetTid, slot: 1)
+                            }
                         }
                     }
                 }
@@ -3954,28 +5016,63 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func startNewTerminal() {
-        guard let hid = selectedHostId else { return }
+        guard let hid = selectedHostId, let core else { return }
         let dims = lastTerminalDimensions
-        core?.startTerminal(hostId: hid, cwd: activeCwd, cols: dims.cols, rows: dims.rows)
-        reloadHostDetail(hid)
-        terminalScreen = core?.terminalScreen(hostId: hid)
+        let cwd = activeCwd
+        coreWriteQueue.async { [weak self] in
+            core.startTerminal(hostId: hid, cwd: cwd, cols: dims.cols, rows: dims.rows)
+            let nextScreen = core.terminalScreen(hostId: hid)
+            let scrollback = core.terminalScrollback(hostId: hid)
+            Task { @MainActor [weak self] in
+                guard let self, self.selectedHostId == hid else { return }
+                self.reloadHostDetail(hid)
+                let tid = self.currentHostDetail?.activeTerminalId ?? self.currentHostDetail?.terminals.first?.terminalId
+                self.terminalState.setTerminalScreen(nextScreen, terminalId: tid, coreScrollback: scrollback)
+            }
+        }
         hapticLight()
     }
 
     public func attachTerminal(_ terminalId: String) {
-        guard let hid = selectedHostId else { return }
-        core?.attachTerminal(hostId: hid, terminalId: terminalId, slot: 1)
-        core?.resizeTerminal(hostId: hid, cols: lastTerminalDimensions.cols, rows: lastTerminalDimensions.rows)
-        reloadHostDetail(hid)
-        terminalScreen = core?.terminalScreen(hostId: hid)
+        guard let hid = selectedHostId, let core else { return }
+        let dims = lastTerminalDimensions
+        coreWriteQueue.async { [weak self] in
+            core.attachTerminal(hostId: hid, terminalId: terminalId, slot: 1)
+            core.resizeTerminal(hostId: hid, cols: dims.cols, rows: dims.rows)
+            let nextScreen = core.terminalScreen(hostId: hid)
+            let scrollback = core.terminalScrollback(hostId: hid)
+            Task { @MainActor [weak self] in
+                guard let self, self.selectedHostId == hid else { return }
+                self.reloadHostDetail(hid)
+                self.terminalState.setTerminalScreen(nextScreen, terminalId: terminalId, coreScrollback: scrollback)
+            }
+        }
         hapticLight()
     }
 
     public func killTerminal(_ terminalId: String) {
-        guard let hid = selectedHostId else { return }
-        core?.killTerminal(hostId: hid, terminalId: terminalId)
-        reloadHostDetail(hid)
-        terminalScreen = core?.terminalScreen(hostId: hid)
+        guard let hid = selectedHostId, let core else { return }
+        let activeTid = currentHostDetail?.activeTerminalId ?? currentHostDetail?.terminals.first?.terminalId
+        terminalState.clearScrollback(for: terminalId)
+        if activeTid == terminalId {
+            terminalState.setTerminalScreen(nil, terminalId: nil)
+        }
+        let nextLiveId = currentHostDetail?.terminals.first(where: { $0.terminalId != terminalId })?.terminalId
+        let dims = lastTerminalDimensions
+        coreWriteQueue.async { [weak self] in
+            core.killTerminal(hostId: hid, terminalId: terminalId)
+            if let nextLiveId {
+                core.attachTerminal(hostId: hid, terminalId: nextLiveId, slot: 1)
+                core.resizeTerminal(hostId: hid, cols: dims.cols, rows: dims.rows)
+            }
+            let nextScreen = nextLiveId != nil ? core.terminalScreen(hostId: hid) : nil
+            let scrollback = nextLiveId != nil ? core.terminalScrollback(hostId: hid) : []
+            Task { @MainActor [weak self] in
+                guard let self, self.selectedHostId == hid else { return }
+                self.reloadHostDetail(hid)
+                self.terminalState.setTerminalScreen(nextScreen, terminalId: nextLiveId, coreScrollback: scrollback)
+            }
+        }
         hapticMedium()
     }
 
@@ -3986,22 +5083,41 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
         lastTerminalDimensions = (clampedCols, clampedRows)
-        guard let hid = selectedHostId else { return }
-        core?.resizeTerminal(hostId: hid, cols: clampedCols, rows: clampedRows)
-        terminalScreen = core?.terminalScreen(hostId: hid)
+        guard let hid = selectedHostId, let core else { return }
+        coreWriteQueue.async { [weak self] in
+            core.resizeTerminal(hostId: hid, cols: clampedCols, rows: clampedRows)
+            let nextScreen = core.terminalScreen(hostId: hid)
+            let scrollback = core.terminalScrollback(hostId: hid)
+            Task { @MainActor [weak self] in
+                guard let self, self.selectedHostId == hid else { return }
+                let tid = self.currentHostDetail?.activeTerminalId ?? self.currentHostDetail?.terminals.first?.terminalId
+                self.terminalState.setTerminalScreen(nextScreen, terminalId: tid, coreScrollback: scrollback)
+            }
+        }
     }
 
     public func sendTerminalKeys(_ keys: String) {
-        guard let hid = selectedHostId, !keys.isEmpty else { return }
-        core?.sendTerminalKeys(hostId: hid, keys: keys)
+        guard let hid = selectedHostId, !keys.isEmpty, let core else { return }
+        coreWriteQueue.async {
+            core.sendTerminalKeys(hostId: hid, keys: keys)
+        }
     }
 
     public func sendTerminalBytes(_ bytes: Data, slot: UInt8 = 1) {
-        guard let hid = selectedHostId, !bytes.isEmpty else { return }
-        core?.sendTerminalBytes(hostId: hid, slot: slot, bytes: bytes)
+        guard let hid = selectedHostId, !bytes.isEmpty, let core else { return }
+        coreWriteQueue.async {
+            core.sendTerminalBytes(hostId: hid, slot: slot, bytes: bytes)
+        }
     }
 
     public func captureTerminalSnapshotText() -> String? {
+        if let activeTid = currentHostDetail?.activeTerminalId ?? currentHostDetail?.terminals.first?.terminalId {
+            let fullScrollback = terminalState.scrollbackLines(for: activeTid)
+            if !fullScrollback.isEmpty {
+                let text = fullScrollback.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { return text }
+            }
+        }
         guard let screen = terminalScreen, !screen.rowsData.isEmpty else { return nil }
         let lines = screen.rowsData.map { row in
             row.spans.map(\.text).joined().replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
@@ -4046,8 +5162,9 @@ public final class OrbitIosStore: ObservableObject {
 
     // MARK: - Toast & Subtle Haptics
 
-    public func showToast(_ message: String) {
+    public func showToast(_ message: String, isWarning: Bool = false) {
         toastDismissTask?.cancel()
+        toastIsWarning = isWarning
         withAnimation(.easeOut(duration: 0.18)) {
             toastMessage = message
         }
@@ -4056,12 +5173,52 @@ public final class OrbitIosStore: ObservableObject {
             guard !Task.isCancelled else { return }
             withAnimation(.easeIn(duration: 0.2)) {
                 self?.toastMessage = nil
+                self?.toastIsWarning = false
             }
         }
     }
 
     public func clearError() {
         lastError = nil
+    }
+
+    public func resetLocalVaultAndReinitialize() {
+        core = nil
+        hosts = []
+        selectedHostId = nil
+        selectedAgentId = nil
+        agentStage = nil
+        sidebarView = nil
+        currentHostDetail = nil
+        hostDetailsByHostId = [:]
+
+        guard let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            lastError = "Application Support directory unavailable."
+            return
+        }
+        let orbitDir = appSupportDir.appendingPathComponent("Orbit", isDirectory: true)
+        let fm = FileManager.default
+        if let items = try? fm.contentsOfDirectory(at: orbitDir, includingPropertiesForKeys: nil) {
+            for url in items where url.lastPathComponent.hasPrefix("orbit_ios_") || url.lastPathComponent == ".orbit_master_key.bin" {
+                try? fm.removeItem(at: url)
+            }
+        }
+        do {
+            let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: appSupportDir)
+            let keyResult = try OrbitKeychain.shared.loadOrCreateMasterKey(fallbackDirectory: dbURL.deletingLastPathComponent())
+            self.masterKeySource = keyResult.source
+            let instance = try OrbitMobileCore.newWithMasterKey(dbPath: dbURL.path, masterKeyBytes: keyResult.key)
+            self.core = instance
+            let bridge = WeakMobileListenerBridge(owner: self)
+            self.listenerBridge = bridge
+            instance.subscribeThrottled(listener: bridge, intervalMs: 40)
+            self.lastError = nil
+            self.reloadFleet()
+            self.refreshSidebar()
+            self.showToast(OrbitL10n.tr("Reset Local Store"))
+        } catch {
+            self.lastError = OrbitErrorFormatter.humanize(error)
+        }
     }
 
     public func hapticLight() {
@@ -4129,6 +5286,7 @@ public final class OrbitIosStore: ObservableObject {
     public static func sessionModeFromRaw(_ raw: String) -> FfiSessionMode {
         switch raw.lowercased() {
         case "default", "ask": return .default
+        case "plan": return .plan
         case "auto", "guardian": return .auto
         case "full_access", "full": return .fullAccess
         default: return .acceptEdits
@@ -4137,7 +5295,8 @@ public final class OrbitIosStore: ObservableObject {
 
     public static func rawFromSessionMode(_ mode: FfiSessionMode) -> String {
         switch OrbitFormatters.normalizePermissionMode(mode) {
-        case .default, .plan, .custom: return "default"
+        case .default, .custom: return "default"
+        case .plan: return "plan"
         case .acceptEdits: return "accept_edits"
         case .auto: return "auto"
         case .fullAccess: return "full_access"
@@ -4397,6 +5556,7 @@ public final class OrbitIosStore: ObservableObject {
 
     public func archiveWorkspace(_ workspaceId: String, keepAgentsUnclassified: Bool) {
         guard let hid = selectedHostId else { return }
+        let archivedWs = currentHostDetail?.workspaces.first(where: { $0.workspaceId == workspaceId })
         core?.archiveWorkspace(
             hostId: hid,
             workspaceId: workspaceId,
@@ -4405,6 +5565,14 @@ public final class OrbitIosStore: ObservableObject {
         if activeWorkspace?.workspaceId == workspaceId && !keepAgentsUnclassified {
             selectedAgentId = nil
             agentStage = nil
+            if let wsCwd = archivedWs?.cwd, !wsCwd.isEmpty {
+                let fallback = projects.first(where: {
+                    $0.hostId == hid && $0.directories.contains(where: { wsCwd.hasPrefix($0) })
+                })?.directories.first ?? "~"
+                if activeCwd.contains("/worktrees/") || OrbitFormatters.arePathsEquivalent(activeCwd, wsCwd) {
+                    activeCwd = fallback
+                }
+            }
         }
         hapticMedium()
         showToast(keepAgentsUnclassified ? "Dissolved workspace" : "Archived workspace")
@@ -4726,13 +5894,15 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func openSessionOverview() {
-        if let aid = selectedAgentId, let hid = selectedHostId {
-            core?.listProviderSubagents(hostId: hid, parentAgentId: aid)
-        }
         hapticLight()
+        if let aid = selectedAgentId, let hid = selectedHostId, let core {
+            coreReadQueue.async {
+                core.listProviderSubagents(hostId: hid, parentAgentId: aid)
+            }
+        }
         if canShowInlineDiffInspector {
             padInspectorTab = .overview
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            withAnimation(.easeOut(duration: 0.2)) {
                 isPadDiffInspectorVisible = true
             }
         } else {
@@ -4751,7 +5921,7 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
         if canShowInlineDiffInspector {
             padInspectorTab = .files
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            withAnimation(.easeOut(duration: 0.2)) {
                 isPadDiffInspectorVisible = true
             }
         } else {
@@ -4782,7 +5952,7 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
         if canShowInlineDiffInspector {
             padInspectorTab = .sideQuestion
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            withAnimation(.easeOut(duration: 0.2)) {
                 isPadDiffInspectorVisible = true
             }
         } else {
@@ -4833,7 +6003,7 @@ public final class OrbitIosStore: ObservableObject {
                 if case let FfiOrbitError.Core(detail) = error {
                     self.workspaceFileError = detail
                 } else {
-                    self.workspaceFileError = error.localizedDescription
+                    self.workspaceFileError = OrbitErrorFormatter.humanize(error)
                 }
             }
         }
@@ -4904,7 +6074,7 @@ public final class OrbitIosStore: ObservableObject {
                 if case let FfiOrbitError.Core(detail) = error {
                     self.lastError = detail
                 } else {
-                    self.lastError = error.localizedDescription
+                    self.lastError = OrbitErrorFormatter.humanize(error)
                 }
                 self.hapticWarning()
             }
@@ -4972,7 +6142,7 @@ public final class OrbitIosStore: ObservableObject {
                 if case let FfiOrbitError.Core(msg) = error {
                     detail = msg
                 } else {
-                    detail = error.localizedDescription
+                    detail = OrbitErrorFormatter.humanize(error)
                 }
                 if var items = self.sideQuestionsByScope[scopeKey],
                    let idx = items.firstIndex(where: { $0.id == entry.id }) {
@@ -5106,7 +6276,7 @@ public final class OrbitIosStore: ObservableObject {
                 if case let FfiOrbitError.Core(msg) = error {
                     detail = msg
                 } else {
-                    detail = error.localizedDescription
+                    detail = OrbitErrorFormatter.humanize(error)
                 }
                 self.hostUpgradeStates[hostId] = HostDaemonUpgradeState(
                     isUpgrading: false,
@@ -5148,7 +6318,7 @@ public final class OrbitIosStore: ObservableObject {
             refreshSidebar()
             hapticLight()
         } catch {
-            lastError = error.localizedDescription
+            lastError = OrbitErrorFormatter.humanize(error)
         }
     }
 
@@ -5569,7 +6739,7 @@ public final class OrbitIosStore: ObservableObject {
         if case let FfiOrbitError.Core(detail) = error {
             return detail
         }
-        return error.localizedDescription
+        return OrbitErrorFormatter.humanize(error)
     }
 
     private static func formatCloudSyncResult(_ res: FfiCloudSyncResult) -> String {

@@ -1473,13 +1473,13 @@ impl OrbitStore {
         agent_id: &str,
         epoch: u32,
         turn_id: Option<&str>,
-        payload: TimelinePayload,
+        mut payload: TimelinePayload,
     ) -> Result<(TimelineEvent, bool), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let payload_json = serde_json::to_string(&payload)?;
+        let mut payload_json = serde_json::to_string(&payload)?;
         let event_type = payload_event_type(&payload);
         let ckey = coalesce_key(&payload);
         if let TimelinePayload::PermissionResolved { decision, .. } = &payload {
@@ -1527,15 +1527,18 @@ impl OrbitStore {
             }
         }
 
+        let mut effective_now_str = now_str.clone();
+        let mut effective_ts = now;
+
         if let Some(ref key_val) = ckey {
             let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
-            let superseded_seqs: Vec<i64> = {
+            let superseded_rows: Vec<(i64, String, String)> = {
                 if let Ok(mut sel_stmt) = tx.prepare_cached(
-                    "SELECT seq FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
+                    "SELECT seq, timestamp, payload_json FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3 ORDER BY seq ASC",
                 ) {
                     sel_stmt
                         .query_map(params![agent_id, boundary_seq, key_val], |r| {
-                            r.get::<_, i64>(0)
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
                         })
                         .ok()
                         .map(|rows| rows.flatten().collect())
@@ -1544,6 +1547,8 @@ impl OrbitStore {
                     Vec::new()
                 }
             };
+            let superseded_seqs: Vec<i64> =
+                superseded_rows.iter().map(|(seq, _, _)| *seq).collect();
             let is_turn_scoped_late_finalization = match &payload {
                 TimelinePayload::AssistantMessage { item_id, .. }
                 | TimelinePayload::AssistantThinking { item_id, .. } => {
@@ -1585,6 +1590,14 @@ impl OrbitStore {
                         _ => true,
                     };
                     if turns_compatible {
+                        if let Ok(prev_payload) =
+                            serde_json::from_str::<TimelinePayload>(&existing_json)
+                            && matches!(payload, TimelinePayload::ToolCall { .. })
+                        {
+                            payload =
+                                orbit_protocol::merge_tool_call_payload(prev_payload, payload);
+                            payload_json = serde_json::to_string(&payload)?;
+                        }
                         if existing_json == payload_json {
                             tx.commit()?;
                             return Ok((
@@ -1628,6 +1641,18 @@ impl OrbitStore {
                     }
                 }
             }
+            if matches!(payload, TimelinePayload::ToolCall { .. })
+                && let Some((_, earliest_ts, _)) = superseded_rows.first()
+            {
+                effective_now_str = earliest_ts.clone();
+                effective_ts = parse_ts(earliest_ts);
+                for (_, _, prev_json) in &superseded_rows {
+                    if let Ok(prev_payload) = serde_json::from_str::<TimelinePayload>(prev_json) {
+                        payload = orbit_protocol::merge_tool_call_payload(prev_payload, payload);
+                    }
+                }
+                payload_json = serde_json::to_string(&payload)?;
+            }
             search::delete_daemon_fts_by_seqs(&tx, &superseded_seqs)?;
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
@@ -1647,7 +1672,7 @@ impl OrbitStore {
                 epoch,
                 agent_id,
                 turn_id,
-                now_str,
+                effective_now_str,
                 payload_json,
                 event_type,
                 ckey.as_deref()
@@ -1677,7 +1702,7 @@ impl OrbitStore {
                 epoch,
                 agent_id: agent_id.to_string(),
                 turn_id: turn_id.map(ToOwned::to_owned),
-                timestamp: now,
+                timestamp: effective_ts,
                 payload,
             },
             true,

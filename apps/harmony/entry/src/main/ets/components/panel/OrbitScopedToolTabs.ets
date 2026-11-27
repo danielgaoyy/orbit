@@ -25,6 +25,10 @@ export {
   OrbitScopedTerminalTabView
 } from './OrbitScopedTerminalAndBoardTabs';
 export { OrbitScopedAutomationsTabView } from './OrbitScopedAutomationsTab';
+export { WorktreeHandoffSheet } from '../sheets/WorktreeHandoffSheet';
+export { WorkspaceScriptsSheet } from '../sheets/WorkspaceScriptsSheet';
+export { CreateWorkspaceV2Sheet } from '../sheets/CreateWorkspaceV2Sheet';
+export { RenameWorkspaceSheet } from '../sheets/RenameWorkspaceSheet';
 
 /**
  * Unified Scoped Side Question (`/btw`) tab (`kind === 'side_question'`).
@@ -81,7 +85,7 @@ export struct OrbitScopedSideQuestionTabView {
     Column({ space: OrbitTokens.SPACE_SM }) {
       Row({ space: OrbitTokens.SPACE_SM }) {
         Column({ space: 2 }) {
-          Text('Side Question (/btw)')
+          Text($r('app.string.side_question_title'))
             .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
           Text(
             `${this.tab.cwd !== null && this.tab.cwd.length > 0 ? basenameOfPath(this.tab.cwd) : this.tab.hostId}` +
@@ -106,7 +110,7 @@ export struct OrbitScopedSideQuestionTabView {
           this.sideState.answer.length > 0 ||
           this.sideState.error.length > 0
         ) {
-          Button('Clear', { type: ButtonType.Capsule, stateEffect: true })
+          Button($r('app.string.side_question_clear'), { type: ButtonType.Capsule, stateEffect: true })
             .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
             .height(28)
             .padding({ left: 10, right: 10 })
@@ -127,7 +131,7 @@ export struct OrbitScopedSideQuestionTabView {
             this.sideState.error.length === 0 &&
             !this.sideState.streaming
           ) {
-            Text('Ask a side question using this conversation context without interrupting the active turn.')
+            Text($r('app.string.side_question_empty_hint'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
               .padding(OrbitTokens.SPACE_MD)
               .backgroundColor(this.store.palette.listCard)
@@ -169,7 +173,7 @@ export struct OrbitScopedSideQuestionTabView {
       .scrollBar(BarState.Auto)
 
       Row({ space: OrbitTokens.SPACE_XS }) {
-        TextInput({ placeholder: 'Ask without interrupting…', text: this.sideState.draft })
+        TextInput({ placeholder: $r('app.string.side_question_input_placeholder'), text: this.sideState.draft })
           .attributeModifier(
             orbitInputSubhead(
               this.store.palette.fgPrimary,

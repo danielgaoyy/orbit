@@ -1342,6 +1342,9 @@ mod tests {
             mtime_unix_ms: Some(1),
             writable: true,
             line_ending: Some("lf".into()),
+            offset_bytes: 0,
+            next_offset_bytes: 13,
+            etag_mismatch: false,
         };
         let write_resp = WireMessage::WorkspaceFileWritten {
             request_id: req_id,

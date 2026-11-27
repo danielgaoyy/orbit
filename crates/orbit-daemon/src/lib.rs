@@ -114,10 +114,7 @@ use crate::attachments::AttachmentStagingManager;
 use crate::browser::{BrowserManager, CreateBrowserSessionSpec};
 use crate::connected_hosts::ConnectedHostsManager;
 use crate::finish_subscriptions::FinishSubscriptionManager;
-use crate::git::{
-    compute_git_diff, inspect_git_status, list_workspace_files,
-    read_workspace_file_with_attachments_dir,
-};
+use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files};
 use crate::goals::{GoalMonitorEngine, StartGoalSpec, StartMonitorSpec};
 use crate::hooks::HooksEngine;
 use crate::idle_cleanup::IdleRuntimeCleanup;
@@ -829,6 +826,7 @@ impl DaemonRuntime {
             available_providers,
             relay_url: persisted_relay.clone(),
             direct_endpoints: discover_lan_ws_endpoints(advertised_port),
+            board_cas_supported: true,
         };
 
         let (pairing_secret_rotated_tx, _) = broadcast::channel(16);
@@ -5229,16 +5227,20 @@ async fn handle_wire_rpc(
             cwd,
             path,
             max_bytes,
+            offset_bytes,
+            expected_etag,
         } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             let attachments_dir = runtime.attachments.attachments_dir().to_path_buf();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
-                let reply = match read_workspace_file_with_attachments_dir(
+                let reply = match git::read_workspace_file_chunk_with_attachments_dir(
                     &resolved_cwd,
                     &path,
+                    offset_bytes,
                     max_bytes,
+                    expected_etag.as_deref(),
                     Some(&attachments_dir),
                 )
                 .await
@@ -5257,6 +5259,9 @@ async fn handle_wire_rpc(
                         mtime_unix_ms: file_data.mtime_unix_ms,
                         writable: file_data.writable,
                         line_ending: file_data.line_ending,
+                        offset_bytes: file_data.offset_bytes,
+                        next_offset_bytes: file_data.next_offset_bytes,
+                        etag_mismatch: file_data.etag_mismatch,
                     },
                     Err(e) => rpc_err(request_id, "read_file_failed", e),
                 };
@@ -6151,7 +6156,11 @@ async fn handle_wire_rpc(
             request_id,
             workspace_id,
         } => match runtime.orchestrator.get_workspace_board(&workspace_id) {
-            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot { request_id, board }),
+            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot {
+                request_id,
+                board,
+                conflict: false,
+            }),
             Err(e) => Some(rpc_err(request_id, "get_board_failed", e)),
         },
         WireMessage::UpdateWorkspaceBoard {
@@ -6160,14 +6169,25 @@ async fn handle_wire_rpc(
             content,
             section,
             updated_by,
-        } => match runtime.orchestrator.update_workspace_board(
+            expected_revision,
+        } => match runtime.orchestrator.update_workspace_board_cas(
             &workspace_id,
             &content,
             section.as_deref(),
+            expected_revision,
             updated_by.as_deref().or(Some("user")),
             None,
         ) {
-            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot { request_id, board }),
+            Ok(Ok(board)) => Some(WireMessage::WorkspaceBoardSnapshot {
+                request_id,
+                board,
+                conflict: false,
+            }),
+            Ok(Err(current)) => Some(WireMessage::WorkspaceBoardSnapshot {
+                request_id,
+                board: current,
+                conflict: true,
+            }),
             Err(e) => Some(rpc_err(request_id, "update_board_failed", e)),
         },
         WireMessage::ListWorkspaceEvents {
@@ -6210,7 +6230,11 @@ async fn handle_wire_rpc(
             updated_by.as_deref().or(Some("user")),
             None,
         ) {
-            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot { request_id, board }),
+            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot {
+                request_id,
+                board,
+                conflict: false,
+            }),
             Err(e) => Some(rpc_err(request_id, "reset_board_failed", e)),
         },
         WireMessage::HarvestConversation {
@@ -6595,15 +6619,18 @@ async fn handle_wire_rpc(
             title,
             cols,
             rows,
+            slot: requested_slot,
         } => match runtime
             .orchestrator
             .create_terminal(cwd, title, cols, rows)
             .await
         {
             Ok(terminal) => {
-                let slot = (1u8..=250u8)
-                    .find(|s| !slot_to_terminal.contains_key(s))
-                    .unwrap_or(1u8);
+                let slot = requested_slot.map(|s| s.clamp(1, 250)).unwrap_or_else(|| {
+                    (1u8..=250u8)
+                        .find(|s| !slot_to_terminal.contains_key(s))
+                        .unwrap_or(1u8)
+                });
                 bind_terminal_stream_to_client(
                     runtime,
                     &terminal.terminal_id,

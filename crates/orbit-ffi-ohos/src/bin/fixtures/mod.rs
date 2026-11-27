@@ -1,5 +1,8 @@
 use orbit_client_core::personal_agent::PersonalAgentBriefingView;
-use orbit_client_core::render::{TerminalScreenView, parse_markdown_blocks};
+use orbit_client_core::render::{
+    HighlightedCodeView, TerminalRowView, TerminalScreenDeltaView, TerminalScreenView,
+    TerminalSpanView, highlight_workspace_code_capped, parse_markdown_blocks,
+};
 use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{
     AgentStageDeltaView, PendingPlanApprovalView, StageTurnView, describe_tool_step,
@@ -11,7 +14,8 @@ use orbit_client_core::viewmodel::{
 use orbit_protocol::{
     AgentMessageDeliveryStatus, AgentMessageKind, BackgroundTaskInfo, GuardianAssessment,
     GuardianDecision, GuardianRiskLevel, PermissionCheckpointRef, PlanApprovalPayload,
-    QuestionItem, ToolCallDetail, ToolCallStatus,
+    QuestionItem, ToolCallDetail, ToolCallStatus, WorkspaceScriptInfo, WorkspaceScriptKind,
+    WorkspaceScriptStatus,
 };
 use serde_json::{Value, to_value};
 use std::error::Error;
@@ -227,7 +231,24 @@ pub(super) fn contracts() -> Result<Vec<(String, Value)>, Box<dyn Error>> {
         ),
         (
             "HostDetailView".into(),
-            to_value(HostDetailView::default())?,
+            to_value({
+                let mut detail = HostDetailView::default();
+                detail.workspace_scripts.insert(
+                    "ws-1".into(),
+                    vec![WorkspaceScriptInfo {
+                        workspace_id: "ws-1".into(),
+                        name: "dev".into(),
+                        command: "npm run dev".into(),
+                        kind: WorkspaceScriptKind::Service,
+                        status: WorkspaceScriptStatus::Running,
+                        terminal_id: Some("term-1".into()),
+                        port: Some(5173),
+                        proxy_url: Some("http://127.0.0.1:5173".into()),
+                        last_error: None,
+                    }],
+                );
+                detail
+            })?,
         ),
         (
             "FleetSidebarView".into(),
@@ -251,6 +272,35 @@ pub(super) fn contracts() -> Result<Vec<(String, Value)>, Box<dyn Error>> {
                 cursor_row: 0,
                 cursor_col: 0,
                 rows_data: vec![],
+            })?,
+        ),
+        (
+            "TerminalScreenDeltaView".into(),
+            to_value(TerminalScreenDeltaView {
+                revision: 2,
+                slot: 1,
+                reset: false,
+                cols: 80,
+                rows: 24,
+                cursor_row: 1,
+                cursor_col: 0,
+                changed_rows: vec![TerminalRowView {
+                    row_index: 0,
+                    spans: vec![TerminalSpanView {
+                        text: "ready".into(),
+                        fg_hex: "#E2E8F0".into(),
+                        bg_hex: None,
+                        bold: false,
+                        underline: false,
+                        inverse: false,
+                    }],
+                }],
+            })?,
+        ),
+        (
+            "HighlightedCodeView".into(),
+            to_value(HighlightedCodeView {
+                ..highlight_workspace_code_capped("rust", "fn main() {}\n", 250)
             })?,
         ),
         (

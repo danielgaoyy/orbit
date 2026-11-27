@@ -92,13 +92,14 @@ pub use crate::viewmodel::{
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
     extract_ws_port, normalize_relay_input, provision_ssh_tunnel_relay_with_home,
-    read_local_daemon_identity, read_local_daemon_relay_url, read_local_workspace_file,
-    read_local_workspace_file_with_writable, resolve_orbit_home_dir, stage_local_attachment,
+    read_local_daemon_identity, read_local_daemon_relay_url, resolve_orbit_home_dir,
+    stage_local_attachment,
 };
 use crate::render::{
-    DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
-    detect_language_for_path, highlight_code_lines_capped, highlight_code_lines_prefix,
-    parse_markdown_blocks, parse_unified_diff,
+    DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator,
+    TerminalScreenDeltaView, TerminalScreenView, detect_language_for_path,
+    highlight_code_lines_capped, highlight_code_lines_prefix_bounded, parse_markdown_blocks,
+    parse_unified_diff,
 };
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
@@ -112,6 +113,30 @@ const CLOUD_AUTO_SYNC_THROTTLED_MIN_INTERVAL_MS: u64 = 30_000;
 const CLOUD_SYNC_ETAG_POLL_INTERVAL_SECS: u64 = 30;
 const MAX_PENDING_GIT_DIFF_REQUESTS: usize = 512;
 const MAX_PENDING_GIT_STATUS_REQUESTS: usize = 256;
+
+#[derive(Debug, Clone)]
+struct PendingTerminalSlotBind {
+    request_id: Uuid,
+    bind_gen: u64,
+    /// True when the caller explicitly pinned the slot via `start_terminal_slot`.
+    /// If a legacy daemon replies with `attached_slot != expected_slot`, we keep the barrier
+    /// active on `expected_slot`, suppress the daemon's auto-allocated temporary slot, and
+    /// immediately rebind the new `terminal_id` onto `expected_slot` via `AttachTerminal`
+    /// before releasing buffered input.
+    explicit_slot: bool,
+    /// Expected `terminal_id` once a legacy-daemon slot-mismatch rebind `AttachTerminal` is in flight.
+    expected_terminal_id: Option<String>,
+    /// Bounded rebind retry counter (max 1 attempt to prevent infinite loops).
+    rebind_attempts: u8,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTerminalSlotAttach {
+    request_id: Uuid,
+    attach_gen: u64,
+    terminal_id: String,
+    silent: bool,
+}
 
 #[derive(Debug, Clone)]
 struct StoredGitDiff {
@@ -803,6 +828,14 @@ pub struct WorkspaceFileView {
     pub writable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_ending: Option<String>,
+    #[serde(default)]
+    pub offset_bytes: u64,
+    #[serde(default)]
+    pub next_offset_bytes: u64,
+    #[serde(default)]
+    pub etag_mismatch: bool,
+    #[serde(default)]
+    pub highlight_truncated: bool,
     pub highlighted_lines: Vec<HighlightedLineView>,
     pub markdown_blocks: Vec<RichBlockView>,
 }
@@ -833,6 +866,9 @@ struct RawFileReadResponse {
     mtime_unix_ms: Option<i64>,
     writable: bool,
     line_ending: Option<String>,
+    offset_bytes: u64,
+    next_offset_bytes: u64,
+    etag_mismatch: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1232,7 +1268,17 @@ struct HostMemoryState {
     slot_attach_dispatched_gen: HashMap<u8, u64>,
     slot_confirmed_gen: HashMap<u8, u64>,
     pending_slot_frames: HashMap<u8, VecDeque<TerminalBinaryFrame>>,
-    silent_attach_req_ids: HashSet<Uuid>,
+    next_terminal_slot_bind_gen: u64,
+    pending_slot_create_by_slot: HashMap<u8, PendingTerminalSlotBind>,
+    pending_slot_create_by_req: HashMap<Uuid, (u8, u64)>,
+    pending_slot_attach_by_slot: HashMap<u8, PendingTerminalSlotAttach>,
+    pending_slot_attach_by_req: HashMap<Uuid, (u8, u64)>,
+    /// Legacy-daemon temporary slots auto-allocated during an explicit-slot mismatch rebind (`R4-P0`).
+    /// While present, inbound output/snapshot/resize frames for that slot are dropped and outbound
+    /// slot input/resize frames are rejected until the user explicitly binds that slot.
+    suppressed_legacy_temp_slots: HashMap<u8, String>,
+    blocked_terminal_slots: HashSet<u8>,
+    board_cas_supported: bool,
     terminal_emulators: HashMap<u8, TerminalGridEmulator>,
     terminal_raw_history: HashMap<String, Vec<u8>>,
     pending_slot_raw_history: HashMap<u8, Vec<u8>>,
@@ -1443,7 +1489,14 @@ impl HostMemoryState {
             slot_attach_dispatched_gen: HashMap::new(),
             slot_confirmed_gen: HashMap::new(),
             pending_slot_frames: HashMap::new(),
-            silent_attach_req_ids: HashSet::new(),
+            next_terminal_slot_bind_gen: 0,
+            pending_slot_create_by_slot: HashMap::new(),
+            pending_slot_create_by_req: HashMap::new(),
+            pending_slot_attach_by_slot: HashMap::new(),
+            pending_slot_attach_by_req: HashMap::new(),
+            suppressed_legacy_temp_slots: HashMap::new(),
+            blocked_terminal_slots: HashSet::new(),
+            board_cas_supported: false,
             terminal_emulators,
             terminal_raw_history: HashMap::new(),
             pending_slot_raw_history: HashMap::new(),
@@ -1970,8 +2023,92 @@ impl HostMemoryState {
             agent_count: active_agent_count,
             pending_approval_count,
             supports_server_queue: self.daemon_protocol_version.is_some_and(|pv| pv >= 4),
+            board_cas_supported: self.board_cas_supported,
             is_local: self.is_local,
         }
+    }
+
+    /// Begin a new pending `CreateTerminal` bind generation on `slot`, immediately severing
+    /// direct passthrough to any previously bound PTY and discarding stale queued frames from
+    /// any earlier superseded create so early input can NEVER leak into the old PTY.
+    fn begin_pending_slot_create(
+        &mut self,
+        slot: u8,
+        request_id: Uuid,
+        explicit_slot: bool,
+    ) -> u64 {
+        self.next_terminal_slot_bind_gen = self.next_terminal_slot_bind_gen.saturating_add(1);
+        let bind_gen = self.next_terminal_slot_bind_gen;
+        let entry = PendingTerminalSlotBind {
+            request_id,
+            bind_gen,
+            explicit_slot,
+            expected_terminal_id: None,
+            rebind_attempts: 0,
+        };
+        if let Some(old) = self.pending_slot_create_by_slot.insert(slot, entry) {
+            self.pending_slot_create_by_req.remove(&old.request_id);
+        }
+        if let Some(old_attach) = self.pending_slot_attach_by_slot.remove(&slot) {
+            self.pending_slot_attach_by_req
+                .remove(&old_attach.request_id);
+        }
+        self.pending_slot_create_by_req
+            .insert(request_id, (slot, bind_gen));
+        self.suppressed_legacy_temp_slots.remove(&slot);
+        self.slot_confirmed_gen.remove(&slot);
+        self.slot_terminal_ids.remove(&slot);
+        self.slot_attach_dispatched_gen.remove(&slot);
+        self.pending_slot_frames.remove(&slot);
+        self.pending_slot_raw_history.remove(&slot);
+        self.blocked_terminal_slots.remove(&slot);
+        bind_gen
+    }
+
+    /// Begin a tracked in-flight `AttachTerminal` request on `slot` with positive `request_id`
+    /// correlation (`R4-P1-1`), releasing any prior legacy temporary-slot suppression (`R4-P0`).
+    fn begin_pending_slot_attach(
+        &mut self,
+        slot: u8,
+        request_id: Uuid,
+        terminal_id: String,
+        silent: bool,
+    ) -> u64 {
+        self.next_terminal_slot_bind_gen = self.next_terminal_slot_bind_gen.saturating_add(1);
+        let attach_gen = self.next_terminal_slot_bind_gen;
+        if let Some(old_create) = self.pending_slot_create_by_slot.remove(&slot) {
+            self.pending_slot_create_by_req
+                .remove(&old_create.request_id);
+        }
+        if let Some(old_attach) = self.pending_slot_attach_by_slot.insert(
+            slot,
+            PendingTerminalSlotAttach {
+                request_id,
+                attach_gen,
+                terminal_id,
+                silent,
+            },
+        ) {
+            self.pending_slot_attach_by_req
+                .remove(&old_attach.request_id);
+        }
+        self.pending_slot_attach_by_req
+            .insert(request_id, (slot, attach_gen));
+        self.suppressed_legacy_temp_slots.remove(&slot);
+        self.blocked_terminal_slots.remove(&slot);
+        attach_gen
+    }
+
+    fn cancel_pending_slot_create(&mut self, slot: u8) {
+        if let Some(old) = self.pending_slot_create_by_slot.remove(&slot) {
+            self.pending_slot_create_by_req.remove(&old.request_id);
+        }
+        if let Some(old_attach) = self.pending_slot_attach_by_slot.remove(&slot) {
+            self.pending_slot_attach_by_req
+                .remove(&old_attach.request_id);
+        }
+        self.pending_slot_frames.remove(&slot);
+        self.blocked_terminal_slots.remove(&slot);
     }
 }
 
@@ -3797,6 +3934,19 @@ impl OrbitAppCore {
                 .map(TerminalGridEmulator::snapshot)
                 .unwrap_or_else(|| TerminalGridEmulator::new(100, 30).snapshot()),
         )
+    }
+
+    pub fn terminal_screen_delta_slot(
+        &self,
+        host_id: &str,
+        slot: u8,
+        since_revision: u64,
+    ) -> Option<TerminalScreenDeltaView> {
+        let mut guard = self.hosts.write().ok()?;
+        let state = guard.get_mut(host_id)?;
+        let normalized_slot = slot.max(1);
+        let emu = state.emulator_slot_mut(normalized_slot);
+        Some(emu.snapshot_with_delta_for_slot(normalized_slot, since_revision))
     }
 
     /// Unified sidebar + Launchpad snapshot computed centrally in Rust so Desktop, iOS,
@@ -5698,12 +5848,19 @@ impl OrbitAppCore {
             };
             h.last_error = None;
             h.session = None;
+            h.board_cas_supported = false;
             h.caught_up_agents.clear();
             h.timeline_loading_older.clear();
             h.pending_tail_catchups.clear();
             h.slot_attach_dispatched_gen.clear();
             h.slot_confirmed_gen.clear();
-            h.silent_attach_req_ids.clear();
+            h.pending_slot_frames.clear();
+            h.pending_slot_create_by_slot.clear();
+            h.pending_slot_create_by_req.clear();
+            h.pending_slot_attach_by_slot.clear();
+            h.pending_slot_attach_by_req.clear();
+            h.suppressed_legacy_temp_slots.clear();
+            h.blocked_terminal_slots.clear();
             if h.transient_requests.is_empty()
                 && self
                     .store
@@ -5850,13 +6007,41 @@ impl OrbitAppCore {
                     h.session_gen = h.session_gen.wrapping_add(1);
                     let conn_gen = h.session_gen;
                     h.session = Some(handle.clone());
+                    h.board_cas_supported = false;
                     h.caught_up_agents.clear();
                     h.slot_attach_dispatched_gen.clear();
                     h.slot_confirmed_gen.clear();
-                    h.silent_attach_req_ids.clear();
+                    h.suppressed_legacy_temp_slots.clear();
+                    h.blocked_terminal_slots.clear();
                     prune_pending_git_diff_requests_not_queued(h);
 
                     let outbox = std::mem::take(&mut h.transient_requests);
+                    let queued_create_ids: HashSet<Uuid> = outbox
+                        .iter()
+                        .filter_map(|m| match m {
+                            WireMessage::CreateTerminal { request_id, .. }
+                            | WireMessage::AttachTerminal { request_id, .. } => Some(*request_id),
+                            _ => None,
+                        })
+                        .collect();
+                    h.pending_slot_create_by_slot.retain(|slot, entry| {
+                        let keep = queued_create_ids.contains(&entry.request_id);
+                        if !keep {
+                            h.pending_slot_frames.remove(slot);
+                        }
+                        keep
+                    });
+                    h.pending_slot_create_by_req
+                        .retain(|req_id, _| queued_create_ids.contains(req_id));
+                    h.pending_slot_attach_by_slot.retain(|slot, entry| {
+                        let keep = queued_create_ids.contains(&entry.request_id);
+                        if !keep {
+                            h.pending_slot_frames.remove(slot);
+                        }
+                        keep
+                    });
+                    h.pending_slot_attach_by_req
+                        .retain(|req_id, _| queued_create_ids.contains(req_id));
                     let resubs: Vec<(String, u64)> = h
                         .timelines
                         .iter()
@@ -6311,13 +6496,19 @@ impl OrbitAppCore {
             h.profile.state = HostConnectionState::Disconnected;
             h.via_ssh_tunnel = false;
             h.session = None;
+            h.board_cas_supported = false;
             h.caught_up_agents.clear();
             h.timeline_loading_older.clear();
             h.pending_tail_catchups.clear();
             h.slot_attach_dispatched_gen.clear();
             h.slot_confirmed_gen.clear();
             h.pending_slot_frames.clear();
-            h.silent_attach_req_ids.clear();
+            h.pending_slot_create_by_slot.clear();
+            h.pending_slot_create_by_req.clear();
+            h.pending_slot_attach_by_slot.clear();
+            h.pending_slot_attach_by_req.clear();
+            h.suppressed_legacy_temp_slots.clear();
+            h.blocked_terminal_slots.clear();
             if h.transient_requests.is_empty()
                 && self
                     .store
@@ -6412,6 +6603,7 @@ impl OrbitAppCore {
         let mut host_sync_to_apply: Option<(HostSyncState, bool)> = None;
         let mut flush_terminal_frames: Option<(HostSessionHandle, VecDeque<TerminalBinaryFrame>)> =
             None;
+        let mut rebind_terminal_attach: Option<(Uuid, String, u8)> = None;
         let mut preview_tunnels_to_close: Vec<(HostSessionHandle, Uuid, &'static str)> = Vec::new();
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut cancel_created_agent: Option<String> = None;
@@ -6430,6 +6622,7 @@ impl OrbitAppCore {
                     state.profile.hostname = host.hostname;
                     state.daemon_version = Some(host.daemon_version);
                     state.daemon_protocol_version = Some(host.protocol_version);
+                    state.board_cas_supported = host.board_cas_supported;
                     state.os_arch = Some(format!("{} / {}", host.os, host.arch));
                     if !host.available_providers.is_empty() {
                         state.available_providers = host.available_providers;
@@ -9092,6 +9285,9 @@ impl OrbitAppCore {
                     mtime_unix_ms,
                     writable,
                     line_ending,
+                    offset_bytes,
+                    next_offset_bytes,
+                    etag_mismatch,
                     ..
                 } => {
                     if let Some(tx) = state.pending_file_reads.remove(&request_id) {
@@ -9106,6 +9302,9 @@ impl OrbitAppCore {
                             mtime_unix_ms,
                             writable,
                             line_ending,
+                            offset_bytes,
+                            next_offset_bytes,
+                            etag_mismatch,
                         }));
                     }
                 }
@@ -9714,43 +9913,190 @@ impl OrbitAppCore {
                     } else {
                         let slot = slot.max(1);
                         let tid = terminal.terminal_id.clone();
-                        let was_silent = state.silent_attach_req_ids.remove(&request_id);
-                        state.slot_terminal_ids.insert(slot, tid.clone());
-                        state
-                            .slot_attach_dispatched_gen
-                            .insert(slot, state.session_gen);
-                        state.slot_confirmed_gen.insert(slot, state.session_gen);
-                        let _ = state.emulator_slot_mut(slot);
-                        if let Some(pending_raw) = state.pending_slot_raw_history.remove(&slot) {
-                            let resync_bytes = state
-                                .terminal_emulators
-                                .get(&slot)
-                                .map(TerminalGridEmulator::render_resync_bytes)
-                                .unwrap_or_else(|| TERMINAL_RESYNC_RESET_SEQ.to_vec());
-                            let hist = state.terminal_raw_history.entry(tid.clone()).or_default();
-                            append_terminal_history_or_resync(
-                                hist,
-                                &pending_raw,
-                                MAX_TERMINAL_RAW_HISTORY_BYTES,
-                                || resync_bytes.clone(),
-                            );
-                            self.dispatch_terminal_binary_bytes(
-                                host_id,
-                                slot,
-                                Some(tid.as_str()),
-                                &pending_raw,
-                                || resync_bytes.clone(),
-                            );
-                        }
-                        if let Some(pending_frames) = state.pending_slot_frames.remove(&slot)
-                            && !pending_frames.is_empty()
-                            && let Some(handle) = state.session.clone()
+                        let (should_bind_slot, matched_create_slot, was_silent) = if let Some((
+                            expected_slot,
+                            bind_gen,
+                        )) =
+                            state.pending_slot_create_by_req.remove(&request_id)
                         {
-                            flush_terminal_frames = Some((handle, pending_frames));
-                        }
-                        if !was_silent || state.active_terminal_id.is_none() {
-                            state.active_terminal_id = Some(tid);
-                            state.active_terminal_slot = slot;
+                            let active_matches = state
+                                .pending_slot_create_by_slot
+                                .get(&expected_slot)
+                                .is_some_and(|e| {
+                                    e.request_id == request_id && e.bind_gen == bind_gen
+                                });
+                            if !active_matches {
+                                // Superseded by a newer `CreateTerminal` on this slot: never
+                                // bind or flush the newer generation's buffered frames.
+                                (false, None, false)
+                            } else {
+                                let entry = state
+                                    .pending_slot_create_by_slot
+                                    .get(&expected_slot)
+                                    .cloned();
+                                if let Some(mut entry) = entry {
+                                    let id_matches = entry
+                                        .expected_terminal_id
+                                        .as_deref()
+                                        .is_none_or(|exp_tid| exp_tid == tid.as_str());
+                                    if entry.explicit_slot && slot != expected_slot {
+                                        // R3-P0 & R4-P0: Legacy daemon ignored requested_slot and
+                                        // auto-picked a temporary slot (`slot != expected_slot`).
+                                        // 1) Immediately suppress and clear that unclaimed temp slot
+                                        //    so it can NEVER view or write to `tid`'s shell.
+                                        state
+                                            .suppressed_legacy_temp_slots
+                                            .insert(slot, tid.clone());
+                                        state.slot_terminal_ids.remove(&slot);
+                                        state.slot_attach_dispatched_gen.remove(&slot);
+                                        state.slot_confirmed_gen.remove(&slot);
+                                        state.pending_slot_frames.remove(&slot);
+                                        state.pending_slot_raw_history.remove(&slot);
+                                        state.emulator_slot_mut(slot).clear();
+
+                                        // 2) Keep the barrier on `expected_slot` active and rebind
+                                        //    `tid` onto `expected_slot` via explicit `AttachTerminal`.
+                                        if entry.rebind_attempts == 0 && id_matches {
+                                            let rebind_req_id = Uuid::new_v4();
+                                            entry.request_id = rebind_req_id;
+                                            entry.expected_terminal_id = Some(tid.clone());
+                                            entry.rebind_attempts = 1;
+                                            state
+                                                .pending_slot_create_by_slot
+                                                .insert(expected_slot, entry);
+                                            state
+                                                .pending_slot_create_by_req
+                                                .insert(rebind_req_id, (expected_slot, bind_gen));
+                                            state.emulator_slot_mut(expected_slot).clear();
+                                            rebind_terminal_attach =
+                                                Some((rebind_req_id, tid.clone(), expected_slot));
+                                        } else {
+                                            // Rebind failed to land on requested_slot: abort
+                                            // cleanly, drop buffered input, and block slot so
+                                            // nothing ever leaks into the old shell.
+                                            state
+                                                .pending_slot_create_by_slot
+                                                .remove(&expected_slot);
+                                            state.pending_slot_frames.remove(&expected_slot);
+                                            state.blocked_terminal_slots.insert(expected_slot);
+                                            state.last_error = Some(format!(
+                                                "terminal slot rebind mismatch: requested slot {expected_slot}, daemon attached slot {slot}"
+                                            ));
+                                        }
+                                        (false, None, false)
+                                    } else if !id_matches {
+                                        state.pending_slot_create_by_slot.remove(&expected_slot);
+                                        state.pending_slot_frames.remove(&expected_slot);
+                                        state.blocked_terminal_slots.insert(expected_slot);
+                                        state.last_error = Some(
+                                            "terminal slot rebind returned unexpected terminal_id"
+                                                .to_string(),
+                                        );
+                                        (false, None, false)
+                                    } else {
+                                        state.pending_slot_create_by_slot.remove(&expected_slot);
+                                        (true, Some(expected_slot), false)
+                                    }
+                                } else {
+                                    (false, None, false)
+                                }
+                            }
+                        } else if let Some((expected_slot, attach_gen)) =
+                            state.pending_slot_attach_by_req.remove(&request_id)
+                        {
+                            // R4-P1-1: Positive in-flight correlation for explicit/reconnect
+                            // `AttachTerminal` requests.
+                            let active_entry = state
+                                .pending_slot_attach_by_slot
+                                .get(&expected_slot)
+                                .cloned();
+                            if let Some(entry) = active_entry
+                                && entry.request_id == request_id
+                                && entry.attach_gen == attach_gen
+                                && slot == expected_slot
+                                && entry.terminal_id == tid
+                            {
+                                state.pending_slot_attach_by_slot.remove(&expected_slot);
+                                (true, None, entry.silent)
+                            } else {
+                                (false, None, false)
+                            }
+                        } else if request_id.is_nil() {
+                            // Unsolicited server attach broadcast (no request_id): allow only
+                            // when the target slot has no active barrier, block, or temp-slot
+                            // suppression.
+                            let allowed = !state.pending_slot_create_by_slot.contains_key(&slot)
+                                && !state.pending_slot_attach_by_slot.contains_key(&slot)
+                                && !state.blocked_terminal_slots.contains(&slot)
+                                && !state.suppressed_legacy_temp_slots.contains_key(&slot);
+                            (allowed, None, false)
+                        } else {
+                            // R4-P1-1: Non-nil `request_id` did NOT match any active in-flight
+                            // create/rebind/attach/upgrade request. Treat as stale/superseded
+                            // in O(1) without any bounded lossy blacklist!
+                            (false, None, false)
+                        };
+
+                        if should_bind_slot {
+                            state.suppressed_legacy_temp_slots.remove(&slot);
+                            state.blocked_terminal_slots.remove(&slot);
+                            if let Some(expected_slot) = matched_create_slot {
+                                state.suppressed_legacy_temp_slots.remove(&expected_slot);
+                                state.blocked_terminal_slots.remove(&expected_slot);
+                            }
+                            state.slot_terminal_ids.insert(slot, tid.clone());
+                            state
+                                .slot_attach_dispatched_gen
+                                .insert(slot, state.session_gen);
+                            state.slot_confirmed_gen.insert(slot, state.session_gen);
+                            let _ = state.emulator_slot_mut(slot);
+                            if let Some(pending_raw) = state.pending_slot_raw_history.remove(&slot)
+                            {
+                                let resync_bytes = state
+                                    .terminal_emulators
+                                    .get(&slot)
+                                    .map(TerminalGridEmulator::render_resync_bytes)
+                                    .unwrap_or_else(|| TERMINAL_RESYNC_RESET_SEQ.to_vec());
+                                let hist =
+                                    state.terminal_raw_history.entry(tid.clone()).or_default();
+                                append_terminal_history_or_resync(
+                                    hist,
+                                    &pending_raw,
+                                    MAX_TERMINAL_RAW_HISTORY_BYTES,
+                                    || resync_bytes.clone(),
+                                );
+                                self.dispatch_terminal_binary_bytes(
+                                    host_id,
+                                    slot,
+                                    Some(tid.as_str()),
+                                    &pending_raw,
+                                    || resync_bytes.clone(),
+                                );
+                            }
+                            let drain_slot = matched_create_slot.unwrap_or(slot);
+                            if let Some(mut pending_frames) =
+                                state.pending_slot_frames.remove(&drain_slot)
+                                && !pending_frames.is_empty()
+                                && let Some(handle) = state.session.clone()
+                            {
+                                if drain_slot != slot {
+                                    for frame in &mut pending_frames {
+                                        match frame {
+                                            TerminalBinaryFrame::Input { slot: s, .. }
+                                            | TerminalBinaryFrame::Resize { slot: s, .. }
+                                            | TerminalBinaryFrame::Output { slot: s, .. }
+                                            | TerminalBinaryFrame::Snapshot { slot: s, .. } => {
+                                                *s = slot;
+                                            }
+                                        }
+                                    }
+                                }
+                                flush_terminal_frames = Some((handle, pending_frames));
+                            }
+                            if !was_silent || state.active_terminal_id.is_none() {
+                                state.active_terminal_id = Some(tid);
+                                state.active_terminal_slot = slot;
+                            }
                         }
                         state
                             .terminals
@@ -9904,6 +10250,34 @@ impl OrbitAppCore {
                                 .insert(slot_key, (err_rev, error_status_rev));
                         }
                         push_notify_git_cwd(failed_diff_req.raw_cwd);
+                    }
+                    if let Some(req_id) = request_id
+                        && let Some((failed_slot, failed_gen)) =
+                            state.pending_slot_create_by_req.remove(&req_id)
+                        && state
+                            .pending_slot_create_by_slot
+                            .get(&failed_slot)
+                            .is_some_and(|e| e.request_id == req_id && e.bind_gen == failed_gen)
+                    {
+                        state.pending_slot_create_by_slot.remove(&failed_slot);
+                        state.pending_slot_frames.remove(&failed_slot);
+                        state.blocked_terminal_slots.insert(failed_slot);
+                        state.last_error = Some(format!("[{code}] {message}"));
+                        notify_host = true;
+                    }
+                    if let Some(req_id) = request_id
+                        && let Some((failed_slot, failed_gen)) =
+                            state.pending_slot_attach_by_req.remove(&req_id)
+                        && state
+                            .pending_slot_attach_by_slot
+                            .get(&failed_slot)
+                            .is_some_and(|e| e.request_id == req_id && e.attach_gen == failed_gen)
+                    {
+                        state.pending_slot_attach_by_slot.remove(&failed_slot);
+                        state.pending_slot_frames.remove(&failed_slot);
+                        state.blocked_terminal_slots.insert(failed_slot);
+                        state.last_error = Some(format!("[{code}] {message}"));
+                        notify_host = true;
                     }
                     if let Some(req_id) = request_id
                         && clear_pending_queue_op_by_req(state, req_id, true)
@@ -10573,6 +10947,16 @@ impl OrbitAppCore {
             );
         }
 
+        if let Some((rebind_req_id, terminal_id, target_slot)) = rebind_terminal_attach {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::AttachTerminal {
+                    request_id: rebind_req_id,
+                    terminal_id,
+                    slot: target_slot,
+                },
+            );
+        }
         if let Some((handle, pending_frames)) = flush_terminal_frames {
             self.runtime.spawn(async move {
                 for frame in pending_frames {
@@ -10656,6 +11040,12 @@ impl OrbitAppCore {
             match frame {
                 TerminalBinaryFrame::Output { slot, data } => {
                     let slot = slot.max(1);
+                    if state.suppressed_legacy_temp_slots.contains_key(&slot) {
+                        // R4-P0: Legacy daemon continues streaming on its auto-allocated
+                        // temporary slot after we rebound the PTY to `requested_slot`.
+                        // Drop all inbound frames so the unclaimed slot stays completely blank.
+                        return;
+                    }
                     state.emulator_slot_mut(slot).process(&data);
                     let resync_fn = || {
                         state
@@ -10693,6 +11083,10 @@ impl OrbitAppCore {
                 }
                 TerminalBinaryFrame::Snapshot { slot, data } => {
                     let slot = slot.max(1);
+                    if state.suppressed_legacy_temp_slots.contains_key(&slot) {
+                        // R4-P0: Ignore snapshots targeting a suppressed legacy temporary slot.
+                        return;
+                    }
                     let emu = state.emulator_slot_mut(slot);
                     emu.clear();
                     emu.process(&data);
@@ -10734,6 +11128,9 @@ impl OrbitAppCore {
                 }
                 TerminalBinaryFrame::Resize { slot, cols, rows } => {
                     let slot = slot.max(1);
+                    if state.suppressed_legacy_temp_slots.contains_key(&slot) {
+                        return;
+                    }
                     state.emulator_slot_mut(slot).resize(cols, rows);
                 }
                 TerminalBinaryFrame::Input { .. } => {}
@@ -12672,8 +13069,95 @@ impl OrbitAppCore {
                 content,
                 section,
                 updated_by,
+                expected_revision: None,
             },
         );
+    }
+
+    /// Update a workspace's Shared Blackboard (`BOARD.md`) with authoritative daemon-side
+    /// optimistic concurrency (`expected_revision`). Normal edits pass `Some(base_revision)`
+    /// (including `Some(0)`); only explicit force overwrites pass `None`.
+    pub async fn update_workspace_board_cas_on_host(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        content: String,
+        section: Option<String>,
+        expected_revision: Option<u64>,
+        updated_by: Option<String>,
+    ) -> Result<crate::contract::WorkspaceBoardUpdateOutcome, String> {
+        // R2-P0-A: Never send a guarded CAS write (`expected_revision: Some(_)`) to a daemon that
+        // did not explicitly advertise `board_cas_supported = true` in `WireMessage::Welcome`.
+        // Older protocol-v4 daemons ignore `expected_revision` and would silently overwrite the board.
+        // Explicit force overwrites (`expected_revision: None`) remain allowed on all daemons.
+        if expected_revision.is_some() {
+            let cas_supported = self
+                .hosts
+                .read()
+                .ok()
+                .and_then(|g| g.get(host_id).map(|h| h.board_cas_supported))
+                .unwrap_or(false);
+            if !cas_supported {
+                return Err(
+                    "board_cas_unsupported: connected daemon does not support server-side Board CAS; upgrade daemon or use explicit Force Overwrite"
+                        .into(),
+                );
+            }
+        }
+        let request_id = Uuid::new_v4();
+        let reply = self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::UpdateWorkspaceBoard {
+                    request_id,
+                    workspace_id: workspace_id.to_string(),
+                    content,
+                    section,
+                    updated_by,
+                    expected_revision,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::WorkspaceBoardSnapshot { request_id: rid, .. }
+                            if *rid == request_id
+                    )
+                },
+            )
+            .await?;
+        match reply {
+            WireMessage::WorkspaceBoardSnapshot {
+                board, conflict, ..
+            } => {
+                if let Ok(mut guard) = self.hosts.write()
+                    && let Some(state) = guard.get_mut(host_id)
+                {
+                    let ws_id = board.workspace_id.clone();
+                    let rev = board.revision;
+                    if let Some(ws) = state
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.workspace_id == ws_id)
+                    {
+                        ws.board_revision = rev;
+                    }
+                    state.workspace_boards.insert(ws_id, board.clone());
+                }
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+                Ok(crate::contract::WorkspaceBoardUpdateOutcome {
+                    ok: !conflict,
+                    conflict,
+                    board,
+                })
+            }
+            _ => Err("unexpected daemon reply for update_workspace_board_cas".into()),
+        }
     }
 
     pub fn fetch_workspace_events(
@@ -13053,7 +13537,14 @@ impl OrbitAppCore {
             )
             .await?
         {
-            WireMessage::Ack { .. } => Ok(()),
+            WireMessage::Ack { .. } => {
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+                Ok(())
+            }
             _ => Err("unexpected daemon reply for archive_workspace".into()),
         }
     }
@@ -13066,6 +13557,94 @@ impl OrbitAppCore {
                 workspace_id: workspace_id.to_string(),
             },
         );
+    }
+
+    pub async fn unarchive_workspace_confirmed(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::UnarchiveWorkspace {
+                    request_id,
+                    workspace_id: workspace_id.to_string(),
+                },
+                Duration::from_secs(30),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => {
+                if let Ok(mut guard) = self.hosts.write()
+                    && let Some(h) = guard.get_mut(host_id)
+                    && let Some(ws) = h
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.workspace_id == workspace_id)
+                {
+                    ws.archived_at = None;
+                }
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+                Ok(())
+            }
+            _ => Err("unexpected daemon reply for unarchive_workspace".into()),
+        }
+    }
+
+    pub async fn rename_workspace_confirmed(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err("rename_workspace requires a non-empty title".into());
+        }
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::RenameWorkspace {
+                    request_id,
+                    workspace_id: workspace_id.to_string(),
+                    title: trimmed.to_string(),
+                },
+                Duration::from_secs(30),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => {
+                if let Ok(mut guard) = self.hosts.write()
+                    && let Some(h) = guard.get_mut(host_id)
+                    && let Some(ws) = h
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.workspace_id == workspace_id)
+                {
+                    ws.title = trimmed.to_string();
+                    ws.title_locked = true;
+                    ws.is_curated = true;
+                }
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+                Ok(())
+            }
+            _ => Err("unexpected daemon reply for rename_workspace".into()),
+        }
     }
 
     pub fn list_workspace_scripts(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
@@ -16491,6 +17070,7 @@ impl OrbitAppCore {
     }
 
     pub fn start_terminal(self: &Arc<Self>, host_id: &str, cwd: &str, cols: u16, rows: u16) {
+        let request_id = Uuid::new_v4();
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
@@ -16498,21 +17078,57 @@ impl OrbitAppCore {
             let emu = h.emulator_slot_mut(slot);
             emu.clear();
             emu.resize(cols, rows);
+            h.begin_pending_slot_create(slot, request_id, false);
         }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::CreateTerminal {
-                request_id: Uuid::new_v4(),
+                request_id,
                 cwd: cwd.to_string(),
                 title: Some("Orbit PTY".to_string()),
                 cols,
                 rows,
+                slot: None,
+            },
+        );
+    }
+
+    /// Start a new PTY terminal explicitly bound to `slot` (`1..=250`), without mutating or
+    /// depending on host-global `active_terminal_slot`.
+    pub fn start_terminal_slot(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        slot: u8,
+    ) {
+        let normalized_slot = slot.clamp(1, 250);
+        let request_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            let emu = h.emulator_slot_mut(normalized_slot);
+            emu.clear();
+            emu.resize(cols, rows);
+            h.begin_pending_slot_create(normalized_slot, request_id, true);
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::CreateTerminal {
+                request_id,
+                cwd: cwd.to_string(),
+                title: Some("Orbit PTY".to_string()),
+                cols,
+                rows,
+                slot: Some(normalized_slot),
             },
         );
     }
 
     pub fn attach_terminal(self: &Arc<Self>, host_id: &str, terminal_id: &str, slot: u8) {
         let slot = slot.max(1);
+        let request_id = Uuid::new_v4();
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
@@ -16521,6 +17137,7 @@ impl OrbitAppCore {
                 h.emulator_slot_mut(slot).clear();
                 h.pending_slot_frames.remove(&slot);
             }
+            h.begin_pending_slot_attach(slot, request_id, terminal_id.to_string(), false);
             h.slot_terminal_ids.insert(slot, terminal_id.to_string());
             h.slot_confirmed_gen.remove(&slot);
             if h.session.is_some() {
@@ -16532,7 +17149,7 @@ impl OrbitAppCore {
         self.dispatch_wire_queued(
             host_id,
             WireMessage::AttachTerminal {
-                request_id: Uuid::new_v4(),
+                request_id,
                 terminal_id: terminal_id.to_string(),
                 slot,
             },
@@ -16572,11 +17189,15 @@ impl OrbitAppCore {
                 if !trimmed_tid.is_empty() {
                     h.terminal_raw_history.get(&trimmed_tid).cloned()
                 } else if let Some(slot) = norm_slot {
-                    h.slot_terminal_ids
-                        .get(&slot)
-                        .and_then(|tid| h.terminal_raw_history.get(tid))
-                        .or_else(|| h.pending_slot_raw_history.get(&slot))
-                        .cloned()
+                    if h.suppressed_legacy_temp_slots.contains_key(&slot) {
+                        None
+                    } else {
+                        h.slot_terminal_ids
+                            .get(&slot)
+                            .and_then(|tid| h.terminal_raw_history.get(tid))
+                            .or_else(|| h.pending_slot_raw_history.get(&slot))
+                            .cloned()
+                    }
                 } else {
                     None
                 }
@@ -16686,12 +17307,14 @@ impl OrbitAppCore {
             .map(|(&slot, tid)| (slot.max(1), tid.clone()))
             .collect();
         for (slot, tid) in bound {
-            if already_queued.contains(&(slot, tid.clone())) {
+            if already_queued.contains(&(slot, tid.clone()))
+                || h.pending_slot_create_by_slot.contains_key(&slot)
+            {
                 continue;
             }
             let req_id = Uuid::new_v4();
             h.slot_attach_dispatched_gen.insert(slot, conn_gen);
-            h.silent_attach_req_ids.insert(req_id);
+            h.begin_pending_slot_attach(slot, req_id, tid.clone(), true);
             attaches.push((req_id, slot, tid));
         }
         attaches
@@ -16728,23 +17351,27 @@ impl OrbitAppCore {
                         h.slot_attach_dispatched_gen
                             .insert(existing_slot, h.session_gen);
                     }
-                    h.silent_attach_req_ids.insert(req_id);
+                    h.begin_pending_slot_attach(existing_slot, req_id, tid.to_string(), true);
                     attach_req = Some((req_id, existing_slot));
                 }
                 existing_slot
             } else {
                 let slot = (1u8..=250u8)
-                    .find(|s| !h.slot_terminal_ids.contains_key(s))
+                    .find(|s| {
+                        !h.slot_terminal_ids.contains_key(s)
+                            && !h.suppressed_legacy_temp_slots.contains_key(s)
+                    })
+                    .or_else(|| (1u8..=250u8).find(|s| !h.slot_terminal_ids.contains_key(s)))
                     .unwrap_or(1u8);
                 let req_id = Uuid::new_v4();
                 h.emulator_slot_mut(slot).clear();
                 h.pending_slot_frames.remove(&slot);
                 h.slot_confirmed_gen.remove(&slot);
+                h.begin_pending_slot_attach(slot, req_id, tid.to_string(), true);
                 h.slot_terminal_ids.insert(slot, tid.to_string());
                 if h.session.is_some() {
                     h.slot_attach_dispatched_gen.insert(slot, h.session_gen);
                 }
-                h.silent_attach_req_ids.insert(req_id);
                 attach_req = Some((req_id, slot));
                 slot
             }
@@ -16775,6 +17402,7 @@ impl OrbitAppCore {
                 .filter_map(|(&slot, mapped_tid)| (mapped_tid == terminal_id).then_some(slot))
                 .collect();
             for slot in removed_slots {
+                h.cancel_pending_slot_create(slot);
                 h.slot_terminal_ids.remove(&slot);
                 h.slot_attach_dispatched_gen.remove(&slot);
                 h.slot_confirmed_gen.remove(&slot);
@@ -16824,15 +17452,27 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
+            if h.suppressed_legacy_temp_slots.contains_key(&slot) {
+                // R4-P0: Reject all input and resize frames targeting an unclaimed
+                // legacy-daemon temporary slot so nothing leaks into the rebound PTY.
+                return;
+            }
             if let TerminalBinaryFrame::Resize { cols, rows, .. } = frame {
                 h.emulator_slot_mut(slot).resize(cols, rows);
             }
-            let slot_confirmed = h.slot_confirmed_gen.get(&slot) == Some(&h.session_gen);
+            let has_pending_create = h.pending_slot_create_by_slot.contains_key(&slot);
+            let slot_blocked = h.blocked_terminal_slots.contains(&slot);
+            let slot_confirmed = !has_pending_create
+                && !slot_blocked
+                && h.slot_confirmed_gen.get(&slot) == Some(&h.session_gen);
             if slot_confirmed && let Some(handle) = h.session.clone() {
                 send_now = Some((handle, frame));
-            } else if h.slot_terminal_ids.contains_key(&slot) {
+            } else if has_pending_create || h.slot_terminal_ids.contains_key(&slot) {
                 let q = h.pending_slot_frames.entry(slot).or_default();
                 push_pending_slot_frame(q, frame);
+            } else if slot_blocked {
+                // Previous `CreateTerminal` replacement failed on this slot; refuse to leak
+                // keystrokes into the previously bound PTY until a new attach/create succeeds.
             } else if let Some(handle) = h.session.clone() {
                 // Legacy slot-only call with no tracked terminal_id binding
                 send_now = Some((handle, frame));
@@ -17914,6 +18554,7 @@ impl OrbitAppCore {
                     title: Some("Orbit Auto-Update".to_string()),
                     cols: 120,
                     rows: 30,
+                    slot: None,
                 })
                 .await
             {
@@ -17991,7 +18632,7 @@ impl OrbitAppCore {
         cwd: &str,
         path: &str,
     ) -> Result<WorkspaceFileView, String> {
-        self.read_workspace_file_on_host_inner(host_id, cwd, path, false)
+        self.read_workspace_file_on_host_options(host_id, cwd, path, None, None, None, false)
             .await
     }
 
@@ -18004,15 +18645,39 @@ impl OrbitAppCore {
         cwd: &str,
         path: &str,
     ) -> Result<WorkspaceFileView, String> {
-        self.read_workspace_file_on_host_inner(host_id, cwd, path, true)
+        self.read_workspace_file_on_host_options(host_id, cwd, path, None, None, None, true)
             .await
     }
 
-    async fn read_workspace_file_on_host_inner(
+    /// Read a workspace file or bounded chunk (`offset_bytes`, `max_bytes`, `expected_etag`)
+    /// with prefix-only syntax highlighting on initial reads and zero redundant highlighting on
+    /// continuation chunks.
+    pub async fn read_workspace_file_request_on_host(
+        self: &Arc<Self>,
+        req: crate::contract::ReadWorkspaceFileRequest,
+        prefix_highlight_only: bool,
+    ) -> Result<WorkspaceFileView, String> {
+        self.read_workspace_file_on_host_options(
+            &req.host_id,
+            &req.cwd,
+            &req.path,
+            req.offset_bytes,
+            req.max_bytes,
+            req.expected_etag,
+            prefix_highlight_only,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_workspace_file_on_host_options(
         self: &Arc<Self>,
         host_id: &str,
         cwd: &str,
         path: &str,
+        offset_bytes: Option<u64>,
+        max_bytes: Option<u64>,
+        expected_etag: Option<String>,
         prefix_highlight_only: bool,
     ) -> Result<WorkspaceFileView, String> {
         let (session, is_local) = {
@@ -18034,12 +18699,15 @@ impl OrbitAppCore {
             let owned_host = host_id.to_string();
             let owned_cwd = cwd.to_string();
             let owned_path = path.to_string();
+            let owned_expected_etag = expected_etag.clone();
             let has_session = session.is_some();
             let local_res = tokio::task::spawn_blocking(move || {
-                let raw = read_local_workspace_file_with_writable(
+                let raw = crate::desktop_ops::read_local_workspace_file_chunk_with_writable(
                     &owned_cwd,
                     &owned_path,
-                    None,
+                    offset_bytes,
+                    max_bytes,
+                    owned_expected_etag.as_deref(),
                     has_session,
                 )?;
                 Ok::<WorkspaceFileView, String>(build_workspace_file_view(
@@ -18057,6 +18725,9 @@ impl OrbitAppCore {
                         mtime_unix_ms: raw.mtime_unix_ms,
                         writable: raw.writable,
                         line_ending: raw.line_ending,
+                        offset_bytes: raw.offset_bytes,
+                        next_offset_bytes: raw.next_offset_bytes,
+                        etag_mismatch: raw.etag_mismatch,
                     },
                     prefix_highlight_only,
                 ))
@@ -18081,6 +18752,7 @@ impl OrbitAppCore {
         let owned_host_id = host_id.to_string();
         let owned_cwd = cwd.to_string();
         let owned_path = path.to_string();
+        let owned_expected_etag = expected_etag;
         let (res_tx, res_rx) = tokio::sync::oneshot::channel();
 
         self.runtime.spawn(async move {
@@ -18111,7 +18783,9 @@ impl OrbitAppCore {
                     request_id: req_id,
                     cwd: owned_cwd.clone(),
                     path: owned_path.clone(),
-                    max_bytes: None,
+                    max_bytes,
+                    offset_bytes,
+                    expected_etag: owned_expected_etag.clone(),
                 })
                 .await;
 
@@ -18134,8 +18808,16 @@ impl OrbitAppCore {
                     if is_local && rpc_err.contains("outside the workspace directory") {
                         let fallback_cwd = owned_cwd.clone();
                         let fallback_path = owned_path.clone();
+                        let fallback_etag = owned_expected_etag.clone();
                         match tokio::task::spawn_blocking(move || {
-                            read_local_workspace_file(&fallback_cwd, &fallback_path, None)
+                            crate::desktop_ops::read_local_workspace_file_chunk_with_writable(
+                                &fallback_cwd,
+                                &fallback_path,
+                                offset_bytes,
+                                max_bytes,
+                                fallback_etag.as_deref(),
+                                false,
+                            )
                         })
                         .await
                         {
@@ -18150,6 +18832,9 @@ impl OrbitAppCore {
                                 mtime_unix_ms: local.mtime_unix_ms,
                                 writable: local.writable,
                                 line_ending: local.line_ending,
+                                offset_bytes: local.offset_bytes,
+                                next_offset_bytes: local.next_offset_bytes,
+                                etag_mismatch: local.etag_mismatch,
                             }),
                             _ => Err(rpc_err),
                         }
@@ -18167,8 +18852,16 @@ impl OrbitAppCore {
                     if is_local {
                         let fallback_cwd = owned_cwd.clone();
                         let fallback_path = owned_path.clone();
+                        let fallback_etag = owned_expected_etag.clone();
                         match tokio::task::spawn_blocking(move || {
-                            read_local_workspace_file(&fallback_cwd, &fallback_path, None)
+                            crate::desktop_ops::read_local_workspace_file_chunk_with_writable(
+                                &fallback_cwd,
+                                &fallback_path,
+                                offset_bytes,
+                                max_bytes,
+                                fallback_etag.as_deref(),
+                                false,
+                            )
                         })
                         .await
                         {
@@ -18183,6 +18876,9 @@ impl OrbitAppCore {
                                 mtime_unix_ms: local.mtime_unix_ms,
                                 writable: local.writable,
                                 line_ending: local.line_ending,
+                                offset_bytes: local.offset_bytes,
+                                next_offset_bytes: local.next_offset_bytes,
+                                etag_mismatch: local.etag_mismatch,
                             }),
                             Ok(Err(e)) => Err(e),
                             Err(_) => Err("local file read task cancelled".to_string()),
@@ -24516,6 +25212,24 @@ impl OrbitAppCore {
             .block_on(self.read_workspace_file_on_host(host_id, cwd, path))
     }
 
+    pub fn read_workspace_file_prefix_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+    ) -> Result<WorkspaceFileView, String> {
+        self.runtime
+            .block_on(self.read_workspace_file_on_host_prefix(host_id, cwd, path))
+    }
+
+    pub fn read_workspace_file_request_blocking(
+        self: &Arc<Self>,
+        req: crate::contract::ReadWorkspaceFileRequest,
+    ) -> Result<WorkspaceFileView, String> {
+        self.runtime
+            .block_on(self.read_workspace_file_request_on_host(req, true))
+    }
+
     pub fn search_workspace_symbols_blocking(
         self: &Arc<Self>,
         req: crate::contract::SearchWorkspaceSymbolsRequest,
@@ -26717,30 +27431,36 @@ fn build_workspace_file_view(
     prefix_highlight_only: bool,
 ) -> WorkspaceFileView {
     let language = detect_language_for_path(path).to_string();
-    let (highlighted_lines, markdown_blocks) = if raw.content_kind == "text" {
+    let (highlighted_lines, markdown_blocks, highlight_truncated) = if raw.content_kind == "text"
+        && raw.offset_bytes == 0
+        && !raw.etag_mismatch
+    {
         if language == "markdown" {
             // Markdown opens in Preview mode by default; skip expensive upfront `syntect`
             // source highlighting so large Markdown artifacts open instantaneously.
             // Source view falls back cleanly to raw content and lazily highlights on demand.
             let md = parse_markdown_blocks(&raw.content, false);
-            (Vec::new(), md)
+            (Vec::new(), md, false)
         } else if language == "text" {
             // Plain text / log files need neither syntax highlighting nor duplicate line wrappers.
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), false)
         } else if prefix_highlight_only {
-            // Highlight one virtualized 250-line chunk eagerly for instant first paint;
-            // Desktop FileViewerTab renders deeper lines directly from `content` and lazily
-            // highlights visible 250-line chunks on scroll without IPC payload duplication.
-            let lines =
-                highlight_code_lines_prefix(&language, &raw.content, EAGER_FILE_HIGHLIGHT_LINES);
-            (lines, Vec::new())
+            // Highlight one virtualized 250-line chunk eagerly with the shared per-line (4 KiB)
+            // and total (64 KiB) preview budget so minified single-line files never explode JSON
+            // payload size or falsely report `truncated = false`.
+            let (lines, truncated) = highlight_code_lines_prefix_bounded(
+                &language,
+                &raw.content,
+                EAGER_FILE_HIGHLIGHT_LINES,
+            );
+            (lines, Vec::new(), truncated)
         } else {
             let lines =
                 highlight_code_lines_capped(&language, &raw.content, EAGER_FILE_HIGHLIGHT_LINES);
-            (lines, Vec::new())
+            (lines, Vec::new(), false)
         }
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), false)
     };
 
     WorkspaceFileView {
@@ -26758,6 +27478,10 @@ fn build_workspace_file_view(
         mtime_unix_ms: raw.mtime_unix_ms,
         writable: raw.writable,
         line_ending: raw.line_ending,
+        offset_bytes: raw.offset_bytes,
+        next_offset_bytes: raw.next_offset_bytes,
+        etag_mismatch: raw.etag_mismatch,
+        highlight_truncated,
         highlighted_lines,
         markdown_blocks,
     }
@@ -31056,11 +31780,28 @@ mod tests {
             ));
         }
 
-        // Daemon confirms TerminalAttached for slot 2 -> marks slot_confirmed_gen and drains pending frames
+        // Daemon confirms TerminalAttached for slot 2 (echoing the queued AttachTerminal request_id)
+        // -> marks slot_confirmed_gen and drains pending frames.
+        let attach_req_id = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_order").expect("host");
+            h.transient_requests
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    WireMessage::AttachTerminal {
+                        request_id,
+                        terminal_id,
+                        slot: 2,
+                    } if terminal_id == "term-b" => Some(*request_id),
+                    _ => None,
+                })
+                .expect("queued AttachTerminal request_id for term-b")
+        };
         core.handle_inbound_wire(
             "h_order",
             WireMessage::TerminalAttached {
-                request_id: Uuid::new_v4(),
+                request_id: attach_req_id,
                 terminal: TerminalSummary {
                     terminal_id: "term-b".into(),
                     title: "shell-b".into(),
@@ -31081,6 +31822,879 @@ mod tests {
         assert_eq!(
             h.slot_terminal_ids.get(&1).map(String::as_str),
             Some("term-a")
+        );
+    }
+
+    #[test]
+    fn terminal_slot_replace_buffers_until_matching_attach_and_handles_supersede_and_failure() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_replace".into(),
+                hostname: "replace-host".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.session_gen = 7;
+            mem.connecting_in_flight = true;
+            // Slot 3 already confirmed attached to old PTY
+            mem.slot_terminal_ids.insert(3, "term-old".into());
+            mem.slot_attach_dispatched_gen.insert(3, 7);
+            mem.slot_confirmed_gen.insert(3, 7);
+            core.hosts
+                .write()
+                .expect("hosts write")
+                .insert("h_replace".into(), mem);
+        }
+
+        // 1. Replace slot 3 with create #1: immediately clears confirmed state and buffers batch-1 input.
+        core.start_terminal_slot("h_replace", "/tmp/dir_b", 80, 24, 3);
+        let req1 = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert!(
+                !h.slot_confirmed_gen.contains_key(&3),
+                "start_terminal_slot must sever old PTY confirmed passthrough immediately"
+            );
+            h.pending_slot_create_by_slot
+                .get(&3)
+                .map(|e| e.request_id)
+                .expect("req1 tracked")
+        };
+        core.send_terminal_input_slot("h_replace", 3, b"BATCH1\n".to_vec());
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            let q = h.pending_slot_frames.get(&3).expect("batch1 buffered");
+            assert_eq!(q.len(), 1);
+        }
+
+        // 2. Rapid second start_terminal_slot on slot 3 supersedes req1 and discards batch-1 input.
+        core.start_terminal_slot("h_replace", "/tmp/dir_c", 90, 30, 3);
+        let req2 = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert!(
+                !h.pending_slot_frames.contains_key(&3),
+                "second create must discard stale batch-1 buffered frames"
+            );
+            assert!(
+                !h.pending_slot_create_by_req.contains_key(&req1),
+                "superseded req1 must be removed from active in-flight create table"
+            );
+            let rid = h
+                .pending_slot_create_by_slot
+                .get(&3)
+                .map(|e| e.request_id)
+                .expect("req2 tracked");
+            assert_ne!(rid, req1);
+            rid
+        };
+        core.send_terminal_input_slot("h_replace", 3, b"BATCH2\n".to_vec());
+
+        // 3a. R3-P1-1 Case 1: Stale TerminalAttached(req1) arrives BEFORE req2 -> ignored, BATCH2 stays queued!
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::TerminalAttached {
+                request_id: req1,
+                terminal: TerminalSummary {
+                    terminal_id: "term-stale-1".into(),
+                    title: "stale".into(),
+                    cwd: "/tmp/dir_b".into(),
+                    cols: 80,
+                    rows: 24,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert!(!h.slot_confirmed_gen.contains_key(&3));
+            assert_eq!(
+                h.pending_slot_frames.get(&3).map(VecDeque::len),
+                Some(1),
+                "stale req1 attach must keep BATCH2 queued for req2"
+            );
+        }
+
+        // 4. Matching TerminalAttached(req2) binds slot 3 and clears pending create.
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::TerminalAttached {
+                request_id: req2,
+                terminal: TerminalSummary {
+                    terminal_id: "term-new-2".into(),
+                    title: "new".into(),
+                    cwd: "/tmp/dir_c".into(),
+                    cols: 90,
+                    rows: 30,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert_eq!(h.slot_confirmed_gen.get(&3), Some(&7));
+            assert_eq!(
+                h.slot_terminal_ids.get(&3).map(String::as_str),
+                Some("term-new-2")
+            );
+            assert_eq!(h.active_terminal_id.as_deref(), Some("term-new-2"));
+            assert!(!h.pending_slot_create_by_slot.contains_key(&3));
+        }
+
+        // 3b. R3-P1-1 Case 2: Superseded TerminalAttached(req1) arrives AFTER req2 already settled ->
+        //     MUST be rejected before generic bind path so slot 3 and active_terminal_id stay term-new-2!
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::TerminalAttached {
+                request_id: req1,
+                terminal: TerminalSummary {
+                    terminal_id: "term-stale-1".into(),
+                    title: "stale-late".into(),
+                    cwd: "/tmp/dir_b".into(),
+                    cols: 80,
+                    rows: 24,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert_eq!(
+                h.slot_terminal_ids.get(&3).map(String::as_str),
+                Some("term-new-2"),
+                "late superseded req1 MUST NOT overwrite settled slot 3"
+            );
+            assert_eq!(
+                h.active_terminal_id.as_deref(),
+                Some("term-new-2"),
+                "late superseded req1 MUST NOT overwrite active_terminal_id"
+            );
+        }
+
+        // 5. R3-P1-1 Case 3: Create #3 superseded by Create #4 which fails with RpcError, then stale
+        //    TerminalAttached(req3) arrives -> MUST NOT bind term-stale-3 or unblock slot 3!
+        core.start_terminal_slot("h_replace", "/tmp/dir_d", 80, 24, 3);
+        let req3 = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_replace")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("req3 tracked")
+        };
+        core.start_terminal_slot("h_replace", "/nonexistent", 80, 24, 3);
+        let req4 = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_replace")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("req4 tracked")
+        };
+        core.send_terminal_input_slot("h_replace", 3, b"NEVER_DELIVER\n".to_vec());
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::RpcError {
+                request_id: Some(req4),
+                code: "create_terminal_failed".into(),
+                message: "cwd not found".into(),
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert!(!h.pending_slot_create_by_slot.contains_key(&3));
+            assert!(!h.pending_slot_frames.contains_key(&3));
+            assert!(h.blocked_terminal_slots.contains(&3));
+        }
+        // Now stale req3 arrives after req4 failed -> slot 3 MUST stay blocked and unbound!
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::TerminalAttached {
+                request_id: req3,
+                terminal: TerminalSummary {
+                    terminal_id: "term-stale-3".into(),
+                    title: "stale-after-fail".into(),
+                    cwd: "/tmp/dir_d".into(),
+                    cols: 80,
+                    rows: 24,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert!(
+                h.blocked_terminal_slots.contains(&3),
+                "stale req3 after failed req4 must keep slot 3 blocked"
+            );
+            assert!(
+                !h.slot_terminal_ids.contains_key(&3),
+                "stale req3 after failed req4 must never bind term-stale-3"
+            );
+        }
+
+        // 6. R4-P1-1: 300 consecutive supersedes (> old 256 cap!) — earliest ACK arriving AFTER
+        //    latest success MUST NEVER overwrite `slot 3` or `active_terminal_id` (O(1) memory)!
+        core.start_terminal_slot("h_replace", "/tmp/dir_0", 80, 24, 3);
+        let first_expired_req = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_replace")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("first_expired_req")
+        };
+        let mut req_257 = first_expired_req;
+        for i in 1..=300usize {
+            core.start_terminal_slot("h_replace", &format!("/tmp/dir_{i}"), 80, 24, 3);
+            if i == 257 {
+                let hosts = core.hosts.read().expect("hosts read");
+                req_257 = hosts
+                    .get("h_replace")
+                    .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                    .map(|e| e.request_id)
+                    .expect("req_257");
+            }
+        }
+        let latest_ok_req = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert_eq!(h.pending_slot_create_by_req.len(), 1);
+            h.pending_slot_create_by_slot
+                .get(&3)
+                .map(|e| e.request_id)
+                .expect("latest_ok_req")
+        };
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::TerminalAttached {
+                request_id: latest_ok_req,
+                terminal: TerminalSummary {
+                    terminal_id: "term-current".into(),
+                    title: "current".into(),
+                    cwd: "/tmp/dir_300".into(),
+                    cols: 80,
+                    rows: 24,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        // Deliver earliest ACK (300 supersedes ago) and 257th ACK -> both rejected cleanly!
+        for (stale_rid, stale_tid) in [
+            (first_expired_req, "term-expired"),
+            (req_257, "term-expired-257"),
+        ] {
+            core.handle_inbound_wire(
+                "h_replace",
+                WireMessage::TerminalAttached {
+                    request_id: stale_rid,
+                    terminal: TerminalSummary {
+                        terminal_id: stale_tid.into(),
+                        title: stale_tid.into(),
+                        cwd: "/tmp/dir_0".into(),
+                        cols: 80,
+                        rows: 24,
+                        created_at: Utc::now(),
+                    },
+                    slot: 3,
+                },
+            );
+        }
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert_eq!(
+                h.slot_terminal_ids.get(&3).map(String::as_str),
+                Some("term-current"),
+                "stale ACK past 256/257/300 supersedes MUST NOT overwrite settled slot 3"
+            );
+            assert_eq!(
+                h.active_terminal_id.as_deref(),
+                Some("term-current"),
+                "stale ACK past 256/257/300 supersedes MUST NOT overwrite active_terminal_id"
+            );
+        }
+
+        // 7. R4-P1-1: 300 consecutive supersedes ending in RpcError -> earliest ACK arriving
+        //    after failure MUST NOT unblock or bind slot 3!
+        core.start_terminal_slot("h_replace", "/tmp/fail_0", 80, 24, 3);
+        let first_fail_expired_req = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_replace")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("first_fail_expired_req")
+        };
+        for i in 1..=300usize {
+            core.start_terminal_slot("h_replace", &format!("/tmp/fail_{i}"), 80, 24, 3);
+        }
+        let latest_fail_req = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_replace")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("latest_fail_req")
+        };
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::RpcError {
+                request_id: Some(latest_fail_req),
+                code: "create_terminal_failed".into(),
+                message: "boom".into(),
+            },
+        );
+        core.handle_inbound_wire(
+            "h_replace",
+            WireMessage::TerminalAttached {
+                request_id: first_fail_expired_req,
+                terminal: TerminalSummary {
+                    terminal_id: "term-expired-after-fail".into(),
+                    title: "expired-fail".into(),
+                    cwd: "/tmp/fail_0".into(),
+                    cols: 80,
+                    rows: 24,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_replace").expect("host");
+            assert!(h.blocked_terminal_slots.contains(&3));
+            assert!(!h.slot_terminal_ids.contains_key(&3));
+            assert_eq!(h.pending_slot_create_by_req.len(), 0);
+        }
+    }
+
+    #[test]
+    fn terminal_slot_replace_on_legacy_daemon_rebinds_mismatched_slot_for_both_pre_and_post_input()
+    {
+        // R3-P0: Simulate baseline daemon (`0baeebd0`) that ignores `slot: Some(3)` in
+        // `CreateTerminal` and replies with `attached_slot = 2`. Core MUST keep the barrier on
+        // slot 3, dispatch an explicit `AttachTerminal { terminal_id: new_term, slot: 3 }`, and
+        // only release pre-attach + post-attach input onto slot 3 once `slot == 3` is confirmed!
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_legacy_slot".into(),
+                hostname: "legacy-host".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.session_gen = 9;
+            mem.connecting_in_flight = true;
+            // Old PTY A is currently bound to slot 3 on the legacy daemon
+            mem.slot_terminal_ids.insert(3, "term-old-dir-a".into());
+            mem.slot_attach_dispatched_gen.insert(3, 9);
+            mem.slot_confirmed_gen.insert(3, 9);
+            core.hosts
+                .write()
+                .expect("hosts write")
+                .insert("h_legacy_slot".into(), mem);
+        }
+
+        // 1. Request replacement on slot 3 in dir_b; immediately send pre-attach command.
+        core.start_terminal_slot("h_legacy_slot", "/tmp/dir_b", 96, 28, 3);
+        let create_req_id = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_legacy_slot").expect("host");
+            assert!(!h.slot_confirmed_gen.contains_key(&3));
+            h.pending_slot_create_by_slot
+                .get(&3)
+                .map(|e| e.request_id)
+                .expect("create_req_id")
+        };
+        core.send_terminal_input_slot("h_legacy_slot", 3, b"PRE_ATTACH_CMD\n".to_vec());
+
+        // 2. Legacy daemon auto-picks slot 2 instead of slot 3!
+        core.handle_inbound_wire(
+            "h_legacy_slot",
+            WireMessage::TerminalAttached {
+                request_id: create_req_id,
+                terminal: TerminalSummary {
+                    terminal_id: "term-new-dir-b".into(),
+                    title: "new-b".into(),
+                    cwd: "/tmp/dir_b".into(),
+                    cols: 96,
+                    rows: 28,
+                    created_at: Utc::now(),
+                },
+                slot: 2,
+            },
+        );
+
+        // Barrier MUST still be held on slot 3, pre-attach command MUST remain queued on slot 3,
+        // and Core MUST have dispatched `AttachTerminal { terminal_id: "term-new-dir-b", slot: 3 }`!
+        let rebind_req_id = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_legacy_slot").expect("host");
+            assert!(
+                !h.slot_confirmed_gen.contains_key(&3),
+                "slot 3 barrier MUST stay active while legacy rebind AttachTerminal is in flight"
+            );
+            assert!(
+                !h.slot_terminal_ids.contains_key(&2),
+                "mismatched slot 2 must not be falsely adopted as slot 3's binding"
+            );
+            assert_eq!(
+                h.pending_slot_frames.get(&3).map(VecDeque::len),
+                Some(1),
+                "pre-attach input must remain buffered on slot 3 until rebind confirms"
+            );
+            let pending = h
+                .pending_slot_create_by_slot
+                .get(&3)
+                .expect("pending rebind on slot 3");
+            assert_eq!(pending.rebind_attempts, 1);
+            assert_eq!(
+                pending.expected_terminal_id.as_deref(),
+                Some("term-new-dir-b")
+            );
+            let dispatched_attach = h.transient_requests.iter().rev().find_map(|m| match m {
+                WireMessage::AttachTerminal {
+                    request_id,
+                    terminal_id,
+                    slot,
+                } if *request_id == pending.request_id => Some((terminal_id.clone(), *slot)),
+                _ => None,
+            });
+            assert_eq!(
+                dispatched_attach,
+                Some(("term-new-dir-b".to_string(), 3)),
+                "Core must dispatch AttachTerminal(term-new-dir-b, slot=3) to rebind legacy daemon"
+            );
+            pending.request_id
+        };
+
+        // 3. Input sent while rebind is in flight ALSO buffers on slot 3 (never leaks to old shell!).
+        core.send_terminal_input_slot("h_legacy_slot", 3, b"MID_REBIND_CMD\n".to_vec());
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_legacy_slot").expect("host");
+            assert_eq!(h.pending_slot_frames.get(&3).map(VecDeque::len), Some(2));
+        }
+
+        // 4. Legacy daemon confirms AttachTerminal on slot 3 -> barrier lifts & slot 3 binds term-new-dir-b!
+        core.handle_inbound_wire(
+            "h_legacy_slot",
+            WireMessage::TerminalAttached {
+                request_id: rebind_req_id,
+                terminal: TerminalSummary {
+                    terminal_id: "term-new-dir-b".into(),
+                    title: "new-b".into(),
+                    cwd: "/tmp/dir_b".into(),
+                    cols: 96,
+                    rows: 28,
+                    created_at: Utc::now(),
+                },
+                slot: 3,
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_legacy_slot").expect("host");
+            assert_eq!(h.slot_confirmed_gen.get(&3), Some(&9));
+            assert_eq!(
+                h.slot_terminal_ids.get(&3).map(String::as_str),
+                Some("term-new-dir-b")
+            );
+            assert!(!h.pending_slot_create_by_slot.contains_key(&3));
+            assert!(!h.blocked_terminal_slots.contains(&3));
+            assert_eq!(
+                h.suppressed_legacy_temp_slots.get(&2).map(String::as_str),
+                Some("term-new-dir-b"),
+                "R4-P0: legacy daemon's auto-allocated temporary slot 2 must remain suppressed"
+            );
+        }
+
+        // 4b. R4-P0: Mount a live mock session channel to verify that:
+        //     (a) Inbound output/snapshot on suppressed temp slot 2 is dropped and NEVER leaks into slot 2's screen;
+        //     (b) Outbound input on suppressed temp slot 2 (both `send_terminal_input_slot(2)` and
+        //         slot-only `send_terminal_input` with active_terminal_slot=2) sends ZERO frames on the wire;
+        //     (c) Outbound input on confirmed slot 3 transmits cleanly;
+        //     (d) Explicitly binding slot 2 via `attach_terminal` lifts suppression and restores normal I/O.
+        let (mock_session, mut out_rx) = HostSessionHandle::new_test_channel();
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            let h = hosts.get_mut("h_legacy_slot").expect("host");
+            h.session = Some(mock_session);
+        }
+        // Legacy daemon keeps streaming slot 3's shell output on temp slot 2 as well as slot 3:
+        core.handle_inbound_terminal(
+            "h_legacy_slot",
+            TerminalBinaryFrame::Snapshot {
+                slot: 2,
+                data: b"SLOT3_SECRET_SNAP\r\n".to_vec(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h_legacy_slot",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: b"SLOT3_SECRET_OUTPUT\r\n".to_vec(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h_legacy_slot",
+            TerminalBinaryFrame::Output {
+                slot: 3,
+                data: b"SLOT3_EXPECTED_OUTPUT\r\n".to_vec(),
+            },
+        );
+        let slot2_delta = core
+            .terminal_screen_delta_slot("h_legacy_slot", 2, 0)
+            .expect("slot 2 delta");
+        let slot2_text: String = slot2_delta
+            .changed_rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|span| span.text.as_str()))
+            .collect();
+        assert!(
+            !slot2_text.contains("SLOT3_SECRET"),
+            "R4-P0: suppressed temp slot 2 must NOT display any output from slot 3, got: {slot2_text:?}"
+        );
+        let slot3_delta = core
+            .terminal_screen_delta_slot("h_legacy_slot", 3, 0)
+            .expect("slot 3 delta");
+        let slot3_text: String = slot3_delta
+            .changed_rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|span| span.text.as_str()))
+            .collect();
+        assert!(
+            slot3_text.contains("SLOT3_EXPECTED_OUTPUT"),
+            "slot 3 must receive live output normally"
+        );
+
+        // Attempt 3 writes via slot 2 (slot-targeted + slot-only active slot): MUST transmit 0 frames!
+        core.send_terminal_input_slot("h_legacy_slot", 2, b"INTRUSION_1\n".to_vec());
+        core.send_terminal_input_slot("h_legacy_slot", 2, b"INTRUSION_2\n".to_vec());
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts
+                .get_mut("h_legacy_slot")
+                .expect("host")
+                .active_terminal_slot = 2;
+        }
+        core.send_terminal_input("h_legacy_slot", b"INTRUSION_3\n".to_vec());
+        // Follow with a legitimate post-attach command on slot 3:
+        core.send_terminal_input_slot("h_legacy_slot", 3, b"POST_ATTACH_SLOT3\n".to_vec());
+
+        let sent_after_rebind = core.runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut frames = Vec::new();
+            while let Ok(payload) = out_rx.try_recv() {
+                if let crate::OutboundPayload::Terminal(f) = payload {
+                    frames.push(f);
+                }
+            }
+            frames
+        });
+        assert_eq!(
+            sent_after_rebind.len(),
+            1,
+            "only slot 3 command may be transmitted; all 3 suppressed slot 2 inputs must be dropped, got: {sent_after_rebind:?}"
+        );
+        assert!(matches!(
+            &sent_after_rebind[0],
+            TerminalBinaryFrame::Input { slot: 3, data } if data == b"POST_ATTACH_SLOT3\n"
+        ));
+
+        // Explicit user attach on slot 2 lifts suppression and restores normal I/O on slot 2!
+        core.attach_terminal("h_legacy_slot", "term-slot2-own", 2);
+        let slot2_attach_req = {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_legacy_slot").expect("host");
+            assert!(!h.suppressed_legacy_temp_slots.contains_key(&2));
+            h.pending_slot_attach_by_slot
+                .get(&2)
+                .map(|e| e.request_id)
+                .expect("slot 2 pending attach")
+        };
+        core.handle_inbound_wire(
+            "h_legacy_slot",
+            WireMessage::TerminalAttached {
+                request_id: slot2_attach_req,
+                terminal: TerminalSummary {
+                    terminal_id: "term-slot2-own".into(),
+                    title: "slot2-own".into(),
+                    cwd: "/tmp/dir_slot2".into(),
+                    cols: 80,
+                    rows: 24,
+                    created_at: Utc::now(),
+                },
+                slot: 2,
+            },
+        );
+        core.handle_inbound_terminal(
+            "h_legacy_slot",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: b"SLOT2_RECOVERED\r\n".to_vec(),
+            },
+        );
+        let slot2_recovered_delta = core
+            .terminal_screen_delta_slot("h_legacy_slot", 2, 0)
+            .expect("slot 2 recovered delta");
+        let slot2_recovered_text: String = slot2_recovered_delta
+            .changed_rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|span| span.text.as_str()))
+            .collect();
+        assert!(
+            slot2_recovered_text.contains("SLOT2_RECOVERED"),
+            "explicit attach on slot 2 must restore inbound output"
+        );
+        core.send_terminal_input_slot("h_legacy_slot", 2, b"SLOT2_OWN_CMD\n".to_vec());
+        let sent_slot2_recovered = core.runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut frames = Vec::new();
+            while let Ok(payload) = out_rx.try_recv() {
+                if let crate::OutboundPayload::Terminal(f) = payload {
+                    frames.push(f);
+                }
+            }
+            frames
+        });
+        assert!(
+            sent_slot2_recovered.iter().any(|f| matches!(
+                f,
+                TerminalBinaryFrame::Input { slot: 2, data } if data == b"SLOT2_OWN_CMD\n"
+            )),
+            "explicit attach on slot 2 must restore outbound input"
+        );
+        // Clear mock session before step 5 (offline queued rebind failure check)
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts.get_mut("h_legacy_slot").expect("host").session = None;
+        }
+
+        // 5. Rebind failure path: if a legacy rebind fails with RpcError, buffered input is dropped
+        //    and slot 3 is blocked so post-failure input NEVER leaks to an old shell.
+        core.start_terminal_slot("h_legacy_slot", "/tmp/dir_c", 96, 28, 3);
+        let create_req_2 = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_legacy_slot")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("create_req_2")
+        };
+        core.send_terminal_input_slot("h_legacy_slot", 3, b"SHOULD_DROP\n".to_vec());
+        core.handle_inbound_wire(
+            "h_legacy_slot",
+            WireMessage::TerminalAttached {
+                request_id: create_req_2,
+                terminal: TerminalSummary {
+                    terminal_id: "term-dir-c".into(),
+                    title: "c".into(),
+                    cwd: "/tmp/dir_c".into(),
+                    cols: 96,
+                    rows: 28,
+                    created_at: Utc::now(),
+                },
+                slot: 4,
+            },
+        );
+        let rebind_req_2 = {
+            let hosts = core.hosts.read().expect("hosts read");
+            hosts
+                .get("h_legacy_slot")
+                .and_then(|h| h.pending_slot_create_by_slot.get(&3))
+                .map(|e| e.request_id)
+                .expect("rebind_req_2")
+        };
+        core.handle_inbound_wire(
+            "h_legacy_slot",
+            WireMessage::RpcError {
+                request_id: Some(rebind_req_2),
+                code: "attach_terminal_failed".into(),
+                message: "terminal gone".into(),
+            },
+        );
+        {
+            let hosts = core.hosts.read().expect("hosts read");
+            let h = hosts.get("h_legacy_slot").expect("host");
+            assert!(!h.pending_slot_create_by_slot.contains_key(&3));
+            assert!(!h.pending_slot_frames.contains_key(&3));
+            assert!(h.blocked_terminal_slots.contains(&3));
+        }
+    }
+
+    #[test]
+    fn build_workspace_file_view_prefix_highlight_bounds_minified_js_and_sets_truncated_flag() {
+        let minified = "const a=1,b=2;function run(x){return a+b+x;}".repeat(2_200);
+        assert!(minified.len() > 88_000);
+        let view = build_workspace_file_view(
+            "h1",
+            "/repo",
+            "bundle.min.js",
+            RawFileReadResponse {
+                resolved_path: "/repo/bundle.min.js".into(),
+                content_kind: "text".into(),
+                mime_type: Some("text/javascript".into()),
+                content: minified,
+                size_bytes: 96_800,
+                truncated: false,
+                etag: Some("etag-1".into()),
+                mtime_unix_ms: Some(1_700_000_000_000),
+                writable: true,
+                line_ending: Some("lf".into()),
+                offset_bytes: 0,
+                next_offset_bytes: 96_800,
+                etag_mismatch: false,
+            },
+            true,
+        );
+        assert!(
+            view.highlight_truncated,
+            "oversized single-line JS must set highlight_truncated=true"
+        );
+        assert_eq!(view.highlighted_lines.len(), 1);
+        let span_bytes: usize = view.highlighted_lines[0]
+            .tokens
+            .iter()
+            .map(|t| t.text.len())
+            .sum();
+        assert!(
+            span_bytes <= crate::render::MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES,
+            "single-line pre-highlight must stay within 4 KiB budget, got {span_bytes}"
+        );
+    }
+
+    #[test]
+    fn board_cas_capability_blocks_guarded_writes_on_legacy_daemon_welcome_and_allows_on_new() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_cas_cap".into(),
+                hostname: "legacy-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            core.hosts
+                .write()
+                .expect("hosts write")
+                .insert("h_cas_cap".into(), mem);
+        }
+
+        // Legacy daemon Welcome (protocol_version = 4, board_cas_supported omitted -> false)
+        let legacy_welcome_json = serde_json::json!({
+            "op": "welcome",
+            "host": {
+                "host_id": "h_cas_cap",
+                "hostname": "legacy-box",
+                "os": "macos",
+                "arch": "aarch64",
+                "public_key_b64": "pk",
+                "protocol_version": orbit_protocol::PROTOCOL_VERSION,
+                "daemon_version": "0.11.0-baseline",
+                "available_providers": []
+            }
+        });
+        let legacy_msg: WireMessage =
+            serde_json::from_value(legacy_welcome_json).expect("parse legacy welcome");
+        core.handle_inbound_wire("h_cas_cap", legacy_msg);
+        assert!(
+            !core
+                .host_detail("h_cas_cap")
+                .expect("detail")
+                .host
+                .board_cas_supported
+        );
+
+        // Both rev 0 and non-zero rev guarded writes are rejected locally WITHOUT queueing any wire write.
+        for rev in [0u64, 5u64] {
+            let err = rt
+                .block_on(core.update_workspace_board_cas_on_host(
+                    "h_cas_cap",
+                    "ws-1",
+                    "draft".into(),
+                    None,
+                    Some(rev),
+                    Some("user".into()),
+                ))
+                .expect_err("legacy daemon must reject guarded CAS write");
+            assert!(err.contains("board_cas_unsupported"), "got: {err}");
+        }
+        assert!(
+            core.hosts
+                .read()
+                .expect("hosts read")
+                .get("h_cas_cap")
+                .expect("host")
+                .transient_requests
+                .is_empty(),
+            "rejected guarded CAS write must NEVER enqueue WireMessage::UpdateWorkspaceBoard"
+        );
+
+        // Upgraded daemon Welcome sets `board_cas_supported = true` on HostCardView.
+        core.handle_inbound_wire(
+            "h_cas_cap",
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: "h_cas_cap".into(),
+                    hostname: "upgraded-box".into(),
+                    os: "macos".into(),
+                    arch: "aarch64".into(),
+                    public_key_b64: "pk".into(),
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.12.0".into(),
+                    available_providers: vec![],
+                    relay_url: None,
+                    direct_endpoints: vec![],
+                    board_cas_supported: true,
+                },
+            },
+        );
+        assert!(
+            core.host_detail("h_cas_cap")
+                .expect("detail")
+                .host
+                .board_cas_supported
         );
     }
 
@@ -31111,6 +32725,109 @@ mod tests {
         // After draining overflow resync, normal incremental delivery resumes cleanly
         assert!(queue.push_with_resync(b"next-chunk", || emu.render_resync_bytes()));
         assert_eq!(queue.take_pending(), Some(b"next-chunk".to_vec()));
+    }
+
+    #[test]
+    fn terminal_screen_delta_slot_isolates_slots_one_to_three() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut hosts = core.hosts.write().expect("hosts write");
+            hosts.insert(
+                "h_slots".into(),
+                HostMemoryState::new(SavedHostProfile {
+                    host_id: "h_slots".into(),
+                    hostname: "slots-box".into(),
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: 7474,
+                    custom_direct_endpoint: None,
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    daemon_pubkey_b64: String::new(),
+                    pairing_secret: String::new(),
+                    pairing_secret_updated_at_ms: 0,
+                    state: HostConnectionState::OnlineDirect,
+                }),
+            );
+        }
+
+        core.handle_inbound_terminal(
+            "h_slots",
+            TerminalBinaryFrame::Output {
+                slot: 1,
+                data: b"slot-one-line\r\n".to_vec(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h_slots",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: b"slot-two-line\r\n".to_vec(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h_slots",
+            TerminalBinaryFrame::Output {
+                slot: 3,
+                data: b"slot-three-line\r\n".to_vec(),
+            },
+        );
+
+        let d1 = core
+            .terminal_screen_delta_slot("h_slots", 1, 0)
+            .expect("slot 1 delta");
+        let d2 = core
+            .terminal_screen_delta_slot("h_slots", 2, 0)
+            .expect("slot 2 delta");
+        let d3 = core
+            .terminal_screen_delta_slot("h_slots", 3, 0)
+            .expect("slot 3 delta");
+        assert!(d1.reset && d2.reset && d3.reset);
+        assert_eq!(d1.slot, 1);
+        assert_eq!(d2.slot, 2);
+        assert_eq!(d3.slot, 3);
+
+        // Slot 0 normalizes to slot 1
+        let d0 = core
+            .terminal_screen_delta_slot("h_slots", 0, d1.revision)
+            .expect("slot 0 normalized");
+        assert_eq!(d0.slot, 1);
+        assert!(!d0.reset);
+        assert!(d0.changed_rows.is_empty());
+
+        // Mutate ONLY slot 2 and verify slots 1 & 3 are completely unaffected
+        core.handle_inbound_terminal(
+            "h_slots",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: b"slot-two-second\r\n".to_vec(),
+            },
+        );
+        let d1_after = core
+            .terminal_screen_delta_slot("h_slots", 1, d1.revision)
+            .expect("slot 1 after");
+        let d2_after = core
+            .terminal_screen_delta_slot("h_slots", 2, d2.revision)
+            .expect("slot 2 after");
+        let d3_after = core
+            .terminal_screen_delta_slot("h_slots", 3, d3.revision)
+            .expect("slot 3 after");
+        assert!(d1_after.changed_rows.is_empty());
+        assert!(d3_after.changed_rows.is_empty());
+        assert!(!d2_after.reset);
+        assert_eq!(d2_after.changed_rows.len(), 1);
+        let s2_text: String = d2_after.changed_rows[0]
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(s2_text.contains("slot-two-second"));
+
+        assert!(
+            core.terminal_screen_delta_slot("missing_host", 1, 0)
+                .is_none()
+        );
     }
 
     #[test]
@@ -35773,6 +37490,7 @@ mod tests {
                     available_providers: vec![],
                     relay_url: Some("https://relay.example.com".into()),
                     direct_endpoints: vec![],
+                    board_cas_supported: false,
                 },
             },
         );
@@ -35965,6 +37683,7 @@ mod tests {
                     available_providers: vec![],
                     relay_url: None,
                     direct_endpoints: vec![],
+                    board_cas_supported: false,
                 },
             },
         );
@@ -36632,6 +38351,7 @@ mod tests {
                         "ws://127.0.0.1:6868/ws".into(),
                         "ws://100.102.176.111:6868/ws".into(),
                     ],
+                    board_cas_supported: false,
                 },
             },
         );
@@ -36880,6 +38600,7 @@ mod tests {
                     available_providers: vec![],
                     relay_url: Some(modern_url.into()),
                     direct_endpoints: vec!["ws://127.0.0.1:6868/ws".into()],
+                    board_cas_supported: false,
                 },
             },
         );
@@ -36925,6 +38646,7 @@ mod tests {
                     available_providers: vec![],
                     relay_url: Some(modern_url.into()),
                     direct_endpoints: vec![],
+                    board_cas_supported: false,
                 },
             },
         );

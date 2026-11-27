@@ -293,6 +293,118 @@
       "value": "シロフクロウ"
     },
     {
+      "name": "board_cas_conflict_body",
+      "value": "編集中にリモートボードが rev %1$d へ更新されました（編集中は rev %2$d 基準）。解決方法を選択してください："
+    },
+    {
+      "name": "board_cas_conflict_title",
+      "value": "BOARD.md リビジョン競合"
+    },
+    {
+      "name": "board_cas_force_overwrite",
+      "value": "強制上書き"
+    },
+    {
+      "name": "board_cas_reload_merge",
+      "value": "再読込してマージ"
+    },
+    {
+      "name": "board_cas_unsupported_banner",
+      "value": "接続中のデーモンは競合安全な保存（CAS）に未対応です。更新するか強制上書きを使用してください。"
+    },
+    {
+      "name": "board_cas_unsupported_toast",
+      "value": "旧デーモンでは通常保存が無効です（下書き保持）。更新または強制上書きしてください"
+    },
+    {
+      "name": "board_dev_scripts",
+      "value": "スクリプト"
+    },
+    {
+      "name": "board_editor_placeholder",
+      "value": "## 目標\n\n## 契約"
+    },
+    {
+      "name": "board_empty_notice",
+      "value": "このワークスペースの BOARD.md は空です。"
+    },
+    {
+      "name": "board_loading_metadata",
+      "value": "ワークスペース情報を読み込み中…"
+    },
+    {
+      "name": "board_loading_metadata_hint",
+      "value": "ホストがワークスペース帰属を確認するまで編集はロックされます。"
+    },
+    {
+      "name": "board_loading_snapshot",
+      "value": "BOARD.md スナップショットを読み込み中…"
+    },
+    {
+      "name": "board_loading_snapshot_hint",
+      "value": "ホストから初期スナップショットを読み込むと編集できます。"
+    },
+    {
+      "name": "board_peer_aliases",
+      "value": "旧名 %s"
+    },
+    {
+      "name": "board_peers_tab_count",
+      "value": "ピア (%d)"
+    },
+    {
+      "name": "board_recent_activity",
+      "value": "最近のアクティビティ"
+    },
+    {
+      "name": "board_refresh_aria",
+      "value": "BOARD.md を更新"
+    },
+    {
+      "name": "board_revision_badge",
+      "value": "rev %d"
+    },
+    {
+      "name": "board_save_failed",
+      "value": "BOARD.md の保存に失敗しました"
+    },
+    {
+      "name": "board_save_failed_detail",
+      "value": "BOARD.md の保存に失敗しました: %s"
+    },
+    {
+      "name": "board_saved_toast",
+      "value": "BOARD.md を保存しました"
+    },
+    {
+      "name": "board_snapshot_not_loaded",
+      "value": "BOARD.md スナップショットの読み込みが完了していません"
+    },
+    {
+      "name": "board_spawn_peer_action",
+      "value": "ワークスペースピアを起動"
+    },
+    {
+      "name": "board_unbound_hint",
+      "value": "ホスト上のワークスペースに一致するまで BOARD.md 編集とピア起動は無効です。"
+    },
+    {
+      "name": "board_unbound_title",
+      "value": "このディレクトリに紐づくワークスペースがありません"
+    },
+    {
+      "name": "board_workspace_changed",
+      "value": "ワークスペースが変更されたかタブと一致しません"
+    },
+    {
+      "name": "board_workspace_loading",
+      "value": "ワークスペース情報を読み込み中です"
+    },
+    {
+      "name": "board_workspace_unbound",
+      "value": "このタブにワークスペースが紐づいていません"
+    },
+    {
       "name": "briefing_actorGuardian",
       "value": "Guardian"
     },
@@ -789,6 +901,30 @@
       "value": "履歴をエクスポート"
     },
     {
+      "name": "files_action_quote",
+      "value": "引用"
+    },
+    {
+      "name": "files_chunk_binary_tail_locked",
+      "value": "後続チャンクにバイナリデータを検出したため、切り詰め防止のため読み取り専用にロックしました。"
+    },
+    {
+      "name": "files_chunk_etag_conflict",
+      "value": "続きの読み込み中にホスト側のファイルが変更されました。最新を再読み込みしてください。"
+    },
+    {
+      "name": "files_chunk_incomplete_locked",
+      "value": "チャンクの整合性を確認できないため、読み取り専用にロックしました。"
+    },
+    {
+      "name": "files_chunk_limit_reached",
+      "value": "読み込み上限に達しました（%1$s / %2$s 読込済・読み取り専用）"
+    },
+    {
+      "name": "files_chunk_load_failed",
+      "value": "ファイル分塊の読み込みに失敗しました"
+    },
+    {
       "name": "files_create_as_dir",
       "value": "ディレクトリを作成"
     },
@@ -801,12 +937,64 @@
       "value": "このワークスペースに読み込まれたファイルはありません。"
     },
     {
+      "name": "files_empty_indexed",
+      "value": "このディレクトリにインデックス済みファイルがありません"
+    },
+    {
+      "name": "files_filter_placeholder",
+      "value": "ファイルを絞り込む…"
+    },
+    {
+      "name": "files_load_full",
+      "value": "全文を読み込む"
+    },
+    {
+      "name": "files_load_next_chunk",
+      "value": "続きを読み込む"
+    },
+    {
+      "name": "files_loading_chunk",
+      "value": "読み込み中…"
+    },
+    {
       "name": "files_new_entry",
       "value": "新規"
     },
     {
       "name": "files_new_path_placeholder",
       "value": "相対パス（例: src/main.ts）"
+    },
+    {
+      "name": "files_overwrite_anyway",
+      "value": "強制上書き"
+    },
+    {
+      "name": "files_panel_title",
+      "value": "ワークスペースファイル"
+    },
+    {
+      "name": "files_preview_capped",
+      "value": "全 %2$d 行中、先頭 %1$d 行をハイライト表示中"
+    },
+    {
+      "name": "files_preview_capped_lower_bound",
+      "value": "%2$d+ 行中、先頭 %1$d 行をハイライト表示中"
+    },
+    {
+      "name": "files_readonly_notice",
+      "value": "読み取り専用ファイル（編集無効）"
+    },
+    {
+      "name": "files_refresh_list_aria",
+      "value": "ファイル一覧を更新"
+    },
+    {
+      "name": "files_reload_disk",
+      "value": "ディスクから再読込"
+    },
+    {
+      "name": "files_reload_file_aria",
+      "value": "ファイルを再読み込み"
     },
     {
       "name": "files_save_file",
@@ -817,12 +1005,32 @@
       "value": "ワークスペースのファイルを絞り込む…"
     },
     {
+      "name": "files_showing_full",
+      "value": "全文を表示中（全 %d 行）"
+    },
+    {
+      "name": "files_showing_full_lower_bound",
+      "value": "全文を表示中（%d+ 行）"
+    },
+    {
+      "name": "files_showing_partial",
+      "value": "読込済み先頭を表示中（%1$s / %2$s・ソース省略あり）"
+    },
+    {
+      "name": "files_source_truncated_banner",
+      "value": "ソースファイルは省略されています（%1$s / %2$s 読込済・読み取り専用）"
+    },
+    {
       "name": "files_title",
       "value": "ファイルエクスプローラー"
     },
     {
       "name": "files_truncated_notice",
       "value": "先頭プレビューを表示中（ファイルは省略されました）"
+    },
+    {
+      "name": "files_unavailable_scope",
+      "value": "このタブスコープではファイルを利用できません"
     },
     {
       "name": "git_amend",
@@ -845,6 +1053,50 @@
       "value": "PR を作成"
     },
     {
+      "name": "git_diff_unconfirmed_notice",
+      "value": "並列切替または状態更新により Diff の帰属が未確定です。"
+    },
+    {
+      "name": "git_discard",
+      "value": "変更を破棄"
+    },
+    {
+      "name": "git_discard_confirm_action",
+      "value": "破棄を確定"
+    },
+    {
+      "name": "git_discard_failed",
+      "value": "変更の破棄に失敗しました"
+    },
+    {
+      "name": "git_discard_failed_detail",
+      "value": "変更の破棄に失敗しました: %s"
+    },
+    {
+      "name": "git_discard_include_untracked",
+      "value": "未追跡ファイルも削除"
+    },
+    {
+      "name": "git_discard_input_placeholder",
+      "value": "確認のためファイル名を入力…"
+    },
+    {
+      "name": "git_discard_success",
+      "value": "%d 件のファイル変更を破棄しました"
+    },
+    {
+      "name": "git_discard_title",
+      "value": "変更の破棄を確認"
+    },
+    {
+      "name": "git_discard_warning",
+      "value": "%s のローカル変更を完全に破棄します。確定するにはファイル名を正確に入力してください："
+    },
+    {
+      "name": "git_filter_changed_placeholder",
+      "value": "変更ファイルを絞り込む…"
+    },
+    {
       "name": "git_generate_message",
       "value": "AI 生成"
     },
@@ -865,12 +1117,52 @@
       "value": "Pull Request タイトル"
     },
     {
+      "name": "git_push",
+      "value": "プッシュ"
+    },
+    {
+      "name": "git_push_branch_placeholder",
+      "value": "ブランチ（既定: 現在のブランチ）"
+    },
+    {
+      "name": "git_push_failed",
+      "value": "プッシュに失敗しました"
+    },
+    {
+      "name": "git_push_failed_detail",
+      "value": "プッシュに失敗しました: %s"
+    },
+    {
+      "name": "git_push_remote_placeholder",
+      "value": "リモート（既定: origin）"
+    },
+    {
+      "name": "git_push_set_upstream",
+      "value": "アップストリームを設定 (-u)"
+    },
+    {
+      "name": "git_push_success",
+      "value": "%1$s → %2$s をプッシュしました"
+    },
+    {
       "name": "git_rebase_abort",
       "value": "リベース中止"
     },
     {
       "name": "git_rebase_continue",
       "value": "リベース続行"
+    },
+    {
+      "name": "git_refresh_diff",
+      "value": "Diff を更新"
+    },
+    {
+      "name": "git_refresh_review_aria",
+      "value": "Git レビューを更新"
+    },
+    {
+      "name": "git_show_all_lines",
+      "value": "全 %d 行を表示"
     },
     {
       "name": "git_stage",
@@ -881,6 +1173,10 @@
       "value": "すべてステージ"
     },
     {
+      "name": "git_stash_list_title",
+      "value": "保存済みスタッシュ"
+    },
+    {
       "name": "git_stash_pop",
       "value": "スタッシュ適用"
     },
@@ -889,12 +1185,124 @@
       "value": "スタッシュ"
     },
     {
+      "name": "git_stashes_count",
+      "value": "スタッシュ (%d)"
+    },
+    {
       "name": "git_unstage",
       "value": "解除"
     },
     {
       "name": "git_unstage_all",
       "value": "すべて解除"
+    },
+    {
+      "name": "git_working_tree_clean_scope",
+      "value": "このスコープの作業ツリーはクリーンです"
+    },
+    {
+      "name": "handoff_allow_three_way",
+      "value": "3-way コンフリクトマーカーを許可"
+    },
+    {
+      "name": "handoff_backup_ref",
+      "value": "バックアップ参照: %s"
+    },
+    {
+      "name": "handoff_branch_placeholder",
+      "value": "対象ブランチ（任意）"
+    },
+    {
+      "name": "handoff_capsule",
+      "value": "Worktree"
+    },
+    {
+      "name": "handoff_clean_preview",
+      "value": "競合なしで適用可能（%d ファイル）"
+    },
+    {
+      "name": "handoff_conflicts_warning",
+      "value": "%d 件のファイル競合を検出"
+    },
+    {
+      "name": "handoff_dir_to_local",
+      "value": "Worktree → ローカル"
+    },
+    {
+      "name": "handoff_dir_to_worktree",
+      "value": "ローカル → Worktree"
+    },
+    {
+      "name": "handoff_empty_preview",
+      "value": "引き継ぎ可能な変更はありません"
+    },
+    {
+      "name": "handoff_execute",
+      "value": "引き継ぎを実行"
+    },
+    {
+      "name": "handoff_execute_failed",
+      "value": "Worktree の引き継ぎに失敗しました"
+    },
+    {
+      "name": "handoff_execute_failed_detail",
+      "value": "Worktree の引き継ぎに失敗しました: %s"
+    },
+    {
+      "name": "handoff_execute_success",
+      "value": "Worktree の引き継ぎが完了しました"
+    },
+    {
+      "name": "handoff_hard_blocker",
+      "value": "安全に適用できません。先に対象ワークスペースの状態を確認してください"
+    },
+    {
+      "name": "handoff_include_committed",
+      "value": "コミット済み変更を含める"
+    },
+    {
+      "name": "handoff_mode_apply",
+      "value": "適用（元を維持）"
+    },
+    {
+      "name": "handoff_mode_move",
+      "value": "移動（元をリセット）"
+    },
+    {
+      "name": "handoff_preview_failed",
+      "value": "引き継ぎプレビューに失敗しました"
+    },
+    {
+      "name": "handoff_preview_failed_detail",
+      "value": "引き継ぎプレビューに失敗しました: %s"
+    },
+    {
+      "name": "handoff_preview_refresh",
+      "value": "プレビュー"
+    },
+    {
+      "name": "handoff_success_apply",
+      "value": "%d 件のファイル変更を適用しました"
+    },
+    {
+      "name": "handoff_success_apply_branch",
+      "value": "%1$d 件のファイル変更を %2$s に適用しました"
+    },
+    {
+      "name": "handoff_success_move",
+      "value": "%d 件のファイル変更を移動しました"
+    },
+    {
+      "name": "handoff_success_move_branch",
+      "value": "%1$d 件のファイル変更を %2$s に移動しました"
+    },
+    {
+      "name": "handoff_title",
+      "value": "ワークツリー引き継ぎ"
+    },
+    {
+      "name": "handoff_untracked_conflict",
+      "value": "未追跡ファイルの競合は 3-way マージで解決できません"
     },
     {
       "name": "module_desc",
@@ -1097,6 +1505,22 @@
       "value": "差分を表示"
     },
     {
+      "name": "peers_empty_notice",
+      "value": "このワークスペースにアクティブなピアはいません。"
+    },
+    {
+      "name": "peers_handle_placeholder",
+      "value": "任意の @handle（例: reviewer）"
+    },
+    {
+      "name": "peers_prompt_placeholder",
+      "value": "新しいピアへのタスク説明…"
+    },
+    {
+      "name": "peers_spawn_title",
+      "value": "ピアを起動"
+    },
+    {
       "name": "permission_microphone_reason",
       "value": "デバイス上の音声認識を使用してエージェントへプロンプトを入力します。"
     },
@@ -1189,6 +1613,54 @@
       "value": "ホストの外部メモリを共有"
     },
     {
+      "name": "scripts_empty",
+      "value": "このワークスペースの orbit.json にスクリプト設定がありません。"
+    },
+    {
+      "name": "scripts_start",
+      "value": "開始"
+    },
+    {
+      "name": "scripts_start_failed",
+      "value": "スクリプトの開始に失敗しました"
+    },
+    {
+      "name": "scripts_start_failed_detail",
+      "value": "スクリプトの開始に失敗しました: %s"
+    },
+    {
+      "name": "scripts_status_failed",
+      "value": "失敗"
+    },
+    {
+      "name": "scripts_status_running",
+      "value": "実行中"
+    },
+    {
+      "name": "scripts_status_stopped",
+      "value": "停止中"
+    },
+    {
+      "name": "scripts_status_summary_label",
+      "value": "状態 / エンドポイント / コマンド"
+    },
+    {
+      "name": "scripts_stop",
+      "value": "停止"
+    },
+    {
+      "name": "scripts_stop_failed",
+      "value": "スクリプトの停止に失敗しました"
+    },
+    {
+      "name": "scripts_stop_failed_detail",
+      "value": "スクリプトの停止に失敗しました: %s"
+    },
+    {
+      "name": "scripts_title",
+      "value": "開発スクリプト"
+    },
+    {
       "name": "search_empty_hint",
       "value": "キーワードを入力して全フリートの FTS5 履歴を検索します。"
     },
@@ -1211,6 +1683,22 @@
     {
       "name": "settings_upgrade_daemon",
       "value": "デーモンをリモート更新"
+    },
+    {
+      "name": "side_question_clear",
+      "value": "クリア"
+    },
+    {
+      "name": "side_question_empty_hint",
+      "value": "現在の会話コンテキストを使って進行中のターンを中断せずに質問します。"
+    },
+    {
+      "name": "side_question_input_placeholder",
+      "value": "中断せずに質問を入力…"
+    },
+    {
+      "name": "side_question_title",
+      "value": "サイド質問 (/btw)"
     },
     {
       "name": "sidebar_activeCount",
@@ -1653,6 +2141,30 @@
       "value": "パスフレーズ不要の即時解除"
     },
     {
+      "name": "terminal_buffer_empty",
+      "value": "ターミナルバッファが空です"
+    },
+    {
+      "name": "terminal_close_failed",
+      "value": "ターミナルの終了に失敗しました"
+    },
+    {
+      "name": "terminal_closed_toast",
+      "value": "ターミナルを閉じました"
+    },
+    {
+      "name": "terminal_copied_toast",
+      "value": "ターミナル出力をコピーしました"
+    },
+    {
+      "name": "terminal_delta_rev",
+      "value": "rev %d"
+    },
+    {
+      "name": "terminal_empty_slot",
+      "value": "このスロットにアクティブな端末バッファはありません。"
+    },
+    {
       "name": "terminal_line_placeholder",
       "value": "コマンドを入力して送信…"
     },
@@ -1665,12 +2177,28 @@
       "value": "Raw"
     },
     {
+      "name": "terminal_new_shell",
+      "value": "+ 新規"
+    },
+    {
+      "name": "terminal_no_buffer",
+      "value": "このスロットにアクティブな出力がありません。"
+    },
+    {
       "name": "terminal_raw_placeholder",
       "value": "生のキー入力を送信…"
     },
     {
+      "name": "terminal_slot_label",
+      "value": "S%d"
+    },
+    {
       "name": "terminal_spawn_shell",
       "value": "シェルセッションを開始"
+    },
+    {
+      "name": "terminal_start_failed",
+      "value": "ターミナルの起動に失敗しました"
     },
     {
       "name": "terminal_title",
@@ -1731,6 +2259,146 @@
     {
       "name": "topbar_showOverview",
       "value": "概要を表示"
+    },
+    {
+      "name": "workspace_archive",
+      "value": "ワークスペースをアーカイブ"
+    },
+    {
+      "name": "workspace_archive_failed",
+      "value": "ワークスペースのアーカイブに失敗しました"
+    },
+    {
+      "name": "workspace_archive_failed_detail",
+      "value": "ワークスペースのアーカイブに失敗しました: %s"
+    },
+    {
+      "name": "workspace_archive_keep_unclassified",
+      "value": "アーカイブ（エージェントを未分類で維持）"
+    },
+    {
+      "name": "workspace_archived_toast",
+      "value": "ワークスペースをアーカイブしました"
+    },
+    {
+      "name": "workspace_base_ref_placeholder",
+      "value": "ベース参照（例: main）"
+    },
+    {
+      "name": "workspace_branch_placeholder",
+      "value": "ブランチ名（任意）"
+    },
+    {
+      "name": "workspace_create_dispatched",
+      "value": "ワークスペース作成を送信しました"
+    },
+    {
+      "name": "workspace_create_failed",
+      "value": "ワークスペースの作成に失敗しました"
+    },
+    {
+      "name": "workspace_create_failed_detail",
+      "value": "ワークスペースの作成に失敗しました: %s"
+    },
+    {
+      "name": "workspace_isolation_local",
+      "value": "ローカル"
+    },
+    {
+      "name": "workspace_isolation_worktree",
+      "value": "Git Worktree"
+    },
+    {
+      "name": "workspace_menu_active_group",
+      "value": "アクティブなワークスペース"
+    },
+    {
+      "name": "workspace_menu_archive_item",
+      "value": "アーカイブ · %s"
+    },
+    {
+      "name": "workspace_menu_archive_keep_item",
+      "value": "アーカイブ（未分類維持）· %s"
+    },
+    {
+      "name": "workspace_menu_archived_group",
+      "value": "アーカイブ済みワークスペース"
+    },
+    {
+      "name": "workspace_menu_rename_item",
+      "value": "名前変更 · %s"
+    },
+    {
+      "name": "workspace_menu_restore_item",
+      "value": "復元 · %s"
+    },
+    {
+      "name": "workspace_menu_scripts_item",
+      "value": "開発スクリプト · %s"
+    },
+    {
+      "name": "workspace_mode_branch_off",
+      "value": "新規ブランチ"
+    },
+    {
+      "name": "workspace_mode_checkout_branch",
+      "value": "既存ブランチ"
+    },
+    {
+      "name": "workspace_mode_checkout_pr",
+      "value": "PR をチェックアウト"
+    },
+    {
+      "name": "workspace_new_v2",
+      "value": "新規ワークスペース"
+    },
+    {
+      "name": "workspace_pr_number_placeholder",
+      "value": "PR 番号"
+    },
+    {
+      "name": "workspace_rename_confirm",
+      "value": "名前を変更"
+    },
+    {
+      "name": "workspace_rename_failed",
+      "value": "ワークスペース名の変更に失敗しました"
+    },
+    {
+      "name": "workspace_rename_failed_detail",
+      "value": "ワークスペース名の変更に失敗しました: %s"
+    },
+    {
+      "name": "workspace_rename_placeholder",
+      "value": "ワークスペース名を入力"
+    },
+    {
+      "name": "workspace_rename_title",
+      "value": "ワークスペース名を変更"
+    },
+    {
+      "name": "workspace_renamed_toast",
+      "value": "ワークスペース名を変更しました"
+    },
+    {
+      "name": "workspace_restore_failed",
+      "value": "ワークスペースの復元に失敗しました"
+    },
+    {
+      "name": "workspace_restore_failed_detail",
+      "value": "ワークスペースの復元に失敗しました: %s"
+    },
+    {
+      "name": "workspace_restored_toast",
+      "value": "ワークスペースを復元しました"
+    },
+    {
+      "name": "workspace_title_placeholder",
+      "value": "ワークスペース名（任意）"
+    },
+    {
+      "name": "workspace_unarchive",
+      "value": "ワークスペースを復元"
     }
   ]
 }

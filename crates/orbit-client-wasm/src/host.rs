@@ -111,6 +111,7 @@ impl WasmHost {
                 h.host.available_providers = host.available_providers;
                 h.host.os_arch = Some(format!("{} {}", host.os, host.arch));
                 h.host.supports_server_queue = host.protocol_version >= 4;
+                h.host.board_cas_supported = host.board_cas_supported;
             }
             AgentsSnapshot { agents, .. } => {
                 h.agents = agents

@@ -13,6 +13,7 @@
   "host": {
     "agent_count": 0,
     "available_providers": [],
+    "board_cas_supported": false,
     "client_protocol_version": 0,
     "connection_state": "disconnected",
     "custom_direct_endpoint": null,
@@ -72,6 +73,19 @@
   "workspace_boards": {},
   "workspace_events": {},
   "workspace_organize_status": {},
-  "workspace_scripts": {},
+  "workspace_scripts": {
+    "ws-1": [
+      {
+        "command": "npm run dev",
+        "kind": "service",
+        "name": "dev",
+        "port": 5173,
+        "proxy_url": "http://127.0.0.1:5173",
+        "status": "running",
+        "terminal_id": "term-1",
+        "workspace_id": "ws-1"
+      }
+    ]
+  },
   "workspaces": []
 }

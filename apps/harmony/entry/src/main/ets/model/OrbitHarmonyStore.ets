@@ -22,10 +22,12 @@ import {
   CreateSchedulePayloadDto,
   CreateSessionRequestDto,
   CreateWorkspaceEntryRequestDto,
+  CreateWorkspaceV2RequestDto,
   DagStepSpecDto,
   DeleteWorkspaceEntryRequestDto,
   DiffFileDto,
   DiffLineDto,
+  ExecuteWorktreeHandoffRequestDto,
   ExportOptionsDto,
   ExportedTranscriptDto,
   FleetOverviewDto,
@@ -35,8 +37,11 @@ import {
   GitCommitResultDto,
   GitConflictEntryDto,
   GitCreatePrResultDto,
+  GitDiscardFilesRequestDto,
   GitGeneratedCommitMessageDto,
   GitPrStatusDto,
+  GitPushRequestDto,
+  GitPushResultDto,
   GitRebaseStatusDto,
   GitReviewDto,
   GitStashEntryDto,
@@ -44,6 +49,8 @@ import {
   GithubDeviceFlowPollDto,
   GithubDeviceFlowStartDto,
   GoalRunRecordDto,
+  HighlightWorkspaceCodeRequestDto,
+  HighlightedCodeDto,
   HostCardDto,
   HostDetailDto,
   InlineMentionRegistration,
@@ -54,11 +61,15 @@ import {
   ModelSelectionRequestDto,
   MonitorWatchRecordDto,
   OrbitMeshPeerRow,
+  OrbitProjectDirectoryGroupInput,
+  OrbitScopedActionOutcome,
+  OrbitWorkspaceBoardDraft,
   PendingPlanApprovalDto,
   PermissionBatchItemDto,
   PersonalAgentActivityEntryDto,
   PersonalAgentBriefingDto,
   PersonalRouterConfigDto,
+  PreviewWorktreeHandoffRequestDto,
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
@@ -67,6 +78,7 @@ import {
   QueuedPromptDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
+  ReadWorkspaceFileRequestDto,
   RegisterPushDeviceRequestDto,
   RenameWorkspaceEntryRequestDto,
   RenderDiagramRequestDto,
@@ -90,23 +102,31 @@ import {
   StartMonitorWatchRequestDto,
   StopMonitorWatchRequestDto,
   TerminalRowDto,
+  TerminalScreenDeltaDto,
   TerminalScreenDto,
   ThreadPrefSeedDto,
   TimelineItemDto,
   TimerConditionDto,
   ToolStepDescriptorDto,
+  UpdateWorkspaceBoardCasRequestDto,
   WorkflowRunRecordDto,
+  WorkspaceBoardCasResultDto,
   WorkspaceBoardSnapshotDto,
   WorkspaceDto,
   WorkspaceEventRecordDto,
   WorkspaceFileViewDto,
   WorkspaceFileWriteResultDto,
+  WorkspaceScriptInfoDto,
+  WorktreeHandoffOutcomeDto,
+  WorktreeHandoffPreviewDto,
   WriteWorkspaceFileRequestDto,
   basenameOfPath,
+  clipCodeForSyncHighlightPreview,
   cwdPathsEquivalent,
   formatEffortLabel,
   formatModeLabel,
   gitStatusMayHaveDiffForSlot,
+  hasBoardCasConflict,
   isSubagentSettledStatus,
   isWorkspaceFileEditable,
   nonBlankPath,
@@ -114,6 +134,7 @@ import {
   normalizeModeSlug,
   normalizeWorkspaceRelPath,
   parseProviderSubagentTimelineJson,
+  resolveAuthoritativeProjectWorkspaces,
   resolveSubagentActualHostId,
   resolveSubagentDirectParentAgentId,
   resolveSubagentDirectParentHostId
@@ -287,6 +308,25 @@ export interface OrbitWorkspaceFileWriteOutcome {
   etag: string;
   currentContent: string | null;
   errorMessage: string;
+}
+
+export interface OrbitScopedBoardSaveOutcome {
+  ok: boolean;
+  conflict: boolean;
+  currentRevision: number;
+  currentContent: string;
+  errorMessage: string;
+  errorCode: string;
+}
+
+export interface OrbitWorktreeHandoffContext {
+  hostId: string;
+  workspaceId: string;
+  sourceAgentId: string | null;
+  cwd: string;
+  branch: string;
+  isWorktree: boolean;
+  title: string;
 }
 
 export interface OrbitScopedGitCollabData {
@@ -745,6 +785,9 @@ export class OrbitHarmonyStore {
   private cachedFallbackCatalogs: ProviderModelCatalogDto[] = [];
   private diagramRenderCache: Map<string, RenderDiagramViewDto> = new Map<string, RenderDiagramViewDto>();
   private diagramRenderOrder: string[] = [];
+  // R2-P1-1: Persist unfinished BOARD.md drafts (content + original baseRevision) in Store
+  // keyed by verified `(hostId, workspaceId)` so drafts survive component unmount/remount.
+  private workspaceBoardDrafts: Map<string, OrbitWorkspaceBoardDraft> = new Map<string, OrbitWorkspaceBoardDraft>();
   private pinnedThreadsFilePath: string = '';
   private draftPrefsFilePath: string = '';
   @Trace public draftUseWorktree: boolean = false;
@@ -778,6 +821,9 @@ export class OrbitHarmonyStore {
   @Trace public selectedAgentId: string = '';
   @Trace public currentAgent: AgentCardDto | null = null;
   @Trace public activeCwd: string = '~';
+  // R3-P1-4: Monotonic epoch bumped on every host switch so late Archive/Restore/Rename
+  // outcomes from h1 never surface toast/haptics/sheet-close after h1->h2 or h1->h2->h1.
+  @Trace public hostSelectionEpoch: number = 0;
 
   // OmniComposer & Context State (draft text & slash directive delegated to OrbitComposerStore)
   @Trace public composerProvider: string = 'antigravity';
@@ -816,6 +862,7 @@ export class OrbitHarmonyStore {
   @Trace public lastError: string = '';
   @Trace public statusNote: string = '';
   @Trace public toastMessage: string = '';
+  @Trace public toastResource: Resource | null = null;
   @Trace public toastIsError: boolean = false;
   @Trace public toastRevision: number = 0;
   private toastTimerId: number = -1;
@@ -1887,6 +1934,7 @@ export class OrbitHarmonyStore {
       clearTimeout(this.toastTimerId);
       this.toastTimerId = -1;
     }
+    this.toastResource = null;
     this.toastIsError = isError;
     this.toastMessage = clean;
     this.toastRevision += 1;
@@ -1897,6 +1945,29 @@ export class OrbitHarmonyStore {
     }
     this.toastTimerId = setTimeout(() => {
       this.toastMessage = '';
+      this.toastResource = null;
+      this.toastTimerId = -1;
+    }, 2600);
+  }
+
+  public showToastResource(resource: Resource, isError: boolean = false, errorSummary: string = ''): void {
+    if (this.toastTimerId !== -1) {
+      clearTimeout(this.toastTimerId);
+      this.toastTimerId = -1;
+    }
+    const cleanSummary = errorSummary.trim();
+    this.toastIsError = isError;
+    this.toastResource = resource;
+    this.toastMessage = cleanSummary;
+    this.toastRevision += 1;
+    if (isError && cleanSummary.length > 0) {
+      this.lastError = cleanSummary;
+    } else if (!isError && cleanSummary.length > 0) {
+      this.statusNote = cleanSummary;
+    }
+    this.toastTimerId = setTimeout(() => {
+      this.toastMessage = '';
+      this.toastResource = null;
       this.toastTimerId = -1;
     }, 2600);
   }
@@ -2951,6 +3022,9 @@ export class OrbitHarmonyStore {
     const prevHostId = this.selectedHostId;
     const prevAgentId = this.selectedAgentId;
     const changed = this.fleetStore.setSelectedHostId(hostId);
+    if (changed || bumpNavigation) {
+      this.hostSelectionEpoch += 1;
+    }
     this.pushPrefs = clonePushPreferences(this.getPushPreferencesForHost(hostId));
     if (changed) {
       if (prevWasPa && prevHostId.length > 0 && prevAgentId.length > 0) {
@@ -10354,6 +10428,136 @@ export class OrbitHarmonyStore {
     }
   }
 
+  public async gitPushScoped(
+    hostId: string,
+    cwd: string,
+    remote: string | null,
+    branch: string | null,
+    setUpstream: boolean
+  ): Promise<OrbitScopedActionOutcome<GitPushResultDto>> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      const cleanRemote = remote !== null && remote.trim().length > 0 ? remote.trim() : null;
+      const cleanBranch = branch !== null && branch.trim().length > 0 ? branch.trim() : null;
+      const req: GitPushRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        remote: cleanRemote,
+        branch: cleanBranch,
+        set_upstream: setUpstream
+      };
+      const raw = await this.bridge.gitPushJson(JSON.stringify(req));
+      const res = JSON.parse(raw) as GitPushResultDto;
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        true
+      );
+      this.gitPanelRevision += 1;
+      return { ok: true, data: res, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitPushScoped failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public async gitDiscardScopedFiles(
+    hostId: string,
+    cwd: string,
+    paths: string[],
+    includeUntracked: boolean
+  ): Promise<OrbitScopedActionOutcome<number>> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || paths.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    const validPaths: string[] = [];
+    for (let i = 0; i < paths.length; i++) {
+      // Preserve literal trailing spaces on paths (never call .trim() on non-empty file paths).
+      if (paths[i].length > 0 && paths[i].trim().length > 0) {
+        validPaths.push(paths[i]);
+      }
+    }
+    if (validPaths.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      const req: GitDiscardFilesRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        paths: validPaths,
+        include_untracked: includeUntracked
+      };
+      await this.bridge.gitDiscardFilesJson(JSON.stringify(req));
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        true
+      );
+      this.gitPanelRevision += 1;
+      return { ok: true, data: validPaths.length, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitDiscardScopedFiles failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public highlightScopedWorkspaceCode(
+    language: string,
+    code: string,
+    maxLines: number = 250
+  ): HighlightedCodeDto | null {
+    if (this.bridge === null) {
+      return null;
+    }
+    try {
+      const capped = Math.max(1, Math.min(250, Math.floor(maxLines)));
+      // R2-P1-3: Pre-clip oversized inputs on safe UTF-16 surrogate boundaries BEFORE
+      // JSON.stringify so 16 MiB single-line bundles complete in < 5 ms without copying 16 MiB JSON.
+      const clipped = clipCodeForSyncHighlightPreview(code, capped);
+      const req: HighlightWorkspaceCodeRequestDto = {
+        language: language,
+        code: clipped.clippedCode,
+        max_lines: capped,
+        plain_line_numbers: clipped.plainLineNumbers.length > 0 ? clipped.plainLineNumbers : undefined
+      };
+      const raw = this.bridge.highlightWorkspaceCodeJson(JSON.stringify(req));
+      const parsed = JSON.parse(raw) as HighlightedCodeDto;
+      if (clipped.preTruncated) {
+        return {
+          language: parsed.language,
+          lines: parsed.lines,
+          total_lines: clipped.totalLines > 0
+            ? Math.max(parsed.total_lines, clipped.totalLines)
+            : parsed.total_lines,
+          total_lines_exact: clipped.totalLinesExact && parsed.total_lines_exact !== false,
+          truncated: true
+        };
+      }
+      return {
+        language: parsed.language,
+        lines: parsed.lines,
+        total_lines: parsed.total_lines,
+        total_lines_exact: parsed.total_lines_exact !== false,
+        truncated: parsed.truncated
+      };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'highlightScopedWorkspaceCode failed', err as Object);
+      return null;
+    }
+  }
+
   // --- Scoped Workspace Files & Protected File Save Helpers ---
 
   public loadScopedWorkspaceFiles(
@@ -10398,6 +10602,40 @@ export class OrbitHarmonyStore {
     } catch (err) {
       orbitLogWarn('OrbitStore', 'readScopedWorkspaceFile failed', err as Object);
       return null;
+    }
+  }
+
+  public async readScopedWorkspaceFileChunk(
+    req: ReadWorkspaceFileRequestDto
+  ): Promise<OrbitScopedActionOutcome<WorkspaceFileViewDto>> {
+    const cleanHost = req.host_id.trim();
+    const cleanCwd = nonBlankPath(req.cwd);
+    const cleanPath = nonBlankPath(req.path);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanPath.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      const payload: ReadWorkspaceFileRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        path: cleanPath,
+        offset_bytes: req.offset_bytes !== undefined && req.offset_bytes !== null && req.offset_bytes >= 0
+          ? Math.floor(req.offset_bytes)
+          : null,
+        max_bytes: req.max_bytes !== undefined && req.max_bytes !== null && req.max_bytes > 0
+          ? Math.floor(req.max_bytes)
+          : null,
+        expected_etag: req.expected_etag !== undefined && req.expected_etag !== null && req.expected_etag.trim().length > 0
+          ? req.expected_etag.trim()
+          : null
+      };
+      const json = await this.bridge.readWorkspaceFileRequestJson(JSON.stringify(payload));
+      const view = JSON.parse(json) as WorkspaceFileViewDto;
+      return { ok: true, data: view, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'readScopedWorkspaceFileChunk failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
     }
   }
 
@@ -10728,6 +10966,26 @@ export class OrbitHarmonyStore {
     }
   }
 
+  public loadScopedTerminalDelta(
+    hostId: string,
+    slot: number,
+    sinceRevision: number
+  ): TerminalScreenDeltaDto | null {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return null;
+    }
+    try {
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      const safeSince = sinceRevision > 0 ? Math.floor(sinceRevision) : 0;
+      const raw = this.bridge.terminalScreenDeltaSlotJson(cleanHost, normalizedSlot, safeSince);
+      return JSON.parse(raw) as TerminalScreenDeltaDto | null;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'loadScopedTerminalDelta failed', err as Object);
+      return null;
+    }
+  }
+
   public sendScopedTerminalBytes(hostId: string, slot: number, bytes: Uint8Array): void {
     const cleanHost = hostId.trim();
     if (this.bridge === null || cleanHost.length === 0 || bytes.length === 0) {
@@ -10805,24 +11063,32 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public startScopedTerminal(hostId: string, cwd: string, cols?: number, rows?: number): void {
+  public startScopedTerminal(
+    hostId: string,
+    cwd: string,
+    cols?: number,
+    rows?: number,
+    slot: number = 1
+  ): void {
     const cleanHost = hostId.trim();
     const cleanCwd = nonBlankPath(cwd);
     if (this.bridge === null || cleanHost.length === 0) {
       return;
     }
     try {
-      this.bridge.startTerminal(
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      this.bridge.startTerminalSlot(
         cleanHost,
         cleanCwd.length > 0 ? cleanCwd : '~',
         cols !== undefined && cols >= 24 ? Math.floor(cols) : this.terminalCols,
-        rows !== undefined && rows >= 8 ? Math.floor(rows) : this.terminalGridRows
+        rows !== undefined && rows >= 8 ? Math.floor(rows) : this.terminalGridRows,
+        normalizedSlot
       );
-      this.clearScopedTerminalGridCache(cleanHost);
+      this.clearScopedTerminalGridCache(cleanHost, normalizedSlot);
       this.triggerHaptic(10);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'startScopedTerminal failed', err as Object);
-      this.showToast('Failed to start terminal', true);
+      this.showToastResource($r('app.string.terminal_start_failed'), true);
     }
   }
 
@@ -10853,11 +11119,11 @@ export class OrbitHarmonyStore {
       this.clearScopedTerminalGridCache(cleanHost);
       this.reloadHostAsync(cleanHost);
       this.terminalPanelRevision += 1;
-      this.showToast('Terminal closed', false);
+      this.showToastResource($r('app.string.terminal_closed_toast'), false);
       this.triggerHaptic(10);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'killScopedTerminal failed', err as Object);
-      this.showToast('Failed to close terminal', true);
+      this.showToastResource($r('app.string.terminal_close_failed'), true);
     }
   }
 
@@ -11113,58 +11379,697 @@ export class OrbitHarmonyStore {
     };
   }
 
-  public saveScopedWorkspaceBoard(
+  public getWorkspaceBoardDraft(targetKey: string): OrbitWorkspaceBoardDraft | null {
+    const clean = targetKey.trim();
+    if (clean.length === 0) {
+      return null;
+    }
+    const found = this.workspaceBoardDrafts.get(clean);
+    if (found === undefined) {
+      return null;
+    }
+    return {
+      content: found.content,
+      baseRevision: found.baseRevision
+    };
+  }
+
+  public setWorkspaceBoardDraft(targetKey: string, content: string, baseRevision: number): void {
+    const clean = targetKey.trim();
+    if (clean.length === 0) {
+      return;
+    }
+    this.workspaceBoardDrafts.set(clean, {
+      content: content,
+      baseRevision: Math.max(0, Math.floor(baseRevision))
+    });
+  }
+
+  public clearWorkspaceBoardDraft(targetKey: string): void {
+    const clean = targetKey.trim();
+    if (clean.length === 0) {
+      return;
+    }
+    this.workspaceBoardDrafts.delete(clean);
+  }
+
+  public isHostBoardCasSupported(hostId: string): boolean {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return false;
+    }
+    const detail = this.getScopedHostDetail(cleanHost);
+    if (detail !== null && detail.host !== undefined && detail.host !== null) {
+      return detail.host.board_cas_supported === true;
+    }
+    for (let i = 0; i < this.hosts.length; i++) {
+      if (this.hosts[i].host_id === cleanHost) {
+        return this.hosts[i].board_cas_supported === true;
+      }
+    }
+    return false;
+  }
+
+  public async saveScopedWorkspaceBoardWithCas(
     hostId: string,
     workspaceId: string,
     content: string,
+    expectedRevision: number,
+    force: boolean = false,
     expectedCwd: string = '',
     expectedAgentId: string | null = null
-  ): boolean {
+  ): Promise<OrbitScopedBoardSaveOutcome> {
     const cleanHost = hostId.trim();
     const cleanWs = workspaceId.trim();
     if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
-      this.showToast('No workspace bound to this tab', true);
-      return false;
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: 0,
+        currentContent: '',
+        errorMessage: '',
+        errorCode: 'unbound'
+      };
     }
-    // Re-verify workspace ownership and loaded snapshot immediately before write (R2-P0-2).
     const detail = this.getScopedHostDetail(cleanHost);
     if (detail === null) {
-      this.showToast('Workspace metadata is still loading — please wait', true);
-      return false;
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: 0,
+        currentContent: '',
+        errorMessage: '',
+        errorCode: 'loading'
+      };
     }
     const verified = this.verifyScopedWorkspace(detail, expectedCwd, cleanWs, expectedAgentId);
     if (verified === null || verified.workspace_id !== cleanWs) {
-      this.showToast('Workspace changed or no longer matches this tab', true);
-      return false;
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: 0,
+        currentContent: '',
+        errorMessage: '',
+        errorCode: 'changed'
+      };
     }
     let hasLoadedSnapshot = false;
+    let liveRevision = 0;
+    let liveContent = '';
     try {
       const snapJson = this.bridge.workspaceBoardJson(cleanHost, cleanWs);
       if (snapJson !== undefined && snapJson !== null && snapJson.trim().length > 0) {
         const parsedSnap: Object | null = JSON.parse(snapJson) as Object | null;
         if (parsedSnap !== null && typeof parsedSnap === 'object') {
           const snap = parsedSnap as WorkspaceBoardSnapshotDto;
-          hasLoadedSnapshot = typeof snap.content === 'string';
+          if (typeof snap.content === 'string') {
+            hasLoadedSnapshot = true;
+            liveContent = snap.content;
+            liveRevision = typeof snap.revision === 'number' ? snap.revision : 0;
+          }
         }
       }
     } catch (_err) {
       hasLoadedSnapshot = false;
     }
     if (!hasLoadedSnapshot) {
-      this.showToast('Board snapshot has not finished loading yet', true);
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: 0,
+        currentContent: '',
+        errorMessage: '',
+        errorCode: 'snapshot_not_loaded'
+      };
+    }
+    const detailBoard = detail.workspace_boards !== undefined && detail.workspace_boards !== null
+      ? detail.workspace_boards[cleanWs]
+      : undefined;
+    if (detailBoard !== undefined && typeof detailBoard.revision === 'number' && detailBoard.revision > liveRevision) {
+      liveRevision = detailBoard.revision;
+      if (typeof detailBoard.content === 'string') {
+        liveContent = detailBoard.content;
+      }
+    }
+    // R2-P0-A: Refuse guarded CAS writes locally BEFORE calling native RPC when the connected
+    // daemon did not advertise `board_cas_supported === true`, preserving both daemon & draft.
+    if (!force && detail.host.board_cas_supported !== true) {
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: liveRevision,
+        currentContent: liveContent,
+        errorMessage: '',
+        errorCode: 'cas_unsupported'
+      };
+    }
+    if (!force && hasBoardCasConflict(expectedRevision, liveRevision)) {
+      return {
+        ok: false,
+        conflict: true,
+        currentRevision: liveRevision,
+        currentContent: liveContent,
+        errorMessage: '',
+        errorCode: 'cas_conflict'
+      };
+    }
+    try {
+      const req: UpdateWorkspaceBoardCasRequestDto = {
+        host_id: cleanHost,
+        workspace_id: cleanWs,
+        content: content,
+        section: null,
+        updated_by: 'harmony-user',
+        expected_revision: force ? null : Math.max(0, Math.floor(expectedRevision))
+      };
+      const raw = await this.bridge.updateWorkspaceBoardCasJson(JSON.stringify(req));
+      const parsed = JSON.parse(raw) as WorkspaceBoardCasResultDto;
+      const returnedBoard = parsed.board;
+      const returnedRev = returnedBoard !== undefined && returnedBoard !== null && typeof returnedBoard.revision === 'number'
+        ? returnedBoard.revision
+        : liveRevision;
+      const returnedContent = returnedBoard !== undefined && returnedBoard !== null && typeof returnedBoard.content === 'string'
+        ? returnedBoard.content
+        : liveContent;
+      this.panelDataRevision += 1;
+      if (parsed.conflict) {
+        return {
+          ok: false,
+          conflict: true,
+          currentRevision: returnedRev,
+          currentContent: returnedContent,
+          errorMessage: '',
+          errorCode: 'cas_conflict'
+        };
+      }
+      if (parsed.ok) {
+        return {
+          ok: true,
+          conflict: false,
+          currentRevision: returnedRev,
+          currentContent: returnedContent,
+          errorMessage: '',
+          errorCode: ''
+        };
+      }
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: returnedRev,
+        currentContent: returnedContent,
+        errorMessage: '',
+        errorCode: 'rpc_error'
+      };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'saveScopedWorkspaceBoardWithCas failed', err as Object);
+      const detailMsg = err instanceof Error ? err.message.trim() : String(err).trim();
+      const isCasUnsupported = detailMsg.toLowerCase().indexOf('board_cas_unsupported') >= 0;
+      return {
+        ok: false,
+        conflict: false,
+        currentRevision: liveRevision,
+        currentContent: liveContent,
+        errorMessage: detailMsg,
+        errorCode: isCasUnsupported ? 'cas_unsupported' : 'rpc_error'
+      };
+    }
+  }
+
+  public async saveScopedWorkspaceBoard(
+    hostId: string,
+    workspaceId: string,
+    content: string,
+    expectedCwd: string = '',
+    expectedAgentId: string | null = null
+  ): Promise<boolean> {
+    const res = await this.saveScopedWorkspaceBoardWithCas(
+      hostId,
+      workspaceId,
+      content,
+      0,
+      true,
+      expectedCwd,
+      expectedAgentId
+    );
+    return res.ok;
+  }
+
+  // --- Worktree Handoff, Workspace v2 & Dev Scripts Helpers (PR-5) ---
+
+  public async previewScopedWorktreeHandoff(
+    req: PreviewWorktreeHandoffRequestDto
+  ): Promise<OrbitScopedActionOutcome<WorktreeHandoffPreviewDto>> {
+    const cleanHost = req.host_id.trim();
+    const cleanWs = req.workspace_id.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      const payload: PreviewWorktreeHandoffRequestDto = {
+        host_id: cleanHost,
+        workspace_id: cleanWs,
+        source_agent_id: req.source_agent_id !== undefined && req.source_agent_id !== null && req.source_agent_id.trim().length > 0
+          ? req.source_agent_id.trim()
+          : null,
+        direction: req.direction,
+        target_workspace_id: req.target_workspace_id !== undefined && req.target_workspace_id !== null && req.target_workspace_id.trim().length > 0
+          ? req.target_workspace_id.trim()
+          : null,
+        include_committed: req.include_committed
+      };
+      const raw = await this.bridge.previewWorktreeHandoffJson(JSON.stringify(payload));
+      const preview = JSON.parse(raw) as WorktreeHandoffPreviewDto;
+      return { ok: true, data: preview, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'previewScopedWorktreeHandoff failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public async executeScopedWorktreeHandoff(
+    req: ExecuteWorktreeHandoffRequestDto
+  ): Promise<OrbitScopedActionOutcome<WorktreeHandoffOutcomeDto>> {
+    const cleanHost = req.host_id.trim();
+    const cleanWs = req.workspace_id.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      const payload: ExecuteWorktreeHandoffRequestDto = {
+        host_id: cleanHost,
+        workspace_id: cleanWs,
+        source_agent_id: req.source_agent_id !== undefined && req.source_agent_id !== null && req.source_agent_id.trim().length > 0
+          ? req.source_agent_id.trim()
+          : null,
+        direction: req.direction,
+        mode: req.mode,
+        target_workspace_id: req.target_workspace_id !== undefined && req.target_workspace_id !== null && req.target_workspace_id.trim().length > 0
+          ? req.target_workspace_id.trim()
+          : null,
+        include_committed: req.include_committed,
+        branch: req.branch !== undefined && req.branch !== null && req.branch.trim().length > 0
+          ? req.branch.trim()
+          : null,
+        allow_three_way_conflicts: req.allow_three_way_conflicts
+      };
+      const raw = await this.bridge.executeWorktreeHandoffJson(JSON.stringify(payload));
+      const outcome = JSON.parse(raw) as WorktreeHandoffOutcomeDto;
+      this.reloadHostAsync(cleanHost);
+      this.gitPanelRevision += 1;
+      this.panelDataRevision += 1;
+      return { ok: true, data: outcome, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'executeScopedWorktreeHandoff failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public createWorkspaceV2(req: CreateWorkspaceV2RequestDto): boolean {
+    const cleanHost = req.host_id.trim();
+    const cleanCwd = nonBlankPath(req.source_cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
       return false;
     }
     try {
-      this.bridge.updateWorkspaceBoard(cleanHost, cleanWs, content, null, 'harmony-user');
-      this.showToast('Saved BOARD.md', false);
+      const payload: CreateWorkspaceV2RequestDto = {
+        host_id: cleanHost,
+        source_cwd: cleanCwd,
+        title: req.title !== undefined && req.title !== null && req.title.trim().length > 0 ? req.title.trim() : null,
+        isolation: req.isolation ?? 'local',
+        worktree_mode: req.worktree_mode ?? 'branch_off',
+        worktree_branch: req.worktree_branch !== undefined && req.worktree_branch !== null && req.worktree_branch.trim().length > 0
+          ? req.worktree_branch.trim()
+          : null,
+        base_ref: req.base_ref !== undefined && req.base_ref !== null && req.base_ref.trim().length > 0
+          ? req.base_ref.trim()
+          : null,
+        pr_number: req.pr_number !== undefined && req.pr_number !== null && req.pr_number > 0
+          ? Math.floor(req.pr_number)
+          : null
+      };
+      this.bridge.createWorkspaceV2Json(JSON.stringify(payload));
+      this.reloadHostAsync(cleanHost);
       this.panelDataRevision += 1;
+      this.showToastResource($r('app.string.workspace_create_dispatched'), false);
       this.triggerHaptic(10);
       return true;
     } catch (err) {
-      orbitLogWarn('OrbitStore', 'saveScopedWorkspaceBoard failed', err as Object);
-      this.showToast('Failed to save BOARD.md', true);
+      orbitLogWarn('OrbitStore', 'createWorkspaceV2 failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      this.showToastResource(
+        detail.length > 0
+          ? $r('app.string.workspace_create_failed_detail', detail)
+          : $r('app.string.workspace_create_failed'),
+        true,
+        detail
+      );
       return false;
     }
+  }
+
+  public async archiveWorkspaceV2(
+    hostId: string,
+    workspaceId: string,
+    keepAgentsUnclassified: boolean
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      await this.bridge.archiveWorkspaceV2Json(cleanHost, cleanWs, keepAgentsUnclassified);
+      this.reloadHostAsync(cleanHost);
+      this.panelDataRevision += 1;
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'archiveWorkspaceV2 failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public async unarchiveWorkspace(
+    hostId: string,
+    workspaceId: string
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      await this.bridge.unarchiveWorkspaceJson(cleanHost, cleanWs);
+      this.reloadHostAsync(cleanHost);
+      this.panelDataRevision += 1;
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'unarchiveWorkspace failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public async renameWorkspace(
+    hostId: string,
+    workspaceId: string,
+    title: string
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    const cleanTitle = title.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0 || cleanTitle.length === 0) {
+      return { ok: false, data: null, errorDetail: '' };
+    }
+    try {
+      await this.bridge.renameWorkspaceConfirmedJson(cleanHost, cleanWs, cleanTitle);
+      this.reloadHostAsync(cleanHost);
+      this.panelDataRevision += 1;
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'renameWorkspace failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      return { ok: false, data: null, errorDetail: detail };
+    }
+  }
+
+  public requestWorkspaceScripts(hostId: string, workspaceId: string): boolean {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
+      return false;
+    }
+    try {
+      this.bridge.requestWorkspaceScripts(cleanHost, cleanWs);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'requestWorkspaceScripts failed', err as Object);
+      return false;
+    }
+  }
+
+  public getWorkspaceScripts(hostId: string, workspaceId: string): WorkspaceScriptInfoDto[] {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (cleanHost.length === 0 || cleanWs.length === 0) {
+      return [];
+    }
+    const detail = this.getScopedHostDetail(cleanHost);
+    if (detail === null || detail.workspace_scripts === undefined || detail.workspace_scripts === null) {
+      return [];
+    }
+    const list = detail.workspace_scripts[cleanWs];
+    return Array.isArray(list) ? list : [];
+  }
+
+  public startWorkspaceScript(hostId: string, workspaceId: string, scriptName: string): boolean {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    const cleanName = scriptName.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0 || cleanName.length === 0) {
+      return false;
+    }
+    try {
+      this.bridge.startWorkspaceScriptJson(cleanHost, cleanWs, cleanName);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'startWorkspaceScript failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      this.showToastResource(
+        detail.length > 0
+          ? $r('app.string.scripts_start_failed_detail', detail)
+          : $r('app.string.scripts_start_failed'),
+        true,
+        detail
+      );
+      return false;
+    }
+  }
+
+  public stopWorkspaceScript(hostId: string, workspaceId: string, scriptName: string): boolean {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    const cleanName = scriptName.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0 || cleanName.length === 0) {
+      return false;
+    }
+    try {
+      this.bridge.stopWorkspaceScriptJson(cleanHost, cleanWs, cleanName);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'stopWorkspaceScript failed', err as Object);
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      this.showToastResource(
+        detail.length > 0
+          ? $r('app.string.scripts_stop_failed_detail', detail)
+          : $r('app.string.scripts_stop_failed'),
+        true,
+        detail
+      );
+      return false;
+    }
+  }
+
+  public resolveProjectWorkspaces(
+    hostId: string,
+    projectCwd: string,
+    projectDirectories?: string[],
+    targetGroupId?: string
+  ): WorkspaceDto[] {
+    const cleanHost = hostId.trim();
+    const detail = this.getScopedHostDetail(cleanHost);
+    if (detail === null) {
+      return [];
+    }
+    const primary = nonBlankPath(projectCwd);
+    const fallbackDirs: string[] = [];
+    if (primary.length > 0) {
+      fallbackDirs.push(primary);
+    }
+    if (projectDirectories !== undefined && projectDirectories !== null) {
+      for (let i = 0; i < projectDirectories.length; i++) {
+        const d = nonBlankPath(projectDirectories[i]);
+        if (d.length > 0 && fallbackDirs.indexOf(d) < 0) {
+          fallbackDirs.push(d);
+        }
+      }
+    }
+    const hostGroups: OrbitProjectDirectoryGroupInput[] = [];
+    let resolvedTargetId = (targetGroupId ?? '').trim();
+    const groups = this.sidebarView !== null && Array.isArray(this.sidebarView.projects)
+      ? this.sidebarView.projects
+      : [];
+    let matchedSidebarGroupWorkspaceIds: string[] | null = null;
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (g.host_id !== cleanHost) {
+        continue;
+      }
+      hostGroups.push({
+        id: g.id,
+        primaryCwd: g.primary_cwd,
+        directories: g.directories
+      });
+      const isTargetMatch = resolvedTargetId.length > 0
+        ? g.id === resolvedTargetId
+        : (primary.length > 0 && cwdPathsEquivalent(g.primary_cwd, primary, null));
+      if (isTargetMatch) {
+        if (resolvedTargetId.length === 0) {
+          resolvedTargetId = g.id;
+        }
+        if (Array.isArray(g.workspace_ids)) {
+          matchedSidebarGroupWorkspaceIds = g.workspace_ids;
+        }
+      }
+    }
+    // R3-P1-2: Prefer authoritative Core `SidebarProjectGroupView.workspace_ids` projection
+    // directly when available so HarmonyOS project menus NEVER drift from Rust `sidebar.rs`.
+    if (matchedSidebarGroupWorkspaceIds !== null) {
+      const idSet = new Set<string>(matchedSidebarGroupWorkspaceIds);
+      const projected: WorkspaceDto[] = [];
+      for (let i = 0; i < detail.workspaces.length; i++) {
+        const ws = detail.workspaces[i];
+        if (idSet.has(ws.workspace_id)) {
+          projected.push(ws);
+        }
+      }
+      return projected;
+    }
+    if (resolvedTargetId.length === 0) {
+      if (fallbackDirs.length === 0) {
+        return [];
+      }
+      resolvedTargetId = `__fallback__::${cleanHost}::${fallbackDirs[0]}`;
+      hostGroups.push({
+        id: resolvedTargetId,
+        primaryCwd: fallbackDirs[0],
+        directories: fallbackDirs
+      });
+    } else {
+      let targetExists = false;
+      for (let i = 0; i < hostGroups.length; i++) {
+        if (hostGroups[i].id === resolvedTargetId) {
+          targetExists = true;
+          break;
+        }
+      }
+      if (!targetExists && fallbackDirs.length > 0) {
+        hostGroups.push({
+          id: resolvedTargetId,
+          primaryCwd: fallbackDirs[0],
+          directories: fallbackDirs
+        });
+      }
+    }
+    return resolveAuthoritativeProjectWorkspaces(detail.workspaces, hostGroups, resolvedTargetId);
+  }
+
+  public resolveActiveWorktreeWorkspace(): OrbitWorktreeHandoffContext | null {
+    const hostId = this.selectedHostId.trim();
+    if (hostId.length === 0) {
+      return null;
+    }
+    const detail = this.getScopedHostDetail(hostId);
+    if (detail === null) {
+      return null;
+    }
+    const agent = this.currentAgent;
+    const explicitWs = agent !== null && agent.workspace_id !== null ? agent.workspace_id.trim() : '';
+    const cwd = agent !== null && nonBlankPath(agent.cwd).length > 0 ? agent.cwd : this.activeCwd;
+    const ws = this.verifyScopedWorkspace(detail, cwd, explicitWs, agent !== null ? agent.agent_id : null);
+    if (ws === null) {
+      return null;
+    }
+    return {
+      hostId: hostId,
+      workspaceId: ws.workspace_id,
+      sourceAgentId: agent !== null ? agent.agent_id : null,
+      cwd: ws.cwd,
+      branch: ws.git_branch ?? '',
+      isWorktree: ws.is_worktree,
+      title: ws.title
+    };
+  }
+
+  public openWorktreeHandoffSheet(
+    hostId: string,
+    workspaceId: string,
+    sourceAgentId: string | null,
+    cwd: string,
+    title: string = ''
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (cleanHost.length === 0 || cleanWs.length === 0) {
+      return;
+    }
+    this.shellStore.openModal({
+      kind: 'worktree_handoff',
+      hostId: cleanHost,
+      workspaceId: cleanWs,
+      agentId: sourceAgentId !== null ? sourceAgentId : undefined,
+      cwd: cwd,
+      title: title
+    });
+  }
+
+  public openWorkspaceScriptsSheet(
+    hostId: string,
+    workspaceId: string,
+    title: string = ''
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (cleanHost.length === 0 || cleanWs.length === 0) {
+      return;
+    }
+    // WorkspaceScriptsSheet owns automatic ListWorkspaceScripts dispatch on appear / target change (P1-6).
+    this.shellStore.openModal({
+      kind: 'workspace_scripts',
+      hostId: cleanHost,
+      workspaceId: cleanWs,
+      title: title
+    });
+  }
+
+  public openCreateWorkspaceV2Sheet(
+    hostId: string,
+    sourceCwd: string,
+    title: string = ''
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(sourceCwd);
+    if (cleanHost.length === 0 || cleanCwd.length === 0) {
+      return;
+    }
+    this.shellStore.openModal({
+      kind: 'create_workspace_v2',
+      hostId: cleanHost,
+      cwd: cleanCwd,
+      title: title
+    });
+  }
+
+  public openRenameWorkspaceSheet(
+    hostId: string,
+    workspaceId: string,
+    currentTitle: string = ''
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (cleanHost.length === 0 || cleanWs.length === 0) {
+      return;
+    }
+    this.shellStore.openModal({
+      kind: 'rename_workspace',
+      hostId: cleanHost,
+      workspaceId: cleanWs,
+      title: currentTitle
+    });
   }
 
   public spawnScopedWorkspacePeer(

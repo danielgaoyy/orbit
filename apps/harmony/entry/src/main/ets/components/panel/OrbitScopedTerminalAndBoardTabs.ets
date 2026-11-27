@@ -1,19 +1,22 @@
 import {
   AgentCardDto,
   DevKeyItem,
+  OrbitTerminalSlotViewState,
   TerminalRowDto,
   TerminalScreenDto,
   TerminalSpanDto,
   TerminalSummaryDto,
   WorkspaceEventRecordDto,
+  applyTerminalScreenDelta,
   basenameOfPath,
-  formatAgentStatusLabel,
   formatCompactRelativeTime,
-  formatProviderLabel
+  mergeBoardCasDraft,
+  parsePeerHandleAliases
 } from '../../model/OrbitTypes';
 import {
   OrbitHarmonyStore,
-  OrbitScopedBoardData
+  OrbitScopedBoardData,
+  OrbitScopedBoardSaveOutcome
 } from '../../model/OrbitHarmonyStore';
 import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitFleetStore } from '../../model/stores/OrbitFleetStore';
@@ -35,6 +38,24 @@ import {
 } from '../../theme/OrbitTokens';
 import { OrbitTheme } from '../../theme/OrbitTheme';
 import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
+import {
+  OrbitAgentListItem,
+  mapAgentCardToListStatus,
+  resolveAgentEffortDisplay,
+  resolveAgentFallbackLabel,
+  resolveCompactAgentModelLabel
+} from '../common/OrbitAgentListItem';
+
+export interface OrbitScopedPeerRowProjection {
+  peer: AgentCardDto;
+  title: string;
+  status: string;
+  modelLabel: string;
+  effortLabel: string;
+  agentLabel: string;
+  aliasesMeta: string;
+  stableKey: string;
+}
 
 interface OrbitScopedTerminalRenderSpan {
   renderKey: string;
@@ -159,6 +180,7 @@ export struct OrbitScopedTerminalTabView {
   @Local private activeSlot: number = 1;
   @Local private screen: TerminalScreenDto | null = null;
   @Local private screenRev: number = 0;
+  @Local private activeDeltaRevision: number = 0;
   @Local private lineInput: string = '';
   @Local private rawMode: boolean = false;
   @Local private ctrlSticky: boolean = false;
@@ -168,12 +190,67 @@ export struct OrbitScopedTerminalTabView {
   @Local private gridRows: number = 24;
 
   private lastTargetKey: string = '';
+  private lastConsumedRevision: number = 0;
   private copiedTimerId: number = -1;
+  private slotStateByKey: Map<string, OrbitTerminalSlotViewState> = new Map<string, OrbitTerminalSlotViewState>();
   @Local private store: OrbitHarmonyStore = orbitRuntime();
   @Local private fleetStore: OrbitFleetStore = orbitRuntime().fleetStore;
 
+  @Computed
+  get isCompactLandscape(): boolean {
+    return this.store.windowWidthVp > this.store.windowHeightVp && this.store.windowHeightVp < 540;
+  }
+
+  private effectiveScopeKey(): string {
+    const clean = this.scopeKey.trim();
+    return clean.length > 0 ? clean : this.store.sidePanelStore.activeScopeKey;
+  }
+
   private currentTargetKey(): string {
-    return `${this.scopeKey}|${this.tab.hostId}::${this.tab.tabId}`;
+    return encodeSidePanelKeyTuple(['pty_tab', this.effectiveScopeKey(), this.tab.hostId.trim(), this.tab.tabId]);
+  }
+
+  private slotStateKeyFor(targetKey: string, slotNum: number): string {
+    const clamped = Math.max(1, Math.min(3, Math.floor(slotNum)));
+    return encodeSidePanelKeyTuple(['pty_slot', targetKey, String(clamped)]);
+  }
+
+  private saveSlotState(targetKey: string, slotNum: number): void {
+    if (targetKey.length === 0) {
+      return;
+    }
+    const key = this.slotStateKeyFor(targetKey, slotNum);
+    this.slotStateByKey.set(key, {
+      screen: this.screen,
+      revision: this.activeDeltaRevision,
+      lastRequestedRevision: this.lastConsumedRevision,
+      lineInput: this.lineInput,
+      rawMode: this.rawMode,
+      ctrlSticky: this.ctrlSticky,
+      altSticky: this.altSticky
+    });
+  }
+
+  private restoreSlotState(targetKey: string, slotNum: number): void {
+    const key = this.slotStateKeyFor(targetKey, slotNum);
+    const saved = this.slotStateByKey.get(key);
+    if (saved !== undefined) {
+      this.screen = saved.screen;
+      this.activeDeltaRevision = saved.revision;
+      this.lastConsumedRevision = saved.lastRequestedRevision;
+      this.lineInput = saved.lineInput;
+      this.rawMode = saved.rawMode;
+      this.ctrlSticky = saved.ctrlSticky;
+      this.altSticky = saved.altSticky;
+    } else {
+      this.screen = null;
+      this.activeDeltaRevision = 0;
+      this.lastConsumedRevision = 0;
+      this.lineInput = '';
+      this.rawMode = false;
+      this.ctrlSticky = false;
+      this.altSticky = false;
+    }
   }
 
   private resolveTabInitialSlot(): number {
@@ -186,6 +263,7 @@ export struct OrbitScopedTerminalTabView {
   aboutToAppear(): void {
     this.lastTargetKey = this.currentTargetKey();
     this.activeSlot = this.resolveTabInitialSlot();
+    this.restoreSlotState(this.lastTargetKey, this.activeSlot);
     if (this.tab.hostId.trim().length > 0) {
       this.store.ensureScopedHostDetailAsync(this.tab.hostId);
     }
@@ -193,6 +271,7 @@ export struct OrbitScopedTerminalTabView {
   }
 
   aboutToDisappear(): void {
+    this.saveSlotState(this.lastTargetKey, this.activeSlot);
     this.store.shellStore.setTerminalFocused(false);
     if (this.copiedTimerId !== -1) {
       clearTimeout(this.copiedTimerId);
@@ -204,11 +283,10 @@ export struct OrbitScopedTerminalTabView {
   onDataChanged(_mon: IMonitor): void {
     const nextKey = this.currentTargetKey();
     if (nextKey !== this.lastTargetKey) {
+      this.saveSlotState(this.lastTargetKey, this.activeSlot);
       this.lastTargetKey = nextKey;
-      this.lineInput = '';
-      this.ctrlSticky = false;
-      this.altSticky = false;
       this.activeSlot = this.resolveTabInitialSlot();
+      this.restoreSlotState(nextKey, this.activeSlot);
       if (this.tab.hostId.trim().length > 0) {
         this.store.ensureScopedHostDetailAsync(this.tab.hostId);
       }
@@ -216,21 +294,67 @@ export struct OrbitScopedTerminalTabView {
     this.reloadScreen();
   }
 
-  private reloadScreen(): void {
-    if (this.tab.hostId.trim().length === 0) {
+  private reloadScreen(forceReset: boolean = false, sinceOverride?: number): void {
+    const cleanHost = this.tab.hostId.trim();
+    const targetKey = this.currentTargetKey();
+    const slot = Math.max(1, Math.min(3, this.activeSlot));
+    if (cleanHost.length === 0) {
       this.screen = null;
+      this.activeDeltaRevision = 0;
+      this.lastConsumedRevision = 0;
+      this.saveSlotState(targetKey, slot);
       this.screenRev += 1;
       return;
     }
-    this.screen = this.store.loadScopedTerminalScreen(this.tab.hostId, this.activeSlot);
+    const prevScreen = forceReset ? null : this.screen;
+    let sinceRev = forceReset
+      ? 0
+      : (sinceOverride !== undefined ? sinceOverride : this.activeDeltaRevision);
+    // P1-1: If this consumer's own cursor ever regresses below its high watermark, request a clean reset (0).
+    if (!forceReset && sinceRev > 0 && sinceRev < this.lastConsumedRevision) {
+      sinceRev = 0;
+    }
+    const delta = this.store.loadScopedTerminalDelta(cleanHost, slot, sinceRev);
+    if (delta !== null) {
+      const applied = applyTerminalScreenDelta(sinceRev === 0 ? null : prevScreen, sinceRev, delta);
+      const cursorMoved = prevScreen === null ||
+        prevScreen.cursor_row !== applied.screen.cursor_row ||
+        prevScreen.cursor_col !== applied.screen.cursor_col;
+      this.screen = applied.screen;
+      this.activeDeltaRevision = applied.revision;
+      this.lastConsumedRevision = delta.reset || sinceRev === 0
+        ? applied.revision
+        : Math.max(this.lastConsumedRevision, applied.revision);
+      this.saveSlotState(targetKey, slot);
+      if (delta.reset || applied.updatedRowCount > 0 || cursorMoved || forceReset || sinceRev === 0) {
+        this.screenRev += 1;
+      }
+      return;
+    }
+    const fallback = this.store.loadScopedTerminalScreen(cleanHost, slot);
+    this.screen = fallback;
+    this.activeDeltaRevision = 0;
+    this.lastConsumedRevision = 0;
+    this.saveSlotState(targetKey, slot);
     this.screenRev += 1;
   }
 
   private selectSlot(slotNum: number): void {
     const clamped = Math.max(1, Math.min(3, slotNum));
-    this.activeSlot = clamped;
-    this.store.sidePanelStore.updateActiveTabTerminalSlot(this.tab.hostId, this.tab.tabId, clamped);
-    this.reloadScreen();
+    const targetKey = this.currentTargetKey();
+    if (clamped !== this.activeSlot) {
+      this.saveSlotState(targetKey, this.activeSlot);
+      this.activeSlot = clamped;
+      this.restoreSlotState(targetKey, clamped);
+    }
+    this.store.sidePanelStore.updateTabTerminalSlot(
+      this.effectiveScopeKey(),
+      this.tab.hostId,
+      this.tab.tabId,
+      clamped
+    );
+    this.screenRev += 1;
+    this.reloadScreen(false);
     if (this.gridCols >= 24 && this.gridRows >= 8) {
       this.store.resizeScopedTerminalIfChanged(this.tab.hostId, clamped, this.gridCols, this.gridRows);
     }
@@ -513,6 +637,7 @@ export struct OrbitScopedTerminalTabView {
     }
     const cmd = this.lineInput;
     this.lineInput = '';
+    this.saveSlotState(this.currentTargetKey(), this.activeSlot);
     this.store.sendScopedTerminalUtf8(host, this.activeSlot, `${cmd}\r`);
     this.reloadScreen();
   }
@@ -575,6 +700,7 @@ export struct OrbitScopedTerminalTabView {
             .onClick(() => {
               this.rawMode = !this.rawMode;
               this.lineInput = '';
+              this.saveSlotState(this.currentTargetKey(), this.activeSlot);
               this.store.triggerHaptic(8);
             })
 
@@ -591,14 +717,15 @@ export struct OrbitScopedTerminalTabView {
           .backgroundColor(
             this.copiedFeedback ? this.store.palette.statusDirectSoft : this.store.palette.subtleSurface
           )
-          .accessibilityText('Copy terminal output')
+          .accessibilityText($r('app.string.action_copy'))
           .onClick(() => {
             const text = this.store.extractTerminalScreenPlainText(this.screen);
             if (text.length === 0) {
-              this.store.showToast('Terminal buffer is empty', true);
+              this.store.showToastResource($r('app.string.terminal_buffer_empty'), true);
               return;
             }
-            this.store.copyToClipboard(text, 'Copied terminal output');
+            this.store.copyToClipboard(text, '');
+            this.store.showToastResource($r('app.string.terminal_copied_toast'), false);
             this.copiedFeedback = true;
             if (this.copiedTimerId !== -1) {
               clearTimeout(this.copiedTimerId);
@@ -618,22 +745,62 @@ export struct OrbitScopedTerminalTabView {
               this.store.quoteScopedTerminalIntoComposer(this.screen, this.tab.cwd ?? '');
             })
 
-          Button('+ New', { type: ButtonType.Capsule, stateEffect: true })
+          Button($r('app.string.terminal_new_shell'), { type: ButtonType.Capsule, stateEffect: true })
             .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
             .height(28)
             .padding({ left: 10, right: 10 })
             .onClick(() => {
-              this.store.startScopedTerminal(this.tab.hostId, this.tab.cwd ?? '~', this.gridCols, this.gridRows);
+              const targetSlot = this.activeSlot;
+              this.store.startScopedTerminal(
+                this.tab.hostId,
+                this.tab.cwd ?? '~',
+                this.gridCols,
+                this.gridRows,
+                targetSlot
+              );
             })
+
+          if (this.isCompactLandscape && this.terminals.length > 0) {
+            ForEach(
+              this.terminals,
+              (term: TerminalSummaryDto, tIdx: number) => {
+                Button(
+                  term.title.length > 0 ? term.title : (basenameOfPath(term.cwd) || `Shell ${tIdx + 1}`),
+                  { type: ButtonType.Capsule, stateEffect: true }
+                )
+                  .attributeModifier(
+                    orbitButtonMeta(
+                      this.activeTerminalId === term.terminal_id
+                        ? this.store.palette.accentPrimary
+                        : this.store.palette.fgSecondary,
+                      this.activeTerminalId === term.terminal_id
+                        ? this.store.palette.accentPrimarySoft
+                        : this.store.palette.listCard
+                    )
+                  )
+                  .height(28)
+                  .padding({ left: 8, right: 8 })
+                  .onClick(() => {
+                    this.store.attachScopedTerminal(this.tab.hostId, term.terminal_id, this.activeSlot);
+                    this.reloadScreen(true);
+                  })
+              },
+              (term: TerminalSummaryDto): string => `sterm_compact_${this.tab.hostId}_${term.terminal_id}`
+            )
+          }
         }
-        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: OrbitTokens.SPACE_SM })
+        .padding({
+          left: OrbitTokens.SPACE_MD,
+          right: OrbitTokens.SPACE_MD,
+          top: this.isCompactLandscape ? 2 : OrbitTokens.SPACE_SM
+        })
       }
       .scrollable(ScrollDirection.Horizontal)
       .scrollBar(BarState.Off)
       .width('100%')
 
-      // Attached / available PTY pills with attach & kill actions
-      if (this.terminals.length > 0) {
+      // Attached / available PTY pills with attach & kill actions (merged into top bar in compact landscape)
+      if (!this.isCompactLandscape && this.terminals.length > 0) {
         Scroll() {
           Row({ space: OrbitTokens.SPACE_XS }) {
             ForEach(
@@ -656,7 +823,7 @@ export struct OrbitScopedTerminalTabView {
                   .backgroundColor(Color.Transparent)
                   .onClick(() => {
                     this.store.attachScopedTerminal(this.tab.hostId, term.terminal_id, this.activeSlot);
-                    this.reloadScreen();
+                    this.reloadScreen(true);
                   })
 
                   Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -697,14 +864,21 @@ export struct OrbitScopedTerminalTabView {
         if (this.renderedRows.length === 0) {
           Column({ space: OrbitTokens.SPACE_SM }) {
             Blank()
-            Text('No active terminal buffer in this slot.')
+            Text($r('app.string.terminal_no_buffer'))
               .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
             Button($r('app.string.terminal_spawn_shell'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
               .height(36)
               .padding({ left: 14, right: 14 })
               .onClick(() => {
-                this.store.startScopedTerminal(this.tab.hostId, this.tab.cwd ?? '~', this.gridCols, this.gridRows);
+                const targetSlot = this.activeSlot;
+                this.store.startScopedTerminal(
+                  this.tab.hostId,
+                  this.tab.cwd ?? '~',
+                  this.gridCols,
+                  this.gridRows,
+                  targetSlot
+                );
               })
             Blank()
           }
@@ -751,6 +925,7 @@ export struct OrbitScopedTerminalTabView {
           }
           .width('100%')
           .height('100%')
+          .cachedCount(8)
           .scrollBar(BarState.Off)
           .onScrollStart(() => {
             dismissHarmonyKeyboard(this.getUIContext());
@@ -848,7 +1023,7 @@ export struct OrbitScopedTerminalTabView {
             this.submitCommand();
           })
 
-        Button('Send', { type: ButtonType.Capsule, stateEffect: true })
+        Button($r('app.string.action_send'), { type: ButtonType.Capsule, stateEffect: true })
           .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
           .height(38)
           .padding({ left: 12, right: 12 })
@@ -887,14 +1062,22 @@ export struct OrbitScopedBoardTabView {
 
   @Local private subTab: string = 'board'; // 'board' | 'peers'
   @Local private editing: boolean = false;
+  @Local private savingBoard: boolean = false;
   @Local private editingTargetKey: string = '';
+  @Local private editBaseRevision: number = 0;
   @Local private boardDraft: string = '';
   @Local private boardData: OrbitScopedBoardData | null = null;
+  @Local private peerRows: OrbitScopedPeerRowProjection[] = [];
+  @Local private casConflictRevision: number = 0;
+  @Local private casConflictRemoteContent: string = '';
+  @Local private showCasConflictDialog: boolean = false;
   @Local private peerHandleDraft: string = '';
   @Local private peerPromptDraft: string = '';
 
-  private draftByWorkspaceKey: Map<string, string> = new Map<string, string>();
   private lastTabIdentity: string = '';
+  private lastPeerProjectionSig: string = '';
+  private boardSaveSeq: number = 0;
+  private disposed: boolean = false;
   @Local private store: OrbitHarmonyStore = orbitRuntime();
   @Local private fleetStore: OrbitFleetStore = orbitRuntime().fleetStore;
 
@@ -930,6 +1113,15 @@ export struct OrbitScopedBoardTabView {
     return this.hasVerifiedWorkspace && this.boardData !== null && this.boardData.snapshotLoaded;
   }
 
+  @Computed
+  get boardCasSupported(): boolean {
+    const _rev = this.fleetStore.hostDetailRevision;
+    if (_rev < 0) {
+      // Keep reactive dependency on host capability updates
+    }
+    return this.store.isHostBoardCasSupported(this.tab.hostId);
+  }
+
   private currentWorkspaceTargetKey(): string {
     if (!this.canEditBoard || this.boardData === null) {
       return '';
@@ -943,6 +1135,7 @@ export struct OrbitScopedBoardTabView {
   }
 
   aboutToAppear(): void {
+    this.disposed = false;
     this.lastTabIdentity = this.tabIdentityKey();
     if (this.tab.hostId.trim().length > 0) {
       this.store.ensureScopedHostDetailAsync(this.tab.hostId);
@@ -950,21 +1143,39 @@ export struct OrbitScopedBoardTabView {
     this.reloadBoard(true);
   }
 
+  aboutToDisappear(): void {
+    // R2-P1-1: Persist unfinished draft (content + original baseRevision) in Store so it
+    // survives full component unmount/remount across side-panel tab switches.
+    if (this.editing && this.editingTargetKey.length > 0) {
+      this.store.setWorkspaceBoardDraft(this.editingTargetKey, this.boardDraft, this.editBaseRevision);
+    }
+    this.disposed = true;
+    this.boardSaveSeq += 1;
+  }
+
   @Monitor('tab', 'scopeKey', 'store.panelDataRevision', 'fleetStore.hostDetailRevision')
   onBoardChanged(_mon: IMonitor): void {
     const nextIdentity = this.tabIdentityKey();
     if (nextIdentity !== this.lastTabIdentity) {
-      // Persist unfinished draft strictly under its originating verified workspace key, then exit edit mode (P0-3 + R2-P0-2).
+      // Persist unfinished draft WITH its original baseRevision strictly under its verified workspace key (P0-1 / R2-P1-1).
       if (this.editing && this.editingTargetKey.length > 0) {
-        this.draftByWorkspaceKey.set(this.editingTargetKey, this.boardDraft);
+        this.store.setWorkspaceBoardDraft(this.editingTargetKey, this.boardDraft, this.editBaseRevision);
       }
       this.lastTabIdentity = nextIdentity;
+      this.boardSaveSeq += 1;
+      this.savingBoard = false;
       this.editing = false;
       this.editingTargetKey = '';
+      this.editBaseRevision = 0;
       this.boardDraft = '';
+      this.casConflictRevision = 0;
+      this.casConflictRemoteContent = '';
+      this.showCasConflictDialog = false;
       this.peerHandleDraft = '';
       this.peerPromptDraft = '';
       this.boardData = null;
+      this.peerRows = [];
+      this.lastPeerProjectionSig = '';
       if (this.tab.hostId.trim().length > 0) {
         this.store.ensureScopedHostDetailAsync(this.tab.hostId);
       }
@@ -978,16 +1189,56 @@ export struct OrbitScopedBoardTabView {
     if (!prevVerified && this.hasVerifiedWorkspace && !prevSnapshotLoaded && !this.canEditBoard) {
       this.reloadBoard(true);
     }
-    // If verified workspace or loaded snapshot disappeared/changed underneath an active editor, drop out safely.
+    // If verified workspace or loaded snapshot disappeared/changed underneath an active editor,
+    // preserve the draft in Store before dropping out of edit mode cleanly.
     if (this.editing && (!this.canEditBoard || this.editingTargetKey !== this.currentWorkspaceTargetKey())) {
+      if (this.editingTargetKey.length > 0) {
+        this.store.setWorkspaceBoardDraft(this.editingTargetKey, this.boardDraft, this.editBaseRevision);
+      }
       this.editing = false;
       this.editingTargetKey = '';
     }
   }
 
+  private rebuildPeerRowsIfChanged(): void {
+    const peers = this.boardData !== null ? this.boardData.peers : [];
+    const hostId = this.tab.hostId.trim();
+    const detailRev = this.fleetStore.hostDetailRevision;
+    let sig = `${hostId}|${detailRev}|${peers.length}`;
+    for (let i = 0; i < peers.length; i++) {
+      const p = peers[i];
+      const rawAliases = p.labels !== undefined && p.labels !== null ? (p.labels['orbit.handle_aliases'] ?? '') : '';
+      sig += `|${p.agent_id}:${p.latest_seq}:${p.status}:${p.handle ?? ''}:${p.title}:${rawAliases}`;
+    }
+    if (sig === this.lastPeerProjectionSig) {
+      return;
+    }
+    this.lastPeerProjectionSig = sig;
+    const detail = this.store.getScopedHostDetail(hostId);
+    const catalogs = detail !== null ? detail.provider_catalogs : [];
+    const projected: OrbitScopedPeerRowProjection[] = [];
+    for (let i = 0; i < peers.length; i++) {
+      const peer = peers[i];
+      const aliasesMeta = this.resolvePeerAliasesMeta(peer);
+      projected.push({
+        peer: peer,
+        title: this.resolvePeerTitle(peer),
+        status: mapAgentCardToListStatus(peer),
+        modelLabel: resolveCompactAgentModelLabel(peer, catalogs),
+        effortLabel: resolveAgentEffortDisplay(peer),
+        agentLabel: resolveAgentFallbackLabel(peer),
+        aliasesMeta: aliasesMeta,
+        stableKey: `sbp_${hostId}_${peer.agent_id}_${peer.latest_seq}_${peer.handle ?? ''}_${aliasesMeta}`
+      });
+    }
+    this.peerRows = projected;
+  }
+
   private reloadBoard(triggerRemote: boolean): void {
     if (this.tab.hostId.trim().length === 0) {
       this.boardData = null;
+      this.peerRows = [];
+      this.lastPeerProjectionSig = '';
       return;
     }
     const wsId = (this.tab.workspaceId !== undefined && this.tab.workspaceId !== null)
@@ -1000,6 +1251,7 @@ export struct OrbitScopedBoardTabView {
       this.tab.agentId,
       triggerRemote
     );
+    this.rebuildPeerRowsIfChanged();
   }
 
   private beginEditing(): void {
@@ -1007,17 +1259,28 @@ export struct OrbitScopedBoardTabView {
     if (!this.canEditBoard || targetKey.length === 0 || this.boardData === null) {
       return;
     }
-    const savedDraft = this.draftByWorkspaceKey.get(targetKey);
-    this.boardDraft = savedDraft !== undefined ? savedDraft : this.boardData.content;
+    const savedDraft = this.store.getWorkspaceBoardDraft(targetKey);
+    if (savedDraft !== null) {
+      // Preserve the draft's original baseRevision so remote updates made while away trigger CAS conflict (P0-1 / R2-P1-1).
+      this.boardDraft = savedDraft.content;
+      this.editBaseRevision = savedDraft.baseRevision;
+    } else {
+      this.boardDraft = this.boardData.content;
+      this.editBaseRevision = this.boardData.revision;
+    }
     this.editingTargetKey = targetKey;
+    this.casConflictRevision = 0;
+    this.casConflictRemoteContent = '';
+    this.showCasConflictDialog = false;
     this.editing = true;
     this.store.triggerHaptic(6);
   }
 
-  private saveBoard(): void {
+  private async saveBoard(forceOverwrite: boolean = false): Promise<void> {
     const targetKey = this.currentWorkspaceTargetKey();
     if (
       !this.editing ||
+      this.savingBoard ||
       !this.canEditBoard ||
       this.boardData === null ||
       targetKey.length === 0 ||
@@ -1025,20 +1288,118 @@ export struct OrbitScopedBoardTabView {
     ) {
       return;
     }
+    if (!forceOverwrite && !this.boardCasSupported) {
+      this.store.showToastResource($r('app.string.board_cas_unsupported_toast'), true);
+      return;
+    }
     dismissHarmonyKeyboard(this.getUIContext());
-    const ok = this.store.saveScopedWorkspaceBoard(
-      this.tab.hostId,
-      this.boardData.workspaceId,
-      this.boardDraft,
-      this.tab.cwd ?? '',
-      this.tab.agentId
+    this.boardSaveSeq += 1;
+    const saveSeq = this.boardSaveSeq;
+    const originIdentity = this.tabIdentityKey();
+    const originHost = this.tab.hostId;
+    const originWs = this.boardData.workspaceId;
+    const originCwd = this.tab.cwd ?? '';
+    const originAgentId = this.tab.agentId;
+    const draftToSave = this.boardDraft;
+    const baseRev = this.editBaseRevision;
+    this.savingBoard = true;
+    const res: OrbitScopedBoardSaveOutcome = await this.store.saveScopedWorkspaceBoardWithCas(
+      originHost,
+      originWs,
+      draftToSave,
+      baseRev,
+      forceOverwrite,
+      originCwd,
+      originAgentId
     );
-    if (ok) {
-      this.draftByWorkspaceKey.delete(targetKey);
+    if (this.disposed || saveSeq !== this.boardSaveSeq) {
+      return;
+    }
+    // R2-P1-1: ALWAYS clear savingBoard for the active saveSeq BEFORE checking transient
+    // snapshotLoaded/targetKey state so a brief snapshot flicker during save can NEVER deadlock UI.
+    this.savingBoard = false;
+    if (res.ok) {
+      this.store.clearWorkspaceBoardDraft(targetKey);
+    }
+    if (
+      originIdentity !== this.tabIdentityKey() ||
+      targetKey !== this.currentWorkspaceTargetKey()
+    ) {
+      return;
+    }
+    if (res.conflict) {
+      this.casConflictRevision = res.currentRevision;
+      this.casConflictRemoteContent = res.currentContent;
+      this.showCasConflictDialog = true;
+      this.store.showToastResource(
+        $r('app.string.board_cas_conflict_body', res.currentRevision, baseRev),
+        true
+      );
+      return;
+    }
+    if (res.ok) {
       this.editing = false;
       this.editingTargetKey = '';
+      this.editBaseRevision = 0;
+      this.casConflictRevision = 0;
+      this.casConflictRemoteContent = '';
+      this.showCasConflictDialog = false;
+      this.store.showToastResource($r('app.string.board_saved_toast'), false);
+      this.store.triggerHaptic(10);
       this.reloadBoard(false);
+      return;
     }
+    if (res.errorCode === 'cas_unsupported') {
+      this.store.showToastResource($r('app.string.board_cas_unsupported_toast'), true);
+    } else if (res.errorCode === 'snapshot_not_loaded') {
+      this.store.showToastResource($r('app.string.board_snapshot_not_loaded'), true);
+    } else if (res.errorCode === 'unbound') {
+      this.store.showToastResource($r('app.string.board_workspace_unbound'), true);
+    } else if (res.errorCode === 'loading') {
+      this.store.showToastResource($r('app.string.board_workspace_loading'), true);
+    } else if (res.errorCode === 'changed') {
+      this.store.showToastResource($r('app.string.board_workspace_changed'), true);
+    } else {
+      this.store.showToastResource(
+        res.errorMessage.length > 0
+          ? $r('app.string.board_save_failed_detail', res.errorMessage)
+          : $r('app.string.board_save_failed'),
+        true,
+        res.errorMessage
+      );
+    }
+  }
+
+  private resolveCasReloadAndMerge(): void {
+    const merged = mergeBoardCasDraft(this.casConflictRemoteContent, this.boardDraft);
+    this.boardDraft = merged;
+    this.editBaseRevision = this.casConflictRevision;
+    if (this.editingTargetKey.length > 0) {
+      this.store.setWorkspaceBoardDraft(this.editingTargetKey, merged, this.casConflictRevision);
+    }
+    this.showCasConflictDialog = false;
+    this.store.triggerHaptic(8);
+  }
+
+  private resolvePeerTitle(peer: AgentCardDto): string {
+    const cleanHandle = (peer.handle ?? '').trim().replace(/^@+/, '');
+    const cleanTitle = peer.title.trim();
+    if (cleanHandle.length > 0) {
+      return cleanTitle.length > 0 ? `@${cleanHandle} · ${cleanTitle}` : `@${cleanHandle}`;
+    }
+    return cleanTitle.length > 0 ? cleanTitle : peer.provider_label;
+  }
+
+  private resolvePeerAliasesMeta(peer: AgentCardDto): string {
+    const aliases = parsePeerHandleAliases(peer);
+    if (aliases.length === 0) {
+      return '';
+    }
+    const tagged: string[] = [];
+    for (let i = 0; i < aliases.length; i++) {
+      tagged.push(`@${aliases[i]}`);
+    }
+    return `aka ${tagged.join(', ')}`;
   }
 
   private submitSpawnPeer(): void {
@@ -1076,7 +1437,7 @@ export struct OrbitScopedBoardTabView {
             this.subTab = 'board';
           })
 
-        Button(`Peers (${this.boardData?.peers.length ?? 0})`, { type: ButtonType.Capsule, stateEffect: true })
+        Button($r('app.string.board_peers_tab_count', this.boardData?.peers.length ?? 0), { type: ButtonType.Capsule, stateEffect: true })
           .attributeModifier(
             orbitButtonMeta(
               this.subTab === 'peers' ? this.store.palette.onAccent : this.store.palette.fgSecondary,
@@ -1089,32 +1450,58 @@ export struct OrbitScopedBoardTabView {
             this.subTab = 'peers';
           })
 
+        if (this.hasVerifiedWorkspace && this.boardData !== null && this.boardData.revision > 0) {
+          Text($r('app.string.board_revision_badge', this.boardData.revision))
+            .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+            .backgroundColor(this.store.palette.subtleSurface)
+            .borderRadius(OrbitTokens.RADIUS_SM)
+        }
+
         Blank()
+
+        if (this.hasVerifiedWorkspace && this.boardData !== null && !this.editing) {
+          Button($r('app.string.board_dev_scripts'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
+            .height(30)
+            .padding({ left: 10, right: 10 })
+            .onClick(() => {
+              if (this.boardData !== null) {
+                this.store.openWorkspaceScriptsSheet(
+                  this.tab.hostId,
+                  this.boardData.workspaceId,
+                  this.boardData.workspace?.title ?? ''
+                );
+              }
+            })
+        }
 
         if (this.subTab === 'board' && this.canEditBoard && this.boardData !== null) {
           if (this.editing) {
-            Button('Cancel', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.action_cancel'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
               .height(30)
               .padding({ left: 10, right: 10 })
               .onClick(() => {
                 dismissHarmonyKeyboard(this.getUIContext());
                 if (this.editingTargetKey.length > 0) {
-                  this.draftByWorkspaceKey.delete(this.editingTargetKey);
+                  this.store.clearWorkspaceBoardDraft(this.editingTargetKey);
                 }
                 this.editing = false;
                 this.editingTargetKey = '';
+                this.showCasConflictDialog = false;
               })
-            Button('Save', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.action_save'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
               .height(30)
               .padding({ left: 12, right: 12 })
+              .enabled(!this.savingBoard && this.boardCasSupported)
               .onClick(() => {
-                this.saveBoard();
+                void this.saveBoard(false);
               })
           } else {
             if (this.boardData.content.length > 0) {
-              Button('Copy', { type: ButtonType.Capsule, stateEffect: true })
+              Button($r('app.string.action_copy'), { type: ButtonType.Capsule, stateEffect: true })
                 .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
                 .height(30)
                 .padding({ left: 10, right: 10 })
@@ -1124,7 +1511,7 @@ export struct OrbitScopedBoardTabView {
                   }
                 })
             }
-            Button('Edit', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.action_edit'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
               .height(30)
               .padding({ left: 10, right: 10 })
@@ -1143,7 +1530,7 @@ export struct OrbitScopedBoardTabView {
         .height(30)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Refresh board')
+        .accessibilityText($r('app.string.board_refresh_aria'))
         .onClick(() => {
           this.reloadBoard(true);
         })
@@ -1160,9 +1547,9 @@ export struct OrbitScopedBoardTabView {
               .width(24)
               .height(24)
               .color(this.store.palette.accentPrimary)
-            Text('Loading workspace metadata…')
+            Text($r('app.string.board_loading_metadata'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-            Text('Editing stays locked until this host confirms workspace ownership.')
+            Text($r('app.string.board_loading_metadata_hint'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
               .textAlign(TextAlign.Center)
               .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
@@ -1170,9 +1557,9 @@ export struct OrbitScopedBoardTabView {
             SymbolGlyph($r('sys.symbol.doc_text'))
               .fontSize(26)
               .fontColor([this.store.palette.fgMuted])
-            Text('No workspace bound to this directory')
+            Text($r('app.string.board_unbound_title'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-            Text('BOARD.md editing and peer spawning stay disabled until this tab matches a Mission Workspace on its host.')
+            Text($r('app.string.board_unbound_hint'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
               .textAlign(TextAlign.Center)
               .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
@@ -1190,9 +1577,9 @@ export struct OrbitScopedBoardTabView {
               .width(24)
               .height(24)
               .color(this.store.palette.accentPrimary)
-            Text('Loading BOARD.md snapshot…')
+            Text($r('app.string.board_loading_snapshot'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-            Text('Editing unlocks once the initial snapshot loads from the host.')
+            Text($r('app.string.board_loading_snapshot_hint'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
               .textAlign(TextAlign.Center)
               .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
@@ -1202,27 +1589,96 @@ export struct OrbitScopedBoardTabView {
           .layoutWeight(1)
           .alignItems(HorizontalAlign.Center)
         } else if (this.editing) {
-          TextArea({ placeholder: '## Goal\n\n## Contracts', text: this.boardDraft })
-            .fontSize(OrbitTokens.FONT_META)
-            .fontFamily(OrbitTokens.FAMILY_MONO)
-            .fontColor(this.store.palette.fgPrimary)
-            .backgroundColor(this.store.palette.listCard)
-            .borderRadius(OrbitTokens.RADIUS_MD)
-            .padding(OrbitTokens.SPACE_MD)
-            .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, bottom: OrbitTokens.SPACE_MD })
-            .layoutWeight(1)
-            .onFocus(() => {
-              this.store.shellStore.setTextInputFocused(true);
-            })
-            .onBlur(() => {
-              this.store.shellStore.setTextInputFocused(false);
-            })
-            .onChange((val: string) => {
-              this.boardDraft = val;
-              if (this.editingTargetKey.length > 0) {
-                this.draftByWorkspaceKey.set(this.editingTargetKey, val);
+          Column({ space: OrbitTokens.SPACE_XS }) {
+            if (!this.boardCasSupported) {
+              Column({ space: OrbitTokens.SPACE_XS }) {
+                Text($r('app.string.board_cas_unsupported_banner'))
+                  .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Medium))
+                  .width('100%')
+                Row({ space: OrbitTokens.SPACE_XS }) {
+                  Button($r('app.string.board_cas_force_overwrite'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.statusDanger))
+                    .height(28)
+                    .padding({ left: 10, right: 10 })
+                    .enabled(!this.savingBoard)
+                    .onClick(() => {
+                      void this.saveBoard(true);
+                    })
+                }
+                .width('100%')
               }
-            })
+              .width('100%')
+              .padding(OrbitTokens.SPACE_SM)
+              .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+              .backgroundColor(this.store.palette.statusWarningSoft)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+            }
+
+            if (this.showCasConflictDialog) {
+              Column({ space: OrbitTokens.SPACE_XS }) {
+                Text($r('app.string.board_cas_conflict_title'))
+                  .attributeModifier(orbitTextSubhead(this.store.palette.statusDanger, FontWeight.Bold))
+                  .width('100%')
+                Text(
+                  $r(
+                    'app.string.board_cas_conflict_body',
+                    this.casConflictRevision,
+                    this.editBaseRevision
+                  )
+                )
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary))
+                  .width('100%')
+                Row({ space: OrbitTokens.SPACE_XS }) {
+                  Button($r('app.string.board_cas_reload_merge'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.listCard))
+                    .height(30)
+                    .padding({ left: 10, right: 10 })
+                    .onClick(() => {
+                      this.resolveCasReloadAndMerge();
+                    })
+                  Button($r('app.string.board_cas_force_overwrite'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.statusDanger))
+                    .height(30)
+                    .padding({ left: 10, right: 10 })
+                    .enabled(!this.savingBoard)
+                    .onClick(() => {
+                      void this.saveBoard(true);
+                    })
+                }
+                .width('100%')
+              }
+              .width('100%')
+              .padding(OrbitTokens.SPACE_SM)
+              .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+              .backgroundColor(this.store.palette.statusDangerSoft)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+            }
+
+            TextArea({ placeholder: $r('app.string.board_editor_placeholder'), text: this.boardDraft })
+              .fontSize(OrbitTokens.FONT_META)
+              .fontFamily(OrbitTokens.FAMILY_MONO)
+              .fontColor(this.store.palette.fgPrimary)
+              .backgroundColor(this.store.palette.listCard)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .padding(OrbitTokens.SPACE_MD)
+              .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, bottom: OrbitTokens.SPACE_MD })
+              .layoutWeight(1)
+              .enabled(!this.savingBoard)
+              .onFocus(() => {
+                this.store.shellStore.setTextInputFocused(true);
+              })
+              .onBlur(() => {
+                this.store.shellStore.setTextInputFocused(false);
+              })
+              .onChange((val: string) => {
+                this.boardDraft = val;
+                if (this.editingTargetKey.length > 0) {
+                  this.store.setWorkspaceBoardDraft(this.editingTargetKey, val, this.editBaseRevision);
+                }
+              })
+          }
+          .width('100%')
+          .layoutWeight(1)
         } else {
           Scroll() {
             Column({ space: OrbitTokens.SPACE_SM }) {
@@ -1235,7 +1691,7 @@ export struct OrbitScopedBoardTabView {
               Text(
                 this.boardData !== null && this.boardData.content.trim().length > 0
                   ? this.boardData.content
-                  : 'BOARD.md is empty for this workspace.'
+                  : $r('app.string.board_empty_notice')
               )
                 .attributeModifier(orbitTextBody(this.store.palette.fgPrimary))
                 .copyOption(CopyOptions.LocalDevice)
@@ -1251,9 +1707,9 @@ export struct OrbitScopedBoardTabView {
         }
       } else {
         List({ space: OrbitTokens.SPACE_SM }) {
-          if ((this.boardData?.peers ?? []).length === 0) {
+          if (this.peerRows.length === 0) {
             ListItem() {
-              Text('No active sibling peers in this workspace yet.')
+              Text($r('app.string.peers_empty_notice'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
                 .padding(OrbitTokens.SPACE_MD)
                 .width('100%')
@@ -1262,66 +1718,41 @@ export struct OrbitScopedBoardTabView {
             }
           } else {
             ForEach(
-              this.boardData?.peers ?? [],
-              (peer: AgentCardDto) => {
+              this.peerRows,
+              (row: OrbitScopedPeerRowProjection) => {
                 ListItem() {
-                  Button({ type: ButtonType.Normal, stateEffect: true }) {
-                    Row({ space: OrbitTokens.SPACE_SM }) {
-                      Row()
-                        .width(8)
-                        .height(8)
-                        .borderRadius(4)
-                        .backgroundColor(
-                          peer.is_awaiting_permission
-                            ? this.store.palette.statusWarning
-                            : (peer.is_running ? this.store.palette.accentPrimary : this.store.palette.statusDirect)
-                        )
-                      Column({ space: 2 }) {
-                        Text(
-                          peer.handle !== undefined && peer.handle !== null && peer.handle.length > 0
-                            ? `@${peer.handle} · ${peer.title}`
-                            : (peer.title.trim().length > 0 ? peer.title : peer.provider_label)
-                        )
-                          .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-                          .maxLines(1)
-                          .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        Text(`${formatProviderLabel(peer.provider)} · ${formatAgentStatusLabel(peer)}`)
-                          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                          .maxLines(1)
-                      }
-                      .alignItems(HorizontalAlign.Start)
-                      .layoutWeight(1)
-                      SymbolGlyph($r('sys.symbol.chevron_right'))
-                        .fontSize(12)
-                        .fontColor([this.store.palette.fgMuted])
+                  OrbitAgentListItem({
+                    variant: 'card',
+                    leadingMode: 'avatar',
+                    title: row.title,
+                    status: row.status,
+                    avatarSeedKey: row.peer.agent_id,
+                    provider: row.peer.provider,
+                    modelLabel: row.modelLabel,
+                    effortLabel: row.effortLabel,
+                    agentLabel: row.agentLabel,
+                    secondaryMeta: row.aliasesMeta,
+                    onItemClick: () => {
+                      this.store.openPeerPanelTab(
+                        this.tab.hostId,
+                        row.peer,
+                        this.tab.parentHostId ?? this.tab.hostId
+                      );
                     }
-                    .width('100%')
-                    .alignItems(VerticalAlign.Center)
-                  }
-                  .width('100%')
-                  .padding(OrbitTokens.SPACE_MD)
-                  .borderRadius(OrbitTokens.RADIUS_MD)
-                  .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
-                  .onClick(() => {
-                    this.store.openPeerPanelTab(
-                      this.tab.hostId,
-                      peer,
-                      this.tab.parentHostId ?? this.tab.hostId
-                    );
                   })
                 }
               },
-              (peer: AgentCardDto): string => `sbp_${this.tab.hostId}_${peer.agent_id}_${peer.latest_seq}`
+              (row: OrbitScopedPeerRowProjection): string => row.stableKey
             )
           }
 
           // Spawn Workspace Peer form (P1-8)
           ListItem() {
             Column({ space: OrbitTokens.SPACE_XS }) {
-              Text('Spawn Peer')
+              Text($r('app.string.peers_spawn_title'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Bold))
 
-              TextInput({ placeholder: 'Optional @handle (e.g. reviewer)', text: this.peerHandleDraft })
+              TextInput({ placeholder: $r('app.string.peers_handle_placeholder'), text: this.peerHandleDraft })
                 .attributeModifier(
                   orbitInputSubhead(
                     this.store.palette.fgPrimary,
@@ -1342,7 +1773,7 @@ export struct OrbitScopedBoardTabView {
                   this.peerHandleDraft = val;
                 })
 
-              TextArea({ placeholder: 'Task brief for the new peer…', text: this.peerPromptDraft })
+              TextArea({ placeholder: $r('app.string.peers_prompt_placeholder'), text: this.peerPromptDraft })
                 .fontSize(OrbitTokens.FONT_META)
                 .fontColor(this.store.palette.fgPrimary)
                 .placeholderColor(this.store.palette.fgMuted)
@@ -1360,7 +1791,7 @@ export struct OrbitScopedBoardTabView {
                   this.peerPromptDraft = val;
                 })
 
-              Button('Spawn Workspace Peer', { type: ButtonType.Capsule, stateEffect: true })
+              Button($r('app.string.board_spawn_peer_action'), { type: ButtonType.Capsule, stateEffect: true })
                 .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
                 .width('100%')
                 .height(34)
@@ -1379,7 +1810,7 @@ export struct OrbitScopedBoardTabView {
           // Recent Workspace Events (P1-8)
           if ((this.boardData?.events ?? []).length > 0) {
             ListItem() {
-              Text('Recent Activity')
+              Text($r('app.string.board_recent_activity'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
                 .padding({ top: OrbitTokens.SPACE_XS })
             }

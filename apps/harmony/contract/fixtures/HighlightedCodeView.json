@@ -1,0 +1,41 @@
+{
+  "language": "rust",
+  "lines": [
+    {
+      "line_number": 1,
+      "tokens": [
+        {
+          "bold": false,
+          "fg_hex": "#B48EAD",
+          "italic": false,
+          "light_fg_hex": "#A71D5D",
+          "text": "fn"
+        },
+        {
+          "bold": false,
+          "fg_hex": "#C0C5CE",
+          "italic": false,
+          "light_fg_hex": "#323232",
+          "text": " "
+        },
+        {
+          "bold": false,
+          "fg_hex": "#8FA1B3",
+          "italic": false,
+          "light_fg_hex": "#795DA3",
+          "text": "main"
+        },
+        {
+          "bold": false,
+          "fg_hex": "#C0C5CE",
+          "italic": false,
+          "light_fg_hex": "#323232",
+          "text": "() {}"
+        }
+      ]
+    }
+  ],
+  "total_lines": 1,
+  "total_lines_exact": true,
+  "truncated": false
+}

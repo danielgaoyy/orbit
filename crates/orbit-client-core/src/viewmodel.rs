@@ -128,6 +128,8 @@ pub struct HostCardView {
     #[serde(default)]
     pub supports_server_queue: bool,
     #[serde(default)]
+    pub board_cas_supported: bool,
+    #[serde(default)]
     pub is_local: bool,
 }
 

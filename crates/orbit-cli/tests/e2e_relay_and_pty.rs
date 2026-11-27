@@ -178,6 +178,7 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
                 title: Some("E2EE Shell".into()),
                 cols: 80,
                 rows: 24,
+                slot: None,
             },
             Duration::from_secs(20),
             |w| matches!(w, WireMessage::TerminalAttached { request_id, .. } if *request_id == term_req),

@@ -538,6 +538,11 @@ pub struct HostInfo {
     pub relay_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_endpoints: Vec<String>,
+    /// True when the daemon enforces authoritative server-side CAS (`expected_revision`)
+    /// on `WireMessage::UpdateWorkspaceBoard` and returns `WorkspaceBoardSnapshot { conflict, .. }`.
+    /// Older daemons omit this field, which deserializes as `false`.
+    #[serde(default)]
+    pub board_cas_supported: bool,
 }
 
 /// Workspace record (either a direct local checkout, isolated git worktree, or multi-agent Mission Workspace).
@@ -2126,6 +2131,10 @@ pub enum WireMessage {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
     },
     WorkspaceFileContentResponse {
         request_id: Uuid,
@@ -2149,6 +2158,15 @@ pub enum WireMessage {
         /// `"lf"` | `"crlf"` | `"mixed"`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         line_ending: Option<String>,
+        /// Starting byte offset of `content` within the source file (`0` for initial/full reads).
+        #[serde(default)]
+        offset_bytes: u64,
+        /// Next byte offset to request for chunked continuation (`offset_bytes + chunk_raw_bytes`).
+        #[serde(default)]
+        next_offset_bytes: u64,
+        /// `true` when `expected_etag` did not match the live disk file during a chunked read.
+        #[serde(default)]
+        etag_mismatch: bool,
     },
     WriteWorkspaceFile {
         request_id: Uuid,
@@ -2620,6 +2638,8 @@ pub enum WireMessage {
         title: Option<String>,
         cols: u16,
         rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slot: Option<u8>,
     },
     AttachTerminal {
         request_id: Uuid,
@@ -3090,6 +3110,10 @@ pub enum WireMessage {
     WorkspaceBoardSnapshot {
         request_id: Uuid,
         board: WorkspaceBoardSnapshot,
+        /// `true` when `UpdateWorkspaceBoard` with `expected_revision` failed CAS and `board`
+        /// returns the authoritative live snapshot without applying the stale write.
+        #[serde(default)]
+        conflict: bool,
     },
     UpdateWorkspaceBoard {
         request_id: Uuid,
@@ -3100,6 +3124,10 @@ pub enum WireMessage {
         section: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         updated_by: Option<String>,
+        /// Optional optimistic concurrency check. Normal saves pass `Some(base_revision)` (including
+        /// `Some(0)`); only explicit force overwrites or legacy clients pass `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<u64>,
     },
     WorkspaceBoardUpdated {
         board: WorkspaceBoardSnapshot,
@@ -4964,6 +4992,8 @@ mod tests {
             cwd: "/workspace/orbit".into(),
             path: "README.md".into(),
             max_bytes: Some(1_048_576),
+            offset_bytes: Some(4096),
+            expected_etag: Some("etag-abc".into()),
         };
         let encoded = read_req.encode_zstd(3).expect("encode read request");
         match WireMessage::decode_zstd(&encoded).expect("decode read request") {
@@ -4972,14 +5002,63 @@ mod tests {
                 cwd,
                 path,
                 max_bytes,
+                offset_bytes,
+                expected_etag,
             } => {
                 assert_eq!(request_id, req_id);
                 assert_eq!(cwd, "/workspace/orbit");
                 assert_eq!(path, "README.md");
                 assert_eq!(max_bytes, Some(1_048_576));
+                assert_eq!(offset_bytes, Some(4096));
+                assert_eq!(expected_etag.as_deref(), Some("etag-abc"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+
+        // Backward-compat: legacy UpdateWorkspaceBoard / WorkspaceBoardSnapshot / CreateTerminal without new fields
+        let legacy_board_update: WireMessage = serde_json::from_value(serde_json::json!({
+            "op": "update_workspace_board",
+            "request_id": req_id,
+            "workspace_id": "ws-1",
+            "content": "hello"
+        }))
+        .expect("decode legacy update_workspace_board");
+        assert!(matches!(
+            legacy_board_update,
+            WireMessage::UpdateWorkspaceBoard {
+                expected_revision: None,
+                ..
+            }
+        ));
+        let cas_zero_update = WireMessage::UpdateWorkspaceBoard {
+            request_id: req_id,
+            workspace_id: "ws-1".into(),
+            content: "first".into(),
+            section: None,
+            updated_by: Some("user".into()),
+            expected_revision: Some(0),
+        };
+        let cas_zero_encoded = cas_zero_update.encode_zstd(3).expect("encode cas rev 0");
+        assert!(matches!(
+            WireMessage::decode_zstd(&cas_zero_encoded).expect("decode cas rev 0"),
+            WireMessage::UpdateWorkspaceBoard {
+                expected_revision: Some(0),
+                ..
+            }
+        ));
+        let legacy_create_term: WireMessage = serde_json::from_value(serde_json::json!({
+            "op": "create_terminal",
+            "request_id": req_id,
+            "cwd": "/tmp",
+            "title": null,
+            "cols": 80,
+            "rows": 24
+        }))
+        .expect("decode legacy create_terminal");
+        assert!(matches!(
+            legacy_create_term,
+            WireMessage::CreateTerminal { slot: None, .. }
+        ));
 
         let side_req = WireMessage::AskSideQuestion {
             request_id: req_id,
@@ -5206,6 +5285,9 @@ mod tests {
             mtime_unix_ms: Some(1_730_000_000_000),
             writable: true,
             line_ending: Some("lf".into()),
+            offset_bytes: 0,
+            next_offset_bytes: 13,
+            etag_mismatch: false,
         };
         let z = enriched.encode_zstd(3).expect("encode enriched");
         match WireMessage::decode_zstd(&z).expect("decode enriched") {

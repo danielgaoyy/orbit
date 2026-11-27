@@ -10,6 +10,8 @@ mod facade;
 mod napi;
 #[cfg(feature = "perf-hooks")]
 mod replay;
+#[cfg(test)]
+mod tests_pr5;
 
 pub use facade::OhosCoreFacade;
 

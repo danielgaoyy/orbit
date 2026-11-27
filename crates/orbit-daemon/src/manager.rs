@@ -15248,6 +15248,7 @@ diff --git a/config/prod.env b/config/prod.env\n\
             available_providers: Vec::new(),
             relay_url: None,
             direct_endpoints: Vec::new(),
+            board_cas_supported: true,
         };
         let connected = crate::connected_hosts::ConnectedHostsManager::new(
             host_info.host_id.clone(),

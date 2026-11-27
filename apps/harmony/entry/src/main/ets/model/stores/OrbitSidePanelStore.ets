@@ -998,9 +998,18 @@ export class OrbitSidePanelStore {
     this.notifyVisibilityChangeIfNeeded(prevOpen, snap.open);
   }
 
-  public updateActiveTabTerminalSlot(hostId: string, tabId: string, slot: number): void {
+  public updateTabTerminalSlot(targetScopeKey: string, hostId: string, tabId: string, slot: number): void {
+    const cleanScope = targetScopeKey.trim().length > 0 ? targetScopeKey.trim() : this.activeScopeKey;
+    if (cleanScope.length === 0 || tabId.trim().length === 0) {
+      return;
+    }
+    const snap = cleanScope === this.activeScopeKey
+      ? this.activeSnapshot
+      : (this.snapshotsByScope.get(cleanScope) ?? null);
+    if (snap === null) {
+      return;
+    }
     const clampedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
-    const snap = this.activeSnapshot;
     const idx = snap.findTabIndex(tabId);
     if (idx < 0) {
       return;
@@ -1016,8 +1025,12 @@ export class OrbitSidePanelStore {
       nextTabs.push(i === idx ? updated : snap.tabs[i]);
     }
     snap.tabs = nextTabs;
-    this.touchAndPersist(this.activeScopeKey, snap);
+    this.touchAndPersist(cleanScope, snap);
     this.stateRevision += 1;
+  }
+
+  public updateActiveTabTerminalSlot(hostId: string, tabId: string, slot: number): void {
+    this.updateTabTerminalSlot(this.activeScopeKey, hostId, tabId, slot);
   }
 
   public updateTabGitStaged(targetScopeKey: string, tabId: string, staged: boolean): void {

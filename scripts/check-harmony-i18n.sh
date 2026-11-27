@@ -11,6 +11,13 @@ ENFORCED_ETS_PATHS=(
   "apps/harmony/entry/src/main/ets/components/personal-agent"
   "apps/harmony/entry/src/main/ets/components/common/OrbitAgentListItem.ets"
   "apps/harmony/entry/src/main/ets/components/common/OrbitSubagentAvatar.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/WorktreeHandoffSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/WorkspaceScriptsSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/CreateWorkspaceV2Sheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/RenameWorkspaceSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedGitAndFilesTabs.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedTerminalAndBoardTabs.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedToolTabs.ets"
 )
 
 SCAN_ALL="0"

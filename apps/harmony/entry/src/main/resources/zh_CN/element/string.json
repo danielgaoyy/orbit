@@ -293,6 +293,118 @@
       "value": "雪鸮"
     },
     {
+      "name": "board_cas_conflict_body",
+      "value": "编辑期间远端白板已更新至修订 %1$d（草稿基于修订 %2$d），请选择处理方式："
+    },
+    {
+      "name": "board_cas_conflict_title",
+      "value": "BOARD.md 修订冲突"
+    },
+    {
+      "name": "board_cas_force_overwrite",
+      "value": "强制覆盖"
+    },
+    {
+      "name": "board_cas_reload_merge",
+      "value": "重新加载合并"
+    },
+    {
+      "name": "board_cas_unsupported_banner",
+      "value": "当前主机守护进程不支持冲突安全保存（CAS），请升级守护进程或显式强制覆盖。"
+    },
+    {
+      "name": "board_cas_unsupported_toast",
+      "value": "旧版守护进程已禁用普通保存（草稿已保留），请升级守护进程或使用强制覆盖"
+    },
+    {
+      "name": "board_dev_scripts",
+      "value": "脚本"
+    },
+    {
+      "name": "board_editor_placeholder",
+      "value": "## 目标\n\n## 契约"
+    },
+    {
+      "name": "board_empty_notice",
+      "value": "当前工作区的 BOARD.md 为空。"
+    },
+    {
+      "name": "board_loading_metadata",
+      "value": "正在加载工作区元数据…"
+    },
+    {
+      "name": "board_loading_metadata_hint",
+      "value": "主机确认工作区归属前将保持锁定。"
+    },
+    {
+      "name": "board_loading_snapshot",
+      "value": "正在加载 BOARD.md 快照…"
+    },
+    {
+      "name": "board_loading_snapshot_hint",
+      "value": "从主机加载初始快照后自动解锁编辑。"
+    },
+    {
+      "name": "board_peer_aliases",
+      "value": "曾用 %s"
+    },
+    {
+      "name": "board_peers_tab_count",
+      "value": "同伴 (%d)"
+    },
+    {
+      "name": "board_recent_activity",
+      "value": "最近动态"
+    },
+    {
+      "name": "board_refresh_aria",
+      "value": "刷新 BOARD.md"
+    },
+    {
+      "name": "board_revision_badge",
+      "value": "修订 %d"
+    },
+    {
+      "name": "board_save_failed",
+      "value": "保存 BOARD.md 失败"
+    },
+    {
+      "name": "board_save_failed_detail",
+      "value": "保存 BOARD.md 失败：%s"
+    },
+    {
+      "name": "board_saved_toast",
+      "value": "已保存 BOARD.md"
+    },
+    {
+      "name": "board_snapshot_not_loaded",
+      "value": "BOARD.md 快照尚未加载完成"
+    },
+    {
+      "name": "board_spawn_peer_action",
+      "value": "派生工作区同伴"
+    },
+    {
+      "name": "board_unbound_hint",
+      "value": "匹配到主机上的工作区前，BOARD.md 编辑与派生同伴保持禁用。"
+    },
+    {
+      "name": "board_unbound_title",
+      "value": "当前目录未绑定工作区"
+    },
+    {
+      "name": "board_workspace_changed",
+      "value": "工作区已变更或与当前标签页不匹配"
+    },
+    {
+      "name": "board_workspace_loading",
+      "value": "工作区元数据仍在加载，请稍候"
+    },
+    {
+      "name": "board_workspace_unbound",
+      "value": "当前标签页未绑定工作区"
+    },
+    {
       "name": "briefing_actorGuardian",
       "value": "Guardian"
     },
@@ -789,6 +901,30 @@
       "value": "导出对话记录"
     },
     {
+      "name": "files_action_quote",
+      "value": "引用"
+    },
+    {
+      "name": "files_chunk_binary_tail_locked",
+      "value": "后续分块检测到二进制数据，已锁定为只读以防覆盖截断源文件。"
+    },
+    {
+      "name": "files_chunk_etag_conflict",
+      "value": "加载剩余分块期间远端文件已变更，请重新加载最新版本。"
+    },
+    {
+      "name": "files_chunk_incomplete_locked",
+      "value": "分块内容校验未通过，已锁定为只读。"
+    },
+    {
+      "name": "files_chunk_limit_reached",
+      "value": "已达读取上限（已加载 %1$s / %2$s · 只读）"
+    },
+    {
+      "name": "files_chunk_load_failed",
+      "value": "加载文件分块失败"
+    },
+    {
       "name": "files_create_as_dir",
       "value": "创建目录"
     },
@@ -801,12 +937,64 @@
       "value": "当前工作区暂无已加载文件。"
     },
     {
+      "name": "files_empty_indexed",
+      "value": "当前目录暂无已索引工作区文件"
+    },
+    {
+      "name": "files_filter_placeholder",
+      "value": "筛选文件…"
+    },
+    {
+      "name": "files_load_full",
+      "value": "加载全文"
+    },
+    {
+      "name": "files_load_next_chunk",
+      "value": "加载后续分块"
+    },
+    {
+      "name": "files_loading_chunk",
+      "value": "加载中…"
+    },
+    {
       "name": "files_new_entry",
       "value": "新建"
     },
     {
       "name": "files_new_path_placeholder",
       "value": "相对路径，例如 src/main.ts"
+    },
+    {
+      "name": "files_overwrite_anyway",
+      "value": "仍要覆盖"
+    },
+    {
+      "name": "files_panel_title",
+      "value": "工作区文件"
+    },
+    {
+      "name": "files_preview_capped",
+      "value": "已语法高亮前 %1$d / %2$d 行"
+    },
+    {
+      "name": "files_preview_capped_lower_bound",
+      "value": "已语法高亮前 %1$d / %2$d+ 行"
+    },
+    {
+      "name": "files_readonly_notice",
+      "value": "只读文件（已禁用编辑）"
+    },
+    {
+      "name": "files_refresh_list_aria",
+      "value": "刷新文件列表"
+    },
+    {
+      "name": "files_reload_disk",
+      "value": "重新加载磁盘版本"
+    },
+    {
+      "name": "files_reload_file_aria",
+      "value": "重新加载文件"
     },
     {
       "name": "files_save_file",
@@ -817,12 +1005,32 @@
       "value": "筛选工作区文件…"
     },
     {
+      "name": "files_showing_full",
+      "value": "正在显示全文（共 %d 行）"
+    },
+    {
+      "name": "files_showing_full_lower_bound",
+      "value": "正在显示全文（%d+ 行）"
+    },
+    {
+      "name": "files_showing_partial",
+      "value": "显示已加载前缀（%1$s / %2$s · 源文件已截断）"
+    },
+    {
+      "name": "files_source_truncated_banner",
+      "value": "源文件已截断（已加载 %1$s / %2$s · 只读）"
+    },
+    {
       "name": "files_title",
       "value": "文件浏览器"
     },
     {
       "name": "files_truncated_notice",
       "value": "仅显示前缀预览（文件已截断）"
+    },
+    {
+      "name": "files_unavailable_scope",
+      "value": "当前标签作用域无法访问该文件"
     },
     {
       "name": "git_amend",
@@ -845,6 +1053,50 @@
       "value": "创建 PR"
     },
     {
+      "name": "git_diff_unconfirmed_notice",
+      "value": "并发切换或仅状态刷新导致 Diff 归属待确认。"
+    },
+    {
+      "name": "git_discard",
+      "value": "丢弃更改"
+    },
+    {
+      "name": "git_discard_confirm_action",
+      "value": "确认丢弃"
+    },
+    {
+      "name": "git_discard_failed",
+      "value": "丢弃更改失败"
+    },
+    {
+      "name": "git_discard_failed_detail",
+      "value": "丢弃更改失败：%s"
+    },
+    {
+      "name": "git_discard_include_untracked",
+      "value": "同时删除未跟踪文件"
+    },
+    {
+      "name": "git_discard_input_placeholder",
+      "value": "输入文件名以确认…"
+    },
+    {
+      "name": "git_discard_success",
+      "value": "已丢弃 %d 个文件的更改"
+    },
+    {
+      "name": "git_discard_title",
+      "value": "确认丢弃更改"
+    },
+    {
+      "name": "git_discard_warning",
+      "value": "此操作将永久还原 %s 的本地更改，请输入准确文件名以解锁确认："
+    },
+    {
+      "name": "git_filter_changed_placeholder",
+      "value": "筛选变更文件…"
+    },
+    {
       "name": "git_generate_message",
       "value": "AI 生成"
     },
@@ -865,12 +1117,52 @@
       "value": "Pull Request 标题"
     },
     {
+      "name": "git_push",
+      "value": "推送"
+    },
+    {
+      "name": "git_push_branch_placeholder",
+      "value": "分支（默认当前分支）"
+    },
+    {
+      "name": "git_push_failed",
+      "value": "推送失败"
+    },
+    {
+      "name": "git_push_failed_detail",
+      "value": "推送失败：%s"
+    },
+    {
+      "name": "git_push_remote_placeholder",
+      "value": "远程仓库（默认 origin）"
+    },
+    {
+      "name": "git_push_set_upstream",
+      "value": "设置上游跟踪 (-u)"
+    },
+    {
+      "name": "git_push_success",
+      "value": "已推送 %1$s → %2$s"
+    },
+    {
       "name": "git_rebase_abort",
       "value": "中止变基"
     },
     {
       "name": "git_rebase_continue",
       "value": "继续变基"
+    },
+    {
+      "name": "git_refresh_diff",
+      "value": "刷新 Diff"
+    },
+    {
+      "name": "git_refresh_review_aria",
+      "value": "刷新 Git 变更"
+    },
+    {
+      "name": "git_show_all_lines",
+      "value": "展开全部 %d 行"
     },
     {
       "name": "git_stage",
@@ -881,6 +1173,10 @@
       "value": "全部暂存"
     },
     {
+      "name": "git_stash_list_title",
+      "value": "已保存的暂存"
+    },
+    {
       "name": "git_stash_pop",
       "value": "弹出储藏"
     },
@@ -889,12 +1185,124 @@
       "value": "储藏变更"
     },
     {
+      "name": "git_stashes_count",
+      "value": "暂存 (%d)"
+    },
+    {
       "name": "git_unstage",
       "value": "取消暂存"
     },
     {
       "name": "git_unstage_all",
       "value": "全部取消暂存"
+    },
+    {
+      "name": "git_working_tree_clean_scope",
+      "value": "当前作用域工作区干净无变更"
+    },
+    {
+      "name": "handoff_allow_three_way",
+      "value": "允许 3-way 冲突标记"
+    },
+    {
+      "name": "handoff_backup_ref",
+      "value": "安全备份引用：%s"
+    },
+    {
+      "name": "handoff_branch_placeholder",
+      "value": "目标分支（可选）"
+    },
+    {
+      "name": "handoff_capsule",
+      "value": "Worktree"
+    },
+    {
+      "name": "handoff_clean_preview",
+      "value": "可无冲突应用（共 %d 个文件）"
+    },
+    {
+      "name": "handoff_conflicts_warning",
+      "value": "检测到 %d 个文件冲突"
+    },
+    {
+      "name": "handoff_dir_to_local",
+      "value": "Worktree → 本地"
+    },
+    {
+      "name": "handoff_dir_to_worktree",
+      "value": "本地 → Worktree"
+    },
+    {
+      "name": "handoff_empty_preview",
+      "value": "未检测到可交接的变更"
+    },
+    {
+      "name": "handoff_execute",
+      "value": "确认执行交接"
+    },
+    {
+      "name": "handoff_execute_failed",
+      "value": "Worktree 交接失败"
+    },
+    {
+      "name": "handoff_execute_failed_detail",
+      "value": "Worktree 交接失败：%s"
+    },
+    {
+      "name": "handoff_execute_success",
+      "value": "Worktree 交接完成"
+    },
+    {
+      "name": "handoff_hard_blocker",
+      "value": "无法无冲突应用，请先处理目标工作区状态"
+    },
+    {
+      "name": "handoff_include_committed",
+      "value": "包含已提交的变更"
+    },
+    {
+      "name": "handoff_mode_apply",
+      "value": "应用（保留源更改）"
+    },
+    {
+      "name": "handoff_mode_move",
+      "value": "移动（清理源更改）"
+    },
+    {
+      "name": "handoff_preview_failed",
+      "value": "交接预览失败"
+    },
+    {
+      "name": "handoff_preview_failed_detail",
+      "value": "交接预览失败：%s"
+    },
+    {
+      "name": "handoff_preview_refresh",
+      "value": "预览变更"
+    },
+    {
+      "name": "handoff_success_apply",
+      "value": "已成功应用 %d 个文件变更"
+    },
+    {
+      "name": "handoff_success_apply_branch",
+      "value": "已将 %1$d 个文件变更应用到 %2$s"
+    },
+    {
+      "name": "handoff_success_move",
+      "value": "已成功移动 %d 个文件变更"
+    },
+    {
+      "name": "handoff_success_move_branch",
+      "value": "已将 %1$d 个文件变更移动到 %2$s"
+    },
+    {
+      "name": "handoff_title",
+      "value": "Worktree 变更交接"
+    },
+    {
+      "name": "handoff_untracked_conflict",
+      "value": "未跟踪文件冲突不支持三方合并"
     },
     {
       "name": "module_desc",
@@ -1097,6 +1505,22 @@
       "value": "查看变更"
     },
     {
+      "name": "peers_empty_notice",
+      "value": "当前工作区暂无活跃同伴。"
+    },
+    {
+      "name": "peers_handle_placeholder",
+      "value": "可选 @handle（如 reviewer）"
+    },
+    {
+      "name": "peers_prompt_placeholder",
+      "value": "输入给新同伴的任务说明…"
+    },
+    {
+      "name": "peers_spawn_title",
+      "value": "派生同伴"
+    },
+    {
       "name": "permission_microphone_reason",
       "value": "使用端侧语音识别向编程智能体口述指令。"
     },
@@ -1189,6 +1613,54 @@
       "value": "共享宿主机外部记忆"
     },
     {
+      "name": "scripts_empty",
+      "value": "当前工作区的 orbit.json 未配置开发脚本。"
+    },
+    {
+      "name": "scripts_start",
+      "value": "启动"
+    },
+    {
+      "name": "scripts_start_failed",
+      "value": "启动脚本失败"
+    },
+    {
+      "name": "scripts_start_failed_detail",
+      "value": "启动脚本失败：%s"
+    },
+    {
+      "name": "scripts_status_failed",
+      "value": "失败"
+    },
+    {
+      "name": "scripts_status_running",
+      "value": "运行中"
+    },
+    {
+      "name": "scripts_status_stopped",
+      "value": "已停止"
+    },
+    {
+      "name": "scripts_status_summary_label",
+      "value": "状态 / 入口 / 命令"
+    },
+    {
+      "name": "scripts_stop",
+      "value": "停止"
+    },
+    {
+      "name": "scripts_stop_failed",
+      "value": "停止脚本失败"
+    },
+    {
+      "name": "scripts_stop_failed_detail",
+      "value": "停止脚本失败：%s"
+    },
+    {
+      "name": "scripts_title",
+      "value": "开发脚本"
+    },
+    {
       "name": "search_empty_hint",
       "value": "输入关键词即可跨机群全文检索 FTS5 历史对话。"
     },
@@ -1211,6 +1683,22 @@
     {
       "name": "settings_upgrade_daemon",
       "value": "远程热升级守护进程"
+    },
+    {
+      "name": "side_question_clear",
+      "value": "清空"
+    },
+    {
+      "name": "side_question_empty_hint",
+      "value": "基于当前会话上下文进行旁路提问，不打断正在进行的回合。"
+    },
+    {
+      "name": "side_question_input_placeholder",
+      "value": "输入旁路问题，不打断当前对话…"
+    },
+    {
+      "name": "side_question_title",
+      "value": "旁路提问 (/btw)"
     },
     {
       "name": "sidebar_activeCount",
@@ -1653,6 +2141,30 @@
       "value": "免口令即时解锁"
     },
     {
+      "name": "terminal_buffer_empty",
+      "value": "终端缓冲区为空"
+    },
+    {
+      "name": "terminal_close_failed",
+      "value": "关闭终端失败"
+    },
+    {
+      "name": "terminal_closed_toast",
+      "value": "终端已关闭"
+    },
+    {
+      "name": "terminal_copied_toast",
+      "value": "已复制终端输出"
+    },
+    {
+      "name": "terminal_delta_rev",
+      "value": "版本 %d"
+    },
+    {
+      "name": "terminal_empty_slot",
+      "value": "当前槽位暂无活跃终端缓冲区。"
+    },
+    {
       "name": "terminal_line_placeholder",
       "value": "输入命令行并发送…"
     },
@@ -1665,12 +2177,28 @@
       "value": "原始键"
     },
     {
+      "name": "terminal_new_shell",
+      "value": "+ 新建"
+    },
+    {
+      "name": "terminal_no_buffer",
+      "value": "当前终端槽暂无活跃输出。"
+    },
+    {
       "name": "terminal_raw_placeholder",
       "value": "实时发送原始按键…"
     },
     {
+      "name": "terminal_slot_label",
+      "value": "槽%d"
+    },
+    {
       "name": "terminal_spawn_shell",
       "value": "新建终端会话"
+    },
+    {
+      "name": "terminal_start_failed",
+      "value": "启动终端失败"
     },
     {
       "name": "terminal_title",
@@ -1731,6 +2259,146 @@
     {
       "name": "topbar_showOverview",
       "value": "显示概览"
+    },
+    {
+      "name": "workspace_archive",
+      "value": "归档工作区"
+    },
+    {
+      "name": "workspace_archive_failed",
+      "value": "归档工作区失败"
+    },
+    {
+      "name": "workspace_archive_failed_detail",
+      "value": "归档工作区失败：%s"
+    },
+    {
+      "name": "workspace_archive_keep_unclassified",
+      "value": "归档工作区（保留智能体未分类）"
+    },
+    {
+      "name": "workspace_archived_toast",
+      "value": "工作区已归档"
+    },
+    {
+      "name": "workspace_base_ref_placeholder",
+      "value": "基线引用（如 main）"
+    },
+    {
+      "name": "workspace_branch_placeholder",
+      "value": "分支名（可选）"
+    },
+    {
+      "name": "workspace_create_dispatched",
+      "value": "已提交创建工作区"
+    },
+    {
+      "name": "workspace_create_failed",
+      "value": "创建工作区失败"
+    },
+    {
+      "name": "workspace_create_failed_detail",
+      "value": "创建工作区失败：%s"
+    },
+    {
+      "name": "workspace_isolation_local",
+      "value": "本地目录"
+    },
+    {
+      "name": "workspace_isolation_worktree",
+      "value": "Git Worktree"
+    },
+    {
+      "name": "workspace_menu_active_group",
+      "value": "活跃工作区"
+    },
+    {
+      "name": "workspace_menu_archive_item",
+      "value": "归档 · %s"
+    },
+    {
+      "name": "workspace_menu_archive_keep_item",
+      "value": "归档（保留未分类）· %s"
+    },
+    {
+      "name": "workspace_menu_archived_group",
+      "value": "已归档工作区"
+    },
+    {
+      "name": "workspace_menu_rename_item",
+      "value": "重命名 · %s"
+    },
+    {
+      "name": "workspace_menu_restore_item",
+      "value": "恢复 · %s"
+    },
+    {
+      "name": "workspace_menu_scripts_item",
+      "value": "开发脚本 · %s"
+    },
+    {
+      "name": "workspace_mode_branch_off",
+      "value": "新建分支"
+    },
+    {
+      "name": "workspace_mode_checkout_branch",
+      "value": "检出已有分支"
+    },
+    {
+      "name": "workspace_mode_checkout_pr",
+      "value": "检出 PR"
+    },
+    {
+      "name": "workspace_new_v2",
+      "value": "新建工作区"
+    },
+    {
+      "name": "workspace_pr_number_placeholder",
+      "value": "PR 编号"
+    },
+    {
+      "name": "workspace_rename_confirm",
+      "value": "确认重命名"
+    },
+    {
+      "name": "workspace_rename_failed",
+      "value": "重命名工作区失败"
+    },
+    {
+      "name": "workspace_rename_failed_detail",
+      "value": "重命名工作区失败：%s"
+    },
+    {
+      "name": "workspace_rename_placeholder",
+      "value": "输入工作区名称"
+    },
+    {
+      "name": "workspace_rename_title",
+      "value": "重命名工作区"
+    },
+    {
+      "name": "workspace_renamed_toast",
+      "value": "工作区已重命名"
+    },
+    {
+      "name": "workspace_restore_failed",
+      "value": "恢复工作区失败"
+    },
+    {
+      "name": "workspace_restore_failed_detail",
+      "value": "恢复工作区失败：%s"
+    },
+    {
+      "name": "workspace_restored_toast",
+      "value": "工作区已恢复"
+    },
+    {
+      "name": "workspace_title_placeholder",
+      "value": "工作区名称（可选）"
+    },
+    {
+      "name": "workspace_unarchive",
+      "value": "取消归档工作区"
     }
   ]
 }

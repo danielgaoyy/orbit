@@ -2030,6 +2030,7 @@ pub struct OrbitAppCore {
     fleet_relay_fabric_in_flight: Arc<AtomicBool>,
     fleet_relay_auto_attempted: Arc<AtomicBool>,
     last_vault_fingerprint: Arc<RwLock<Option<String>>>,
+    account_default_mode: Arc<RwLock<Option<(SessionMode, i64)>>>,
 }
 
 impl OrbitAppCore {
@@ -2326,6 +2327,7 @@ impl OrbitAppCore {
             fleet_relay_fabric_in_flight: Arc::new(AtomicBool::new(false)),
             fleet_relay_auto_attempted: Arc::new(AtomicBool::new(false)),
             last_vault_fingerprint: Arc::new(RwLock::new(None)),
+            account_default_mode: Arc::new(RwLock::new(None)),
         });
         if !core.store.is_replica_fts_backfill_done() {
             let store_bg = Arc::clone(&core.store);
@@ -2744,7 +2746,17 @@ impl OrbitAppCore {
                     rendered_by_event.push(rendered);
                 }
 
-                let sliced = stage::process_timeline_turns_slice(&items, 0, 0, cwd);
+                let split_finish_reports = host_state
+                    .agents
+                    .get(agent_id)
+                    .is_some_and(|a| a.is_personal_router());
+                let sliced = stage::process_timeline_turns_slice_with_options(
+                    &items,
+                    0,
+                    0,
+                    cwd,
+                    split_finish_reports,
+                );
                 let provider_subagents = host_state
                     .provider_subagents
                     .get(agent_id)
@@ -2831,6 +2843,14 @@ impl OrbitAppCore {
                             .partition_point(|&start| start <= base_item_idx)
                             .saturating_sub(1)
                     };
+                    // Interleaved deferred finish reports share their predecessor's `turn_item_starts`
+                    // anchor; walk back so incremental tail rebuilds never slice mid-interleave.
+                    while replace_from_turn_idx > 0
+                        && cached.turn_item_starts[replace_from_turn_idx]
+                            == cached.turn_item_starts[replace_from_turn_idx - 1]
+                    {
+                        replace_from_turn_idx -= 1;
+                    }
                     let start_item_idx = if replace_from_turn_idx == 0 {
                         0
                     } else {
@@ -2839,11 +2859,16 @@ impl OrbitAppCore {
                     cached.turns.truncate(replace_from_turn_idx);
                     cached.turn_item_starts.truncate(replace_from_turn_idx);
 
-                    let sliced = stage::process_timeline_turns_slice(
+                    let split_finish_reports = host_state
+                        .agents
+                        .get(agent_id)
+                        .is_some_and(|a| a.is_personal_router());
+                    let sliced = stage::process_timeline_turns_slice_with_options(
                         &cached.items,
                         start_item_idx,
                         replace_from_turn_idx as u32,
                         cwd,
+                        split_finish_reports,
                     );
                     cached.turns.extend(sliced.turns);
                     cached.turn_item_starts.extend(sliced.turn_item_starts);
@@ -3545,11 +3570,29 @@ impl OrbitAppCore {
                     .git_diffs
                     .get(&(norm_cwd.clone(), norm_path.clone(), false))
                     .map(|entry| entry.diff_revision)
+                    .or_else(|| {
+                        h.git_diffs
+                            .iter()
+                            .filter(|((sc, sp, ss), _)| {
+                                *sp == norm_path && !*ss && h.canonical_git_cwd(sc) == norm_cwd
+                            })
+                            .map(|(_, entry)| entry.diff_revision)
+                            .max()
+                    })
                     .unwrap_or(0);
                 let staged_rev = h
                     .git_diffs
                     .get(&(norm_cwd.clone(), norm_path.clone(), true))
                     .map(|entry| entry.diff_revision)
+                    .or_else(|| {
+                        h.git_diffs
+                            .iter()
+                            .filter(|((sc, sp, ss), _)| {
+                                *sp == norm_path && *ss && h.canonical_git_cwd(sc) == norm_cwd
+                            })
+                            .map(|(_, entry)| entry.diff_revision)
+                            .max()
+                    })
                     .unwrap_or(0);
                 if unstaged_rev > 0 || staged_rev > 0 {
                     Some(staged_rev > unstaged_rev)
@@ -3623,10 +3666,22 @@ impl OrbitAppCore {
 
             let norm_cwd = host_state.canonical_git_cwd(cwd);
             let exact_key = (norm_cwd.clone(), norm_path.clone(), staged);
-            let (raw_diff, diff_revision) = match host_state.git_diffs.get(&exact_key) {
-                Some(entry) => (entry.unified_diff.clone(), entry.diff_revision),
-                None => (String::new(), 0),
-            };
+            let (raw_diff, diff_revision) =
+                match host_state.git_diffs.get(&exact_key).or_else(|| {
+                    host_state
+                        .git_diffs
+                        .iter()
+                        .filter(|((stored_cwd, stored_path, stored_staged), _)| {
+                            *stored_path == norm_path
+                                && *stored_staged == staged
+                                && host_state.canonical_git_cwd(stored_cwd) == norm_cwd
+                        })
+                        .max_by_key(|(_, entry)| entry.diff_revision)
+                        .map(|(_, entry)| entry)
+                }) {
+                    Some(entry) => (entry.unified_diff.clone(), entry.diff_revision),
+                    None => (String::new(), 0),
+                };
             let diff_in_flight = host_state.has_live_git_diff_in_flight(&exact_key);
             let status_revision = host_state
                 .git_status_revision_by_cwd
@@ -3650,6 +3705,11 @@ impl OrbitAppCore {
                 .git_statuses
                 .get(&norm_cwd)
                 .or_else(|| host_state.git_statuses.get(cwd))
+                .or_else(|| {
+                    host_state.git_statuses.iter().find_map(|(k, v)| {
+                        (host_state.canonical_git_cwd(k) == norm_cwd).then_some(v)
+                    })
+                })
                 .cloned();
             let status_identity_epoch = if status.is_some() {
                 host_state
@@ -5020,8 +5080,7 @@ impl OrbitAppCore {
     ) -> Result<ClientProjectView, ClientCoreError> {
         let clean_dirs: Vec<String> = directories
             .into_iter()
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty())
+            .filter(|d| !d.trim().is_empty())
             .collect();
         let primary = clean_dirs
             .first()
@@ -5030,7 +5089,14 @@ impl OrbitAppCore {
         let id = project_id
             .filter(|s| !s.trim().is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("{host_id}::{}", primary.trim_end_matches('/')));
+            .unwrap_or_else(|| {
+                let norm_primary = if primary == "/" {
+                    "/"
+                } else {
+                    primary.trim_end_matches('/')
+                };
+                format!("{host_id}::{norm_primary}")
+            });
         let clean_name = if name.trim().is_empty() {
             folder_basename(&primary)
         } else {
@@ -6734,7 +6800,13 @@ impl OrbitAppCore {
                         if local_max_seq > agent.latest_seq {
                             agent.latest_seq = local_max_seq;
                         }
-                        if !stage_fields_unchanged {
+                        let router_role_changed = prev_summary
+                            .map_or(agent.is_personal_router(), |prev| {
+                                prev.is_personal_router() != agent.is_personal_router()
+                            });
+                        if router_role_changed {
+                            state.mark_stage_dirty(&ag_id, 0, true);
+                        } else if !stage_fields_unchanged {
                             state.mark_stage_meta_dirty(&ag_id);
                         }
                     }
@@ -10254,6 +10326,19 @@ impl OrbitAppCore {
                 self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(host_id, now_ms));
                 self.schedule_cloud_auto_sync(false);
             }
+            if let Ok(guard) = self.account_default_mode.read()
+                && let Some((mode, updated_at_ms)) = guard.clone()
+                && !matches!(mode, SessionMode::Plan)
+            {
+                self.dispatch_wire_queued(
+                    host_id,
+                    WireMessage::SetAccountDefaultMode {
+                        request_id: Uuid::new_v4(),
+                        mode,
+                        updated_at_ms,
+                    },
+                );
+            }
         }
         if let Some(ref relay) = promoted_fleet_relay {
             self.propagate_fleet_relay_to_online_hosts(relay);
@@ -11364,6 +11449,7 @@ impl OrbitAppCore {
                 handle: clean_handle,
                 auto_cluster: req.auto_cluster,
                 acp_agent_id: clean_acp_agent_id,
+                labels: std::collections::HashMap::new(),
             },
         );
 
@@ -11615,9 +11701,11 @@ impl OrbitAppCore {
         {
             h.cancelled_optimistic_agents.remove(agent_id);
             if let Some(ag) = h.agents.get_mut(agent_id) {
-                ag.status = AgentStatus::Running {
-                    turn_id: "pending".into(),
-                };
+                if !matches!(ag.status, AgentStatus::AwaitingPermission { .. }) {
+                    ag.status = AgentStatus::Running {
+                        turn_id: "pending".into(),
+                    };
+                }
                 ag.archived_at = None;
                 ag.updated_at = now;
             }
@@ -14740,6 +14828,51 @@ impl OrbitAppCore {
         if changed_any {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
             self.schedule_cloud_auto_sync(false);
+        }
+    }
+
+    pub fn set_account_default_mode(self: &Arc<Self>, mode: SessionMode, updated_at_ms: i64) {
+        if matches!(mode, SessionMode::Plan) {
+            return;
+        }
+        if let Ok(mut guard) = self.account_default_mode.write() {
+            let should_store = match guard.as_ref() {
+                None => true,
+                Some((_, prev_ts)) => updated_at_ms > 0 && updated_at_ms >= *prev_ts,
+            };
+            if should_store {
+                *guard = Some((mode.clone(), updated_at_ms));
+            }
+        }
+        let host_ids: Vec<String> = self
+            .hosts
+            .read()
+            .map(|guard| guard.keys().cloned().collect())
+            .unwrap_or_default();
+        for host_id in host_ids {
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(&host_id)
+            {
+                let should_update = if updated_at_ms > 0 {
+                    updated_at_ms >= h.orchestration_config.default_session_mode_updated_at_ms
+                } else {
+                    h.orchestration_config.default_session_mode.is_none()
+                };
+                if should_update {
+                    h.orchestration_config.default_session_mode = Some(mode.clone());
+                    if updated_at_ms > 0 {
+                        h.orchestration_config.default_session_mode_updated_at_ms = updated_at_ms;
+                    }
+                }
+            }
+            self.dispatch_wire_queued(
+                &host_id,
+                WireMessage::SetAccountDefaultMode {
+                    request_id: Uuid::new_v4(),
+                    mode: mode.clone(),
+                    updated_at_ms,
+                },
+            );
         }
     }
 
@@ -44594,5 +44727,184 @@ mod tests {
             .map(|e| e.staged)
             .collect();
         assert_eq!(t3_flags, vec![true, false]);
+    }
+
+    #[test]
+    fn git_review_never_fuzzy_matches_tilde_cache_against_unrelated_absolute_path() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        let pa_diff = "diff --git a/pa-only.txt b/pa-only.txt\n--- a/pa-only.txt\n+++ b/pa-only.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let worker_diff = "diff --git a/worker-only.txt b/worker-only.txt\n--- a/worker-only.txt\n+++ b/worker-only.txt\n@@ -1 +1 @@\n-a\n+b\n";
+
+        let deliver_diff =
+            |cwd: &str,
+             path: Option<&str>,
+             diff: &str,
+             rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>| {
+                core.fetch_git_diff(&host_id, cwd, path, false);
+                let (req_id, _, _, _) = recv_git_diff_request(&core, rx);
+                core.handle_inbound_wire(
+                    &host_id,
+                    WireMessage::GitDiffResponse {
+                        request_id: req_id,
+                        cwd: cwd.into(),
+                        path: path.map(ToOwned::to_owned),
+                        unified_diff: diff.into(),
+                        repo_root: None,
+                        repo_prefix: None,
+                    },
+                );
+            };
+
+        // Cache PA diff/status under daemon shorthand `~/project`
+        deliver_diff("~/project", None, pa_diff, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "~/project".into(),
+                    is_git_repo: true,
+                    branch: Some("pa-branch".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                },
+            },
+        );
+
+        // Without authoritative home, querying `/home/worker/project` MUST miss (empty, never `pa-only.txt`)
+        let cold_worker = core.git_review(&host_id, "/home/worker/project", None);
+        assert!(
+            cold_worker.diff_files.is_empty(),
+            "~/project cache must never leak into /home/worker/project"
+        );
+        assert!(cold_worker.status.is_none());
+
+        // With authoritative home `/home/pa`, `/home/pa/project` matches `~/project`, while `/home/worker/project` STILL misses
+        {
+            let mut hosts = core.hosts.write().expect("write");
+            hosts
+                .get_mut(&host_id)
+                .expect("host")
+                .authoritative_home_dir = Some("/home/pa".into());
+        }
+        let auth_pa = core.git_review(&host_id, "/home/pa/project", None);
+        assert_eq!(auth_pa.diff_files.len(), 1);
+        assert_eq!(auth_pa.diff_files[0].path, "pa-only.txt");
+        let auth_worker_miss = core.git_review(&host_id, "/home/worker/project", None);
+        assert!(auth_worker_miss.diff_files.is_empty());
+        assert!(auth_worker_miss.status.is_none());
+
+        // Once `/home/worker/project` arrives, it resolves cleanly without mixing with `~/project`
+        deliver_diff("/home/worker/project", None, worker_diff, &mut rx);
+        let hydrated_worker = core.git_review(&host_id, "/home/worker/project", None);
+        assert_eq!(hydrated_worker.diff_files.len(), 1);
+        assert_eq!(hydrated_worker.diff_files[0].path, "worker-only.txt");
+
+        // POSIX literal backslash directory `/tmp/team\project` vs `/tmp/team/project` must stay distinct
+        deliver_diff("/tmp/team\\project", None, worker_diff, &mut rx);
+        deliver_diff("/tmp/team/project", None, pa_diff, &mut rx);
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/team\\project", None)
+                .diff_files[0]
+                .path,
+            "worker-only.txt"
+        );
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/team/project", None)
+                .diff_files[0]
+                .path,
+            "pa-only.txt"
+        );
+
+        // Structured `(cwd, Option<path>, staged)` keys MUST eliminate `::` delimiter collisions both on
+        // reads and on `GitMutationResult` eviction!
+        let colon_diff = "diff --git a/team::index.txt b/team::index.txt\n--- a/team::index.txt\n+++ b/team::index.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let release_diff = "diff --git a/release::notes.txt b/release::notes.txt\n--- a/release::notes.txt\n+++ b/release::notes.txt\n@@ -1 +1 @@\n-v1\n+v2\n";
+        deliver_diff("/repo", Some("team::index.txt"), colon_diff, &mut rx);
+        deliver_diff("/repo", Some("release::notes.txt"), release_diff, &mut rx);
+        // Querying `(/repo::team, Some("index.txt"))` MUST miss (never collide with `(/repo, Some("team::index.txt"))`)
+        let colon_collision_probe = core.git_review(&host_id, "/repo::team", Some("index.txt"));
+        assert!(
+            colon_collision_probe.diff_files.is_empty(),
+            "structured git_diffs keys must never collide across `::` boundaries"
+        );
+        assert!(colon_collision_probe.raw_diff.is_empty());
+        assert_eq!(
+            core.git_review(&host_id, "/repo", Some("team::index.txt"))
+                .diff_files[0]
+                .path,
+            "team::index.txt"
+        );
+
+        // Empty-files `GitMutationResult` for `/repo` MUST evict `release::notes.txt` cleanly
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo".into(),
+                result: orbit_protocol::GitMutationOutcome::FilesStaged {
+                    paths: vec![],
+                    all: true,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        assert!(
+            core.git_review(&host_id, "/repo", Some("release::notes.txt"))
+                .raw_diff
+                .is_empty(),
+            "empty GitMutationResult must evict cached files whose names contain `::`"
+        );
+        assert!(
+            core.git_review(&host_id, "/repo", Some("team::index.txt"))
+                .raw_diff
+                .is_empty()
+        );
+
+        // Legal POSIX directory names differing only by trailing whitespace (`/tmp/project` vs
+        // `/tmp/project `) MUST remain strictly distinct in both lookup and eviction.
+        deliver_diff("/tmp/project", None, worker_diff, &mut rx);
+        deliver_diff("/tmp/project ", None, pa_diff, &mut rx);
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/project", None).diff_files[0].path,
+            "worker-only.txt"
+        );
+        assert_eq!(
+            core.git_review(&host_id, "/tmp/project ", None).diff_files[0].path,
+            "pa-only.txt"
+        );
+        assert!(!crate::viewmodel::git_cache_paths_equivalent(
+            "/tmp/project",
+            "/tmp/project ",
+            None
+        ));
+        assert!(crate::viewmodel::git_cache_paths_equivalent(
+            "\\\\server\\share\\p",
+            "//server/share/p",
+            None
+        ));
+        assert!(!crate::viewmodel::git_cache_paths_equivalent(
+            "C:\\", "C:", None
+        ));
+        assert!(crate::viewmodel::git_cache_paths_equivalent(
+            "C:\\", "C:/", None
+        ));
     }
 }

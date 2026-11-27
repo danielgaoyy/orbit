@@ -48,6 +48,9 @@ jobs:
           echo "@ohos:registry=https://repo.harmonyos.com/npm/" >> "$HOME/.npmrc"
           ohpm config set registry https://repo.harmonyos.com/ohpm/
           hvigorw --version || true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-ohos
@@ -56,6 +59,9 @@ jobs:
           bash scripts/check-ohos-dts-sync.sh --print-count
           cargo run -p orbit-ffi-ohos --bin export_dto_fixtures -- --check
           node scripts/check-harmony-dto-contract.mjs
+          node scripts/gen-harmony-strings.mjs --check
+          bash scripts/check-harmony-i18n.sh
+          node scripts/gen-harmony-avatars.mjs --check
           cargo test -p orbit-ffi-ohos --features perf-hooks --test stage_replay
       - name: Build .so (x86_64 only)
         run: ./apps/harmony/scripts/build-rust-ohos.sh --arch x86_64

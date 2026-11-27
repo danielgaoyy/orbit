@@ -1227,6 +1227,8 @@ export interface OrchestrationConfig {
   installed_skills: string[];
   auto_cluster_enabled?: boolean;
   keep_awake_while_running?: boolean;
+  default_session_mode?: SessionMode | null;
+  default_session_mode_updated_at_ms?: number;
 }
 
 export interface KeepAwakeStatus {
@@ -5416,6 +5418,11 @@ export const orbitIpc = {
     await invoke<void>("update_orchestration_config", { hostId, config });
   },
 
+  setAccountDefaultMode: async (mode: SessionMode, updatedAtMs = 0): Promise<void> => {
+    if (!transport() || mode === "plan") return;
+    await invoke<void>("set_account_default_mode", { mode, updatedAtMs }).catch(() => {});
+  },
+
   syncOrchestrationSkills: async (hostId: string, skillIds: string[]): Promise<void> => {
     if (!transport()) return;
     await invoke<void>("sync_orchestration_skills", { hostId, skillIds });
@@ -7136,7 +7143,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!transport()) return "0.11.10";
+    if (!transport()) return "0.11.11";
     return invoke<string>("get_app_version");
   },
 

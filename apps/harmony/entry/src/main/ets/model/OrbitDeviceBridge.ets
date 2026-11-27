@@ -290,13 +290,28 @@ export async function requestHarmonyNotificationPermission(
   }
 }
 
+export async function setHarmonyAppBadgeNumber(count: number): Promise<void> {
+  if (!canIUse('SystemCapability.Notification.Notification')) {
+    return;
+  }
+  try {
+    const safeCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+    await notificationManager.setBadgeNumber(safeCount);
+  } catch (err) {
+    orbitLogWarn('OrbitNotify', 'Failed to update app badge number', err as Object);
+  }
+}
+
 export async function publishOrbitDeepLinkNotification(
   context: common.Context | undefined,
   notificationId: number,
   title: string,
   body: string,
   hostId: string,
-  agentId: string
+  agentId: string,
+  eventKind: string = '',
+  requestId: string = '',
+  targetSeq: number = 0
 ): Promise<boolean> {
   if (
     !canIUse('SystemCapability.Notification.Notification') ||
@@ -309,16 +324,38 @@ export async function publishOrbitDeepLinkNotification(
     const uiCtx = context as common.UIAbilityContext;
     const bundleName = uiCtx.abilityInfo?.bundleName ?? 'dev.orbit.harmony';
     const abilityName = uiCtx.abilityInfo?.name ?? 'EntryAbility';
-    const deepLinkUri = `orbit://open?host=${encodeURIComponent(hostId)}&agent=${encodeURIComponent(agentId)}`;
+    const cleanEvent = eventKind.trim();
+    const cleanReqId = requestId.trim();
+    const safeSeq = Number.isFinite(targetSeq) && targetSeq > 0 ? Math.floor(targetSeq) : 0;
+    let deepLinkUri = `orbit://open?host=${encodeURIComponent(hostId)}&agent=${encodeURIComponent(agentId)}`;
+    if (cleanEvent.length > 0) {
+      deepLinkUri += `&event_kind=${encodeURIComponent(cleanEvent)}`;
+    }
+    if (cleanReqId.length > 0) {
+      deepLinkUri += `&request_id=${encodeURIComponent(cleanReqId)}`;
+    }
+    if (safeSeq > 0) {
+      deepLinkUri += `&seq=${safeSeq}`;
+    }
+    const params: Record<string, Object> = {
+      'orbit_open_uri': deepLinkUri,
+      'orbit_host_id': hostId,
+      'orbit_agent_id': agentId
+    };
+    if (cleanEvent.length > 0) {
+      params['event_kind'] = cleanEvent;
+    }
+    if (cleanReqId.length > 0) {
+      params['orbit_request_id'] = cleanReqId;
+    }
+    if (safeSeq > 0) {
+      params['orbit_target_seq'] = String(safeSeq);
+    }
     const targetWant: Want = {
       bundleName: bundleName,
       abilityName: abilityName,
       uri: deepLinkUri,
-      parameters: {
-        'orbit_open_uri': deepLinkUri,
-        'orbit_host_id': hostId,
-        'orbit_agent_id': agentId
-      }
+      parameters: params
     };
     const agentInfo: wantAgent.WantAgentInfo = {
       wants: [targetWant],

@@ -526,6 +526,40 @@ impl std::fmt::Display for BoardCasConflictError {
 
 impl std::error::Error for BoardCasConflictError {}
 
+/// When Personal Router runs on an ACP engine (e.g. Hermes) and omits `provider`,
+/// pick an available coding provider on the target host (local or remote) instead of
+/// inheriting `ProviderKind::Acp` without an `acp_agent_id`.
+async fn pick_router_fallback_coding_provider(
+    rt: &Arc<DaemonRuntime>,
+    target_host: Option<&str>,
+) -> ProviderKind {
+    const PREFERRED: [ProviderKind; 4] = [
+        ProviderKind::ClaudeCode,
+        ProviderKind::Codex,
+        ProviderKind::Antigravity,
+        ProviderKind::Pi,
+    ];
+    if let Some(remote_host_id) = target_host {
+        let summaries = rt.connected_hosts.list_summaries().await;
+        if let Some(remote) = summaries
+            .iter()
+            .find(|h| h.host_id.as_deref() == Some(remote_host_id))
+            && !remote.available_providers.is_empty()
+            && let Some(found) = PREFERRED
+                .iter()
+                .copied()
+                .find(|p| remote.available_providers.contains(p))
+        {
+            return found;
+        }
+        return ProviderKind::ClaudeCode;
+    }
+    PREFERRED
+        .into_iter()
+        .find(|p| orbit_providers::find_provider_executable(*p).is_some())
+        .unwrap_or(ProviderKind::Acp)
+}
+
 /// Execute any Orbit orchestration tool by name with caller scoping & policy checks.
 pub async fn execute_tool(
     runtime: &Arc<DaemonRuntime>,
@@ -873,12 +907,23 @@ async fn execute_tool_inner(
         "orbit_memory" => {
             let caller = caller
                 .ok_or_else(|| anyhow::anyhow!("orbit_memory requires a workspace-bound caller"))?;
-            if caller.is_personal_router() {
-                anyhow::bail!(
-                    "orbit_memory is scoped to project workspaces and cannot be invoked from the host-level Personal Router"
-                );
-            }
-            crate::memory::execute_tool(&rt.orchestrator.memory, &caller, args).await
+            Box::pin(async move {
+                if caller.is_personal_router() {
+                    let personal_root = rt.home_dir.join("router_memory");
+                    tokio::fs::create_dir_all(&personal_root).await?;
+                    let root_str = personal_root.to_string_lossy().to_string();
+                    crate::memory::execute_tool_for_root(
+                        &rt.orchestrator.memory,
+                        &root_str,
+                        &caller,
+                        args,
+                    )
+                    .await
+                } else {
+                    crate::memory::execute_tool(&rt.orchestrator.memory, &caller, args).await
+                }
+            })
+            .await
         }
         "orbit_plugin" => {
             anyhow::ensure!(
@@ -925,7 +970,7 @@ async fn execute_tool_inner(
             }
         }
         // ==================== AGENTS ====================
-        "create_agent" | "dispatch_conversation" => {
+        "create_agent" | "dispatch_conversation" => Box::pin(async move {
             let caller_is_router = caller.as_ref().is_some_and(|c| c.is_personal_router());
             let creates_primary_conversation = caller_agent_id.is_none() || caller_is_router;
             let profile_id = opt_str(args, "profile_id").or_else(|| opt_str(args, "profile"));
@@ -940,10 +985,20 @@ async fn execute_tool_inner(
             } else {
                 None
             };
-            let (provider, inline_model) = if let Some(provider_raw) = opt_str(args, "provider") {
+            let explicit_provider = opt_str(args, "provider");
+            let explicit_acp_agent_id = opt_str(args, "acp_agent_id");
+            let (provider, inline_model) = if let Some(provider_raw) = explicit_provider {
                 parse_provider_and_model(&provider_raw)?
             } else if let Some(ref prof) = local_profile {
                 (prof.provider, None)
+            } else if caller_is_router
+                && caller
+                    .as_ref()
+                    .is_some_and(|c| c.provider == ProviderKind::Acp)
+            {
+                let fallback_provider =
+                    pick_router_fallback_coding_provider(rt, target_host.as_deref()).await;
+                (fallback_provider, None)
             } else if let Some(ref c) = caller {
                 (c.provider, None)
             } else {
@@ -951,6 +1006,11 @@ async fn execute_tool_inner(
                     "missing required string argument `provider` (or supply `profile_id`)"
                 );
             };
+            let resolved_acp_agent_id = explicit_acp_agent_id.or_else(|| {
+                (provider == ProviderKind::Acp)
+                    .then(|| caller.as_ref().and_then(|c| c.acp_agent_id.clone()))
+                    .flatten()
+            });
             let model = opt_str(args, "model")
                 .or(inline_model)
                 .or_else(|| local_profile.as_ref().and_then(|p| p.model.clone()));
@@ -958,9 +1018,17 @@ async fn execute_tool_inner(
                 .and_then(|s| ReasoningEffort::from_slug(&s))
                 .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
             let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
+            let account_default_mode = rt
+                .orch_config
+                .read()
+                .await
+                .default_session_mode
+                .clone()
+                .filter(|m| !matches!(m, SessionMode::Plan));
             let mode = opt_str(args, "mode")
                 .map(|s| parse_session_mode(&s))
                 .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
+                .or(account_default_mode)
                 .unwrap_or(SessionMode::AcceptEdits);
             let initial_prompt = opt_str(args, "initial_prompt")
                 .or_else(|| opt_str(args, "prompt"))
@@ -1038,6 +1106,21 @@ async fn execute_tool_inner(
                         "remote `create_agent` requires `workspace_id` or `cwd` on host `{remote_host_id}`"
                     );
                 }
+                let mut remote_init_labels = HashMap::new();
+                if caller_is_router && let Some(cid) = caller_agent_id {
+                    remote_init_labels.insert(
+                        orbit_protocol::LABEL_ROUTED_BY_AGENT.to_string(),
+                        cid.to_string(),
+                    );
+                    remote_init_labels.insert(
+                        orbit_protocol::LABEL_ROUTED_BY_HOST.to_string(),
+                        rt.host_info.host_id.clone(),
+                    );
+                    remote_init_labels.insert(
+                        orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                        orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
+                    );
+                }
                 let req_id = Uuid::new_v4();
                 let resp = rt
                     .connected_hosts
@@ -1077,7 +1160,8 @@ async fn execute_tool_inner(
                             branch: opt_str(args, "branch"),
                             handle: opt_str(args, "handle"),
                             auto_cluster: effective_auto_cluster,
-                            acp_agent_id: opt_str(args, "acp_agent_id"),
+                            acp_agent_id: resolved_acp_agent_id.clone(),
+                            labels: remote_init_labels.clone(),
                         },
                         Duration::from_secs(30),
                     )
@@ -1098,22 +1182,16 @@ async fn execute_tool_inner(
                     }
                     _ => anyhow::bail!("unexpected remote reply to create_agent"),
                 };
-                // Stamp `orbit.routed_by_agent` + `orbit.routed_by_host` BEFORE registering finish watch
-                // so remote FinishSubscriptions authenticate Router ownership without hiding the Conversation.
-                if caller_is_router && let Some(cid) = caller_agent_id {
+                // Backwards-compatible fallback for older remote daemons that do not yet honor
+                // `CreateAgent.labels`: stamp routing labels immediately if missing.
+                if caller_is_router
+                    && !remote_init_labels.is_empty()
+                    && !remote_agent
+                        .labels
+                        .contains_key(orbit_protocol::LABEL_ROUTED_BY_AGENT)
+                {
                     let mut routed_labels = remote_agent.labels.clone();
-                    routed_labels.insert(
-                        orbit_protocol::LABEL_ROUTED_BY_AGENT.to_string(),
-                        cid.to_string(),
-                    );
-                    routed_labels.insert(
-                        orbit_protocol::LABEL_ROUTED_BY_HOST.to_string(),
-                        rt.host_info.host_id.clone(),
-                    );
-                    routed_labels.insert(
-                        orbit_protocol::LABEL_SESSION_TIER.to_string(),
-                        orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
-                    );
+                    routed_labels.extend(remote_init_labels);
                     let upd_req_id = Uuid::new_v4();
                     let _ = rt
                         .connected_hosts
@@ -1202,7 +1280,7 @@ async fn execute_tool_inner(
                                 .map(|n| n as u32),
                             handle: opt_str(args, "handle"),
                             auto_cluster: effective_auto_cluster,
-                            acp_agent_id: opt_str(args, "acp_agent_id"),
+                            acp_agent_id: resolved_acp_agent_id,
                         },
                         init_labels,
                     ),
@@ -1248,7 +1326,8 @@ async fn execute_tool_inner(
                     .commit_receipt("create_agent", idem, &result.to_string());
             }
             Ok(result)
-        }
+        })
+        .await,
 
         "send_agent_prompt" => {
             let agent_id = str_arg(args, "agent_id")?;
@@ -2708,45 +2787,65 @@ async fn execute_tool_inner_collab(
                     "agent permission resolution only permits `allow` or `deny` (persistent `allow_always` grants require explicit human approval)"
                 );
             }
-            let is_pa_caller = match caller_agent_id {
-                Some(cid) => {
-                    rt.personal_router
-                        .is_authorized_global_router(cid, target_host.is_some())
-                        .await
-                }
-                None => false,
-            };
-            let mut resolved_pending_info: Option<orbit_protocol::PendingPermissionSummary> = None;
-            // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling & worker ownership when called by PersonalRouter
+            let caller_is_router = caller.as_ref().is_some_and(|c| c.is_personal_router());
             if let Some(cid) = caller_agent_id
-                && is_pa_caller
+                && caller_is_router
+                && !rt
+                    .personal_router
+                    .is_authorized_global_router(cid, target_host.is_some())
+                    .await
             {
-                if target_host.is_none() {
-                    if !is_worker_spawned_by_caller(&rt.store, &agent_id, cid)? {
+                anyhow::bail!(
+                    "Personal Router `{cid}` is not authorized to resolve permissions on {}",
+                    if target_host.is_some() {
+                        "remote hosts (enable Personal Router with Global Fleet scope)"
+                    } else {
+                        "this host (enable Personal Router first)"
+                    }
+                );
+            }
+            let mut resolved_pending_info: Option<orbit_protocol::PendingPermissionSummary> = None;
+            if let Some(ref remote_host_id) = target_host {
+                // Unconditionally verify worker ownership on the remote host for EVERY agent caller
+                // (PersonalRouter OR regular parent agent) before resolving or validating.
+                if let Some(cid) = caller_agent_id {
+                    let agents_req_id = Uuid::new_v4();
+                    let agents_resp = rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            agents_req_id,
+                            WireMessage::ListAgents {
+                                request_id: agents_req_id,
+                                workspace_id: None,
+                                parent_agent_id: None,
+                                include_background: true,
+                                include_archived: false,
+                            },
+                            Duration::from_secs(15),
+                        )
+                        .await?;
+                    let owns_remote = match agents_resp {
+                        WireMessage::AgentsSnapshot { agents, .. } => {
+                            is_remote_worker_spawned_by_caller(
+                                &agents,
+                                &agent_id,
+                                cid,
+                                &rt.host_info.host_id,
+                            )
+                        }
+                        WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                        _ => false,
+                    };
+                    if !owns_remote {
                         anyhow::bail!(
-                            "Personal Router can only resolve permissions for workers it routed or spawned; escalate unrelated session `{agent_id}` to the human"
+                            "caller `{cid}` can only resolve permissions for workers it routed or spawned; escalate unrelated remote session `{agent_id}` to the human"
                         );
                     }
-                    resolved_pending_info = rt
-                        .orchestrator
-                        .list_pending_permissions(Some(&agent_id))
-                        .await
-                        .into_iter()
-                        .find(|p| p.request_id == request_id);
                 }
-                let pending_assessment = resolved_pending_info
-                    .as_ref()
-                    .and_then(|p| p.guardian_assessment.as_ref());
-                if let Err(reason) = rt
-                    .personal_router
-                    .validate_router_permission_decision(&decision, pending_assessment)
-                    .await
-                {
-                    anyhow::bail!("{reason}");
-                }
-            }
-            if let Some(ref remote_host_id) = target_host {
-                // Agents/Routers must NEVER resolve human-only plan approval gates on remote hosts.
+                // Fetch remote pending permission metadata BEFORE Guardian ceiling validation so
+                // Tier-2 remote `allow` decisions receive the real Guardian risk assessment and
+                // agents/routers can never resolve human-only / plan approval gates.
                 let list_req_id = Uuid::new_v4();
                 let list_resp = rt
                     .connected_hosts
@@ -2784,6 +2883,34 @@ async fn execute_tool_inner_collab(
                     }
                     _ => {}
                 }
+            } else if let Some(cid) = caller_agent_id {
+                // Unconditionally verify local worker ownership for EVERY agent caller.
+                if !is_worker_spawned_by_caller(&rt.store, &agent_id, cid)? {
+                    anyhow::bail!(
+                        "caller `{cid}` can only resolve permissions for workers it routed or spawned; escalate unrelated session `{agent_id}` to the human"
+                    );
+                }
+                resolved_pending_info = rt
+                    .orchestrator
+                    .list_pending_permissions(Some(&agent_id))
+                    .await
+                    .into_iter()
+                    .find(|p| p.request_id == request_id);
+            }
+            // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling for both local and remote hosts.
+            if caller_agent_id.is_some() && caller_is_router {
+                let pending_assessment = resolved_pending_info
+                    .as_ref()
+                    .and_then(|p| p.guardian_assessment.as_ref());
+                if let Err(reason) = rt
+                    .personal_router
+                    .validate_router_permission_decision(&decision, pending_assessment)
+                    .await
+                {
+                    anyhow::bail!("{reason}");
+                }
+            }
+            if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
                 let resp = rt
                     .connected_hosts
@@ -2814,7 +2941,7 @@ async fn execute_tool_inner_collab(
                     .resolve_permission_by_agent(&agent_id, request_id.clone(), decision.clone())
                     .await?;
             }
-            if is_pa_caller {
+            if caller_is_router {
                 let target_host_id = target_host
                     .clone()
                     .unwrap_or_else(|| rt.host_info.host_id.clone());
@@ -3333,15 +3460,29 @@ async fn execute_tool_inner_collab(
                     .flatten()
                     .or_else(|| rt.store.get_profile_by_name(pid).ok().flatten())
             });
-            let (provider, inline_model) = if let Some(provider_raw) = opt_str(args, "provider") {
+            let explicit_provider = opt_str(args, "provider");
+            let explicit_acp_agent_id = opt_str(args, "acp_agent_id");
+            let caller_is_router = caller.as_ref().is_some_and(|c| c.is_personal_router());
+            let (provider, inline_model) = if let Some(provider_raw) = explicit_provider {
                 parse_provider_and_model(&provider_raw)?
             } else if let Some(ref prof) = local_profile {
                 (prof.provider, None)
+            } else if caller_is_router
+                && caller
+                    .as_ref()
+                    .is_some_and(|c| c.provider == ProviderKind::Acp)
+            {
+                (pick_router_fallback_coding_provider(rt, None).await, None)
             } else if let Some(ref c) = caller {
                 (c.provider, None)
             } else {
                 (ProviderKind::ClaudeCode, None)
             };
+            let resolved_acp_agent_id = explicit_acp_agent_id.or_else(|| {
+                (provider == ProviderKind::Acp)
+                    .then(|| caller.as_ref().and_then(|c| c.acp_agent_id.clone()))
+                    .flatten()
+            });
             let model = opt_str(args, "model")
                 .or(inline_model)
                 .or_else(|| local_profile.as_ref().and_then(|p| p.model.clone()));
@@ -3349,9 +3490,17 @@ async fn execute_tool_inner_collab(
                 .and_then(|s| ReasoningEffort::from_slug(&s))
                 .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
             let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
+            let account_default_mode = rt
+                .orch_config
+                .read()
+                .await
+                .default_session_mode
+                .clone()
+                .filter(|m| !matches!(m, SessionMode::Plan));
             let mode = opt_str(args, "mode")
                 .map(|s| parse_session_mode(&s))
                 .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
+                .or(account_default_mode)
                 .unwrap_or(SessionMode::AcceptEdits);
             let initial_prompt = opt_str(args, "initial_prompt")
                 .or_else(|| opt_str(args, "prompt"))
@@ -3445,7 +3594,7 @@ async fn execute_tool_inner_collab(
                         pr_number: None,
                         handle,
                         auto_cluster: Some(false),
-                        acp_agent_id: opt_str(args, "acp_agent_id"),
+                        acp_agent_id: resolved_acp_agent_id,
                     },
                     peer_labels,
                 )
@@ -8028,6 +8177,146 @@ mod tests {
         assert_eq!(entries[1].actor, "guardian_tier1");
         assert_eq!(entries[1].decision, "allow");
         assert_eq!(entries[1].risk_level.as_deref(), Some("low"));
+
+        rt.browser.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[tokio::test]
+    async fn personal_router_can_use_orbit_memory_in_host_personal_scope() {
+        let tmp_home = std::env::temp_dir().join(format!("orbit-router-memory-{}", Uuid::new_v4()));
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+        let now = chrono::Utc::now();
+        rt.store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_router".into(),
+                title: "Personal Router Workspace".into(),
+                cwd: tmp_home.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("insert router workspace");
+
+        let router_id = "ag_router_mem_1";
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            orbit_protocol::LABEL_AGENT_ROLE.to_string(),
+            orbit_protocol::AGENT_ROLE_PERSONAL_ROUTER.to_string(),
+        );
+        let router = orbit_protocol::AgentSummary {
+            agent_id: router_id.into(),
+            workspace_id: "ws_router".into(),
+            cwd: tmp_home.to_string_lossy().to_string(),
+            title: "Personal Agent".into(),
+            provider: ProviderKind::Acp,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: orbit_protocol::SessionMode::Auto,
+            status: orbit_protocol::AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels,
+            attention: orbit_protocol::AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: true,
+            pinned_order: 1,
+            handle: Some("router".into()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: Some("hermes".into()),
+        };
+        rt.store.upsert_agent(&router, None).expect("upsert router");
+
+        let saved_res = execute_tool(
+            &rt,
+            Some(router_id),
+            "orbit_memory",
+            json!({
+                "action": "remember",
+                "title": "Preferred permission mode",
+                "content": "User prefers full access across development hosts.",
+                "category": "preference"
+            }),
+        )
+        .await;
+        assert!(
+            !saved_res.is_error,
+            "Personal Router must be allowed to store personal memory: {}",
+            saved_res.text
+        );
+        let saved: Value = serde_json::from_str(&saved_res.text).expect("saved json");
+        let saved_id = saved["item"]["id"]
+            .as_str()
+            .expect("saved item id")
+            .to_string();
+
+        let confirmed_res = execute_tool(
+            &rt,
+            Some(router_id),
+            "orbit_memory",
+            json!({
+                "action": "confirm",
+                "id": saved_id
+            }),
+        )
+        .await;
+        assert!(
+            !confirmed_res.is_error,
+            "confirm personal memory failed: {}",
+            confirmed_res.text
+        );
+
+        let recalled_res = execute_tool(
+            &rt,
+            Some(router_id),
+            "orbit_memory",
+            json!({
+                "action": "recall",
+                "query": "full access permission",
+                "limit": 5
+            }),
+        )
+        .await;
+        assert!(
+            !recalled_res.is_error,
+            "recall personal memory failed: {}",
+            recalled_res.text
+        );
+        let recalled: Value = serde_json::from_str(&recalled_res.text).expect("recalled json");
+        let hits = recalled["hits"].as_array().expect("hits array");
+        assert!(
+            !hits.is_empty(),
+            "Personal Router must recall confirmed personal memories from $ORBIT_HOME/router_memory"
+        );
+        assert!(tmp_home.join("router_memory").is_dir());
 
         rt.browser.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&tmp_home);

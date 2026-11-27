@@ -115,10 +115,13 @@ export interface AgentCardDto {
   is_running: boolean;
   has_background_tasks?: boolean;
   has_armed_timers?: boolean;
+  has_running_subagents?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
   parent_host_id?: string | null;
+  acp_agent_id?: string | null;
   archived_at_rfc3339?: string | null;
+  labels?: Record<string, string>;
   handle?: string | null;
   latest_seq: number;
   created_at_rfc3339?: string | null;
@@ -2195,6 +2198,18 @@ export interface PermissionBatchItemDto {
   permission_request_id: string;
 }
 
+export interface BatchPermissionSkipReasonDto {
+  agent_id: string;
+  permission_request_id: string;
+  reason: string;
+}
+
+export interface ResolvePermissionsBatchResultDto {
+  resolved_count: number;
+  skipped_count: number;
+  skipped_reasons?: BatchPermissionSkipReasonDto[];
+}
+
 export interface OverviewPendingApprovalItem {
   key: string;
   host_id: string;
@@ -2344,17 +2359,17 @@ export interface RouterHostCapabilitiesDto {
 
 export interface PersonalRouterConfigDto {
   enabled: boolean;
-  router_agent_id: string | null;
+  router_agent_id?: string | null;
   provider: string;
-  acp_agent_id: string | null;
-  model: string | null;
-  effort: string | null;
-  cwd: string | null;
+  acp_agent_id?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  cwd?: string | null;
   scope: string; // 'global_fleet' | 'local_host_only'
   pre_review_mode: string; // 'disabled' | 'medium_risk_only' | 'assist_only'
   share_host_hermes_memory: boolean;
-  soul_prompt_override: string | null;
-  external_webhook_url: string | null;
+  soul_prompt_override?: string | null;
+  external_webhook_url?: string | null;
   has_external_webhook_secret: boolean;
 }
 
@@ -2626,6 +2641,16 @@ export interface BriefingSinceLastVisitDto {
   auto_handled: number;
 }
 
+export interface BriefingGoalSnapshotDto {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  goal_id: string;
+  status: string;
+  objective: string;
+  updated_at_ms: number;
+}
+
 export interface PersonalAgentBriefingDto {
   personal_agent: BriefingAgentRefDto | null;
   needs_you: BriefingDecisionDto[];
@@ -2635,6 +2660,7 @@ export interface PersonalAgentBriefingDto {
   hosts: BriefingHostDto[];
   counts: BriefingCountsDto;
   since_last_visit: BriefingSinceLastVisitDto;
+  goal_snapshots?: BriefingGoalSnapshotDto[];
 }
 
 export interface AgentStageDeltaRequestDto {

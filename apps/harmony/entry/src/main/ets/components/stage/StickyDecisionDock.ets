@@ -3,7 +3,9 @@ import {
   formatPermissionDecisionLabel
 } from '../../model/OrbitTypes';
 import { OrbitTimelineItemModel } from '../../model/viewmodels/OrbitStageModels';
+import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { OrbitStageStore } from '../../model/stores/OrbitStageStore';
 import {
   OrbitTokens,
   orbitButtonMeta,
@@ -14,12 +16,17 @@ import {
   orbitTextSubhead
 } from '../../theme/OrbitTokens';
 
-interface QueuedDecisionCard {
-  key: string;
-  kind: string; // 'permission' | 'question'
-  seq: number;
-  item: OrbitTimelineItemModel;
-}
+import {
+  QueuedDecisionCard,
+  findFocusedDecisionQueueIndex
+} from '../../model/OrbitDecisionFocusModel';
+
+export {
+  DecisionFocusTarget,
+  QueuedDecisionCard,
+  buildDecisionFocusTarget,
+  findFocusedDecisionQueueIndex
+} from '../../model/OrbitDecisionFocusModel';
 
 @ComponentV2
 export struct StickyDecisionDock {
@@ -29,7 +36,52 @@ export struct StickyDecisionDock {
   @Local isPreviewExpanded: boolean = false;
   private customAnswersMap: Map<string, string> = new Map<string, string>();
 
-  private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private store: OrbitHarmonyStore = orbitRuntime();
+  @Local private stageStore: OrbitStageStore = orbitRuntime().stageStore;
+
+  aboutToAppear(): void {
+    this.syncFocusedDecisionCard();
+  }
+
+  @Monitor(
+    'store.decisionFocusRevision',
+    'store.pendingFocusDecisionHostId',
+    'store.pendingFocusDecisionAgentId',
+    'store.pendingFocusDecisionEventKind',
+    'store.pendingFocusDecisionRequestId',
+    'store.pendingFocusDecisionSeq',
+    'stageStore.activeRevision'
+  )
+  onDecisionFocusChanged(_mon: IMonitor): void {
+    this.syncFocusedDecisionCard();
+  }
+
+  private syncFocusedDecisionCard(): void {
+    if (this.store.pendingFocusDecisionEventKind !== 'permission_required') {
+      return;
+    }
+    const targetHost = this.store.pendingFocusDecisionHostId.trim();
+    const targetAgent = this.store.pendingFocusDecisionAgentId.trim();
+    const reqId = this.store.pendingFocusDecisionRequestId;
+    const seq = this.store.pendingFocusDecisionSeq;
+    // Require complete (host, agent) scope before consuming any decision-card focus.
+    if (targetHost.length === 0 || targetAgent.length === 0 || (reqId.length === 0 && seq <= 0)) {
+      return;
+    }
+    const matched = findFocusedDecisionQueueIndex(
+      this.decisionQueue,
+      reqId,
+      seq,
+      targetHost,
+      targetAgent,
+      this.store.selectedHostId,
+      this.store.selectedAgentId
+    );
+    if (matched >= 0) {
+      this.activeQueueIndex = matched;
+      this.store.clearPendingDecisionFocus();
+    }
+  }
 
   @Computed
   get decisionQueue(): QueuedDecisionCard[] {

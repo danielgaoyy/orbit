@@ -75,6 +75,10 @@ impl OhosCoreFacade {
         self.inner.mark_agent_seen(host_id, agent_id, seq);
     }
 
+    pub fn mark_agent_read(&self, host_id: &str, agent_id: &str) {
+        self.inner.mark_agent_read(host_id, agent_id);
+    }
+
     pub fn mark_agent_unread(&self, host_id: &str, agent_id: &str) {
         self.inner.mark_agent_unread(host_id, agent_id);
     }

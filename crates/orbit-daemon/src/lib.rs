@@ -5486,6 +5486,7 @@ async fn handle_wire_rpc(
             handle,
             auto_cluster,
             acp_agent_id,
+            labels,
         } => {
             let mut reserved_key: Option<String> = None;
             if let Some(ref idem) = idempotency_key
@@ -5594,34 +5595,37 @@ async fn handle_wire_rpc(
                 });
                 let reply = match rt
                     .orchestrator
-                    .create_and_start_agent(CreateAgentSpec {
-                        cwd,
-                        extra_dirs,
-                        title,
-                        provider,
-                        model,
-                        effort,
-                        fast_mode,
-                        mode,
-                        initial_prompt,
-                        initial_display_prompt,
-                        initial_badges,
-                        worktree,
-                        workspace_id,
-                        parent_agent_id,
-                        parent_host_id,
-                        initial_prompt_source,
-                        profile_id,
-                        background,
-                        auto_archive,
-                        base_ref,
-                        worktree_mode,
-                        branch,
-                        pr_number: None,
-                        handle,
-                        auto_cluster,
-                        acp_agent_id,
-                    })
+                    .create_and_start_agent_with_labels(
+                        CreateAgentSpec {
+                            cwd,
+                            extra_dirs,
+                            title,
+                            provider,
+                            model,
+                            effort,
+                            fast_mode,
+                            mode,
+                            initial_prompt,
+                            initial_display_prompt,
+                            initial_badges,
+                            worktree,
+                            workspace_id,
+                            parent_agent_id,
+                            parent_host_id,
+                            initial_prompt_source,
+                            profile_id,
+                            background,
+                            auto_archive,
+                            base_ref,
+                            worktree_mode,
+                            branch,
+                            pr_number: None,
+                            handle,
+                            auto_cluster,
+                            acp_agent_id,
+                        },
+                        labels,
+                    )
                     .await
                 {
                     Ok(agent) => {
@@ -9184,8 +9188,32 @@ async fn handle_wire_rpc(
             let config = runtime.orch_config.read().await.clone();
             Some(WireMessage::OrchestrationConfigSnapshot { request_id, config })
         }
-        WireMessage::UpdateOrchestrationConfig { request_id, config } => {
-            *runtime.orch_config.write().await = config.clone();
+        WireMessage::UpdateOrchestrationConfig {
+            request_id,
+            mut config,
+        } => {
+            {
+                let mut cur = runtime.orch_config.write().await;
+                // Preserve existing account-wide default permission mode when an older client
+                // or Host Settings panel sends an OrchestrationConfig without `default_session_mode`,
+                // and never allow `SessionMode::Plan` to become the account-wide default.
+                if matches!(
+                    config.default_session_mode,
+                    Some(orbit_protocol::SessionMode::Plan)
+                ) {
+                    config.default_session_mode = None;
+                }
+                if config.default_session_mode.is_none()
+                    || (cur.default_session_mode.is_some()
+                        && config.default_session_mode_updated_at_ms
+                            < cur.default_session_mode_updated_at_ms)
+                {
+                    config.default_session_mode = cur.default_session_mode.clone();
+                    config.default_session_mode_updated_at_ms =
+                        cur.default_session_mode_updated_at_ms;
+                }
+                *cur = config.clone();
+            }
             runtime
                 .keep_awake
                 .set_enabled(config.keep_awake_while_running);
@@ -9193,6 +9221,46 @@ async fn handle_wire_rpc(
                 cfg.orchestration = config.clone()
             }) {
                 Ok(()) => Some(WireMessage::OrchestrationConfigSnapshot { request_id, config }),
+                Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
+            }
+        }
+        WireMessage::SetAccountDefaultMode {
+            request_id,
+            mode,
+            updated_at_ms,
+        } => {
+            // Never allow transient Plan mode to become the account-wide default permission mode.
+            if matches!(mode, orbit_protocol::SessionMode::Plan) {
+                return Some(WireMessage::Ack { request_id });
+            }
+            let applied = {
+                let mut cur = runtime.orch_config.write().await;
+                let should_apply = if updated_at_ms > 0 {
+                    updated_at_ms >= cur.default_session_mode_updated_at_ms
+                } else {
+                    // Cold-start / unversioned fallback (`0`) only seeds when host has no default yet.
+                    cur.default_session_mode.is_none()
+                };
+                if should_apply {
+                    cur.default_session_mode = Some(mode.clone());
+                    if updated_at_ms > 0 {
+                        cur.default_session_mode_updated_at_ms = updated_at_ms;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if !applied {
+                return Some(WireMessage::Ack { request_id });
+            }
+            match DaemonPersistedConfig::update(&runtime.home_dir, |cfg| {
+                cfg.orchestration.default_session_mode = Some(mode.clone());
+                if updated_at_ms > 0 {
+                    cfg.orchestration.default_session_mode_updated_at_ms = updated_at_ms;
+                }
+            }) {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
                 Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
             }
         }
@@ -13356,5 +13424,127 @@ mod self_upgrade_tests {
         assert_eq!(fallback_status.repo_prefix.as_deref(), Some("removed_sub"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn expand_host_path_preserves_trailing_space_strings() {
+        let abs_with_space = "/tmp/orbit_space_test/project ";
+        assert_eq!(
+            expand_host_path(abs_with_space),
+            PathBuf::from(abs_with_space)
+        );
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
+            assert_eq!(expand_host_path("~/project "), home.join("project "));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expand_host_path_and_git_ops_preserve_trailing_space_directories() {
+        let root =
+            std::env::temp_dir().join(format!("orbit_space_git_{}", Uuid::new_v4().simple()));
+        let plain_repo = root.join("project");
+        let space_repo = root.join("project ");
+        std::fs::create_dir_all(&plain_repo).expect("mkdir plain");
+        std::fs::create_dir_all(&space_repo).expect("mkdir space");
+
+        let init_repo = |dir: &Path, filename: &str| {
+            let run_git = |args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("GIT_AUTHOR_NAME", "Orbit Test")
+                    .env("GIT_AUTHOR_EMAIL", "test@orbit.local")
+                    .env("GIT_COMMITTER_NAME", "Orbit Test")
+                    .env("GIT_COMMITTER_EMAIL", "test@orbit.local")
+                    .status()
+                    .expect("run git");
+                assert!(
+                    status.success(),
+                    "git {:?} failed in {}",
+                    args,
+                    dir.display()
+                );
+            };
+            run_git(&["init", "-q"]);
+            std::fs::write(dir.join(filename), "initial\n").expect("write initial");
+            run_git(&["add", filename]);
+            run_git(&["commit", "-q", "-m", "init"]);
+            std::fs::write(dir.join(filename), "modified\n").expect("write modified");
+        };
+
+        init_repo(&plain_repo, "plain-only.txt");
+        init_repo(&space_repo, "space-only.txt");
+
+        let plain_str = plain_repo.to_string_lossy().to_string();
+        let space_str = space_repo.to_string_lossy().to_string();
+        assert_ne!(plain_str, space_str);
+
+        // `expand_host_path` MUST preserve significant trailing spaces for both absolute and `~/` paths.
+        assert_eq!(expand_host_path(&space_str), space_repo);
+        assert_eq!(expand_host_path(&plain_str), plain_repo);
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
+            assert_eq!(expand_host_path(""), home);
+            assert_eq!(expand_host_path("   "), home);
+            assert_eq!(expand_host_path("~"), home);
+            assert_eq!(expand_host_path("~/project "), home.join("project "));
+        }
+
+        // Git status + diff on `project ` MUST strictly read `space-only.txt` and NEVER `plain-only.txt`.
+        let resolved_space = expand_host_path(&space_str);
+        let space_status = inspect_git_status(&resolved_space).await;
+        let space_paths: Vec<&str> = space_status.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(space_paths, vec!["space-only.txt"]);
+        let space_diff = compute_git_diff(&resolved_space, None, false)
+            .await
+            .expect("space diff");
+        assert!(space_diff.contains("space-only.txt"));
+        assert!(!space_diff.contains("plain-only.txt"));
+
+        // Control: Git status + diff on `project` strictly reads `plain-only.txt` and NEVER `space-only.txt`.
+        let resolved_plain = expand_host_path(&plain_str);
+        let plain_status = inspect_git_status(&resolved_plain).await;
+        let plain_paths: Vec<&str> = plain_status.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(plain_paths, vec!["plain-only.txt"]);
+        let plain_diff = compute_git_diff(&resolved_plain, None, false)
+            .await
+            .expect("plain diff");
+        assert!(plain_diff.contains("plain-only.txt"));
+        assert!(!plain_diff.contains("space-only.txt"));
+
+        // Write/stage authorization & staging on `project ` MUST authorize `project ` without matching `project`.
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_space".into(),
+                name: "Project Space".into(),
+                directories: vec![space_str.clone()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert space project");
+        let authorized_space = authorize_workspace_mutation_cwd(&store, &resolved_space)
+            .await
+            .expect("authorize space repo");
+        assert!(
+            authorize_workspace_mutation_cwd(&store, &resolved_plain)
+                .await
+                .is_err(),
+            "registering `project ` must not authorize sibling `project`"
+        );
+        crate::git_write::stage_files(&authorized_space, &["space-only.txt".into()], false)
+            .await
+            .expect("stage space-only.txt");
+        let staged_space_diff = compute_git_diff(&authorized_space, None, true)
+            .await
+            .expect("staged space diff");
+        assert!(staged_space_diff.contains("space-only.txt"));
+        let staged_plain_diff = compute_git_diff(&resolved_plain, None, true)
+            .await
+            .expect("staged plain diff");
+        assert!(staged_plain_diff.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -432,6 +432,12 @@ export class OrbitCoreBridge
     });
   }
 
+  public markAgentRead(hostId: string, agentId: string): void {
+    this.traceVoidSync('markAgentRead', 0, (): void => {
+      this.core.markAgentRead(hostId, agentId);
+    });
+  }
+
   public markAgentUnread(hostId: string, agentId: string): void {
     this.traceVoidSync('markAgentUnread', 0, (): void => {
       this.core.markAgentUnread(hostId, agentId);
@@ -550,6 +556,12 @@ export class OrbitCoreBridge
   public setSessionMode(hostId: string, agentId: string, mode: string): void {
     this.traceVoidSync('setSessionMode', 0, (): void => {
       this.core.setSessionMode(hostId, agentId, mode);
+    });
+  }
+
+  public setAccountDefaultMode(mode: string, updatedAtMs: number = 0): void {
+    this.traceVoidSync('setAccountDefaultMode', 0, (): void => {
+      this.core.setAccountDefaultMode(mode, updatedAtMs);
     });
   }
 

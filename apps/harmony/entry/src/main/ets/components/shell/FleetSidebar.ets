@@ -5,10 +5,12 @@ import {
   SidebarProjectGroupDto,
   basenameOfPath,
   cwdPathsEquivalent,
-  formatCompactRelativeTime,
-  formatCompactTopBarConnectionLabel
+  formatProviderLabel,
+  parseRfc3339Ms
 } from '../../model/OrbitTypes';
+import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { OrbitSidebarRow } from '../../model/stores/OrbitFleetStore';
 import {
   OrbitTokens,
   orbitButtonSubhead,
@@ -21,16 +23,21 @@ import {
   resolveSelectedHost
 } from '../common/OrbitCommonControls';
 import {
-  MAX_VISIBLE_THREADS_PER_PROJECT,
-  filterSidebarConversationsForHost,
-  filterSidebarProjectsForHost
-} from './FleetProjectGrouping';
+  OrbitAgentListItem,
+  mapAgentCardToListStatus,
+  resolveAgentEffortDisplay,
+  resolveAgentFallbackLabel,
+  resolveCompactAgentModelLabel
+} from '../common/OrbitAgentListItem';
+import { resolveConnectionStateResource } from './TopBarDisplayModel';
+import {
+  compactTimeSpecToResource,
+  resolveRelativeTimeSpec
+} from '../personal-agent/PersonalAgentBriefingModel';
 
 @ComponentV2
 export struct FleetSidebar {
-  @Local expandedMoreProjectIds: string[] = [];
-
-  private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  private readonly store: OrbitHarmonyStore = orbitRuntime();
 
   @Computed
   get normalizedQuery(): string {
@@ -42,49 +49,6 @@ export struct FleetSidebar {
     return resolveSelectedHost(this.store);
   }
 
-  @Computed
-  get needsAttentionList(): SidebarConversationDto[] {
-    if (this.normalizedQuery.length > 0) {
-      return [];
-    }
-    return filterSidebarConversationsForHost(
-      this.store.sidebarView?.needs_attention,
-      this.store.selectedHostId
-    );
-  }
-
-  @Computed
-  get pinnedList(): SidebarConversationDto[] {
-    if (this.normalizedQuery.length > 0) {
-      return [];
-    }
-    return filterSidebarConversationsForHost(
-      this.store.sidebarView?.pinned_conversations,
-      this.store.selectedHostId
-    );
-  }
-
-  @Computed
-  get unifiedProjects(): SidebarProjectGroupDto[] {
-    return filterSidebarProjectsForHost(
-      this.store.sidebarView,
-      this.store.selectedHostId
-    );
-  }
-
-  private isProjectMoreExpanded(projectId: string): boolean {
-    return this.expandedMoreProjectIds.indexOf(projectId) >= 0;
-  }
-
-  private toggleProjectMoreExpanded(projectId: string): void {
-    if (this.isProjectMoreExpanded(projectId)) {
-      this.expandedMoreProjectIds = this.expandedMoreProjectIds.filter((id: string) => id !== projectId);
-    } else {
-      this.expandedMoreProjectIds = this.expandedMoreProjectIds.concat([projectId]);
-    }
-    this.store.triggerHaptic(6);
-  }
-
   private hasCustomSortOrFilter(): boolean {
     return (
       this.store.sidebarProjectSort !== 'recent' ||
@@ -92,26 +56,46 @@ export struct FleetSidebar {
     );
   }
 
-  private hostConnectionSummary(host: HostCardDto): string {
-    const conn = formatCompactTopBarConnectionLabel(host.connection_state, host.via_ssh_tunnel);
-    return host.last_ping_ms !== null ? `${conn} · ${host.last_ping_ms}ms` : conn;
+  private hostConnectionResource(host: HostCardDto): Resource {
+    return resolveConnectionStateResource(host.connection_state, host.via_ssh_tunnel);
   }
 
-  private visibleThreadsForGroup(group: SidebarProjectGroupDto): SidebarConversationDto[] {
-    if (this.normalizedQuery.length > 0 || this.isProjectMoreExpanded(group.id)) {
-      return group.conversations;
+  private resolveConversationRelativeTime(rfc3339: string): ResourceStr {
+    const ms = parseRfc3339Ms(rfc3339);
+    if (ms <= 0) {
+      return '';
     }
-    return group.conversations.slice(0, MAX_VISIBLE_THREADS_PER_PROJECT);
+    return compactTimeSpecToResource(resolveRelativeTimeSpec(ms, Date.now()));
+  }
+
+  private paNeedsYouCount(): number {
+    const briefing = this.store.briefing;
+    return briefing !== null ? briefing.counts.needs_you : 0;
+  }
+
+  private isPersonalAgentActive(): boolean {
+    return this.store.showPersonalAgentSetup || this.store.isCurrentSessionPersonalAgent();
+  }
+
+  private resolveConversationTitle(conv: SidebarConversationDto): string {
+    const title = conv.agent.title.trim();
+    return title.length > 0 ? title : formatProviderLabel(conv.agent.provider);
+  }
+
+  private resolveConversationModel(conv: SidebarConversationDto): string {
+    const detail = this.store.fleetStore.getCachedHostDetail(conv.host_id);
+    const catalogs = detail !== null ? detail.provider_catalogs : [];
+    return resolveCompactAgentModelLabel(conv.agent, catalogs);
   }
 
   @Builder
   private renderFilterSortMenu() {
     Menu() {
-      MenuItemGroup({ header: 'Sort by' }) {
+      MenuItemGroup({ header: $r('app.string.sidebar_sortBy') }) {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.clock'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Recent',
+          content: $r('app.string.sidebar_sortRecent'),
           symbolEndIcon: this.store.sidebarProjectSort === 'recent'
             ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
             : undefined
@@ -123,7 +107,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.textformat'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Name',
+          content: $r('app.string.sidebar_sortName'),
           symbolEndIcon: this.store.sidebarProjectSort === 'name'
             ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
             : undefined
@@ -135,7 +119,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.line_3_horizontal'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Manual',
+          content: $r('app.string.sidebar_sortCustom'),
           symbolEndIcon: this.store.sidebarProjectSort === 'manual'
             ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
             : undefined
@@ -145,11 +129,11 @@ export struct FleetSidebar {
           })
       }
 
-      MenuItemGroup({ header: 'Show' }) {
+      MenuItemGroup({ header: $r('app.string.sidebar_show') }) {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.message'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'All Conversations',
+          content: $r('app.string.sidebar_filterAll'),
           symbolEndIcon: this.store.sidebarThreadFilter === 'all'
             ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
             : undefined
@@ -161,7 +145,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Active & Unread',
+          content: $r('app.string.sidebar_filterActiveUnread'),
           symbolEndIcon: this.store.sidebarThreadFilter === 'active_unread'
             ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
             : undefined
@@ -176,7 +160,7 @@ export struct FleetSidebar {
   @Builder
   private renderHostSwitcherMenu() {
     Menu() {
-      MenuItemGroup({ header: 'Hosts' }) {
+      MenuItemGroup({ header: $r('app.string.briefing_hostsTitle') }) {
         ForEach(
           this.store.hosts,
           (host: HostCardDto) => {
@@ -184,7 +168,7 @@ export struct FleetSidebar {
               symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
                 .fontColor([resolveHostStatusColor(host, this.store)]),
               content: host.display_name,
-              labelInfo: this.hostConnectionSummary(host),
+              labelInfo: this.hostConnectionResource(host),
               symbolEndIcon: host.host_id === this.store.selectedHostId
                 ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
                 : undefined
@@ -195,7 +179,7 @@ export struct FleetSidebar {
                 this.store.triggerHaptic(8);
               })
           },
-          (host: HostCardDto) => `host_menu_${host.host_id}`
+          (host: HostCardDto): string => `host_menu_${host.host_id}`
         )
       }
 
@@ -203,7 +187,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.qrcode'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Pair New Host'
+          content: $r('app.string.sidebar_pairNewHost')
         })
           .onClick(() => {
             this.store.openHostSettings();
@@ -212,7 +196,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.bolt'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Connect Local Host'
+          content: $r('app.string.sidebar_connectLocalHost')
         })
           .onClick(() => {
             this.store.discoverAndPairLocalDaemon();
@@ -228,7 +212,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.plus'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'New Session Here'
+          content: $r('app.string.sidebar_newSessionHere')
         })
           .onClick(() => {
             this.store.startNewSessionDraft(group.primary_cwd);
@@ -237,7 +221,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Select Workspace'
+          content: $r('app.string.sidebar_selectWorkspace')
         })
           .onClick(() => {
             this.store.startNewSessionDraft(group.primary_cwd);
@@ -264,7 +248,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Terminal'
+          content: $r('app.string.nav_terminal')
         })
           .onClick(() => {
             this.store.openPtyTerminalInCwd(group.primary_cwd, group.host_id);
@@ -274,7 +258,9 @@ export struct FleetSidebar {
           symbolStartIcon: new SymbolGlyphModifier(
             (group.pinned_project_id ?? '').length > 0 ? $r('sys.symbol.pin_slash') : $r('sys.symbol.pin')
           ).fontColor([this.store.palette.iconPrimary]),
-          content: (group.pinned_project_id ?? '').length > 0 ? 'Unpin Project' : 'Pin Project'
+          content: (group.pinned_project_id ?? '').length > 0
+            ? $r('app.string.sidebar_unpinProject')
+            : $r('app.string.sidebar_pinProject')
         })
           .onClick(() => {
             const pinnedProjId = group.pinned_project_id ?? '';
@@ -288,10 +274,10 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Copy Path'
+          content: $r('app.string.sidebar_copyPath')
         })
           .onClick(() => {
-            this.store.copyToClipboard(group.primary_cwd, 'Copied path');
+            this.store.copyToClipboard(group.primary_cwd, '');
           })
       }
     }
@@ -305,25 +291,36 @@ export struct FleetSidebar {
           symbolStartIcon: new SymbolGlyphModifier(
             conv.is_pinned ? $r('sys.symbol.pin_slash') : $r('sys.symbol.pin')
           ).fontColor([this.store.palette.iconPrimary]),
-          content: conv.is_pinned ? 'Unpin Conversation' : 'Pin Conversation'
+          content: conv.is_pinned ? $r('app.string.sidebar_unpin') : $r('app.string.sidebar_pin')
         })
           .onClick(() => {
             this.store.togglePinThread(conv.host_id, conv.agent.agent_id);
           })
 
-        MenuItem({
-          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
-            .fontColor([this.store.palette.iconPrimary]),
-          content: 'Mark Unread'
-        })
-          .onClick(() => {
-            this.store.markAgentUnread(conv.host_id, conv.agent.agent_id);
+        if (conv.is_unread) {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.checkmark_circle'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: $r('app.string.sidebar_markRead')
           })
+            .onClick(() => {
+              this.store.markAgentRead(conv.host_id, conv.agent.agent_id);
+            })
+        } else {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: $r('app.string.sidebar_markUnread')
+          })
+            .onClick(() => {
+              this.store.markAgentUnread(conv.host_id, conv.agent.agent_id);
+            })
+        }
 
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.plus'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'New Session in Workspace'
+          content: $r('app.string.sidebar_newSessionHere')
         })
           .onClick(() => {
             this.store.startNewSessionDraft(conv.agent.cwd);
@@ -332,7 +329,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Diff Review'
+          content: $r('app.string.nav_git_review')
         })
           .onClick(() => {
             this.store.inspectGitDiffForCwd(conv.agent.cwd, conv.host_id);
@@ -341,7 +338,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Terminal'
+          content: $r('app.string.nav_terminal')
         })
           .onClick(() => {
             this.store.openPtyTerminalInCwd(conv.agent.cwd, conv.host_id);
@@ -350,10 +347,10 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Copy Workspace Path'
+          content: $r('app.string.sidebar_copyPath')
         })
           .onClick(() => {
-            this.store.copyToClipboard(conv.agent.cwd, 'Copied path');
+            this.store.copyToClipboard(conv.agent.cwd, '');
           })
       }
 
@@ -361,7 +358,7 @@ export struct FleetSidebar {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
             .fontColor([this.store.palette.statusDanger]),
-          content: 'Archive'
+          content: $r('app.string.common_archive')
         })
           .contentFontColor(this.store.palette.statusDanger)
           .onClick(() => {
@@ -385,7 +382,7 @@ export struct FleetSidebar {
       .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
       .backgroundColor(this.store.palette.statusDanger)
       .borderRadius(OrbitTokens.RADIUS_MD)
-      .accessibilityText('Archive session')
+      .accessibilityText($r('app.string.sidebar_archiveConversation'))
       .onClick(() => {
         this.store.archiveSession(agentId);
       })
@@ -395,171 +392,249 @@ export struct FleetSidebar {
   }
 
   @Builder
-  private renderConversationRow(
-    conv: SidebarConversationDto,
-    showWorkspaceHint: boolean,
-    indentLeft: number
-  ) {
-    ListItem() {
+  private renderPersonalAgentEntry() {
+    Column({ space: 2 }) {
+      // Personal Agent 30vp primary navigation row
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Row() {
-          if (conv.agent.is_awaiting_permission) {
-            SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
-              .fontSize(14)
-              .fontColor([this.store.palette.statusWarning])
-          } else if (conv.agent.is_running) {
-            LoadingProgress()
-              .width(16)
-              .height(16)
-              .color(this.store.palette.iconSecondary)
-          } else if (conv.is_unread) {
-            Row()
-              .width(7)
-              .height(7)
-              .borderRadius(3.5)
-              .backgroundColor(this.store.palette.unreadBadge)
-          }
-        }
-        .width(20)
-        .justifyContent(FlexAlign.Center)
-        .alignItems(VerticalAlign.Center)
+        Image($r('app.media.orbit_agent_bot'))
+          .width(15)
+          .height(15)
+          .objectFit(ImageFit.Contain)
+          .fillColor($r('app.color.icon_primary'))
+          .draggable(false)
+          .flexShrink(0)
 
-        Column({ space: 2 }) {
-          Text(conv.agent.title.trim().length > 0 ? conv.agent.title : conv.agent.provider_label)
-            .attributeModifier(
-              orbitTextSubhead(
-                this.store.palette.fgPrimary,
-                !this.store.isNewSessionDraft && this.store.selectedAgentId === conv.agent.agent_id
-                  ? FontWeight.Medium
-                  : FontWeight.Normal
-              )
-            )
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-          if (showWorkspaceHint) {
-            Text(basenameOfPath(conv.agent.cwd))
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        if (formatCompactRelativeTime(conv.agent.updated_at_rfc3339).length > 0) {
-          Text(formatCompactRelativeTime(conv.agent.updated_at_rfc3339))
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-            .maxLines(1)
-        }
-      }
-      .width('100%')
-      .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-      .padding({
-        left: indentLeft,
-        right: OrbitTokens.SPACE_MD,
-        top: 6,
-        bottom: 6
-      })
-      .backgroundColor(
-        !this.store.isNewSessionDraft && this.store.selectedAgentId === conv.agent.agent_id
-          ? this.store.palette.subtleSurface
-          : Color.Transparent
-      )
-      .borderRadius(OrbitTokens.RADIUS_MD)
-      .alignItems(VerticalAlign.Center)
-      .onClick(() => {
-        dismissHarmonyKeyboard(this.getUIContext());
-        this.store.selectAgent(conv.agent.agent_id);
-      })
-      .bindContextMenu(
-        () => {
-          this.renderSessionContextMenu(conv);
-        },
-        ResponseType.LongPress
-      )
-    }
-    .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 1, bottom: 1 })
-    .swipeAction({
-      end: {
-        builder: () => {
-          this.renderSwipeArchiveButton(conv.agent.agent_id);
-        }
-      }
-    })
-  }
-
-  @Builder
-  private renderProjectHeaderRow(group: SidebarProjectGroupDto) {
-    ListItem() {
-      Row({ space: 6 }) {
-        SymbolGlyph(
-          this.normalizedQuery.length === 0 && this.store.isProjectCollapsed(group.id)
-            ? $r('sys.symbol.chevron_right')
-            : $r('sys.symbol.chevron_down')
-        )
-          .fontSize(12)
-          .fontColor([this.store.palette.fgMuted])
-
-        SymbolGlyph($r('sys.symbol.folder'))
-          .fontSize(16)
-          .fontColor([
-            this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
-              ? this.store.palette.accentPrimary
-              : this.store.palette.iconSecondary
-          ])
-
-        Text(group.name)
-          .attributeModifier(
-            orbitTextSubhead(
-              this.store.palette.fgPrimary,
-              this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
-                ? FontWeight.Bold
-                : FontWeight.Medium
-            )
-          )
+        Text($r('app.string.sidebar_personalRouter'))
+          .fontSize(OrbitTokens.FONT_SUBHEAD)
+          .fontWeight(this.isPersonalAgentActive() ? FontWeight.Medium : FontWeight.Normal)
+          .fontColor(this.store.palette.fgPrimary)
+          .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
 
-        Button({ type: ButtonType.Circle, stateEffect: true }) {
-          SymbolGlyph($r('sys.symbol.plus'))
-            .fontSize(16)
-            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-            .fontColor([this.store.palette.iconSecondary])
+        if (this.paNeedsYouCount() > 0) {
+          Text($r('app.string.sidebar_personalAgentNeedsYou', this.paNeedsYouCount()))
+            .fontSize(OrbitTokens.FONT_META)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.store.palette.statusWarning)
+            .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+            .maxLines(1)
+            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+            .borderRadius(OrbitTokens.RADIUS_SM)
+            .backgroundColor(this.store.palette.statusWarningSoft)
+            .flexShrink(0)
         }
-        .width(OrbitTokens.HIT_COMPACT)
-        .height(OrbitTokens.HIT_COMPACT)
-        .padding(0)
-        .backgroundColor(Color.Transparent)
-        .accessibilityText(`New session in ${group.name}`)
-        .onClick(() => {
-          dismissHarmonyKeyboard(this.getUIContext());
-          this.store.startNewSessionDraft(group.primary_cwd);
-        })
       }
       .width('100%')
-      .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-      .padding({ left: 8, right: 4 })
+      .constraintSize({ minHeight: 30 })
+      .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+      .borderRadius(OrbitTokens.RADIUS_MD)
       .backgroundColor(
-        this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
+        this.isPersonalAgentActive()
           ? this.store.palette.subtleSurface
           : Color.Transparent
       )
-      .borderRadius(OrbitTokens.RADIUS_MD)
       .alignItems(VerticalAlign.Center)
+      .accessibilityText($r('app.string.sidebar_personalRouter'))
       .onClick(() => {
         dismissHarmonyKeyboard(this.getUIContext());
-        this.store.toggleProjectCollapsed(group.id);
+        this.store.openPersonalAgentHome();
       })
-      .bindContextMenu(
-        () => {
-          this.renderProjectContextMenu(group);
-        },
-        ResponseType.LongPress
-      )
+
+      // Fleet-wide search shortcut
+      Row({ space: OrbitTokens.SPACE_SM }) {
+        SymbolGlyph($r('sys.symbol.magnifyingglass'))
+          .fontSize(14)
+          .fontColor([this.store.palette.iconSecondary])
+          .flexShrink(0)
+
+        Text($r('app.string.nav_search_fleet'))
+          .fontSize(OrbitTokens.FONT_SUBHEAD)
+          .fontWeight(FontWeight.Normal)
+          .fontColor(this.store.palette.fgSecondary)
+          .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .constraintSize({ minHeight: 30 })
+      .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+      .borderRadius(OrbitTokens.RADIUS_MD)
+      .alignItems(VerticalAlign.Center)
+      .accessibilityText($r('app.string.nav_search_fleet'))
+      .onClick(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+        this.store.openGlobalSearch();
+      })
     }
-    .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 1, bottom: 1 })
+    .width('100%')
+    .padding({
+      left: OrbitTokens.SPACE_SM,
+      right: OrbitTokens.SPACE_SM,
+      bottom: OrbitTokens.SPACE_XS
+    })
+  }
+
+  @Builder
+  private renderProjectsSectionHeader() {
+    Row({ space: 4 }) {
+      Text($r('app.string.sidebar_projects'))
+        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+        .maxLines(1)
+        .layoutWeight(1)
+
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        SymbolGlyph($r('sys.symbol.sort'))
+          .fontSize(17)
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          .fontColor([
+            this.hasCustomSortOrFilter()
+              ? this.store.palette.accentPrimary
+              : this.store.palette.iconSecondary
+          ])
+      }
+      .width(OrbitTokens.HIT_COMPACT)
+      .height(OrbitTokens.HIT_COMPACT)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText($r('app.string.sidebar_sortAndFilterAria'))
+      .bindMenu(this.renderFilterSortMenu())
+
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        SymbolGlyph($r('sys.symbol.folder_badge_plus'))
+          .fontSize(17)
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          .fontColor([
+            this.store.showDirBrowser
+              ? this.store.palette.accentPrimary
+              : this.store.palette.iconSecondary
+          ])
+      }
+      .width(OrbitTokens.HIT_COMPACT)
+      .height(OrbitTokens.HIT_COMPACT)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText($r('app.string.sidebar_browseDirectoryAria'))
+      .onClick(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+        if (this.store.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+          this.store.sidebarOpen = false;
+        }
+        this.store.browseDirectory(
+          this.store.activeCwd === '~' ? null : this.store.activeCwd
+        );
+      })
+    }
+    .width('100%')
+    .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_SM, top: 8, bottom: 2 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  private renderProjectHeaderRow(group: SidebarProjectGroupDto, isCollapsed: boolean) {
+    Row({ space: 6 }) {
+      SymbolGlyph(
+        isCollapsed ? $r('sys.symbol.chevron_right') : $r('sys.symbol.chevron_down')
+      )
+        .fontSize(12)
+        .fontColor([this.store.palette.fgMuted])
+        .flexShrink(0)
+
+      SymbolGlyph($r('sys.symbol.folder'))
+        .fontSize(15)
+        .fontColor([
+          this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
+            ? this.store.palette.accentPrimary
+            : this.store.palette.iconSecondary
+        ])
+        .flexShrink(0)
+
+      Text(group.name)
+        .attributeModifier(
+          orbitTextSubhead(
+            this.store.palette.fgPrimary,
+            this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
+              ? FontWeight.Bold
+              : FontWeight.Medium
+          )
+        )
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(15)
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          .fontColor([this.store.palette.iconSecondary])
+      }
+      .width(OrbitTokens.HIT_COMPACT)
+      .height(OrbitTokens.HIT_COMPACT)
+      .padding(0)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText($r('app.string.sidebar_newConversationInTarget', group.name))
+      .onClick(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+        this.store.startNewSessionDraft(group.primary_cwd);
+      })
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 40 })
+    .padding({ left: 8, right: 4, top: 4, bottom: 4 })
+    .backgroundColor(
+      this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
+        ? this.store.palette.subtleSurface
+        : Color.Transparent
+    )
+    .borderRadius(OrbitTokens.RADIUS_MD)
+    .alignItems(VerticalAlign.Center)
+    .onClick(() => {
+      dismissHarmonyKeyboard(this.getUIContext());
+      this.store.toggleProjectCollapsed(group.id);
+    })
+    .bindContextMenu(
+      () => {
+        this.renderProjectContextMenu(group);
+      },
+      ResponseType.LongPress
+    )
+  }
+
+  @Builder
+  private renderEmptyProjectsRow() {
+    Column({ space: OrbitTokens.SPACE_SM }) {
+      Text(
+        this.normalizedQuery.length > 0
+          ? $r('app.string.sidebar_noMatchingThreads')
+          : this.store.sidebarThreadFilter === 'active_unread'
+            ? $r('app.string.sidebar_noActiveOrUnread')
+            : $r('app.string.sidebar_noProjectsYet')
+      )
+        .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Normal))
+
+      if (this.normalizedQuery.length > 0) {
+        Button($r('app.string.sidebar_clearThreadFilter'), { type: ButtonType.Normal, stateEffect: true })
+          .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+          .padding({ left: 0, right: OrbitTokens.SPACE_SM })
+          .onClick(() => {
+            this.store.setSidebarSearchQuery('');
+          })
+      } else if (this.store.sidebarThreadFilter !== 'all') {
+        Button($r('app.string.sidebar_showAllConversations'), { type: ButtonType.Normal, stateEffect: true })
+          .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+          .padding({ left: 0, right: OrbitTokens.SPACE_SM })
+          .onClick(() => {
+            this.store.setSidebarThreadFilter('all');
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: OrbitTokens.SPACE_MD })
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder
@@ -569,22 +644,35 @@ export struct FleetSidebar {
       .height(8)
       .borderRadius(4)
       .backgroundColor(resolveHostStatusColor(this.selectedHostCard, this.store))
+      .flexShrink(0)
 
-    Text(this.selectedHostCard?.display_name ?? 'No Host')
+    Text(this.selectedHostCard !== null ? this.selectedHostCard.display_name : $r('app.string.sidebar_noHostShort'))
       .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
       .maxLines(1)
       .textOverflow({ overflow: TextOverflow.Ellipsis })
+      .flexShrink(1)
 
     if (this.selectedHostCard !== null) {
-      Text(this.hostConnectionSummary(this.selectedHostCard))
+      Row({ space: 4 }) {
+        Text(this.hostConnectionResource(this.selectedHostCard))
+          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+          .maxLines(1)
+          .flexShrink(0)
+        if (this.selectedHostCard.last_ping_ms !== null) {
+          Text(`· ${this.selectedHostCard.last_ping_ms}ms`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .flexShrink(1)
+        }
+      }
+      .layoutWeight(1)
+      .alignItems(VerticalAlign.Center)
+    } else {
+      Text($r('app.string.sidebar_tapToPairHost'))
         .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .layoutWeight(1)
-    } else {
-      Text('Tap to pair host')
-        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-        .maxLines(1)
         .layoutWeight(1)
     }
 
@@ -594,20 +682,125 @@ export struct FleetSidebar {
         .padding({ left: 6, right: 6, top: 2, bottom: 2 })
         .borderRadius(OrbitTokens.RADIUS_MD)
         .backgroundColor(this.store.palette.statusWarningSoft)
+        .flexShrink(0)
     }
 
     SymbolGlyph($r('sys.symbol.chevron_down'))
       .fontSize(12)
       .fontColor([this.store.palette.fgMuted])
+      .flexShrink(0)
+  }
+
+  @Builder
+  private renderVirtualizedRow(row: OrbitSidebarRow) {
+    if (row.kind === 'hdr_attention') {
+      ListItem() {
+        Text($r('app.string.sidebar_needsAttention'))
+          .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Medium))
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 6, bottom: 4 })
+      }
+    } else if (row.kind === 'hdr_pinned') {
+      ListItem() {
+        Text($r('app.string.sidebar_pinned'))
+          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 4 })
+      }
+    } else if (row.kind === 'hdr_projects') {
+      ListItem() {
+        this.renderProjectsSectionHeader()
+      }
+    } else if (row.kind === 'hdr_empty_projects') {
+      ListItem() {
+        this.renderEmptyProjectsRow()
+      }
+    } else if (row.kind === 'proj' && row.project !== null) {
+      ListItem() {
+        this.renderProjectHeaderRow(row.project, row.isProjectCollapsed)
+      }
+      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 1, bottom: 1 })
+    } else if (row.kind === 'proj_more' && row.project !== null) {
+      ListItem() {
+        Button(
+          row.isMoreExpanded
+            ? $r('app.string.common_showLess')
+            : $r('app.string.common_showMore', row.hiddenCount),
+          { type: ButtonType.Normal, stateEffect: true }
+        )
+          .attributeModifier(orbitButtonSubhead(this.store.palette.fgMuted, Color.Transparent))
+          .width('100%')
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+          .padding({ left: 36, right: OrbitTokens.SPACE_MD })
+          .onClick(() => {
+            if (row.project !== null) {
+              this.store.toggleProjectMoreExpanded(row.project.id);
+            }
+          })
+      }
+      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
+    } else if (row.kind === 'conv' && row.conv !== null) {
+      ListItem() {
+        Row() {
+          OrbitAgentListItem({
+            variant: 'row',
+            leadingMode: 'signal',
+            title: this.resolveConversationTitle(row.conv),
+            status: mapAgentCardToListStatus(row.conv.agent),
+            avatarSeedKey: row.conv.agent.agent_id,
+            provider: row.conv.agent.provider,
+            modelLabel: this.resolveConversationModel(row.conv),
+            effortLabel: resolveAgentEffortDisplay(row.conv.agent),
+            agentLabel: resolveAgentFallbackLabel(row.conv.agent),
+            secondaryMeta: row.showWorkspaceHint ? basenameOfPath(row.conv.agent.cwd) : '',
+            titleTrailingText: this.resolveConversationRelativeTime(row.conv.agent.updated_at_rfc3339),
+            isUnread: row.conv.is_unread,
+            hasArmedTimers: row.conv.agent.has_armed_timers === true,
+            isWorktree: row.conv.is_worktree,
+            isSelected: !this.store.isNewSessionDraft &&
+              !this.store.showPersonalAgentSetup &&
+              this.store.selectedHostId === row.conv.host_id &&
+              this.store.selectedAgentId === row.conv.agent.agent_id,
+            onItemClick: () => {
+              if (row.conv !== null) {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.selectAgentOnHost(row.conv.host_id, row.conv.agent.agent_id, true);
+              }
+            }
+          })
+        }
+        .width('100%')
+        .padding({ left: row.indentLeft })
+        .bindContextMenu(
+          () => {
+            if (row.conv !== null) {
+              this.renderSessionContextMenu(row.conv);
+            }
+          },
+          ResponseType.LongPress
+        )
+      }
+      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 1, bottom: 1 })
+      .swipeAction({
+        end: {
+          builder: () => {
+            if (row.conv !== null) {
+              this.renderSwipeArchiveButton(row.conv.agent.agent_id);
+            }
+          }
+        }
+      })
+    }
   }
 
   build() {
     Column() {
-      // 1. Native HarmonyOS 7 Search + Compose Action Row
+      // 1. Search + New Conversation Row
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Search({ value: this.store.sidebarSearchQuery, placeholder: 'Search' })
+        Search({
+          value: this.store.sidebarSearchQuery,
+          placeholder: $r('app.string.sidebar_search')
+        })
           .layoutWeight(1)
-          .height(OrbitTokens.HIT_COMPACT)
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
           .backgroundColor(this.store.palette.subtleSurface)
           .placeholderColor(this.store.palette.fgMuted)
           .fontColor(this.store.palette.fgPrimary)
@@ -633,7 +826,7 @@ export struct FleetSidebar {
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
         .enabled(this.store.selectedHostId.length > 0)
-        .accessibilityText('New session')
+        .accessibilityText($r('app.string.sidebar_newConversation'))
         .onClick(() => {
           dismissHarmonyKeyboard(this.getUIContext());
           if (this.store.selectedHostId.length > 0) {
@@ -650,16 +843,16 @@ export struct FleetSidebar {
       })
       .alignItems(VerticalAlign.Center)
 
-      // 2. Unified Projects -> Conversations Scroll Area
+      // 2. Personal Agent Entry + Virtualized Flat List
       if (this.store.hosts.length === 0) {
         Column({ space: OrbitTokens.SPACE_MD }) {
           Column({ space: OrbitTokens.SPACE_SM }) {
-            Text('No Hosts Paired')
+            Text($r('app.string.sidebar_noHostsTitle'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
-            Text('Pair a remote Orbit daemon or connect a local daemon to browse workspaces and sessions.')
+            Text($r('app.string.sidebar_noHostsBody'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgSecondary, FontWeight.Normal))
 
-            Button('Connect Local Daemon')
+            Button($r('app.string.sidebar_connectLocalDaemon'))
               .attributeModifier(
                 orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
               )
@@ -670,7 +863,7 @@ export struct FleetSidebar {
                 this.store.discoverAndPairLocalDaemon();
               })
 
-            Button('Pair Remote Host (QR / URI)')
+            Button($r('app.string.sidebar_pairRemoteHost'))
               .attributeModifier(
                 orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
               )
@@ -691,255 +884,17 @@ export struct FleetSidebar {
         .layoutWeight(1)
         .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: OrbitTokens.SPACE_LG })
       } else {
+        this.renderPersonalAgentEntry()
+
         List() {
-          // Orbital Global Overview + Fleet Search + Personal Router Navigation
-          ListItem() {
-            Column({ space: 2 }) {
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                SymbolGlyph($r('sys.symbol.house'))
-                  .fontSize(16)
-                  .fontColor([
-                    this.store.showGlobalOverview
-                      ? this.store.palette.accentPrimary
-                      : this.store.palette.iconSecondary
-                  ])
-                Text($r('app.string.nav_overview'))
-                  .attributeModifier(
-                    orbitTextSubhead(
-                      this.store.palette.fgPrimary,
-                      this.store.showGlobalOverview ? FontWeight.Medium : FontWeight.Normal
-                    )
-                  )
-                  .layoutWeight(1)
-                if (this.store.totalPendingApprovals > 0) {
-                  Text(`${this.store.totalPendingApprovals}`)
-                    .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Bold))
-                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                    .borderRadius(OrbitTokens.RADIUS_SM)
-                    .backgroundColor(this.store.palette.statusWarningSoft)
-                }
-              }
-              .width('100%')
-              .constraintSize({ minHeight: 42 })
-              .padding({ left: 12, right: 12 })
-              .borderRadius(OrbitTokens.RADIUS_MD)
-              .backgroundColor(
-                this.store.showGlobalOverview
-                  ? this.store.palette.subtleSurface
-                  : Color.Transparent
-              )
-              .alignItems(VerticalAlign.Center)
-              .onClick(() => {
-                dismissHarmonyKeyboard(this.getUIContext());
-                this.store.openGlobalOverview();
-              })
-
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                SymbolGlyph($r('sys.symbol.magnifyingglass'))
-                  .fontSize(15)
-                  .fontColor([this.store.palette.iconSecondary])
-                Text($r('app.string.nav_search_fleet'))
-                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .constraintSize({ minHeight: 40 })
-              .padding({ left: 12, right: 12 })
-              .borderRadius(OrbitTokens.RADIUS_MD)
-              .alignItems(VerticalAlign.Center)
-              .onClick(() => {
-                dismissHarmonyKeyboard(this.getUIContext());
-                this.store.openGlobalSearch();
-              })
-
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                SymbolGlyph($r('sys.symbol.link'))
-                  .fontSize(15)
-                  .fontColor([this.store.palette.iconSecondary])
-                Text($r('app.string.nav_personal_router'))
-                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .constraintSize({ minHeight: 40 })
-              .padding({ left: 12, right: 12 })
-              .borderRadius(OrbitTokens.RADIUS_MD)
-              .alignItems(VerticalAlign.Center)
-              .onClick(() => {
-                dismissHarmonyKeyboard(this.getUIContext());
-                this.store.openRouterMeshSheet();
-              })
-            }
-            .width('100%')
-            .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_XS })
-          }
-
-          if (this.needsAttentionList.length > 0) {
-            ListItem() {
-              Text($r('app.string.sidebar_needs_attention'))
-                .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Medium))
-                .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 6, bottom: 4 })
-            }
-
-            ForEach(
-              this.needsAttentionList,
-              (conv: SidebarConversationDto) => {
-                this.renderConversationRow(conv, true, 12)
-              },
-              (conv: SidebarConversationDto) => `attn_${conv.host_id}_${conv.agent.agent_id}`
-            )
-          }
-
-          if (this.pinnedList.length > 0) {
-            ListItem() {
-              Text($r('app.string.sidebar_pinned'))
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
-                .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 4 })
-            }
-
-            ForEach(
-              this.pinnedList,
-              (conv: SidebarConversationDto) => {
-                this.renderConversationRow(conv, true, 12)
-              },
-              (conv: SidebarConversationDto) => `pin_${conv.host_id}_${conv.agent.agent_id}`
-            )
-          }
-
-          ListItem() {
-            Row({ space: 4 }) {
-              Text($r('app.string.sidebar_projects'))
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
-                .layoutWeight(1)
-
-              Button({ type: ButtonType.Circle, stateEffect: true }) {
-                SymbolGlyph($r('sys.symbol.sort'))
-                  .fontSize(17)
-                  .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                  .fontColor([
-                    this.hasCustomSortOrFilter()
-                      ? this.store.palette.accentPrimary
-                      : this.store.palette.iconSecondary
-                  ])
-              }
-              .width(OrbitTokens.HIT_COMPACT)
-              .height(OrbitTokens.HIT_COMPACT)
-              .padding(0)
-              .backgroundColor(Color.Transparent)
-              .accessibilityText('Sort and filter conversations')
-              .bindMenu(this.renderFilterSortMenu())
-
-              Button({ type: ButtonType.Circle, stateEffect: true }) {
-                SymbolGlyph($r('sys.symbol.folder_badge_plus'))
-                  .fontSize(17)
-                  .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                  .fontColor([
-                    this.store.showDirBrowser
-                      ? this.store.palette.accentPrimary
-                      : this.store.palette.iconSecondary
-                  ])
-              }
-              .width(OrbitTokens.HIT_COMPACT)
-              .height(OrbitTokens.HIT_COMPACT)
-              .padding(0)
-              .backgroundColor(Color.Transparent)
-              .accessibilityText('Browse remote directory')
-              .onClick(() => {
-                dismissHarmonyKeyboard(this.getUIContext());
-                if (this.store.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
-                  this.store.sidebarOpen = false;
-                }
-                this.store.browseDirectory(
-                  this.store.activeCwd === '~' ? null : this.store.activeCwd
-                );
-              })
-            }
-            .width('100%')
-            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_SM, top: 8, bottom: 2 })
-            .alignItems(VerticalAlign.Center)
-          }
-
-          if (this.unifiedProjects.length === 0) {
-            ListItem() {
-              Column({ space: OrbitTokens.SPACE_SM }) {
-                Text(
-                  this.normalizedQuery.length > 0
-                    ? 'No matching projects or conversations.'
-                    : this.store.sidebarThreadFilter === 'active_unread'
-                      ? 'No active or unread conversations.'
-                      : 'No repositories discovered yet.'
-                )
-                  .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Normal))
-
-                if (this.normalizedQuery.length > 0) {
-                  Button('Clear search', { type: ButtonType.Normal, stateEffect: true })
-                    .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
-                    .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
-                    .padding({ left: 0, right: OrbitTokens.SPACE_SM })
-                    .onClick(() => {
-                      this.store.setSidebarSearchQuery('');
-                    })
-                } else if (this.store.sidebarThreadFilter !== 'all') {
-                  Button('Show all conversations', { type: ButtonType.Normal, stateEffect: true })
-                    .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
-                    .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
-                    .padding({ left: 0, right: OrbitTokens.SPACE_SM })
-                    .onClick(() => {
-                      this.store.setSidebarThreadFilter('all');
-                    })
-                }
-              }
-              .width('100%')
-              .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: OrbitTokens.SPACE_MD })
-              .alignItems(HorizontalAlign.Start)
-            }
-          } else {
-            ForEach(
-              this.unifiedProjects,
-              (group: SidebarProjectGroupDto) => {
-                ListItemGroup() {
-                  this.renderProjectHeaderRow(group)
-
-                  if (
-                    this.normalizedQuery.length > 0 ||
-                    !this.store.isProjectCollapsed(group.id)
-                  ) {
-                    ForEach(
-                      this.visibleThreadsForGroup(group),
-                      (conv: SidebarConversationDto) => {
-                        this.renderConversationRow(conv, false, 20)
-                      },
-                      (conv: SidebarConversationDto) => `t_${group.id}_${conv.host_id}_${conv.agent.agent_id}`
-                    )
-
-                    if (
-                      this.normalizedQuery.length === 0 &&
-                      group.conversations.length > MAX_VISIBLE_THREADS_PER_PROJECT
-                    ) {
-                      ListItem() {
-                        Button(
-                          this.isProjectMoreExpanded(group.id)
-                            ? 'Show less'
-                            : `Show ${group.conversations.length - MAX_VISIBLE_THREADS_PER_PROJECT} more…`,
-                          { type: ButtonType.Normal, stateEffect: true }
-                        )
-                          .attributeModifier(orbitButtonSubhead(this.store.palette.fgMuted, Color.Transparent))
-                          .width('100%')
-                          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
-                          .padding({ left: 46, right: OrbitTokens.SPACE_MD })
-                          .onClick(() => {
-                            this.toggleProjectMoreExpanded(group.id);
-                          })
-                      }
-                      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-                    }
-                  }
-                }
-              },
-              (group: SidebarProjectGroupDto) => `proj_${group.id}`
-            )
-          }
+          Repeat<OrbitSidebarRow>(this.store.fleetStore.sidebarRows)
+            .each((ri: RepeatItem<OrbitSidebarRow>) => {
+              this.renderVirtualizedRow(ri.item)
+            })
+            .key((row: OrbitSidebarRow): string => row.key)
+            .virtualScroll({ totalCount: this.store.fleetStore.sidebarRows.length })
         }
+        .cachedCount(5)
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Auto)
@@ -950,7 +905,7 @@ export struct FleetSidebar {
         })
       }
 
-      // 3. Thumb-Zone Bottom Bar: [ Host Switcher Capsule ] [ Settings Circle ]
+      // 3. Thumb-Zone Bottom Bar: [ Host Switcher Capsule ] [ Automations ] [ Archived ] [ Settings ]
       Row({ space: OrbitTokens.SPACE_SM }) {
         if (this.store.hosts.length > 0) {
           Button({ type: ButtonType.Capsule, stateEffect: true }) {
@@ -961,10 +916,10 @@ export struct FleetSidebar {
             .alignItems(VerticalAlign.Center)
           }
           .layoutWeight(1)
-          .height(OrbitTokens.HIT_COMPACT)
-          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: 6, bottom: 6 })
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText('Switch active host')
+          .accessibilityText($r('app.string.sidebar_switchHostAria'))
           .bindMenu(this.renderHostSwitcherMenu())
         } else {
           Button({ type: ButtonType.Capsule, stateEffect: true }) {
@@ -975,10 +930,10 @@ export struct FleetSidebar {
             .alignItems(VerticalAlign.Center)
           }
           .layoutWeight(1)
-          .height(OrbitTokens.HIT_COMPACT)
-          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: 6, bottom: 6 })
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText('Pair host')
+          .accessibilityText($r('app.string.sidebar_pairHostAria'))
           .onClick(() => {
             this.store.openHostSettings();
           })
@@ -995,7 +950,7 @@ export struct FleetSidebar {
           .height(OrbitTokens.HIT_COMPACT)
           .padding(0)
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText('Automations')
+          .accessibilityText($r('app.string.sidebar_automations'))
           .onClick(() => {
             dismissHarmonyKeyboard(this.getUIContext());
             this.store.openAutomationsSheet();
@@ -1011,7 +966,7 @@ export struct FleetSidebar {
           .height(OrbitTokens.HIT_COMPACT)
           .padding(0)
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText('Archived sessions')
+          .accessibilityText($r('app.string.sidebar_archived'))
           .onClick(() => {
             dismissHarmonyKeyboard(this.getUIContext());
             this.store.openArchivedSessions();
@@ -1028,7 +983,7 @@ export struct FleetSidebar {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Settings and hosts')
+        .accessibilityText($r('app.string.sidebar_settingsAndHostsAria'))
         .onClick(() => {
           dismissHarmonyKeyboard(this.getUIContext());
           this.store.openHostSettings();

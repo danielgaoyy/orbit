@@ -1019,6 +1019,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_send_terminal_keys_slot(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_account_default_mode(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_agent_config(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_agent_fast_mode(
@@ -1504,6 +1506,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_send_terminal_keys(`ptr`: Long,`hostId`: RustBuffer.ByValue,`keys`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_send_terminal_keys_slot(`ptr`: Long,`hostId`: RustBuffer.ByValue,`slot`: Byte,`keys`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_set_account_default_mode(`ptr`: Long,`mode`: RustBuffer.ByValue,`updatedAtMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_set_agent_config(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`model`: RustBuffer.ByValue,`effort`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -2248,6 +2252,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_send_terminal_keys_slot() and 0xFFFF) != 21579) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_account_default_mode() and 0xFFFF) != 41375) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_agent_config() and 0xFFFF) != 45534) {
@@ -3662,6 +3669,8 @@ public interface OrbitMobileCoreInterface {
     fun `sendTerminalKeys`(`hostId`: kotlin.String, `keys`: kotlin.String)
     
     fun `sendTerminalKeysSlot`(`hostId`: kotlin.String, `slot`: kotlin.UByte, `keys`: kotlin.String)
+    
+    fun `setAccountDefaultMode`(`mode`: FfiSessionMode, `updatedAtMs`: kotlin.Long)
     
     fun `setAgentConfig`(`hostId`: kotlin.String, `agentId`: kotlin.String, `model`: kotlin.String?, `effort`: FfiReasoningEffort?)
     
@@ -6029,6 +6038,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         FfiConverterString.lower(`hostId`),
         FfiConverterUByte.lower(`slot`),
         FfiConverterString.lower(`keys`),_status)
+}
+    }
+    
+    
+
+    override fun `setAccountDefaultMode`(`mode`: FfiSessionMode, `updatedAtMs`: kotlin.Long)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_set_account_default_mode(
+        it,
+        
+        FfiConverterTypeFfiSessionMode.lower(`mode`),
+        FfiConverterLong.lower(`updatedAtMs`),_status)
 }
     }
     
@@ -8464,6 +8487,10 @@ data class FfiAgentCard (
     var `isUnread`: kotlin.Boolean
     , 
     var `queuedPrompts`: List<FfiQueuedPrompt>
+    , 
+    var `labels`: Map<kotlin.String, kotlin.String>
+    , 
+    var `isPersonalRouter`: kotlin.Boolean
     
 ){
     
@@ -8513,6 +8540,8 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterULong.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypeFfiQueuedPrompt.read(buf),
+            FfiConverterMapStringString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -8549,7 +8578,9 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.allocationSize(value.`isPinned`) +
             FfiConverterULong.allocationSize(value.`seenSeq`) +
             FfiConverterBoolean.allocationSize(value.`isUnread`) +
-            FfiConverterSequenceTypeFfiQueuedPrompt.allocationSize(value.`queuedPrompts`)
+            FfiConverterSequenceTypeFfiQueuedPrompt.allocationSize(value.`queuedPrompts`) +
+            FfiConverterMapStringString.allocationSize(value.`labels`) +
+            FfiConverterBoolean.allocationSize(value.`isPersonalRouter`)
     )
 
     override fun write(value: FfiAgentCard, buf: ByteBuffer) {
@@ -8586,6 +8617,8 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterULong.write(value.`seenSeq`, buf)
             FfiConverterBoolean.write(value.`isUnread`, buf)
             FfiConverterSequenceTypeFfiQueuedPrompt.write(value.`queuedPrompts`, buf)
+            FfiConverterMapStringString.write(value.`labels`, buf)
+            FfiConverterBoolean.write(value.`isPersonalRouter`, buf)
     }
 }
 

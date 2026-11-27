@@ -131,7 +131,8 @@ import { OrbitPreferencesStore } from './OrbitPreferences';
 import { OrbitPerfProbe } from './OrbitPerfProbe';
 import {
   OrbitEventFlushHandler,
-  OrbitEventFrameScheduler
+  OrbitEventFrameScheduler,
+  isStageScopeVisibleForEvent
 } from './OrbitEventFrameScheduler';
 import {
   orbitApplySystemBarTheme,
@@ -150,7 +151,11 @@ import {
   OrbitTimelineItemModel
 } from './viewmodels/OrbitStageModels';
 import { OrbitFleetStore } from './stores/OrbitFleetStore';
-import { OrbitPersonalAgentStore } from './stores/OrbitPersonalAgentStore';
+import {
+  OrbitBriefingAppliedCallback,
+  OrbitPersonalAgentStore,
+  OrbitPersonalAgentVisitStorage
+} from './stores/OrbitPersonalAgentStore';
 import {
   OrbitComposerStore,
   OrbitComposerToastSink
@@ -177,6 +182,40 @@ import {
   OrbitShellStore
 } from './stores/OrbitShellStore';
 import {
+  DeepLinkAgentValidation,
+  parseOrbitOpenDeepLink,
+  resolveDeepLinkPostNavigationAction,
+  validateDeepLinkAgentInDetail
+} from './OrbitDeepLink';
+import { buildDecisionFocusTarget } from './OrbitDecisionFocusModel';
+import {
+  gitTargetPathsEqual,
+  isGitCollabResponseCurrent,
+  shouldApplyGitDiffForTarget
+} from './OrbitDiffInspectorModel';
+import {
+  DEFAULT_LOCAL_NOTIFICATION_COPY,
+  LocalNotificationCopyStrings,
+  NotificationVisibilityContext,
+  OrbitLocalNotificationPayload,
+  OrbitNotificationEngine,
+  clonePushPreferences,
+  defaultPushPreferences
+} from './OrbitNotificationEngine';
+import {
+  BatchApprovalHostOutcome,
+  FrozenBatchApprovalTarget,
+  aggregateBatchApprovalOutcomes,
+  classifyBatchApprovalFeedback,
+  intersectFrozenBatchTargets,
+  normalizePersonalRouterConfig,
+  parseBatchApprovalHostResponse,
+  reconcileBriefingPresentationOnResize,
+  resolvePaIdentityArrivalPresentation,
+  resolvePaSessionSelectPresentation,
+  snapshotBatchApprovalTargets
+} from '../components/personal-agent/PersonalAgentBriefingModel';
+import {
   checkHarmonyNotificationEnabled,
   publishOrbitDeepLinkNotification,
   readAuthorizedClipboardText,
@@ -184,6 +223,7 @@ import {
   registerHarmonyPushToken,
   requestHarmonyNotificationPermission,
   scanPairingQrCode,
+  setHarmonyAppBadgeNumber,
   triggerNativeHaptic,
   writeClipboardText
 } from './OrbitDeviceBridge';
@@ -405,13 +445,18 @@ class OrbitStoreEventFlushAdapter implements OrbitEventFlushHandler {
       return false;
     }
     if (
-      !this.owner.isNewSessionDraft &&
-      this.owner.fleetStore.selectedHostId === hostId &&
-      this.owner.selectedAgentId === agentId
+      isStageScopeVisibleForEvent(
+        this.owner.isInBackgroundMode(),
+        this.owner.isNewSessionDraft,
+        this.owner.fleetStore.selectedHostId,
+        this.owner.selectedAgentId,
+        hostId,
+        agentId
+      )
     ) {
       return true;
     }
-    if (this.owner.isSidePanelActuallyVisible()) {
+    if (!this.owner.isInBackgroundMode() && this.owner.isSidePanelActuallyVisible()) {
       const tab = this.owner.sidePanelStore.activeTab;
       if (tab !== null && (tab.kind === 'subagent' || tab.kind === 'peer')) {
         if (tab.hostId === hostId && (tab.agentId === agentId || tab.childAgentId === agentId)) {
@@ -489,7 +534,7 @@ class OrbitStoreEventFlushAdapter implements OrbitEventFlushHandler {
   }
 
   onBackgroundTimelineDirty(hostId: string, agentId: string): void {
-    this.owner.fleetStore.markConversationDirty(hostId, agentId);
+    this.owner.handleSchedulerBackgroundTimelineDirty(hostId, agentId);
   }
 
   onVisibleGitDirty(hostId: string, cwd: string): void {
@@ -533,25 +578,71 @@ class OrbitStoreComposerToastAdapter implements OrbitComposerToastSink {
   }
 }
 
+class OrbitStoreBriefingAppliedAdapter implements OrbitBriefingAppliedCallback {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  onBriefingApplied(briefing: PersonalAgentBriefingDto): void {
+    this.owner.handleBriefingApplied(briefing);
+  }
+}
+
+class OrbitStorePaVisitStorageAdapter implements OrbitPersonalAgentVisitStorage {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  getLastVisitMs(hostId: string, agentId: string): number {
+    return this.owner.readPersistedPersonalAgentVisitMs(hostId, agentId);
+  }
+
+  setLastVisitMs(hostId: string, agentId: string, tsMs: number): void {
+    this.owner.writePersistedPersonalAgentVisitMs(hostId, agentId, tsMs);
+  }
+}
+
 @ObservedV2
 export class OrbitHarmonyStore {
   private static instance: OrbitHarmonyStore | null = null;
   private bridge: OrbitCoreBridge | null = null;
+  private abilityContext: common.Context | undefined = undefined;
+  private isAppInBackground: boolean = false;
+  private notificationSeq: number = 1000;
+  private readonly notificationEngine: OrbitNotificationEngine = new OrbitNotificationEngine();
+  private readonly pushPrefsByHost: Map<string, PushPreferencesDto> = new Map<string, PushPreferencesDto>();
+  private routerDiscoveryInFlight: Promise<void> | null = null;
   private prefsStore: OrbitPreferencesStore = new OrbitPreferencesStore();
   private voiceController: OrbitVoiceInputController = new OrbitVoiceInputController();
   private voiceTimerId: number = -1;
   private pendingDeepLink: string = '';
   private pendingDeepLinkEventKind: string = '';
   private pendingDeepLinkNavSeq: number = 0;
+  private pendingDeepLinkRequestId: string = '';
+  private pendingDeepLinkSeq: number = 0;
   private pendingOpenHostId: string = '';
   private pendingOpenAgentId: string = '';
   private pendingOpenEventKind: string = '';
   private pendingOpenNavSeq: number = 0;
+  private pendingOpenRequestId: string = '';
+  private pendingOpenSeq: number = 0;
+  private pendingAgentValidationHostId: string = '';
+  private pendingAgentValidationAgentId: string = '';
+  private pendingAgentValidationEventKind: string = '';
+  private pendingAgentValidationRequestId: string = '';
+  private pendingAgentValidationSeq: number = 0;
+  private pendingAgentValidationNavSeq: number = 0;
   private pendingReplayHostId: string = '';
   private pendingReplayAgentId: string = '';
   private pendingReplayFramesJson: string = '';
   private replayFinishTimerId: number = -1;
   private gitDirty: boolean = false;
+  private gitCollabRequestSeq: number = 0;
+  private briefingDismissedByUserForPaKey: string = '';
   private automationsRefreshSeq: number = 0;
   private sideQuestionGen: number = 0;
 
@@ -566,7 +657,17 @@ export class OrbitHarmonyStore {
 
   @Trace public isNewSessionDraft: boolean = false;
   @Trace public keyProtectionMode: string = 'huks_hardware';
-  @Trace public showGlobalOverview: boolean = true;
+  @Trace public showGlobalOverview: boolean = false;
+  @Trace public showPersonalAgentSetup: boolean = false;
+  @Trace public briefingViewingOpen: boolean = false;
+  @Trace public showBriefingPanel: boolean = true;
+  @Trace public showBriefingSheet: boolean = false;
+  @Trace public decisionFocusRevision: number = 0;
+  @Trace public pendingFocusDecisionHostId: string = '';
+  @Trace public pendingFocusDecisionAgentId: string = '';
+  @Trace public pendingFocusDecisionEventKind: string = '';
+  @Trace public pendingFocusDecisionRequestId: string = '';
+  @Trace public pendingFocusDecisionSeq: number = 0;
   @Trace public panelDataRevision: number = 0;
   @Trace public gitPanelRevision: number = 0;
   @Trace public terminalPanelRevision: number = 0;
@@ -603,6 +704,7 @@ export class OrbitHarmonyStore {
   @Trace public keyboardHeightVp: number = 0;
 
   // Composer model popover visibility (non-sheet popup anchored to OmniComposer)
+  private diffInspectorOpenedByUser: boolean = false;
   @Trace public showModelPickerSheet: boolean = false;
   @Trace public activeSessionUsage: SessionUsageDto | null = null;
   @Trace public inspectedSubagentId: string = '';
@@ -692,7 +794,11 @@ export class OrbitHarmonyStore {
   @Trace public activeQueuedPrompts: QueuedPromptItem[] = [];
   public queuedPromptsByAgent: Map<string, QueuedPromptItem[]> = new Map<string, QueuedPromptItem[]>();
 
-  // Git Working Tree Inspector State
+  // Git Working Tree Inspector State (independent target scope so decision Diff previews
+  // are never overwritten by unrelated PA Stage deltas).
+  @Trace public diffTargetHostId: string = '';
+  @Trace public diffTargetCwd: string = '';
+  @Trace public isDiffTargetPinned: boolean = false;
   @Trace public gitStatus: GitStatusSnapshotDto | null = null;
   @Trace public gitDiffFiles: DiffFileDto[] = [];
   @Trace public gitSelectedPath: string = '';
@@ -720,6 +826,8 @@ export class OrbitHarmonyStore {
     this.composerStore.setToastSink(new OrbitStoreComposerToastAdapter(this));
     this.sidePanelStore.bindParentLookup(new OrbitStoreParentLookupAdapter(this));
     this.sidePanelStore.setVisibilityListener(new OrbitStoreSidePanelVisibilityAdapter(this));
+    this.personalAgentStore.setBriefingAppliedCallback(new OrbitStoreBriefingAppliedAdapter(this));
+    this.personalAgentStore.bindVisitStorage(new OrbitStorePaVisitStorageAdapter(this));
   }
 
   public isSidePanelActuallyVisible(): boolean {
@@ -741,8 +849,152 @@ export class OrbitHarmonyStore {
     return tab !== null && tab.hostId === hostId;
   }
 
+  public readPersistedPersonalAgentVisitMs(hostId: string, agentId: string): number {
+    return this.prefsStore.getPersonalAgentLastVisitMs(hostId, agentId);
+  }
+
+  public writePersistedPersonalAgentVisitMs(hostId: string, agentId: string, tsMs: number): void {
+    this.prefsStore.setPersonalAgentLastVisitMs(hostId, agentId, tsMs);
+  }
+
+  public markPersonalAgentVisitedNow(hostId: string, agentId: string): void {
+    this.personalAgentStore.recordPersonalAgentVisitNow(hostId, agentId, Date.now());
+  }
+
+  public clearPendingDecisionFocus(): void {
+    this.pendingFocusDecisionHostId = '';
+    this.pendingFocusDecisionAgentId = '';
+    this.pendingFocusDecisionEventKind = '';
+    this.pendingFocusDecisionRequestId = '';
+    this.pendingFocusDecisionSeq = 0;
+  }
+
+  private resolveResourceText(res: Resource, fallback: string): string {
+    if (this.abilityContext === undefined) {
+      return fallback;
+    }
+    try {
+      const text = this.abilityContext.resourceManager.getStringSync(res.id);
+      if (typeof text === 'string' && text.trim().length > 0) {
+        return text;
+      }
+    } catch (_err) {
+      // Fall back cleanly when running outside a full ability resource context
+    }
+    return fallback;
+  }
+
+  public showLocalizedToast(
+    res: Resource,
+    fallback: string,
+    isError: boolean = false,
+    args?: (string | number)[]
+  ): void {
+    let text = this.resolveResourceText(res, fallback);
+    if (args !== undefined && args.length > 0) {
+      let argIdx = 0;
+      text = text.replace(/%([1-9][0-9]*\$)?[sd]/g, (_m: string, posGroup: string | undefined): string => {
+        if (posGroup !== undefined && posGroup.length > 1) {
+          const slot = Number.parseInt(posGroup.substring(0, posGroup.length - 1), 10) - 1;
+          if (slot >= 0 && slot < args.length) {
+            return String(args[slot]);
+          }
+        }
+        if (argIdx < args.length) {
+          const val = String(args[argIdx]);
+          argIdx += 1;
+          return val;
+        }
+        return _m;
+      });
+    }
+    this.showToast(text, isError);
+  }
+
+  private resolveLocalNotificationCopyStrings(): LocalNotificationCopyStrings {
+    return {
+      permissionTitle: this.resolveResourceText(
+        $r('app.string.notify_permission_title'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.permissionTitle
+      ),
+      permissionBody: this.resolveResourceText(
+        $r('app.string.notify_permission_body'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.permissionBody
+      ),
+      turnCompletedTitle: this.resolveResourceText(
+        $r('app.string.notify_turn_completed_title'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.turnCompletedTitle
+      ),
+      turnCompletedBody: this.resolveResourceText(
+        $r('app.string.notify_turn_completed_body'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.turnCompletedBody
+      ),
+      agentErrorTitle: this.resolveResourceText(
+        $r('app.string.notify_agent_error_title'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.agentErrorTitle
+      ),
+      agentErrorBody: this.resolveResourceText(
+        $r('app.string.notify_agent_error_body'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.agentErrorBody
+      ),
+      goalFinishedTitle: this.resolveResourceText(
+        $r('app.string.notify_goal_finished_title'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.goalFinishedTitle
+      ),
+      goalFinishedBody: this.resolveResourceText(
+        $r('app.string.notify_goal_finished_body'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.goalFinishedBody
+      ),
+      timerFiredTitle: this.resolveResourceText(
+        $r('app.string.notify_timer_fired_title'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.timerFiredTitle
+      ),
+      timerFiredBody: this.resolveResourceText(
+        $r('app.string.notify_timer_fired_body'),
+        DEFAULT_LOCAL_NOTIFICATION_COPY.timerFiredBody
+      )
+    };
+  }
+
+  private buildNotificationVisibilityContext(): NotificationVisibilityContext {
+    return {
+      isAppInBackground: this.isAppInBackground,
+      isNewSessionDraft: this.isNewSessionDraft,
+      showPersonalAgentSetup: this.showPersonalAgentSetup,
+      selectedHostId: this.selectedHostId,
+      selectedAgentId: this.selectedAgentId
+    };
+  }
+
+  private hydratePushPreferencesFromStorage(): void {
+    const persisted = this.prefsStore.getPushPreferencesMap();
+    this.pushPrefsByHost.clear();
+    const keys = Object.keys(persisted);
+    for (let i = 0; i < keys.length; i += 1) {
+      const k = keys[i];
+      this.pushPrefsByHost.set(k, clonePushPreferences(persisted[k]));
+    }
+    this.pushPrefs = clonePushPreferences(this.getPushPreferencesForHost(this.selectedHostId));
+  }
+
+  public getPushPreferencesForHost(hostId: string): PushPreferencesDto {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length > 0) {
+      const hostScoped = this.pushPrefsByHost.get(cleanHost);
+      if (hostScoped !== undefined) {
+        return hostScoped;
+      }
+    }
+    const fallback = this.pushPrefsByHost.get('__default__');
+    if (fallback !== undefined) {
+      return fallback;
+    }
+    return defaultPushPreferences();
+  }
+
   public handleSchedulerFleetDirty(): void {
     this.reloadFleetAsync();
+    this.personalAgentStore.refreshBriefing(false);
     if (this.isSidePanelActuallyVisible()) {
       const kind = this.sidePanelStore.activeTab?.kind;
       if (kind === 'briefing' || kind === 'board') {
@@ -763,13 +1015,125 @@ export class OrbitHarmonyStore {
     if (this.isHostVisibleInSidePanel(hostId)) {
       this.panelDataRevision += 1;
     }
+    this.reloadWorkspaceFiles();
+    this.personalAgentStore.refreshBriefing(false);
   }
 
   public handleSchedulerBackgroundHostDirty(hostId: string): void {
+    // Strictly avoid polling full HostDetail for unselected background hosts (§3.3),
+    // except when that host is actively visible inside the right side panel.
     this.refreshSidebarAsync();
+    this.personalAgentStore.refreshBriefing(false);
     if (hostId.length > 0 && this.isHostVisibleInSidePanel(hostId)) {
       this.reloadHostAsync(hostId);
     }
+  }
+
+  public handleSchedulerBackgroundTimelineDirty(hostId: string, agentId: string): void {
+    // Strictly comply with §3.3: invisible timeline events ONLY mark the row dirty (0 HostDetail RPCs).
+    this.fleetStore.markConversationDirty(hostId, agentId);
+  }
+
+  public isInBackgroundMode(): boolean {
+    return this.isAppInBackground;
+  }
+
+  public handleBriefingApplied(briefing: PersonalAgentBriefingDto): void {
+    const pa = briefing.personal_agent;
+    if (pa !== null && pa.host_id.length > 0 && pa.agent_id.length > 0) {
+      this.fleetStore.setPersonalAgentKey(pa.host_id, pa.agent_id);
+      if (
+        !this.isNewSessionDraft &&
+        this.selectedHostId === pa.host_id &&
+        this.selectedAgentId === pa.agent_id
+      ) {
+        if (!this.personalAgentStore.activeVisitKeyMatches(pa.host_id, pa.agent_id)) {
+          // Hydrate persisted previous-visit timestamp when cold-start deep link selected the PA
+          // before the initial briefing snapshot arrived.
+          this.personalAgentStore.enterPersonalAgentVisit(pa.host_id, pa.agent_id);
+        }
+        const paKey = `${pa.host_id}::${pa.agent_id}`;
+        const userOpenedDiff = this.showInlineDiffInspector &&
+          (this.diffInspectorOpenedByUser || this.isDiffTargetPinned);
+        const arrived = resolvePaIdentityArrivalPresentation(
+          this.windowWidthVp,
+          true,
+          this.briefingViewingOpen,
+          this.showBriefingPanel,
+          this.showBriefingSheet,
+          userOpenedDiff,
+          this.briefingDismissedByUserForPaKey === paKey,
+          OrbitTokens.BP_EXPANDED_MIN
+        );
+        this.briefingViewingOpen = arrived.briefingViewingOpen;
+        this.showBriefingPanel = arrived.showBriefingPanel;
+        this.showBriefingSheet = arrived.showBriefingSheet;
+        if (arrived.shouldCloseDefaultDiffInspector && !userOpenedDiff) {
+          this.showInlineDiffInspector = false;
+        }
+      }
+    } else {
+      this.fleetStore.setPersonalAgentKey('', '');
+    }
+    const needsCount = briefing.counts !== undefined && briefing.counts !== null
+      ? briefing.counts.needs_you
+      : 0;
+    setHarmonyAppBadgeNumber(needsCount).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'setHarmonyAppBadgeNumber failed', err);
+    });
+
+    const payloads = this.notificationEngine.observeBriefing(
+      briefing,
+      this.buildNotificationVisibilityContext(),
+      (hid: string): PushPreferencesDto => this.getPushPreferencesForHost(hid),
+      this.resolveLocalNotificationCopyStrings()
+    );
+    this.dispatchLocalNotificationPayloads(payloads);
+  }
+
+  private nextNotificationId(): number {
+    this.notificationSeq += 1;
+    if (this.notificationSeq >= 999999) {
+      this.notificationSeq = 1000;
+    }
+    return this.notificationSeq;
+  }
+
+  private dispatchLocalNotificationPayloads(payloads: readonly OrbitLocalNotificationPayload[]): void {
+    if (this.abilityContext === undefined || payloads.length === 0) {
+      return;
+    }
+    for (let i = 0; i < payloads.length; i += 1) {
+      const p = payloads[i];
+      if (!this.getPushPreferencesForHost(p.hostId).enabled || p.hostId.length === 0) {
+        continue;
+      }
+      publishOrbitDeepLinkNotification(
+        this.abilityContext,
+        this.nextNotificationId(),
+        p.title,
+        p.body,
+        p.hostId,
+        p.agentId,
+        p.eventKind,
+        p.requestId,
+        p.seq
+      ).catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'dispatchLocalNotificationPayloads failed', err);
+      });
+    }
+  }
+
+  private observeHostDetailForNotifications(hostId: string, detail: HostDetailDto): void {
+    const prefs = this.getPushPreferencesForHost(hostId);
+    const payloads = this.notificationEngine.observeHostDetail(
+      hostId,
+      detail,
+      this.buildNotificationVisibilityContext(),
+      prefs,
+      this.resolveLocalNotificationCopyStrings()
+    );
+    this.dispatchLocalNotificationPayloads(payloads);
   }
 
   public handleSchedulerVisibleTimelineDirty(hostId: string, agentId: string): void {
@@ -885,6 +1249,10 @@ export class OrbitHarmonyStore {
 
   public set isFoldableDevice(val: boolean) {
     this.shellStore.isFoldableDevice = val;
+  }
+
+  public get reducedMotion(): boolean {
+    return this.shellStore.reducedMotion;
   }
 
   public get foldPosture(): string {
@@ -1355,11 +1723,15 @@ export class OrbitHarmonyStore {
         const uri = this.pendingDeepLink;
         const evKind = this.pendingDeepLinkEventKind;
         const linkNavSeq = this.pendingDeepLinkNavSeq;
+        const reqId = this.pendingDeepLinkRequestId;
+        const seq = this.pendingDeepLinkSeq;
         this.pendingDeepLink = '';
         this.pendingDeepLinkEventKind = '';
         this.pendingDeepLinkNavSeq = 0;
+        this.pendingDeepLinkRequestId = '';
+        this.pendingDeepLinkSeq = 0;
         if (linkNavSeq === this.navigationSeq) {
-          this.handleDeepLinkUri(uri, evKind);
+          this.handleDeepLinkUri(uri, evKind, reqId, seq);
         }
       }
       return;
@@ -1445,11 +1817,15 @@ export class OrbitHarmonyStore {
       const uri = this.pendingDeepLink;
       const evKind = this.pendingDeepLinkEventKind;
       const linkNavSeq = this.pendingDeepLinkNavSeq;
+      const reqId = this.pendingDeepLinkRequestId;
+      const seq = this.pendingDeepLinkSeq;
       this.pendingDeepLink = '';
       this.pendingDeepLinkEventKind = '';
       this.pendingDeepLinkNavSeq = 0;
+      this.pendingDeepLinkRequestId = '';
+      this.pendingDeepLinkSeq = 0;
       if (linkNavSeq === this.navigationSeq) {
-        this.handleDeepLinkUri(uri, evKind);
+        this.handleDeepLinkUri(uri, evKind, reqId, seq);
       }
     }
     if (this.pendingReplayFramesJson.length > 0) {
@@ -1466,11 +1842,13 @@ export class OrbitHarmonyStore {
   // Theme & Layout Management
 
   public bindContext(ctx: common.Context): void {
+    this.abilityContext = ctx;
     this.prefsStore.init(ctx);
     this.shellStore.bindWidthStorage(this.prefsStore);
     this.sidePanelStore.bindStorage(this.prefsStore);
     this.sidePanelStore.hydrate();
     this.sidePanelStore.setDefaultWidthVp(this.shellStore.sidePanelWidthVp);
+    this.hydratePushPreferencesFromStorage();
   }
 
   public bindApplicationContext(ctx: common.ApplicationContext): void {
@@ -1610,7 +1988,7 @@ export class OrbitHarmonyStore {
   }
 
   public setSidebarSearchQuery(query: string): void {
-    this.sidebarSearchQuery = query;
+    this.fleetStore.setSidebarSearchQuery(query);
     this.refreshSidebar();
   }
 
@@ -1682,15 +2060,23 @@ export class OrbitHarmonyStore {
   }
 
   public isProjectCollapsed(projectId: string): boolean {
-    return this.collapsedProjectIds.indexOf(projectId) >= 0;
+    return this.fleetStore.isProjectCollapsed(projectId);
   }
 
   public toggleProjectCollapsed(projectId: string): void {
-    if (this.collapsedProjectIds.indexOf(projectId) >= 0) {
-      this.collapsedProjectIds = this.collapsedProjectIds.filter((id: string) => id !== projectId);
+    this.fleetStore.toggleProjectCollapsed(projectId);
+    if (this.fleetStore.isProjectCollapsed(projectId)) {
+      if (this.collapsedProjectIds.indexOf(projectId) < 0) {
+        this.collapsedProjectIds = this.collapsedProjectIds.concat([projectId]);
+      }
     } else {
-      this.collapsedProjectIds = this.collapsedProjectIds.concat([projectId]);
+      this.collapsedProjectIds = this.collapsedProjectIds.filter((id: string) => id !== projectId);
     }
+    this.triggerHaptic(6);
+  }
+
+  public toggleProjectMoreExpanded(projectId: string): void {
+    this.fleetStore.toggleProjectMoreExpanded(projectId);
     this.triggerHaptic(6);
   }
 
@@ -1714,6 +2100,18 @@ export class OrbitHarmonyStore {
     this.bridge.togglePinAgent(hostId, agentId);
     this.refreshSidebar();
     this.triggerHaptic(8);
+  }
+
+  public markAgentRead(hostId: string, agentId: string): void {
+    if (this.bridge === null || hostId.length === 0 || agentId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.markAgentRead(hostId, agentId);
+      this.refreshSidebarAsync();
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'markAgentRead failed', err as Object);
+    }
   }
 
   public markAgentUnread(hostId: string, agentId: string): void {
@@ -1760,10 +2158,30 @@ export class OrbitHarmonyStore {
   }
 
   public updateWindowSize(widthVp: number, heightVp: number): void {
+    const prevWidthVp = this.windowWidthVp;
     this.shellStore.updateWindowSize(widthVp, heightVp, this.sidePanelStore.isOpen);
     this.sidePanelStore.setCompactViewport(this.shellStore.breakpoint === 'sm');
     if (widthVp > 0) {
       this.stageStore.setTailLimit(resolveStageTailLimit(widthVp));
+    }
+    const reconciledBriefing = reconcileBriefingPresentationOnResize(
+      prevWidthVp,
+      widthVp,
+      this.isCurrentSessionPersonalAgent(),
+      this.showBriefingSheet,
+      this.showBriefingPanel,
+      OrbitTokens.BP_EXPANDED_MIN,
+      this.briefingViewingOpen
+    );
+    this.briefingViewingOpen = reconciledBriefing.briefingViewingOpen;
+    this.showBriefingSheet = reconciledBriefing.showBriefingSheet;
+    this.showBriefingPanel = reconciledBriefing.showBriefingPanel;
+    if (reconciledBriefing.showBriefingSheet) {
+      if (this.shellStore.modalRoute?.kind !== 'pa_briefing') {
+        this.shellStore.openModal({ kind: 'pa_briefing' });
+      }
+    } else if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
     }
   }
 
@@ -1793,6 +2211,8 @@ export class OrbitHarmonyStore {
   // Lifecycle & Network Hooks
 
   public onAppForeground(): void {
+    this.isAppInBackground = false;
+    this.eventScheduler.setBackgroundMode(false);
     if (this.bridge !== null) {
       try {
         this.bridge.onAppForeground();
@@ -1811,6 +2231,11 @@ export class OrbitHarmonyStore {
   }
 
   public onAppBackground(): void {
+    this.isAppInBackground = true;
+    this.eventScheduler.setBackgroundMode(true);
+    if (this.isCurrentSessionPersonalAgent()) {
+      this.markPersonalAgentVisitedNow(this.selectedHostId, this.selectedAgentId);
+    }
     this.composerStore.flushNow();
     this.sidePanelStore.flushNow();
     if (this.bridge !== null) {
@@ -1832,7 +2257,12 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public handleDeepLinkUri(uri: string, eventKind: string = ''): void {
+  public handleDeepLinkUri(
+    uri: string,
+    eventKind: string = '',
+    requestId: string = '',
+    targetSeq: number = 0
+  ): void {
     const trimmed = uri.trim();
     const hashIdx = trimmed.indexOf('#');
     const clean = hashIdx >= 0 ? trimmed.substring(0, hashIdx).trim() : trimmed;
@@ -1845,6 +2275,8 @@ export class OrbitHarmonyStore {
       this.pendingDeepLink = clean;
       this.pendingDeepLinkEventKind = eventKind;
       this.pendingDeepLinkNavSeq = this.navigationSeq;
+      this.pendingDeepLinkRequestId = requestId;
+      this.pendingDeepLinkSeq = targetSeq;
       return;
     }
     const isOpenRoute =
@@ -1866,38 +2298,15 @@ export class OrbitHarmonyStore {
     }
 
     if (isOpenRoute) {
-      const qIdx = clean.indexOf('?');
-      let hostId = '';
-      let agentId = '';
-      let parsedEventKind = eventKind;
-      if (qIdx >= 0 && qIdx + 1 < clean.length) {
-        const queryStr = clean.substring(qIdx + 1);
-        const parts = queryStr.split('&');
-        for (let i = 0; i < parts.length; i++) {
-          const seg = parts[i];
-          const eq = seg.indexOf('=');
-          if (eq <= 0) {
-            continue;
-          }
-          const k = seg.substring(0, eq).trim().toLowerCase();
-          const rawVal = seg.substring(eq + 1).trim();
-          let val = rawVal;
-          try {
-            val = decodeURIComponent(rawVal);
-          } catch (_e) {
-            val = rawVal;
-          }
-          if (k === 'host' || k === 'host_id') {
-            hostId = val;
-          } else if (k === 'agent' || k === 'agent_id') {
-            agentId = val;
-          } else if (k === 'event_kind' || k === 'event') {
-            parsedEventKind = val;
-          }
-        }
-      }
-      if (hostId.length > 0) {
-        this.openSessionFromDeepLink(hostId, agentId, parsedEventKind);
+      const parsedOpen = parseOrbitOpenDeepLink(clean, eventKind, requestId, targetSeq);
+      if (parsedOpen !== null) {
+        this.openSessionFromDeepLink(
+          parsedOpen.hostId,
+          parsedOpen.agentId,
+          parsedOpen.eventKind,
+          parsedOpen.requestId,
+          parsedOpen.targetSeq
+        );
       } else {
         this.showToast('Missing host in Orbit link', true);
       }
@@ -1910,30 +2319,32 @@ export class OrbitHarmonyStore {
     this.showToast('Unsupported Orbit link', true);
   }
 
-  private selectValidatedDeepLinkAgent(hostId: string, agentId: string): void {
-    const cleanAgent = agentId.trim();
-    if (cleanAgent.length === 0) {
-      return;
-    }
-    const detail = this.currentHostDetail;
-    const isOnline = detail !== null &&
-      detail.host.host_id === hostId &&
-      (detail.host.connection_state === 'online_direct' ||
-        detail.host.connection_state === 'online_relay');
-    if (isOnline && detail !== null) {
-      const found = detail.agents.some((ag: AgentCardDto): boolean => ag.agent_id === cleanAgent);
-      if (!found) {
-        this.showToast('Session not found', true);
-        return;
-      }
-    }
-    this.selectAgent(cleanAgent);
+  /**
+   * Tri-state validation for deep-linked agent targets:
+   * - `'selected'`: target agent verified and selected.
+   * - `'pending'`: host detail not yet cached/online; caller must defer side effects until loaded.
+   * - `'not_found'`: host is online and cached, and agent does NOT exist; caller MUST abort.
+   */
+  public validateDeepLinkAgentInDetail(
+    detail: HostDetailDto | null,
+    hostId: string,
+    agentId: string
+  ): DeepLinkAgentValidation {
+    return validateDeepLinkAgentInDetail(detail, hostId, agentId);
   }
 
-  public openSessionFromDeepLink(hostId: string, agentId: string, eventKind: string = ''): void {
+  public openSessionFromDeepLink(
+    hostId: string,
+    agentId: string,
+    eventKind: string = '',
+    requestId: string = '',
+    targetSeq: number = 0
+  ): void {
     const cleanHost = hostId.trim();
     const cleanAgent = agentId.trim();
     const cleanEvent = eventKind.trim().toLowerCase();
+    const cleanReqId = requestId.trim();
+    const cleanSeq = Number.isFinite(targetSeq) && targetSeq > 0 ? Math.floor(targetSeq) : 0;
     if (cleanHost.length === 0) {
       return;
     }
@@ -1944,6 +2355,8 @@ export class OrbitHarmonyStore {
       this.pendingOpenAgentId = cleanAgent;
       this.pendingOpenEventKind = cleanEvent;
       this.pendingOpenNavSeq = navSeq;
+      this.pendingOpenRequestId = cleanReqId;
+      this.pendingOpenSeq = cleanSeq;
       return;
     }
     const hostExists = this.hosts.some((h: HostCardDto): boolean => h.host_id === cleanHost);
@@ -1952,6 +2365,8 @@ export class OrbitHarmonyStore {
       this.pendingOpenAgentId = cleanAgent;
       this.pendingOpenEventKind = cleanEvent;
       this.pendingOpenNavSeq = navSeq;
+      this.pendingOpenRequestId = cleanReqId;
+      this.pendingOpenSeq = cleanSeq;
       this.reloadFleet();
       return;
     }
@@ -1959,23 +2374,86 @@ export class OrbitHarmonyStore {
     this.pendingOpenAgentId = '';
     this.pendingOpenEventKind = '';
     this.pendingOpenNavSeq = 0;
+    this.pendingOpenRequestId = '';
+    this.pendingOpenSeq = 0;
+
+    // Validate target agent BEFORE switching stage or emitting side effects (`markAgentRead`).
+    if (cleanAgent.length > 0) {
+      const targetDetail = this.fleetStore.getCachedHostDetail(cleanHost);
+      const validation = this.validateDeepLinkAgentInDetail(targetDetail, cleanHost, cleanAgent);
+      if (validation === 'not_found') {
+        this.showLocalizedToast($r('app.string.briefing_sessionNotFound'), 'Session not found', true);
+        return;
+      }
+      if (validation === 'pending') {
+        this.pendingAgentValidationHostId = cleanHost;
+        this.pendingAgentValidationAgentId = cleanAgent;
+        this.pendingAgentValidationEventKind = cleanEvent;
+        this.pendingAgentValidationRequestId = cleanReqId;
+        this.pendingAgentValidationSeq = cleanSeq;
+        this.pendingAgentValidationNavSeq = navSeq;
+        if (this.selectedHostId !== cleanHost) {
+          this.selectHostInternal(cleanHost, false, false);
+        } else {
+          this.reloadHostAsync(cleanHost, false);
+        }
+        return;
+      }
+    }
+
+    this.pendingAgentValidationHostId = '';
+    this.pendingAgentValidationAgentId = '';
+    this.pendingAgentValidationEventKind = '';
+    this.pendingAgentValidationRequestId = '';
+    this.pendingAgentValidationSeq = 0;
+    this.pendingAgentValidationNavSeq = 0;
     this.showGlobalOverview = false;
+    this.showPersonalAgentSetup = false;
+    this.showBriefingSheet = false;
     if (this.selectedHostId !== cleanHost) {
       // `openSessionFromDeepLink` already incremented `navigationSeq` above; suppress
       // automatic `agents[0]` selection when an explicit target `cleanAgent` follows.
       this.selectHostInternal(cleanHost, false, cleanAgent.length === 0);
     }
     if (cleanAgent.length > 0) {
-      this.selectValidatedDeepLinkAgent(cleanHost, cleanAgent);
+      this.selectAgent(cleanAgent);
+      this.markAgentRead(cleanHost, cleanAgent);
     }
-    if (cleanEvent === 'permission_required') {
+    const focusTarget = buildDecisionFocusTarget(
+      cleanEvent,
+      cleanHost,
+      cleanAgent,
+      cleanReqId,
+      cleanSeq
+    );
+    if (focusTarget !== null) {
+      this.pendingFocusDecisionHostId = focusTarget.hostId;
+      this.pendingFocusDecisionAgentId = focusTarget.agentId;
+      this.pendingFocusDecisionEventKind = focusTarget.eventKind;
+      this.pendingFocusDecisionRequestId = focusTarget.requestId;
+      this.pendingFocusDecisionSeq = focusTarget.seq;
+      this.decisionFocusRevision += 1;
+    } else {
+      this.clearPendingDecisionFocus();
+    }
+    const postAction = resolveDeepLinkPostNavigationAction(cleanEvent, cleanAgent);
+    if (postAction === 'permission_required') {
       this.reloadStage();
-      this.showToast('Approval waiting for your decision', false);
-    } else if (cleanEvent === 'goal_finished' || cleanEvent === 'timer_fired') {
+      this.decisionFocusRevision += 1;
+      this.showLocalizedToast(
+        $r('app.string.briefing_approvalWaiting'),
+        'Approval waiting for your decision',
+        false
+      );
+    } else if (postAction === 'automations') {
       this.openAutomationsSheet();
-    } else if (cleanEvent === 'agent_error') {
+    } else if (postAction === 'agent_error') {
       this.reloadStage();
-      this.showToast('Agent stopped with an error', true);
+      this.showLocalizedToast(
+        $r('app.string.briefing_agentStoppedError'),
+        'Agent stopped with an error',
+        true
+      );
     }
   }
 
@@ -2222,14 +2700,18 @@ export class OrbitHarmonyStore {
       const targetAgent = this.pendingOpenAgentId;
       const targetEvent = this.pendingOpenEventKind;
       const targetNavSeq = this.pendingOpenNavSeq;
+      const targetReq = this.pendingOpenRequestId;
+      const targetSeq = this.pendingOpenSeq;
       this.pendingOpenHostId = '';
       this.pendingOpenAgentId = '';
       this.pendingOpenEventKind = '';
       this.pendingOpenNavSeq = 0;
+      this.pendingOpenRequestId = '';
+      this.pendingOpenSeq = 0;
       // Only replay a queued deep-link if NO newer user navigation superseded it (R3-P1-2).
       if (targetNavSeq === this.navigationSeq) {
         if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
-          this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent);
+          this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent, targetReq, targetSeq);
         } else {
           this.showToast('Host not found', true);
           if (this.selectedHostId.length === 0 && snap.hosts.length > 0 && !hasValidPendingDeepLink) {
@@ -2465,8 +2947,25 @@ export class OrbitHarmonyStore {
     if (bumpNavigation) {
       this.navigationSeq += 1;
     }
+    const prevWasPa = this.isCurrentSessionPersonalAgent();
+    const prevHostId = this.selectedHostId;
+    const prevAgentId = this.selectedAgentId;
     const changed = this.fleetStore.setSelectedHostId(hostId);
+    this.pushPrefs = clonePushPreferences(this.getPushPreferencesForHost(hostId));
     if (changed) {
+      if (prevWasPa && prevHostId.length > 0 && prevAgentId.length > 0) {
+        this.markPersonalAgentVisitedNow(prevHostId, prevAgentId);
+        this.personalAgentStore.clearActiveVisitKey();
+      }
+      this.briefingViewingOpen = false;
+      this.showBriefingSheet = false;
+      this.briefingDismissedByUserForPaKey = '';
+      if (this.isDiffTargetPinned) {
+        this.closeGitInspector();
+      } else {
+        this.resetGitCollabState();
+      }
+      this.clearPendingDecisionFocus();
       this.automationsRefreshSeq += 1;
       this.sideQuestionGen += 1;
       this.sideQuestionStreaming = false;
@@ -2607,7 +3106,10 @@ export class OrbitHarmonyStore {
 
       const hasPendingDeepLinkOrOpen =
         (this.pendingDeepLink.length > 0 && this.pendingDeepLinkNavSeq === this.navigationSeq) ||
-        (this.pendingOpenHostId.length > 0 && this.pendingOpenNavSeq === this.navigationSeq);
+        (this.pendingOpenHostId.length > 0 && this.pendingOpenNavSeq === this.navigationSeq) ||
+        (this.pendingAgentValidationHostId.length > 0 &&
+          this.pendingAgentValidationAgentId.length > 0 &&
+          this.pendingAgentValidationNavSeq === this.navigationSeq);
       const hasInFlightAgentHydration =
         this.inFlightAgentHydrationNavSeq > 0 &&
         this.inFlightAgentHydrationNavSeq === this.navigationSeq;
@@ -2654,6 +3156,37 @@ export class OrbitHarmonyStore {
       }
       this.refreshSidebarAsync();
 
+      this.observeHostDetailForNotifications(hostId, detail);
+
+      if (this.pendingAgentValidationHostId === hostId && this.pendingAgentValidationAgentId.length > 0) {
+        const valResult = this.validateDeepLinkAgentInDetail(
+          detail,
+          hostId,
+          this.pendingAgentValidationAgentId
+        );
+        if (valResult !== 'pending') {
+          const pHost = this.pendingAgentValidationHostId;
+          const pAgent = this.pendingAgentValidationAgentId;
+          const pEvent = this.pendingAgentValidationEventKind;
+          const pReq = this.pendingAgentValidationRequestId;
+          const pSeq = this.pendingAgentValidationSeq;
+          const pNavSeq = this.pendingAgentValidationNavSeq;
+          this.pendingAgentValidationHostId = '';
+          this.pendingAgentValidationAgentId = '';
+          this.pendingAgentValidationEventKind = '';
+          this.pendingAgentValidationRequestId = '';
+          this.pendingAgentValidationSeq = 0;
+          this.pendingAgentValidationNavSeq = 0;
+          if (pNavSeq === this.navigationSeq) {
+            if (valResult === 'selected') {
+              this.openSessionFromDeepLink(pHost, pAgent, pEvent, pReq, pSeq);
+            } else {
+              this.showLocalizedToast($r('app.string.briefing_sessionNotFound'), 'Session not found', true);
+            }
+          }
+        }
+      }
+
       for (let i = 0; i < detail.agents.length; i++) {
         this.drainQueuedPromptsForAgentIfIdle(hostId, detail.agents[i]);
       }
@@ -2681,20 +3214,47 @@ export class OrbitHarmonyStore {
       }
     }
     if (this.bridge !== null && this.selectedHostId.length > 0) {
+      const canUpdateGitDiff = shouldApplyGitDiffForTarget(
+        this.isDiffTargetPinned,
+        this.diffTargetHostId,
+        this.diffTargetCwd,
+        this.selectedHostId,
+        cwd,
+        this.resolveHostHomeDir(this.selectedHostId)
+      );
       try {
-        this.bridge.fetchGitStatus(this.selectedHostId, cwd);
+        if (canUpdateGitDiff) {
+          this.bridge.fetchGitStatus(this.selectedHostId, cwd);
+        }
         this.bridge.fetchWorkspaceFiles(this.selectedHostId, cwd);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'setActiveCwd fetch failed', err as Object);
       }
-      this.gitDirty = true;
+      if (canUpdateGitDiff) {
+        this.gitDirty = true;
+      }
       this.reloadWorkspaceFiles();
     }
   }
 
   public startNewSessionDraft(cwd?: string): void {
     this.navigationSeq += 1;
+    if (this.isCurrentSessionPersonalAgent() && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0) {
+      this.markPersonalAgentVisitedNow(this.selectedHostId, this.selectedAgentId);
+      this.personalAgentStore.clearActiveVisitKey();
+    }
+    this.briefingViewingOpen = false;
+    this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
+    this.briefingDismissedByUserForPaKey = '';
+    if (this.isDiffTargetPinned) {
+      this.closeGitInspector();
+    }
+    this.clearPendingDecisionFocus();
     this.showGlobalOverview = false;
+    this.showPersonalAgentSetup = false;
     this.isNewSessionDraft = true;
     this.selectedAgentId = '';
     this.currentAgent = null;
@@ -3063,7 +3623,25 @@ export class OrbitHarmonyStore {
   }
 
   private selectRootAgentDirectly(hostId: string, agentId: string): void {
+    const prevWasPa = this.isCurrentSessionPersonalAgent();
+    const prevHostId = hostId;
+    const prevAgentId = this.selectedAgentId;
+    const sameSession = !this.isNewSessionDraft && prevAgentId === agentId;
+    if (prevWasPa && !sameSession && prevHostId.length > 0 && prevAgentId.length > 0) {
+      this.markPersonalAgentVisitedNow(prevHostId, prevAgentId);
+      this.personalAgentStore.clearActiveVisitKey();
+    }
+    if (this.isDiffTargetPinned && !sameSession) {
+      this.closeGitInspector();
+    }
+    if (
+      this.pendingFocusDecisionHostId !== hostId ||
+      this.pendingFocusDecisionAgentId !== agentId
+    ) {
+      this.clearPendingDecisionFocus();
+    }
     this.showGlobalOverview = false;
+    this.showPersonalAgentSetup = false;
     this.isNewSessionDraft = false;
     this.selectedAgentId = agentId;
     this.activeSessionUsage = null;
@@ -3072,6 +3650,47 @@ export class OrbitHarmonyStore {
       this.composerStore.setActiveScope(hostId, agentId);
       this.stageStore.activateSession(hostId, agentId);
       this.sidePanelStore.switchScope(hostId, agentId);
+    }
+    // Unified PA visit & Briefing presentation lifecycle across ALL session navigation entries
+    // (including cold-start deep links, sidebar taps, and cross-host switches).
+    if (this.isCurrentSessionPersonalAgent()) {
+      const paKey = `${hostId}::${agentId}`;
+      const userDismissedCurrentPa = this.briefingDismissedByUserForPaKey === paKey;
+      const userOpenedDiff = this.showInlineDiffInspector &&
+        (this.diffInspectorOpenedByUser || this.isDiffTargetPinned);
+      if (
+        !prevWasPa ||
+        !sameSession ||
+        !this.personalAgentStore.activeVisitKeyMatches(hostId, agentId)
+      ) {
+        this.personalAgentStore.enterPersonalAgentVisit(hostId, agentId);
+      }
+      if (!sameSession) {
+        this.briefingDismissedByUserForPaKey = '';
+      }
+      const nextPres = resolvePaSessionSelectPresentation(
+        this.windowWidthVp,
+        sameSession,
+        this.briefingViewingOpen,
+        this.showBriefingPanel,
+        this.showBriefingSheet,
+        userDismissedCurrentPa,
+        userOpenedDiff,
+        OrbitTokens.BP_EXPANDED_MIN
+      );
+      this.briefingViewingOpen = nextPres.briefingViewingOpen;
+      this.showBriefingPanel = nextPres.showBriefingPanel;
+      this.showBriefingSheet = nextPres.showBriefingSheet;
+      if (nextPres.shouldCloseDefaultDiffInspector && !userOpenedDiff) {
+        this.showInlineDiffInspector = false;
+      }
+    } else {
+      this.briefingViewingOpen = false;
+      this.showBriefingSheet = false;
+      if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+        this.shellStore.closeModal();
+      }
+      this.briefingDismissedByUserForPaKey = '';
     }
     if (this.bridge !== null && hostId.length > 0) {
       const agents = this.currentHostDetail?.agents ?? [];
@@ -3185,6 +3804,21 @@ export class OrbitHarmonyStore {
           this.refreshSidebarAsync();
         }
       }
+      // Unified stage-delta notification observation via OrbitNotificationEngine (zero duplicate state machine)
+      const stageHostCard = this.fleetStore.getHostById(session.hostId);
+      const stageHostLabel = stageHostCard !== null && stageHostCard.display_name.trim().length > 0
+        ? stageHostCard.display_name.trim()
+        : session.hostId;
+      const stagePayloads = this.notificationEngine.observeStageDelta(
+        session.hostId,
+        stageHostLabel,
+        delta.agent,
+        delta.pending_permissions ?? [],
+        this.buildNotificationVisibilityContext(),
+        this.getPushPreferencesForHost(session.hostId),
+        this.resolveLocalNotificationCopyStrings()
+      );
+      this.dispatchLocalNotificationPayloads(stagePayloads);
       this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, delta.agent);
     } else if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
       this.bridge.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
@@ -3339,12 +3973,12 @@ export class OrbitHarmonyStore {
       return;
     }
     try {
-      const clean = dirPath.trim();
-      const name = basenameOfPath(clean);
-      this.bridge.upsertProjectJson(null, this.selectedHostId, name, JSON.stringify([clean]));
+      const name = basenameOfPath(dirPath);
+      this.bridge.upsertProjectJson(null, this.selectedHostId, name, JSON.stringify([dirPath]));
       this.reloadFleet();
-      this.setActiveCwd(clean);
-      this.showToast(`Pinned ${name}`, false);
+      this.setActiveCwd(dirPath);
+      const displayName = name.trim().length > 0 ? name.trim() : name;
+      this.showToast(`Pinned ${displayName}`, false);
       this.triggerHaptic(10);
     } catch (e) {
       this.showToast((e as Error).message, true);
@@ -3787,8 +4421,12 @@ export class OrbitHarmonyStore {
   public setSessionMode(mode: string): void {
     const normalized = mode === 'plan' || mode.length === 0 ? 'default' : mode;
     this.composerMode = normalized;
-    if (this.bridge !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
-      this.bridge.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
+    if (this.bridge !== null) {
+      if (this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+        this.bridge.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
+      } else {
+        this.bridge.setAccountDefaultMode(normalized, Date.now());
+      }
     }
     this.triggerHaptic(8);
   }
@@ -4077,6 +4715,13 @@ export class OrbitHarmonyStore {
     return [];
   }
 
+  public isActiveAgentPersonalAgent(): boolean {
+    if (this.isNewSessionDraft || this.selectedAgentId.length === 0 || this.currentAgent === null) {
+      return false;
+    }
+    return this.currentAgent.labels !== undefined && this.currentAgent.labels['orbit.role'] === 'personal_router';
+  }
+
   public isActiveAgentRunning(): boolean {
     if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
       return false;
@@ -4095,8 +4740,10 @@ export class OrbitHarmonyStore {
     }
     return (
       this.currentAgent.is_running ||
+      this.currentAgent.is_awaiting_permission ||
       this.currentAgent.status.state === 'running' ||
-      this.currentAgent.status.state === 'initializing'
+      this.currentAgent.status.state === 'initializing' ||
+      this.currentAgent.status.state === 'awaiting_permission'
     );
   }
 
@@ -4658,9 +5305,25 @@ export class OrbitHarmonyStore {
       return;
     }
 
-    if (overridePrompt === undefined && this.isActiveAgentRunning()) {
-      this.enqueueCurrentDraft();
-      return;
+    if (this.isActiveAgentRunning()) {
+      if (overridePrompt === undefined) {
+        this.enqueueCurrentDraft();
+        return;
+      }
+      if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+        const badgesJsonOverride = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
+        const queueId = `q_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+        this.bridge.enqueuePrompt(
+          this.selectedHostId,
+          this.selectedAgentId,
+          composed.wire_prompt,
+          composed.display_prompt,
+          badgesJsonOverride,
+          queueId
+        );
+        this.reloadStage();
+        return;
+      }
     }
 
     const badgesJson = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
@@ -4770,11 +5433,13 @@ export class OrbitHarmonyStore {
 
   public pullRefreshGitReview(): void {
     this.triggerHaptic(10);
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return;
     }
     try {
-      this.bridge.refreshHost(this.selectedHostId);
+      this.bridge.refreshHost(targetHost);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'pullRefreshGitReview host refresh failed', err as Object);
     }
@@ -4782,12 +5447,14 @@ export class OrbitHarmonyStore {
       this.gitStagedMode,
       this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
     );
-    try {
-      this.bridge.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
-    } catch (err) {
-      orbitLogWarn('OrbitStore', 'pullRefreshGitReview workspace files failed', err as Object);
+    if (!this.isDiffTargetPinned) {
+      try {
+        this.bridge.fetchWorkspaceFiles(targetHost, targetCwd);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'pullRefreshGitReview workspace files failed', err as Object);
+      }
+      this.reloadWorkspaceFiles();
     }
-    this.reloadWorkspaceFiles();
   }
 
   public interruptCurrentAgent(): void {
@@ -4860,16 +5527,64 @@ export class OrbitHarmonyStore {
 
   // Git Working Tree Diff Actions
 
+  private resolveHostHomeDir(_hostId: string): string {
+    // Only expand `~` when an authoritative daemon home directory is explicitly provided by the host;
+    // never guess from arbitrary sidebar `/home/<user>` groups when multiple users may coexist on a host.
+    return '';
+  }
+
+  public resolvedDiffHostId(): string {
+    return this.isDiffTargetPinned && this.diffTargetHostId.length > 0
+      ? this.diffTargetHostId
+      : this.selectedHostId;
+  }
+
+  public resolvedDiffCwd(): string {
+    return this.isDiffTargetPinned && this.diffTargetCwd.length > 0
+      ? this.diffTargetCwd
+      : this.activeCwd;
+  }
+
+  private resetGitCollabState(): void {
+    this.gitCollabRequestSeq += 1;
+    this.gitPrStatus = null;
+    this.gitStashes = [];
+    this.gitConflicts = [];
+    this.gitRebaseStatus = null;
+  }
+
+  public closeGitInspector(): void {
+    this.showInlineDiffInspector = false;
+    this.showGitDiffSheet = false;
+    this.diffInspectorOpenedByUser = false;
+    this.isDiffTargetPinned = false;
+    this.diffTargetHostId = '';
+    this.diffTargetCwd = '';
+    this.resetGitCollabState();
+  }
+
   public toggleTopBarGitDiff(): void {
     if (this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'review') {
       this.sidePanelStore.dismissPanel();
       this.triggerHaptic(8);
       return;
     }
+    // Reuse `openGitInspector()` so wide-screen right-rail mutual exclusion (yielding docked
+    // Briefing panel and marking `diffInspectorOpenedByUser = true`) stays strictly uniform.
     this.openGitInspector();
   }
 
   public openGitInspector(focusPath?: string, cwdOverride?: string, hostIdOverride?: string): void {
+    this.diffInspectorOpenedByUser = true;
+    if (this.isCurrentSessionPersonalAgent()) {
+      this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
+    }
+    this.briefingViewingOpen = false;
+    this.showBriefingPanel = false;
+    this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
     if (focusPath !== undefined) {
       this.gitSelectedPath = focusPath;
     }
@@ -4923,34 +5638,71 @@ export class OrbitHarmonyStore {
   }
 
   public refreshGitReview(staged: boolean, path: string | null): void {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return;
     }
     try {
-      this.bridge.fetchGitStatus(this.selectedHostId, this.activeCwd);
+      this.bridge.fetchGitStatus(targetHost, targetCwd);
       this.bridge.fetchGitDiff(
-        this.selectedHostId,
-        this.activeCwd,
+        targetHost,
+        targetCwd,
         this.normalizeGitFocusPath(path),
         staged
       );
     } catch (err) {
       orbitLogWarn('OrbitStore', 'refreshGitReview failed', err as Object);
     }
-    if (this.isReviewScopeVisible(this.selectedHostId, this.activeCwd)) {
-      this.reloadGitDiff(this.activeCwd);
+    if (this.isReviewScopeVisible(targetHost, targetCwd)) {
+      this.reloadGitDiff(targetCwd, targetHost);
     }
   }
 
-  public reloadGitDiff(cwd: string): void {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+  public reloadGitDiff(cwd: string, hostId?: string): void {
+    const targetHost = (hostId !== undefined && hostId.trim().length > 0)
+      ? hostId.trim()
+      : this.selectedHostId;
+    if (this.bridge === null || targetHost.length === 0) {
+      return;
+    }
+    if (
+      !shouldApplyGitDiffForTarget(
+        this.isDiffTargetPinned,
+        this.diffTargetHostId,
+        this.diffTargetCwd,
+        targetHost,
+        cwd,
+        this.resolveHostHomeDir(targetHost)
+      )
+    ) {
       return;
     }
     try {
       const pathOpt = this.gitSelectedPath.length > 0 ? this.normalizeGitFocusPath(this.gitSelectedPath) : null;
       const gr = JSON.parse(
-        this.bridge.gitReviewJson(this.selectedHostId, cwd, pathOpt, this.gitStagedMode)
+        this.bridge.gitReviewJson(targetHost, cwd, pathOpt, this.gitStagedMode)
       ) as GitReviewDto;
+      if (this.isDiffTargetPinned) {
+        const hostHomeDir = this.resolveHostHomeDir(targetHost);
+        const respHost = (gr.host_id ?? '').trim();
+        const respCwd = gr.cwd ?? '';
+        const respStatus = gr.status;
+        const hostMismatch = respHost.length === 0 || respHost !== this.diffTargetHostId.trim();
+        const cwdMismatch =
+          respCwd.length === 0 || !gitTargetPathsEqual(respCwd, this.diffTargetCwd, hostHomeDir);
+        let statusCwdMismatch = false;
+        if (respStatus !== null && respStatus !== undefined) {
+          const statusCwd = respStatus.cwd ?? '';
+          statusCwdMismatch =
+            statusCwd.length === 0 || !gitTargetPathsEqual(statusCwd, this.diffTargetCwd, hostHomeDir);
+        }
+        if (hostMismatch || cwdMismatch || statusCwdMismatch) {
+          this.gitStatus = null;
+          this.gitDiffFiles = [];
+          return;
+        }
+      }
       this.gitStatus = gr.status;
       this.gitDiffFiles = gr.diff_files;
     } catch (err) {
@@ -4959,6 +5711,9 @@ export class OrbitHarmonyStore {
   }
 
   public totalDiffFileCount(): number {
+    if (this.isDiffTargetPinned) {
+      return this.gitDiffFiles.length;
+    }
     const source = this.gitDiffFiles.length > 0 ? this.gitDiffFiles : this.sessionDiffs;
     return source.length;
   }
@@ -4982,6 +5737,27 @@ export class OrbitHarmonyStore {
       this.sidebarOpen = false;
     }
     this.openGitInspector('', cleanCwd.length > 0 ? cleanCwd : undefined, cleanHost);
+  }
+
+  /**
+   * Opens Git Diff for a specific `(hostId, cwd)` targeted from a Briefing decision card.
+   * Routes into PR-4's scoped Review tab for `(hostId, cwd)` while yielding the docked Briefing rail.
+   */
+  public openDecisionDiffForHostCwd(hostId: string, cwd: string): void {
+    const cleanHost = hostId.trim();
+    const trimmedCwdCheck = cwd.trim();
+    if (cleanHost.length === 0 || trimmedCwdCheck.length === 0 || trimmedCwdCheck === '~') {
+      this.showLocalizedToast(
+        $r('app.string.briefing_diffTargetUnavailable'),
+        'Workspace path unavailable for this request',
+        true
+      );
+      return;
+    }
+    this.diffTargetHostId = cleanHost;
+    this.diffTargetCwd = cwd;
+    this.isDiffTargetPinned = true;
+    this.openGitInspector('', cwd, cleanHost);
   }
 
   public openPtyTerminalInCwd(cwd: string, hostIdOverride?: string): void {
@@ -6262,12 +7038,16 @@ export class OrbitHarmonyStore {
   }
 
   public async updatePushPreferences(nextPrefs: PushPreferencesDto): Promise<void> {
-    this.pushPrefs = nextPrefs;
+    const copy = clonePushPreferences(nextPrefs);
+    this.pushPrefs = copy;
+    const scopeKey = this.selectedHostId.trim().length > 0 ? this.selectedHostId.trim() : '__default__';
+    this.pushPrefsByHost.set(scopeKey, copy);
+    this.prefsStore.savePushPreferencesForHost(scopeKey, copy);
     if (this.bridge === null || this.selectedHostId.length === 0) {
       return;
     }
     try {
-      await this.bridge.updatePushPreferencesJson(this.selectedHostId, JSON.stringify(nextPrefs));
+      await this.bridge.updatePushPreferencesJson(this.selectedHostId, JSON.stringify(copy));
       this.showToast('Push preferences updated', false);
       this.triggerHaptic(6);
     } catch (err) {
@@ -6352,12 +7132,183 @@ export class OrbitHarmonyStore {
 
   public openGlobalOverview(): void {
     this.navigationSeq += 1;
-    this.showGlobalOverview = true;
-    this.personalAgentStore.refreshBriefing(true);
+    this.openPersonalAgentHome();
+  }
+
+  public isCurrentSessionPersonalAgent(): boolean {
+    if (this.isNewSessionDraft || this.showPersonalAgentSetup) {
+      return false;
+    }
+    if (this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      return false;
+    }
+    const pa = this.personalAgentStore.briefing?.personal_agent ?? null;
+    if (pa !== null && pa.host_id === this.selectedHostId && pa.agent_id === this.selectedAgentId) {
+      return true;
+    }
+    const routerStatus = this.personalAgentStore.activeRouterStatus;
+    if (
+      routerStatus !== null &&
+      this.primaryRouterHostId === this.selectedHostId &&
+      routerStatus.config.router_agent_id !== null &&
+      routerStatus.config.router_agent_id === this.selectedAgentId
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  public selectAgentOnHost(hostId: string, agentId: string, markRead: boolean = true): void {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    if (cleanHost.length === 0 || cleanAgent.length === 0) {
+      return;
+    }
+    this.showPersonalAgentSetup = false;
+    this.showGlobalOverview = false;
+    if (this.selectedHostId !== cleanHost) {
+      this.selectHostInternal(cleanHost, true, false);
+    }
+    this.selectAgent(cleanAgent);
+    if (markRead) {
+      this.markAgentRead(cleanHost, cleanAgent);
+    }
+    if (this.isCurrentSessionPersonalAgent()) {
+      // Reuse fresh briefing if already loaded on entry (zero trailing duplicate RPC).
+      this.personalAgentStore.ensureFreshBriefing();
+      this.refreshPersonalAgentActivity(cleanHost, 50, null, false);
+    }
+  }
+
+  public openPersonalAgentHome(): void {
+    this.navigationSeq += 1;
+    // Reuse fresh briefing when available; fetch once only when missing/stale/invalidated.
+    this.personalAgentStore.ensureFreshBriefing();
+    const pa = this.personalAgentStore.briefing?.personal_agent ?? null;
+    if (pa !== null && pa.host_id.length > 0 && pa.agent_id.length > 0) {
+      this.showPersonalAgentSetup = false;
+      this.showGlobalOverview = false;
+      this.selectAgentOnHost(pa.host_id, pa.agent_id, true);
+      if (this.shellStore.breakpoint === 'sm') {
+        this.sidebarOpen = false;
+      }
+      this.triggerHaptic(8);
+      return;
+    }
+    this.showPersonalAgentSetup = true;
+    this.showGlobalOverview = false;
+    this.briefingViewingOpen = false;
+    this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
+    // Discovery is owned by PersonalAgentSetupCard.aboutToAppear() via coalesced refreshRouterAndMesh().
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
+    this.triggerHaptic(8);
+  }
+
+  public toggleBriefingPanel(): void {
+    const nextOpen = !this.showBriefingPanel;
+    this.briefingViewingOpen = nextOpen;
+    this.showBriefingPanel = nextOpen;
+    if (nextOpen) {
+      this.briefingDismissedByUserForPaKey = '';
+      this.closeGitInspector();
+      if (this.sidePanelStore.isOpen) {
+        this.sidePanelStore.dismissPanel();
+      }
+      this.showBriefingSheet = false;
+      if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+        this.shellStore.closeModal();
+      }
+      this.personalAgentStore.ensureFreshBriefing();
+    } else if (this.isCurrentSessionPersonalAgent()) {
+      this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
+    }
     this.triggerHaptic(6);
+  }
+
+  public closeBriefingPanel(): void {
+    if (this.isCurrentSessionPersonalAgent()) {
+      this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
+    }
+    this.briefingViewingOpen = false;
+    this.showBriefingPanel = false;
+    this.showBriefingSheet = false;
+  }
+
+  public openBriefingSheet(): void {
+    this.briefingDismissedByUserForPaKey = '';
+    this.briefingViewingOpen = true;
+    if (this.windowWidthVp >= OrbitTokens.BP_EXPANDED_MIN) {
+      // Wide screen uses the 304 vp docked rail exclusively; never open Sheet simultaneously.
+      this.showBriefingSheet = false;
+      this.closeGitInspector();
+      this.showBriefingPanel = true;
+      this.personalAgentStore.ensureFreshBriefing();
+      this.triggerHaptic(6);
+      return;
+    }
+    this.showBriefingPanel = false;
+    this.showBriefingSheet = true;
+    this.shellStore.openModal({ kind: 'pa_briefing' });
+    this.personalAgentStore.ensureFreshBriefing();
+    const pa = this.personalAgentStore.briefing?.personal_agent ?? null;
+    if (pa !== null && pa.host_id.length > 0) {
+      this.refreshPersonalAgentActivity(pa.host_id, 50, null, false);
+    }
+    this.triggerHaptic(6);
+  }
+
+  public closeBriefingSheet(): void {
+    this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
+    // Only mark user-dismissed when closing on compact width; programmatic Sheet close during
+    // a 1023 -> 1024 vp promotion MUST preserve `briefingViewingOpen = true` for the docked rail.
+    if (this.windowWidthVp < OrbitTokens.BP_EXPANDED_MIN) {
+      if (this.isCurrentSessionPersonalAgent()) {
+        this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
+      }
+      this.briefingViewingOpen = false;
+      this.showBriefingPanel = false;
+    }
+  }
+
+  public archiveAgentOnHost(hostId: string, agentId: string): void {
+    if (this.bridge === null || hostId.length === 0 || agentId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.archiveAgent(hostId, agentId);
+      if (this.selectedHostId === hostId && this.selectedAgentId === agentId) {
+        this.startNewSessionDraft();
+      }
+      this.reloadHostAsync(hostId);
+      this.refreshSidebarAsync();
+      this.personalAgentStore.refreshBriefing(true);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'archiveAgentOnHost failed', err as Object);
+      this.showToast('Failed to archive session', true);
+    }
+  }
+
+  public providerCatalogsForHost(hostId: string): ProviderModelCatalogDto[] {
+    const detail = hostId.length > 0
+      ? this.fleetStore.getCachedHostDetail(hostId)
+      : this.currentHostDetail;
+    if (detail !== null && detail.provider_catalogs !== undefined && detail.provider_catalogs.length > 0) {
+      return detail.provider_catalogs;
+    }
+    return this.cachedFallbackCatalogs;
+  }
+
+  public ensureFreshPersonalAgentBriefing(): void {
+    this.personalAgentStore.ensureFreshBriefing();
   }
 
   public refreshPersonalAgentBriefing(force: boolean = false): void {
@@ -6397,29 +7348,26 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public async approveSafeBatchPermissions(): Promise<void> {
+  public async approveSafeBatchPermissions(
+    frozenTargets?: readonly FrozenBatchApprovalTarget[]
+  ): Promise<void> {
     if (this.bridge === null) {
       return;
     }
-    const decisions = this.personalAgentStore.needsYou;
-    const byHost: Map<string, PermissionBatchItemDto[]> = new Map<string, PermissionBatchItemDto[]>();
-    for (let i = 0; i < decisions.length; i++) {
-      const item = decisions[i];
-      if (!item.batch_eligible || item.human_only || item.request_id === null || item.request_id.length === 0) {
-        continue;
-      }
-      const existing = byHost.get(item.host_id) ?? [];
-      existing.push({
-        agent_id: item.agent_id,
-        permission_request_id: item.request_id
-      });
-      byHost.set(item.host_id, existing);
-    }
+    const liveDecisions = this.personalAgentStore.needsYou;
+    const confirmedTargets = frozenTargets !== undefined
+      ? frozenTargets
+      : snapshotBatchApprovalTargets(liveDecisions);
+    const byHost = intersectFrozenBatchTargets(confirmedTargets, liveDecisions);
     if (byHost.size === 0) {
-      this.showToast('No batch-eligible approvals available', false);
+      this.showLocalizedToast(
+        $r('app.string.briefing_batchNothingEligible'),
+        'No confirmed requests remain eligible',
+        false
+      );
       return;
     }
-    let resolvedTotal = 0;
+    const outcomes: BatchApprovalHostOutcome[] = [];
     const hostIds = Array.from(byHost.keys());
     for (let i = 0; i < hostIds.length; i++) {
       const hid = hostIds[i];
@@ -6428,20 +7376,80 @@ export class OrbitHarmonyStore {
         continue;
       }
       try {
-        await this.bridge.resolvePermissionsBatchJson(hid, JSON.stringify(batch), 'allow');
-        resolvedTotal += batch.length;
+        const rawReceipt = await this.bridge.resolvePermissionsBatchJson(hid, JSON.stringify(batch), 'allow');
+        outcomes.push(parseBatchApprovalHostResponse(hid, rawReceipt));
       } catch (err) {
         orbitLogWarn('OrbitStore', `resolvePermissionsBatchJson failed on ${hid}`, err as Object);
+        outcomes.push({
+          hostId: hid,
+          resolvedCount: 0,
+          skippedCount: 0,
+          firstSkipReason: '',
+          failed: true
+        });
       }
     }
+    const summary = aggregateBatchApprovalOutcomes(outcomes);
+    const feedback = classifyBatchApprovalFeedback(summary);
     this.reloadFleetAsync();
     this.personalAgentStore.refreshBriefing(true);
     if (this.selectedAgentId.length > 0) {
       this.reloadStage();
     }
-    if (resolvedTotal > 0) {
-      this.showToast(`Approved ${resolvedTotal} safe request${resolvedTotal === 1 ? '' : 's'}`, false);
+    if (feedback.kind === 'approved_all') {
+      this.showLocalizedToast(
+        $r('app.string.briefing_batchApprovedCount', feedback.resolvedCount),
+        `Approved ${feedback.resolvedCount} safe request(s)`,
+        false,
+        [feedback.resolvedCount]
+      );
       this.triggerHaptic(14);
+    } else if (feedback.kind === 'approved_with_skipped') {
+      this.showLocalizedToast(
+        $r('app.string.briefing_batchApprovedWithSkipped', feedback.resolvedCount, feedback.skippedCount),
+        `Approved ${feedback.resolvedCount}, skipped ${feedback.skippedCount}`,
+        false,
+        [feedback.resolvedCount, feedback.skippedCount]
+      );
+      this.triggerHaptic(12);
+    } else if (feedback.kind === 'partial_failure') {
+      this.showLocalizedToast(
+        $r(
+          'app.string.briefing_batchPartialFailure',
+          feedback.resolvedCount,
+          feedback.skippedCount,
+          feedback.failedHostCount
+        ),
+        `Approved ${feedback.resolvedCount}, skipped ${feedback.skippedCount}; ${feedback.failedHostCount} host(s) failed`,
+        true,
+        [feedback.resolvedCount, feedback.skippedCount, feedback.failedHostCount]
+      );
+    } else if (feedback.kind === 'skipped_and_failed') {
+      const baseMsg = this.resolveResourceText(
+        $r('app.string.briefing_batchSkippedAndFailed', feedback.skippedCount, feedback.failedHostCount),
+        `Skipped ${feedback.skippedCount} request(s); ${feedback.failedHostCount} host(s) failed`
+      )
+        .replace(/%1\$d/g, String(feedback.skippedCount))
+        .replace(/%2\$d/g, String(feedback.failedHostCount));
+      const fullMsg = feedback.firstSkipReason.length > 0
+        ? `${baseMsg} (${feedback.firstSkipReason})`
+        : baseMsg;
+      this.showToast(fullMsg, true);
+    } else if (feedback.kind === 'all_skipped') {
+      const baseMsg = this.resolveResourceText(
+        $r('app.string.briefing_batchAllSkipped'),
+        'Skipped %d request(s); none approved'
+      ).replace(/%([1-9][0-9]*\$)?d/g, String(feedback.skippedCount));
+      const fullMsg = feedback.firstSkipReason.length > 0
+        ? `${baseMsg} (${feedback.firstSkipReason})`
+        : baseMsg;
+      this.showToast(fullMsg, true);
+    } else if (feedback.kind === 'failed') {
+      this.showLocalizedToast(
+        $r('app.string.briefing_batchFailed'),
+        'Batch approval failed',
+        true
+      );
     }
   }
 
@@ -6914,15 +7922,15 @@ export class OrbitHarmonyStore {
   // 12. Git Write / Commit / PR / Stash / Conflicts / Rebase
 
   public async gitStagePaths(paths: string[], all: boolean): Promise<boolean> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitStagePathsJson(targetHost, targetCwd, paths, all);
-      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
         this.pullRefreshGitReview();
       }
       this.showToast(all ? 'Staged all changes' : 'Staged file', false);
@@ -6938,15 +7946,15 @@ export class OrbitHarmonyStore {
   }
 
   public async gitUnstagePaths(paths: string[], all: boolean): Promise<boolean> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitUnstagePathsJson(targetHost, targetCwd, paths, all);
-      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
         this.pullRefreshGitReview();
       }
       this.showToast(all ? 'Unstaged all changes' : 'Unstaged file', false);
@@ -6962,12 +7970,14 @@ export class OrbitHarmonyStore {
   }
 
   public async gitGenerateCommitMessage(): Promise<string> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return '';
     }
     this.gitWriteBusy = true;
     try {
-      const json = await this.bridge.gitGenerateCommitMessageJson(this.selectedHostId, this.activeCwd);
+      const json = await this.bridge.gitGenerateCommitMessageJson(targetHost, targetCwd);
       const parsed = JSON.parse(json) as GitGeneratedCommitMessageDto;
       if (parsed.message !== undefined && parsed.message.trim().length > 0) {
         return parsed.message.trim();
@@ -6988,11 +7998,11 @@ export class OrbitHarmonyStore {
 
   public async gitCommit(message: string, amend: boolean): Promise<boolean> {
     const clean = message.trim();
-    if (this.bridge === null || this.selectedHostId.length === 0 || clean.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0 || clean.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       const json = await this.bridge.gitCommitJson(targetHost, targetCwd, clean, amend);
@@ -7014,33 +8024,68 @@ export class OrbitHarmonyStore {
   }
 
   public async refreshGitCollabStatus(): Promise<void> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const hid = this.resolvedDiffHostId();
+    if (this.bridge === null || hid.length === 0) {
       return;
     }
-    const hid = this.selectedHostId;
-    const cwd = this.activeCwd;
+    const cwd = this.resolvedDiffCwd();
+    this.gitCollabRequestSeq += 1;
+    const reqSeq = this.gitCollabRequestSeq;
+    const stillCurrent = (): boolean => isGitCollabResponseCurrent(
+      reqSeq,
+      this.gitCollabRequestSeq,
+      hid,
+      this.resolvedDiffHostId(),
+      cwd,
+      this.resolvedDiffCwd(),
+      this.resolveHostHomeDir(hid)
+    );
     try {
       const prJson = await this.bridge.gitPrStatusJson(hid, cwd);
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitPrStatus = JSON.parse(prJson) as GitPrStatusDto;
     } catch (_e) {
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitPrStatus = null;
     }
     try {
       const stashJson = await this.bridge.gitStashListJson(hid, cwd);
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitStashes = JSON.parse(stashJson) as GitStashEntryDto[];
     } catch (_e) {
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitStashes = [];
     }
     try {
       const confJson = await this.bridge.gitConflictsJson(hid, cwd);
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitConflicts = JSON.parse(confJson) as GitConflictEntryDto[];
     } catch (_e) {
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitConflicts = [];
     }
     try {
       const rebJson = await this.bridge.gitRebaseStatusJson(hid, cwd);
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitRebaseStatus = JSON.parse(rebJson) as GitRebaseStatusDto;
     } catch (_e) {
+      if (!stillCurrent()) {
+        return;
+      }
       this.gitRebaseStatus = null;
     }
   }
@@ -7051,11 +8096,11 @@ export class OrbitHarmonyStore {
     base: string | null,
     draft: boolean
   ): Promise<GitCreatePrResultDto | null> {
-    if (this.bridge === null || this.selectedHostId.length === 0 || title.trim().length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0 || title.trim().length === 0) {
       return null;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       const json = await this.bridge.gitCreatePrJson(
@@ -7083,15 +8128,15 @@ export class OrbitHarmonyStore {
   }
 
   public async gitSaveStash(message: string | null, includeUntracked: boolean): Promise<boolean> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitStashSaveJson(targetHost, targetCwd, message, includeUntracked);
-      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
         this.pullRefreshGitReview();
         this.refreshGitCollabStatus();
       }
@@ -7106,15 +8151,15 @@ export class OrbitHarmonyStore {
   }
 
   public async gitPopStash(stashRef: string, expectedOid: string | null): Promise<boolean> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitStashPopJson(targetHost, targetCwd, stashRef, expectedOid);
-      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
         this.pullRefreshGitReview();
         this.refreshGitCollabStatus();
       }
@@ -7129,15 +8174,15 @@ export class OrbitHarmonyStore {
   }
 
   public async gitRebaseContinue(): Promise<boolean> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitRebaseContinueJson(targetHost, targetCwd);
-      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
         this.pullRefreshGitReview();
         this.refreshGitCollabStatus();
       }
@@ -7152,15 +8197,15 @@ export class OrbitHarmonyStore {
   }
 
   public async gitRebaseAbort(): Promise<boolean> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
+    const targetHost = this.resolvedDiffHostId();
+    const targetCwd = this.resolvedDiffCwd();
+    if (this.bridge === null || targetHost.length === 0) {
       return false;
     }
-    const targetHost = this.selectedHostId;
-    const targetCwd = this.activeCwd;
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitRebaseAbortJson(targetHost, targetCwd);
-      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
         this.pullRefreshGitReview();
         this.refreshGitCollabStatus();
       }
@@ -7252,6 +8297,24 @@ export class OrbitHarmonyStore {
     if (this.bridge === null) {
       return;
     }
+    if (this.routerDiscoveryInFlight !== null) {
+      return this.routerDiscoveryInFlight;
+    }
+    const work = this.executeRouterAndMeshRefresh();
+    this.routerDiscoveryInFlight = work;
+    try {
+      await work;
+    } finally {
+      if (this.routerDiscoveryInFlight === work) {
+        this.routerDiscoveryInFlight = null;
+      }
+    }
+  }
+
+  private async executeRouterAndMeshRefresh(): Promise<void> {
+    if (this.bridge === null) {
+      return;
+    }
     this.routerMeshBusy = true;
     try {
       try {
@@ -7295,6 +8358,24 @@ export class OrbitHarmonyStore {
     }
   }
 
+  /**
+   * Fetches the target host's current `PersonalRouterConfigDto` without mutating
+   * `primaryRouterHostId`. Throws on RPC/parse failure so setup flows never overwrite an
+   * existing host's security/webhook configuration with fallback defaults.
+   */
+  public async fetchHostRouterConfig(hostId: string): Promise<PersonalRouterConfigDto | null> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return null;
+    }
+    const json = await this.bridge.getRouterConfigJson(cleanHost);
+    const snap = JSON.parse(json) as RouterStatusSnapshotDto;
+    if (snap === null || snap === undefined || snap.config === undefined || snap.config === null) {
+      throw new Error('Missing router config in host response');
+    }
+    return normalizePersonalRouterConfig(snap.config);
+  }
+
   public async loadRouterStatusForHost(hostId: string): Promise<void> {
     if (this.bridge === null || hostId.length === 0) {
       return;
@@ -7328,7 +8409,11 @@ export class OrbitHarmonyStore {
       this.activeRouterStatus = JSON.parse(json) as RouterStatusSnapshotDto;
       this.primaryRouterHostId = hostId;
       this.prefsStore.setPrimaryRouterHostId(hostId);
-      this.showToast('Personal Router policy saved', false);
+      this.showLocalizedToast(
+        $r('app.string.briefing_settingsSaved'),
+        'Personal Agent settings saved',
+        false
+      );
       this.triggerHaptic(10);
       return true;
     } catch (err) {

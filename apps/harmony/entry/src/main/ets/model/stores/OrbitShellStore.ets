@@ -9,6 +9,7 @@ export type OrbitModalRouteKind =
   | 'export_transcript'
   | 'directory_browser'
   | 'work_picker'
+  | 'pa_briefing'
   | 'image_viewer'
   | 'diagram_viewer';
 

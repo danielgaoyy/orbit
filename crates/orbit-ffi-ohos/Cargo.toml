@@ -23,7 +23,9 @@ serde_json.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 orbit-crypto.workspace = true
+orbit-store.workspace = true
 
 [target.'cfg(target_env = "ohos")'.dependencies]
 napi-ohos.workspace = true

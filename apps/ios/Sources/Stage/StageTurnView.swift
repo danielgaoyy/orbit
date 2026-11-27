@@ -110,6 +110,9 @@ final class StageTurnActions {
     func refreshPasteboardAvailability() { store?.refreshPasteboardAvailability() }
     func showToast(_ message: String) { store?.showToast(message) }
     func selectAgent(_ agentId: String) { store?.selectAgent(agentId) }
+    func openSourceAgent(_ hostId: String, _ agentId: String) {
+        store?.selectAgent(hostId: hostId, agentId: agentId)
+    }
     func resolveChildPermission(
         childHostId: String?,
         childAgentId: String,
@@ -140,6 +143,9 @@ struct StageTurnView: View, Equatable {
     var expandFirstTurnByDefault: Bool = false
     var isFirstStepBearingTurn: Bool = false
     var isFirstTurn: Bool = false
+    var isPersonalAgentSession: Bool = false
+    var livePendingPermissionIds: Set<String> = []
+    var hostDisplayNames: [String: String] = [:]
     let actions: StageTurnActions
 
     static func == (lhs: StageTurnView, rhs: StageTurnView) -> Bool {
@@ -157,6 +163,9 @@ struct StageTurnView: View, Equatable {
             && lhs.expandFirstTurnByDefault == rhs.expandFirstTurnByDefault
             && lhs.isFirstStepBearingTurn == rhs.isFirstStepBearingTurn
             && lhs.isFirstTurn == rhs.isFirstTurn
+            && lhs.isPersonalAgentSession == rhs.isPersonalAgentSession
+            && lhs.livePendingPermissionIds == rhs.livePendingPermissionIds
+            && lhs.hostDisplayNames == rhs.hostDisplayNames
     }
 
     @Environment(\.orbitPalette) private var palette
@@ -244,8 +253,17 @@ struct StageTurnView: View, Equatable {
         return resolved.isEmpty ? nil : resolved
     }
 
+    private var isPersonalAgentReportTurn: Bool {
+        guard isPersonalAgentSession,
+              let agentMsg = turn.agentMessage,
+              case let .agentMessage(_, _, kind, _, _, _, _, _, permissionContext, _, _, _, _, _, _, _, _) = agentMsg else {
+            return false
+        }
+        return permissionContext == nil && kind != .heartbeat
+    }
+
     private var hasAssistantBody: Bool {
-        !visibleLiveSegments.isEmpty || trailingActivityLabel != nil || turn.terminalReply != nil || !turn.notices.isEmpty
+        !visibleLiveSegments.isEmpty || trailingActivityLabel != nil || turn.terminalReply != nil || !turn.notices.isEmpty || isPersonalAgentReportTurn
     }
 
     var body: some View {
@@ -273,23 +291,37 @@ struct StageTurnView: View, Equatable {
 
                     if let agentMsg = turn.agentMessage,
                        case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, deliveryStatus, _, _, queuedAtMs, dispatchedAtMs, settledAtMs, blocks, timestampMs) = agentMsg {
-                        AgentMessageCardView(
-                            selectedHostId: selectedHostId,
-                            actions: actions,
-                            kind: kind,
-                            sourceAgentId: sourceAgentId,
-                            sourceHostId: sourceHostId,
-                            sourceTitle: sourceTitle,
-                            event: event,
-                            text: text,
-                            permissionContext: permissionContext,
-                            deliveryStatus: deliveryStatus,
-                            queuedAtMs: queuedAtMs,
-                            dispatchedAtMs: dispatchedAtMs,
-                            settledAtMs: settledAtMs,
-                            blocks: blocks,
-                            timestampMs: timestampMs
-                        )
+                        if isPersonalAgentSession && permissionContext == nil && kind != .heartbeat {
+                            PersonalAgentReportHeaderView(
+                                selectedHostId: selectedHostId,
+                                sourceHostId: sourceHostId,
+                                sourceAgentId: sourceAgentId,
+                                sourceTitle: sourceTitle,
+                                event: event,
+                                text: text,
+                                hostDisplayNames: hostDisplayNames,
+                                actions: actions
+                            )
+                        } else {
+                            AgentMessageCardView(
+                                selectedHostId: selectedHostId,
+                                actions: actions,
+                                kind: kind,
+                                sourceAgentId: sourceAgentId,
+                                sourceHostId: sourceHostId,
+                                sourceTitle: sourceTitle,
+                                event: event,
+                                text: text,
+                                permissionContext: permissionContext,
+                                isPermissionStillLive: permissionContext.map { livePendingPermissionIds.contains($0.permissionRequestId) } ?? false,
+                                deliveryStatus: deliveryStatus,
+                                queuedAtMs: queuedAtMs,
+                                dispatchedAtMs: dispatchedAtMs,
+                                settledAtMs: settledAtMs,
+                                blocks: blocks,
+                                timestampMs: timestampMs
+                            )
+                        }
                     }
 
                     if hasAssistantBody {
@@ -329,6 +361,21 @@ struct StageTurnView: View, Equatable {
                                    case let .assistantMessage(_, _, text, _, blocks, _) = replyItem {
                                     assistantMarkdownBlock(text: text, blocks: blocks)
                                 }
+                            }
+
+                            if isPersonalAgentSession,
+                               let agentMsg = turn.agentMessage,
+                               case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, _, text, permissionContext, _, _, _, _, _, _, _, _) = agentMsg,
+                               permissionContext == nil,
+                               kind != .heartbeat {
+                                PersonalAgentReportDetailDisclosure(
+                                    selectedHostId: selectedHostId,
+                                    sourceHostId: sourceHostId,
+                                    sourceAgentId: sourceAgentId,
+                                    sourceTitle: sourceTitle,
+                                    text: text,
+                                    actions: actions
+                                )
                             }
 
                             if !isTurnActive && !turn.turnDiffs.isEmpty {
@@ -543,23 +590,47 @@ struct StageTurnView: View, Equatable {
 
                 case let .agentMessage(_, item):
                     if case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, deliveryStatus, _, _, queuedAtMs, dispatchedAtMs, settledAtMs, blocks, timestampMs) = item {
-                        AgentMessageCardView(
-                            selectedHostId: selectedHostId,
-                            actions: actions,
-                            kind: kind,
-                            sourceAgentId: sourceAgentId,
-                            sourceHostId: sourceHostId,
-                            sourceTitle: sourceTitle,
-                            event: event,
-                            text: text,
-                            permissionContext: permissionContext,
-                            deliveryStatus: deliveryStatus,
-                            queuedAtMs: queuedAtMs,
-                            dispatchedAtMs: dispatchedAtMs,
-                            settledAtMs: settledAtMs,
-                            blocks: blocks,
-                            timestampMs: timestampMs
-                        )
+                        if isPersonalAgentSession && permissionContext == nil && kind != .heartbeat {
+                            VStack(alignment: .leading, spacing: 4) {
+                                PersonalAgentReportHeaderView(
+                                    selectedHostId: selectedHostId,
+                                    sourceHostId: sourceHostId,
+                                    sourceAgentId: sourceAgentId,
+                                    sourceTitle: sourceTitle,
+                                    event: event,
+                                    text: text,
+                                    hostDisplayNames: hostDisplayNames,
+                                    actions: actions
+                                )
+                                PersonalAgentReportDetailDisclosure(
+                                    selectedHostId: selectedHostId,
+                                    sourceHostId: sourceHostId,
+                                    sourceAgentId: sourceAgentId,
+                                    sourceTitle: sourceTitle,
+                                    text: text,
+                                    actions: actions
+                                )
+                            }
+                        } else {
+                            AgentMessageCardView(
+                                selectedHostId: selectedHostId,
+                                actions: actions,
+                                kind: kind,
+                                sourceAgentId: sourceAgentId,
+                                sourceHostId: sourceHostId,
+                                sourceTitle: sourceTitle,
+                                event: event,
+                                text: text,
+                                permissionContext: permissionContext,
+                                isPermissionStillLive: permissionContext.map { livePendingPermissionIds.contains($0.permissionRequestId) } ?? false,
+                                deliveryStatus: deliveryStatus,
+                                queuedAtMs: queuedAtMs,
+                                dispatchedAtMs: dispatchedAtMs,
+                                settledAtMs: settledAtMs,
+                                blocks: blocks,
+                                timestampMs: timestampMs
+                            )
+                        }
                     }
 
                 case let .notice(_, item):
@@ -2735,6 +2806,188 @@ struct TurnNoticeRow: View {
     }
 }
 
+// MARK: - Personal Agent Report Source Tag & Collapsible Detail Disclosure
+
+private func cleanPersonalAgentReportBody(_ raw: String) -> String {
+    var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if s.hasPrefix("<orbit-system") {
+        if let endTag = s.range(of: ">\n"), let closeTag = s.range(of: "</orbit-system>"),
+           endTag.upperBound <= closeTag.lowerBound {
+            s = String(s[endTag.upperBound..<closeTag.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+        }
+    }
+    var preservedErrors: [String] = []
+    if let openRange = s.range(of: "<agent-response>") {
+        let prefix = String(s[..<openRange.lowerBound])
+        for line in prefix.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("error:") {
+                preservedErrors.append(trimmed)
+            }
+        }
+        if let closeRange = s.range(of: "</agent-response>"), openRange.upperBound <= closeRange.lowerBound {
+            s = String(s[openRange.upperBound..<closeRange.lowerBound])
+        } else {
+            s = String(s[openRange.upperBound...])
+        }
+    }
+    // Strip machine boilerplate lines (`Agent ... finished/failed/errored/was closed.`, `Host: ...`, `[truncated ...`)
+    let lines = s.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    let filtered = lines.filter { line in
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return true }
+        if trimmed.hasPrefix("Agent ") && (trimmed.hasSuffix("finished.") || trimmed.hasSuffix("failed.") || trimmed.hasSuffix("errored.") || trimmed.hasSuffix("was closed.")) {
+            return false
+        }
+        if trimmed.hasPrefix("Host: ") {
+            return false
+        }
+        if trimmed.hasPrefix("[truncated ") && trimmed.contains("get_agent_activity") {
+            return false
+        }
+        return true
+    }
+    let body = filtered.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    if preservedErrors.isEmpty {
+        return body
+    }
+    if body.isEmpty {
+        return preservedErrors.joined(separator: "\n")
+    }
+    return preservedErrors.joined(separator: "\n") + "\n\n" + body
+}
+
+struct PersonalAgentReportHeaderView: View {
+    let selectedHostId: String?
+    let sourceHostId: String?
+    let sourceAgentId: String?
+    let sourceTitle: String?
+    let event: String?
+    let text: String
+    let hostDisplayNames: [String: String]
+    let actions: StageTurnActions
+
+    @Environment(\.orbitPalette) private var palette
+
+    private var label: String {
+        let name = sourceTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved = (name?.isEmpty == false) ? name! : (sourceAgentId ?? "Worker")
+        let base = String(format: OrbitL10n.tr("From \"%@\""), resolved)
+        let targetHost = sourceHostId ?? selectedHostId
+        if hostDisplayNames.count > 1, let hid = targetHost, let hostName = hostDisplayNames[hid], !hostName.isEmpty {
+            return "\(base) · \(hostName)"
+        }
+        return base
+    }
+
+    private var isError: Bool {
+        let ev = (event ?? "").lowercased()
+        return ev == "errored" || ev == "failed"
+    }
+
+    var body: some View {
+        let targetHost = sourceHostId ?? selectedHostId
+        if let aid = sourceAgentId, !aid.isEmpty, let hid = targetHost {
+            Button {
+                actions.openSourceAgent(hid, aid)
+            } label: {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(isError ? palette.danger : palette.fgMuted.opacity(0.6))
+                        .frame(width: 6, height: 6)
+                    Text(label)
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgMuted)
+                        .lineLimit(1)
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(palette.fgMuted.opacity(0.75))
+                }
+            }
+            .buttonStyle(.plain)
+        } else {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(isError ? palette.danger : palette.fgMuted.opacity(0.6))
+                    .frame(width: 6, height: 6)
+                Text(label)
+                    .font(OrbitTypography.meta(.medium))
+                    .foregroundStyle(palette.fgMuted)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+struct PersonalAgentReportDetailDisclosure: View {
+    let selectedHostId: String?
+    let sourceHostId: String?
+    let sourceAgentId: String?
+    let sourceTitle: String?
+    let text: String
+    let actions: StageTurnActions
+
+    @Environment(\.orbitPalette) private var palette
+    @State private var isExpanded = false
+
+    private var cleanBody: String {
+        cleanPersonalAgentReportBody(text)
+    }
+
+    private var formattedMarkdown: AttributedString? {
+        try? AttributedString(
+            markdown: cleanBody,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )
+    }
+
+    var body: some View {
+        if !cleanBody.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(isExpanded ? OrbitL10n.tr("Hide details") : OrbitL10n.tr("Details"))
+                            .font(OrbitTypography.meta(.medium))
+                    }
+                    .foregroundStyle(palette.fgMuted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(palette.subtleFill.opacity(0.75), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+
+                if isExpanded {
+                    Group {
+                        if let attributed = formattedMarkdown {
+                            Text(attributed)
+                        } else {
+                            Text(cleanBody)
+                        }
+                    }
+                    .font(OrbitTypography.subhead())
+                    .foregroundStyle(palette.fgSecondary)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+}
+
 // MARK: - Inter-Agent Peer Message / Finish Notification / Heartbeat / Child Permission Card
 
 struct AgentMessageCardView: View {
@@ -2747,6 +3000,7 @@ struct AgentMessageCardView: View {
     let event: String?
     let text: String
     let permissionContext: FfiPermissionCheckpointRef?
+    var isPermissionStillLive: Bool = true
     var deliveryStatus: FfiAgentMessageDeliveryStatus? = nil
     var queuedAtMs: Int64? = nil
     var dispatchedAtMs: Int64? = nil
@@ -2912,6 +3166,15 @@ struct AgentMessageCardView: View {
                             Text("Responded: \(OrbitFormatters.decisionLabel(decided))")
                                 .font(OrbitTypography.meta(.medium))
                                 .foregroundStyle(palette.fgSecondary)
+                        }
+                    } else if !isPermissionStillLive {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle")
+                                .font(.system(size: 12))
+                                .foregroundStyle(palette.fgMuted)
+                            Text(OrbitL10n.tr("Resolved"))
+                                .font(OrbitTypography.meta(.medium))
+                                .foregroundStyle(palette.fgMuted)
                         }
                     } else {
                         let baseDecisions = perm.allowedDecisions.isEmpty

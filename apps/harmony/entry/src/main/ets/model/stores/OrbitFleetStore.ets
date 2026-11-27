@@ -4,16 +4,281 @@ import {
   FleetSidebarDto,
   FleetSidebarRequestDto,
   HostCardDto,
-  HostDetailDto
+  HostDetailDto,
+  SidebarConversationDto,
+  SidebarProjectGroupDto
 } from '../OrbitTypes';
 import { OrbitFleetBridge } from '../OrbitCoreBridge';
 import { orbitLogWarn } from '../OrbitLogger';
 
+export const ORBIT_MAX_VISIBLE_THREADS_PER_PROJECT: number = 5;
+
+export type OrbitSidebarRowKind =
+  | 'hdr_attention'
+  | 'hdr_pinned'
+  | 'hdr_projects'
+  | 'hdr_empty_projects'
+  | 'proj'
+  | 'proj_more'
+  | 'conv';
+
+export interface OrbitSidebarRow {
+  readonly key: string;
+  readonly kind: OrbitSidebarRowKind;
+  readonly section: string;
+  readonly conv: SidebarConversationDto | null;
+  readonly project: SidebarProjectGroupDto | null;
+  readonly showWorkspaceHint: boolean;
+  readonly indentLeft: number;
+  readonly hiddenCount: number;
+  readonly isMoreExpanded: boolean;
+  readonly isProjectCollapsed: boolean;
+}
+
+function conversationCompositeKey(hostId: string, agentId: string): string {
+  return `${hostId}::${agentId}`;
+}
+
+function filterConversationsForSidebar(
+  items: SidebarConversationDto[] | undefined,
+  selectedHostId: string,
+  excludedAgentKey: string
+): SidebarConversationDto[] {
+  if (items === undefined || items.length === 0) {
+    return [];
+  }
+  const out: SidebarConversationDto[] = [];
+  for (let i = 0; i < items.length; i += 1) {
+    const conv = items[i];
+    if (selectedHostId.length > 0 && conv.host_id !== selectedHostId) {
+      continue;
+    }
+    if (
+      excludedAgentKey.length > 0 &&
+      conversationCompositeKey(conv.host_id, conv.agent.agent_id) === excludedAgentKey
+    ) {
+      continue;
+    }
+    out.push(conv);
+  }
+  return out;
+}
+
+/**
+ * Pure deterministic builder flattening `FleetSidebarDto` into virtualized `OrbitSidebarRow[]`
+ * with stable `hdr:` / `conv:` / `proj:` keys.
+ *
+ * Rules:
+ * - Filters out `is_home_workspace === true` groups that have zero visible conversations.
+ * - Excludes the Personal Agent conversation from Pinned and Projects (defense-in-depth alongside core).
+ */
+export function buildOrbitSidebarRows(
+  sidebar: FleetSidebarDto | null,
+  selectedHostId: string,
+  searchQuery: string,
+  collapsedProjectIds: ReadonlySet<string>,
+  expandedMoreProjectIds: ReadonlySet<string>,
+  personalAgentKey: string = ''
+): OrbitSidebarRow[] {
+  const rows: OrbitSidebarRow[] = [];
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+
+  if (normalizedQuery.length === 0 && sidebar !== null) {
+    // Needs Attention still surfaces a Personal Agent when it needs approval (matches core).
+    const needsAttention = filterConversationsForSidebar(
+      sidebar.needs_attention,
+      selectedHostId,
+      ''
+    );
+    if (needsAttention.length > 0) {
+      rows.push({
+        key: 'hdr:attention',
+        kind: 'hdr_attention',
+        section: 'attention',
+        conv: null,
+        project: null,
+        showWorkspaceHint: false,
+        indentLeft: 0,
+        hiddenCount: 0,
+        isMoreExpanded: false,
+        isProjectCollapsed: false
+      });
+      for (let i = 0; i < needsAttention.length; i += 1) {
+        const conv = needsAttention[i];
+        rows.push({
+          key: `conv:attn:${conv.host_id}:${conv.agent.agent_id}`,
+          kind: 'conv',
+          section: 'attention',
+          conv: conv,
+          project: null,
+          showWorkspaceHint: true,
+          indentLeft: 4,
+          hiddenCount: 0,
+          isMoreExpanded: false,
+          isProjectCollapsed: false
+        });
+      }
+    }
+
+    const pinned = filterConversationsForSidebar(
+      sidebar.pinned_conversations,
+      selectedHostId,
+      personalAgentKey
+    );
+    if (pinned.length > 0) {
+      rows.push({
+        key: 'hdr:pinned',
+        kind: 'hdr_pinned',
+        section: 'pinned',
+        conv: null,
+        project: null,
+        showWorkspaceHint: false,
+        indentLeft: 0,
+        hiddenCount: 0,
+        isMoreExpanded: false,
+        isProjectCollapsed: false
+      });
+      for (let i = 0; i < pinned.length; i += 1) {
+        const conv = pinned[i];
+        rows.push({
+          key: `conv:pin:${conv.host_id}:${conv.agent.agent_id}`,
+          kind: 'conv',
+          section: 'pinned',
+          conv: conv,
+          project: null,
+          showWorkspaceHint: true,
+          indentLeft: 4,
+          hiddenCount: 0,
+          isMoreExpanded: false,
+          isProjectCollapsed: false
+        });
+      }
+    }
+  }
+
+  rows.push({
+    key: 'hdr:projects',
+    kind: 'hdr_projects',
+    section: 'projects',
+    conv: null,
+    project: null,
+    showWorkspaceHint: false,
+    indentLeft: 0,
+    hiddenCount: 0,
+    isMoreExpanded: false,
+    isProjectCollapsed: false
+  });
+
+  const visibleProjects: SidebarProjectGroupDto[] = [];
+  const rawProjects = sidebar !== null ? sidebar.projects : [];
+  for (let i = 0; i < rawProjects.length; i += 1) {
+    const group = rawProjects[i];
+    if (selectedHostId.length > 0 && group.host_id !== selectedHostId) {
+      continue;
+    }
+    const filteredConvs = filterConversationsForSidebar(
+      group.conversations,
+      selectedHostId,
+      personalAgentKey
+    );
+    if (group.is_home_workspace && filteredConvs.length === 0) {
+      continue;
+    }
+    if (filteredConvs.length === group.conversations.length) {
+      visibleProjects.push(group);
+    } else {
+      visibleProjects.push({
+        id: group.id,
+        host_id: group.host_id,
+        name: group.name,
+        primary_cwd: group.primary_cwd,
+        directories: group.directories,
+        git_branch: group.git_branch,
+        pinned_project_id: group.pinned_project_id,
+        is_home_workspace: group.is_home_workspace,
+        sort_weight_ms: group.sort_weight_ms,
+        conversations: filteredConvs
+      });
+    }
+  }
+
+  if (visibleProjects.length === 0) {
+    rows.push({
+      key: 'hdr:empty_projects',
+      kind: 'hdr_empty_projects',
+      section: 'projects',
+      conv: null,
+      project: null,
+      showWorkspaceHint: false,
+      indentLeft: 0,
+      hiddenCount: 0,
+      isMoreExpanded: false,
+      isProjectCollapsed: false
+    });
+    return rows;
+  }
+
+  for (let i = 0; i < visibleProjects.length; i += 1) {
+    const group = visibleProjects[i];
+    const isCollapsed = normalizedQuery.length === 0 && collapsedProjectIds.has(group.id);
+    rows.push({
+      key: `proj:${group.id}`,
+      kind: 'proj',
+      section: 'projects',
+      conv: null,
+      project: group,
+      showWorkspaceHint: false,
+      indentLeft: 0,
+      hiddenCount: 0,
+      isMoreExpanded: false,
+      isProjectCollapsed: isCollapsed
+    });
+
+    if (!isCollapsed) {
+      const moreExpanded = normalizedQuery.length > 0 || expandedMoreProjectIds.has(group.id);
+      const total = group.conversations.length;
+      const limit = moreExpanded ? total : Math.min(total, ORBIT_MAX_VISIBLE_THREADS_PER_PROJECT);
+      for (let j = 0; j < limit; j += 1) {
+        const conv = group.conversations[j];
+        rows.push({
+          key: `conv:${group.id}:${conv.host_id}:${conv.agent.agent_id}`,
+          kind: 'conv',
+          section: 'projects',
+          conv: conv,
+          project: group,
+          showWorkspaceHint: false,
+          indentLeft: 12,
+          hiddenCount: 0,
+          isMoreExpanded: false,
+          isProjectCollapsed: false
+        });
+      }
+
+      if (normalizedQuery.length === 0 && total > ORBIT_MAX_VISIBLE_THREADS_PER_PROJECT) {
+        rows.push({
+          key: `proj:more:${group.id}`,
+          kind: 'proj_more',
+          section: 'projects',
+          conv: null,
+          project: group,
+          showWorkspaceHint: false,
+          indentLeft: 12,
+          hiddenCount: total - ORBIT_MAX_VISIBLE_THREADS_PER_PROJECT,
+          isMoreExpanded: moreExpanded,
+          isProjectCollapsed: false
+        });
+      }
+    }
+  }
+
+  return rows;
+}
+
 /**
  * Multi-host Fleet & Sidebar domain store.
  * Strictly obeys the state collection rule:
- * - Rendered collections use `@Trace T[]` arrays.
- * - O(1) lookup indices use non-`@Trace` plain `Map` instances synchronized whenever arrays mutate.
+ * - Rendered collections use `@Trace T[]` arrays (`hosts`, `projects`, `sidebarRows`).
+ * - O(1) lookup indices use non-`@Trace` plain `Map` / `Set` instances synchronized whenever arrays mutate.
  */
 @ObservedV2
 export class OrbitFleetStore {
@@ -24,6 +289,7 @@ export class OrbitFleetStore {
   @Trace public selectedHostId: string = '';
   @Trace public currentHostDetail: HostDetailDto | null = null;
   @Trace public sidebarView: FleetSidebarDto | null = null;
+  @Trace public sidebarRows: OrbitSidebarRow[] = [];
   @Trace public sidebarProjectSort: string = 'recent';
   @Trace public sidebarThreadFilter: string = 'all';
   @Trace public sidebarSearchQuery: string = '';
@@ -40,6 +306,9 @@ export class OrbitFleetStore {
     new Map<string, Promise<HostDetailDto | null>>();
   private readonly removedHostIds: Set<string> = new Set<string>();
   private readonly dirtyConversationIndex: Map<string, boolean> = new Map<string, boolean>();
+  private readonly collapsedProjectIds: Set<string> = new Set<string>();
+  private readonly expandedMoreProjectIds: Set<string> = new Set<string>();
+  private personalAgentKey: string = '';
 
   private bridge: OrbitFleetBridge | null = null;
   private fleetGen: number = 0;
@@ -218,6 +487,65 @@ export class OrbitFleetStore {
     this.bridge = bridge;
   }
 
+  public setPersonalAgentKey(hostId: string, agentId: string): void {
+    const next = hostId.length > 0 && agentId.length > 0 ? `${hostId}::${agentId}` : '';
+    if (this.personalAgentKey === next) {
+      return;
+    }
+    this.personalAgentKey = next;
+    this.rebuildSidebarRows();
+  }
+
+  public isProjectCollapsed(projectId: string): boolean {
+    return this.collapsedProjectIds.has(projectId);
+  }
+
+  public toggleProjectCollapsed(projectId: string): void {
+    if (this.collapsedProjectIds.has(projectId)) {
+      this.collapsedProjectIds.delete(projectId);
+    } else {
+      this.collapsedProjectIds.add(projectId);
+    }
+    this.rebuildSidebarRows();
+  }
+
+  public isProjectMoreExpanded(projectId: string): boolean {
+    return this.expandedMoreProjectIds.has(projectId);
+  }
+
+  public toggleProjectMoreExpanded(projectId: string): void {
+    if (this.expandedMoreProjectIds.has(projectId)) {
+      this.expandedMoreProjectIds.delete(projectId);
+    } else {
+      this.expandedMoreProjectIds.add(projectId);
+    }
+    this.rebuildSidebarRows();
+  }
+
+  public setSidebarSearchQuery(query: string): void {
+    if (this.sidebarSearchQuery === query) {
+      return;
+    }
+    this.sidebarSearchQuery = query;
+    this.rebuildSidebarRows();
+  }
+
+  public applySidebarView(next: FleetSidebarDto | null): void {
+    this.sidebarView = next;
+    this.rebuildSidebarRows();
+  }
+
+  public rebuildSidebarRows(): void {
+    this.sidebarRows = buildOrbitSidebarRows(
+      this.sidebarView,
+      this.selectedHostId,
+      this.sidebarSearchQuery,
+      this.collapsedProjectIds,
+      this.expandedMoreProjectIds,
+      this.personalAgentKey
+    );
+  }
+
   public getHostById(hostId: string): HostCardDto | null {
     const found = this.hostById.get(hostId);
     return found !== undefined ? found : null;
@@ -226,6 +554,10 @@ export class OrbitFleetStore {
   public getCachedHostDetail(hostId: string): HostDetailDto | null {
     const found = this.hostDetailById.get(hostId);
     return found !== undefined ? found : null;
+  }
+
+  public getAllCachedHostDetails(): Map<string, HostDetailDto> {
+    return this.hostDetailById;
   }
 
   public isConversationDirty(hostId: string, agentId: string): boolean {
@@ -251,7 +583,7 @@ export class OrbitFleetStore {
     }
     this.dirtyConversationIndex.delete(key);
     const next: string[] = [];
-    for (let i = 0; i < this.dirtyConversationKeys.length; i++) {
+    for (let i = 0; i < this.dirtyConversationKeys.length; i += 1) {
       if (this.dirtyConversationKeys[i] !== key) {
         next.push(this.dirtyConversationKeys[i]);
       }
@@ -261,7 +593,7 @@ export class OrbitFleetStore {
 
   public applyFleetOverview(snap: FleetOverviewDto): void {
     this.hostById.clear();
-    for (let i = 0; i < snap.hosts.length; i++) {
+    for (let i = 0; i < snap.hosts.length; i += 1) {
       this.hostById.set(snap.hosts[i].host_id, snap.hosts[i]);
       this.removedHostIds.delete(snap.hosts[i].host_id);
     }
@@ -302,7 +634,7 @@ export class OrbitFleetStore {
     };
     this.hostById.set(hostId, synthetic);
     const nextHosts: HostCardDto[] = [];
-    for (let i = 0; i < this.hosts.length; i++) {
+    for (let i = 0; i < this.hosts.length; i += 1) {
       nextHosts.push(this.hosts[i]);
     }
     nextHosts.push(synthetic);
@@ -351,6 +683,7 @@ export class OrbitFleetStore {
       this.selectedHostId = hostId;
       const cached = this.hostDetailById.get(hostId);
       this.currentHostDetail = cached !== undefined ? cached : null;
+      this.rebuildSidebarRows();
     }
     return changed;
   }
@@ -408,6 +741,10 @@ export class OrbitFleetStore {
         }
         const detail = JSON.parse(raw) as HostDetailDto | null;
         if (detail !== null) {
+          const prev = this.hostDetailById.get(hostId);
+          if (prev !== undefined && prev.revision > detail.revision) {
+            return null;
+          }
           this.hostDetailById.set(hostId, detail);
         } else {
           this.hostDetailById.delete(hostId);
@@ -461,7 +798,7 @@ export class OrbitFleetStore {
       const parsed = JSON.parse(
         this.bridge.fleetSidebarByRequestJson(JSON.stringify(req))
       ) as FleetSidebarDto;
-      this.sidebarView = parsed;
+      this.applySidebarView(parsed);
       return parsed;
     } catch (err) {
       orbitLogWarn('OrbitFleetStore', 'fleetSidebarByRequestJson failed', err as Object);
@@ -485,7 +822,7 @@ export class OrbitFleetStore {
         return null;
       }
       const parsed = JSON.parse(raw) as FleetSidebarDto;
-      this.sidebarView = parsed;
+      this.applySidebarView(parsed);
       return parsed;
     } catch (err) {
       orbitLogWarn('OrbitFleetStore', 'fleetSidebarByRequestJsonAsync failed', err as Object);
@@ -495,7 +832,7 @@ export class OrbitFleetStore {
 
   public otherHostsPendingApprovals(): number {
     let total = 0;
-    for (let i = 0; i < this.hosts.length; i++) {
+    for (let i = 0; i < this.hosts.length; i += 1) {
       if (this.hosts[i].host_id !== this.selectedHostId) {
         total += this.hosts[i].pending_approval_count;
       }

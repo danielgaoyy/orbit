@@ -5,7 +5,7 @@ import {
   HdsNavigationTitleMode,
   ScrollEffectType
 } from '@kit.UIDesignKit';
-import { HostCardDto, basenameOfPath, formatCompactTopBarConnectionLabel } from '../../model/OrbitTypes';
+import { HostCardDto } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import { orbitRuntime } from '../../model/OrbitRuntime';
 import { orbitLogWarn } from '../../model/OrbitLogger';
@@ -39,15 +39,24 @@ import {
   resolveHostStatusColor,
   resolveSelectedHost
 } from '../common/OrbitCommonControls';
+import {
+  TopBarDisplayModel,
+  isWorkspaceCwdUnset,
+  resolveConnectionStateResource,
+  resolveTopBarDisplayModel
+} from './TopBarDisplayModel';
 import { FleetSidebar } from './FleetSidebar';
 import { OrbitModalContentRouter } from './OrbitModalContentRouter';
-import { PersonalOverviewView } from './PersonalOverviewView';
 import { OrbitSidePanelContainer } from '../panel/OrbitSidePanelContainer';
 import { SubagentCrewMiniDock } from '../panel/SubagentCrewMiniDock';
+import { PersonalAgentBriefingPanel } from '../personal-agent/PersonalAgentBriefingPanel';
+import { PersonalAgentSetupCard } from '../personal-agent/PersonalAgentSetupCard';
 import { StreamStage } from '../stage/StreamStage';
 import { PlanReviewCard } from '../stage/PlanReviewCard';
 import { StickyDecisionDock } from '../stage/StickyDecisionDock';
 import { OmniComposer } from '../composer/OmniComposer';
+
+const BRIEFING_RAIL_WIDTH_VP: number = 304;
 
 /**
  * Three-form-factor responsive workspace shell + single-modal router:
@@ -99,12 +108,26 @@ export struct AdaptiveWorkspace {
     return this.store.shellStore.breakpoint === 'sm';
   }
 
+  private isExpandedDesktopLayout(): boolean {
+    return this.store.windowWidthVp >= OrbitTokens.BP_EXPANDED_MIN;
+  }
+
   private isHalfFoldedHover(): boolean {
     return this.store.shellStore.isHalfFoldedHover;
   }
 
-  private isShowingOverview(): boolean {
-    return this.hasPairedHosts() && this.store.showGlobalOverview;
+  private isShowingPaSetup(): boolean {
+    return this.hasPairedHosts() && this.store.showPersonalAgentSetup;
+  }
+
+  private isInPersonalAgentSession(): boolean {
+    return this.hasPairedHosts() && !this.store.showPersonalAgentSetup && this.store.isCurrentSessionPersonalAgent();
+  }
+
+  private shouldDockBriefingRail(): boolean {
+    return this.isExpandedDesktopLayout() &&
+      this.isInPersonalAgentSession() &&
+      this.store.showBriefingPanel;
   }
 
   private hasPairedHosts(): boolean {
@@ -119,12 +142,28 @@ export struct AdaptiveWorkspace {
     return this.store.hosts.length > 0 ? this.store.hosts[0] : null;
   }
 
+  private selectedHostDisplayName(): string {
+    const host = this.selectedHost();
+    if (host === null) {
+      return '';
+    }
+    const rawHost = host.display_name.trim();
+    return rawHost.length > 0 ? rawHost : host.host_id;
+  }
+
   private hasActiveConversation(): boolean {
-    return this.hasPairedHosts() && this.store.currentAgent !== null && !this.store.isNewSessionDraft;
+    return this.hasPairedHosts() &&
+      !this.store.showPersonalAgentSetup &&
+      this.store.currentAgent !== null &&
+      !this.store.isNewSessionDraft;
   }
 
   private isDraftTitle(): boolean {
-    return this.hasPairedHosts() && this.store.currentAgent === null;
+    return this.hasPairedHosts() && !this.store.showPersonalAgentSetup && this.store.currentAgent === null;
+  }
+
+  private isWorkspaceCwdUnset(): boolean {
+    return isWorkspaceCwdUnset(this.store.activeCwd);
   }
 
   private isConnectionHealthy(): boolean {
@@ -135,87 +174,107 @@ export struct AdaptiveWorkspace {
     return host.connection_state === 'online_direct' || host.connection_state === 'online_relay';
   }
 
-  private topBarTitle(): string {
-    if (!this.hasPairedHosts()) {
-      return 'Orbit';
-    }
-    if (this.isShowingOverview()) {
-      return 'Overview';
-    }
-    if (this.store.currentAgent !== null && this.store.currentAgent.title.trim().length > 0) {
-      return this.store.currentAgent.title.trim();
-    }
-    return 'New Conversation';
+  private currentTopBarModel(): TopBarDisplayModel {
+    const host = this.selectedHost();
+    return resolveTopBarDisplayModel({
+      hasPairedHosts: this.hasPairedHosts(),
+      isShowingPaSetup: this.isShowingPaSetup(),
+      isPersonalAgentSession: this.isInPersonalAgentSession(),
+      isDraft: this.isDraftTitle(),
+      currentAgentTitle: this.store.currentAgent?.title ?? '',
+      activeCwd: this.store.activeCwd,
+      hostName: this.selectedHostDisplayName(),
+      hostCount: this.store.hosts.length,
+      isConnectionHealthy: this.isConnectionHealthy(),
+      connectionState: host?.connection_state ?? '',
+      viaSshTunnel: host?.via_ssh_tunnel === true,
+      gitBranch: this.store.resolveWorkspaceBranch(this.store.activeCwd)
+    });
   }
 
-  private topBarConnectionLabel(): string {
-    const host = this.selectedHost();
-    if (host !== null) {
-      return formatCompactTopBarConnectionLabel(host.connection_state, host.via_ssh_tunnel);
+  private topBarTitleResource(): ResourceStr {
+    const model = this.currentTopBarModel();
+    if (model.titleKind === 'orbit') {
+      return 'Orbit'; // i18n-ignore
     }
-    return 'Offline';
-  }
-
-  private topBarWorkspaceLabel(): string {
-    if (this.store.activeCwd.length > 0 && this.store.activeCwd !== '~') {
-      return basenameOfPath(this.store.activeCwd);
+    if (model.titleKind === 'pa') {
+      return $r('app.string.sidebar_personalRouter');
     }
-    const host = this.selectedHost();
-    if (host !== null) {
-      const name = host.display_name.trim();
-      return name.length > 0 ? name : host.host_id;
+    if (model.titleKind === 'text' && model.titleText.length > 0) {
+      return model.titleText;
     }
-    return 'Select project';
+    return $r('app.string.sidebar_newConversation');
   }
 
   private topStatusDotColor(): ResourceColor {
     return resolveHostStatusColor(this.selectedHost(), this.store);
   }
 
-  private topBarSubtitle(): string {
-    const host = this.selectedHost();
-    if (host === null) {
-      return 'No Host Paired';
+  private topBarSubtitleResource(): ResourceStr {
+    const model = this.currentTopBarModel();
+    if (model.subtitleKind === 'no_hosts') {
+      return $r('app.string.sidebar_noHostsTitle');
     }
-    const repo = this.topBarWorkspaceLabel();
-    const rawHost = host.display_name.trim();
-    const hostName = rawHost.length > 0 ? rawHost : host.host_id;
-    const isMultiHost = this.store.hosts.length > 1;
-    if (!this.isConnectionHealthy()) {
-      const target = isMultiHost ? hostName : repo;
-      return `${this.topBarConnectionLabel()} · ${target}`;
+    if (model.subtitleKind === 'hosts_count') {
+      return $r('app.string.sidebar_hostsCount', this.store.hosts.length);
     }
-    if (isMultiHost && repo !== hostName) {
-      return `${hostName} / ${repo}`;
+    if (model.subtitleKind === 'select_project') {
+      return $r('app.string.sidebar_selectProject');
     }
-    const branch = this.store.resolveWorkspaceBranch(this.store.activeCwd);
-    if (branch.length > 0) {
-      return `${repo} · ${branch}`;
+    if (model.subtitleKind === 'new_conv') {
+      return $r('app.string.sidebar_newConversation');
     }
-    return repo;
+    if (model.subtitleKind === 'host_select_project') {
+      return $r('app.string.sidebar_hostSelectProject', model.subtitleHostName);
+    }
+    return model.subtitleText;
   }
 
-  private diffFileSubtitle(): string | undefined {
+  private isTopBarConnTargetSubtitle(): boolean {
+    return this.currentTopBarModel().subtitleKind === 'conn_target';
+  }
+
+  private topBarConnStateResource(): Resource {
+    const host = this.selectedHost();
+    return resolveConnectionStateResource(host?.connection_state ?? '', host?.via_ssh_tunnel === true);
+  }
+
+  private topBarConnTargetText(): string {
+    return this.currentTopBarModel().subtitleTarget;
+  }
+
+  private diffFileSubtitle(): ResourceStr | undefined {
     const count = this.store.totalDiffFileCount();
     if (count <= 0) {
       return undefined;
     }
-    return count === 1 ? '1 file' : `${count} files`;
+    return count === 1
+      ? $r('app.string.sidebar_filesCountOne')
+      : $r('app.string.sidebar_filesCountMany', count);
   }
 
-  private terminalSubtitle(): string | undefined {
+  private terminalSubtitle(): ResourceStr | undefined {
     const count = this.store.activeTerminalCount();
-    return count > 0 ? `${count} active` : undefined;
+    return count > 0 ? $r('app.string.sidebar_activeCount', count) : undefined;
+  }
+
+  private paNeedsYouCount(): number {
+    return this.store.briefing !== null ? this.store.briefing.counts.needs_you : 0;
   }
 
   private openFolderFromHeader(): void {
     dismissHarmonyKeyboard(this.getUIContext());
-    this.store.browseDirectory(this.store.activeCwd === '~' ? null : this.store.activeCwd);
+    this.store.browseDirectory(this.isWorkspaceCwdUnset() ? null : this.store.activeCwd);
   }
 
   private modalSheetDetents(): [(SheetSize | Length), (SheetSize | Length)?, (SheetSize | Length)?] {
     const kind = this.store.shellStore.modalRoute?.kind;
-    if (kind === 'host_settings' || kind === 'image_viewer' || kind === 'diagram_viewer') {
+    if (
+      kind === 'host_settings' ||
+      kind === 'pa_briefing' ||
+      kind === 'image_viewer' ||
+      kind === 'diagram_viewer'
+    ) {
       return [SheetSize.LARGE];
     }
     if (kind === 'work_picker' || kind === 'archived') {
@@ -229,7 +288,12 @@ export struct AdaptiveWorkspace {
     if (kind === 'image_viewer') {
       return this.store.palette.scrim;
     }
-    if (kind === 'global_search' || kind === 'export_transcript' || kind === 'diagram_viewer') {
+    if (
+      kind === 'global_search' ||
+      kind === 'export_transcript' ||
+      kind === 'pa_briefing' ||
+      kind === 'diagram_viewer'
+    ) {
       return this.store.palette.canvas;
     }
     return this.store.palette.drawer;
@@ -453,7 +517,7 @@ export struct AdaptiveWorkspace {
       MenuItem({
         symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
           .fontColor([this.store.palette.iconPrimary]),
-        content: 'Open Folder'
+        content: $r('app.string.sidebar_openFolder')
       })
         .onClick(() => {
           this.openFolderFromHeader();
@@ -462,10 +526,10 @@ export struct AdaptiveWorkspace {
       MenuItem({
         symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
           .fontColor([this.store.palette.iconPrimary]),
-        content: 'Copy Path'
+        content: $r('app.string.sidebar_copyPath')
       })
         .onClick(() => {
-          this.store.copyToClipboard(this.store.activeCwd, 'Copied path');
+          this.store.copyToClipboard(this.store.activeCwd, '');
         })
     }
   }
@@ -474,16 +538,14 @@ export struct AdaptiveWorkspace {
   private renderMoreMenu() {
     Menu() {
       MenuItemGroup() {
-        if (!this.isShowingOverview()) {
-          MenuItem({
-            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.house'))
-              .fontColor([this.store.palette.iconPrimary]),
-            content: $r('app.string.nav_overview')
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.person_2'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: $r('app.string.sidebar_personalRouter')
+        })
+          .onClick(() => {
+            this.store.openPersonalAgentHome();
           })
-            .onClick(() => {
-              this.store.openGlobalOverview();
-            })
-        }
 
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.magnifyingglass'))
@@ -506,7 +568,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Diff Review',
+          content: $r('app.string.nav_git_review'),
           labelInfo: this.diffFileSubtitle()
         })
           .labelFontColor(this.store.palette.fgMuted)
@@ -517,7 +579,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Terminal',
+          content: $r('app.string.nav_terminal'),
           labelInfo: this.terminalSubtitle()
         })
           .labelFontColor(this.store.palette.fgMuted)
@@ -528,7 +590,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.doc_text'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Board & Peers'
+          content: $r('app.string.nav_workspace_board')
         })
           .onClick(() => {
             this.store.openWorkspaceBoard();
@@ -537,7 +599,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.message'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Side Question (/btw)'
+          content: $r('app.string.nav_side_question')
         })
           .onClick(() => {
             this.store.openSideQuestionSheet();
@@ -546,7 +608,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.clock'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Automations'
+          content: $r('app.string.nav_automations')
         })
           .onClick(() => {
             this.store.openAutomationsSheet();
@@ -555,7 +617,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.house'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Briefing Panel'
+          content: $r('app.string.briefing_ariaLabel')
         })
           .onClick(() => {
             this.store.openBriefingPanelTab();
@@ -576,7 +638,7 @@ export struct AdaptiveWorkspace {
           MenuItem({
             symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_triangle_divide'))
               .fontColor([this.store.palette.iconPrimary]),
-            content: 'Fork Conversation'
+            content: $r('app.string.topbar_forkConversation')
           })
             .onClick(() => {
               this.store.forkCurrentSession(false);
@@ -585,7 +647,7 @@ export struct AdaptiveWorkspace {
           MenuItem({
             symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_triangle_divide'))
               .fontColor([this.store.palette.iconPrimary]),
-            content: 'Fork in Worktree'
+            content: $r('app.string.topbar_forkInWorktree')
           })
             .onClick(() => {
               this.store.forkCurrentSession(true);
@@ -603,7 +665,7 @@ export struct AdaptiveWorkspace {
           MenuItem({
             symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
               .fontColor([this.store.palette.statusDanger]),
-            content: 'Archive'
+            content: $r('app.string.common_archive')
           })
             .contentFontColor(this.store.palette.statusDanger)
             .onClick(() => {
@@ -618,7 +680,7 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Archived Sessions'
+          content: $r('app.string.nav_archived_sessions')
         })
           .onClick(() => {
             this.store.openArchivedSessions();
@@ -656,8 +718,12 @@ export struct AdaptiveWorkspace {
         .backgroundColor(this.store.palette.subtleSurface)
         .accessibilityText(
           this.isCompactLayout()
-            ? (this.store.shellStore.sidebarOpen ? 'Close navigation drawer' : 'Open navigation drawer')
-            : (this.store.shellStore.isSidebarCollapsed ? 'Expand fleet sidebar' : 'Collapse fleet sidebar')
+            ? (this.store.shellStore.sidebarOpen
+              ? $r('app.string.sidebar_closeDrawerAria')
+              : $r('app.string.sidebar_openDrawerAria'))
+            : (this.store.shellStore.isSidebarCollapsed
+              ? $r('app.string.sidebar_expandSidebarAria')
+              : $r('app.string.sidebar_collapseSidebarAria'))
         )
         .onClick(() => {
           dismissHarmonyKeyboard(this.getUIContext());
@@ -665,12 +731,12 @@ export struct AdaptiveWorkspace {
         })
       }
 
-      if (this.hasPairedHosts() && this.isShowingOverview()) {
+      if (this.hasPairedHosts() && this.isShowingPaSetup()) {
         Column({ space: 2 }) {
-          Text($r('app.string.overview_title'))
+          Text($r('app.string.sidebar_personalRouter'))
             .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
             .maxLines(1)
-          Text(`${this.store.hosts.length} host(s)`)
+          Text($r('app.string.sidebar_hostsCount', this.store.hosts.length))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
             .maxLines(1)
         }
@@ -678,12 +744,26 @@ export struct AdaptiveWorkspace {
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Start)
       } else if (this.hasPairedHosts() && this.isDraftTitle()) {
-        Blank()
-          .layoutWeight(1)
+        Column({ space: 2 }) {
+          Text(this.topBarTitleResource())
+            .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.topBarSubtitleResource())
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Start)
+        .onClick(() => {
+          this.openFolderFromHeader();
+        })
       } else if (this.hasPairedHosts()) {
         Column({ space: 2 }) {
           Row({ space: 4 }) {
-            Text(this.topBarTitle())
+            Text(this.topBarTitleResource())
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -703,11 +783,28 @@ export struct AdaptiveWorkspace {
               .borderRadius(3)
               .backgroundColor(this.topStatusDotColor())
 
-            Text(this.topBarSubtitle())
-              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Normal))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .flexShrink(1)
+            if (this.isTopBarConnTargetSubtitle()) {
+              Text(this.topBarConnStateResource())
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Normal))
+                .maxLines(1)
+                .flexShrink(0)
+              if (this.topBarConnTargetText().length > 0) {
+                Text('·') // i18n-ignore
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Normal))
+                  .flexShrink(0)
+                Text(this.topBarConnTargetText())
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Normal))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .flexShrink(1)
+              }
+            } else {
+              Text(this.topBarSubtitleResource())
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Normal))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .flexShrink(1)
+            }
           }
           .width('100%')
           .alignItems(VerticalAlign.Center)
@@ -724,7 +821,7 @@ export struct AdaptiveWorkspace {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
 
-          Text('No Host Paired')
+          Text($r('app.string.sidebar_noHostsTitle'))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Normal))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -733,7 +830,7 @@ export struct AdaptiveWorkspace {
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Start)
-        .accessibilityText('Pair Host')
+        .accessibilityText($r('app.string.sidebar_pairHostAria'))
         .onClick(() => {
           this.store.scanQrAndPair(this.getUIContext().getHostContext());
         })
@@ -741,6 +838,48 @@ export struct AdaptiveWorkspace {
 
       if (this.hasPairedHosts()) {
         Row({ space: OrbitTokens.SPACE_XS }) {
+          // Briefing toggle button (on compact opens Briefing via single modal router; on wide toggles 304vp rail)
+          if (this.isInPersonalAgentSession()) {
+            Badge({
+              count: this.paNeedsYouCount(),
+              style: {
+                badgeColor: this.store.palette.statusWarning,
+                badgeSize: 8
+              },
+              position: BadgePosition.RightTop
+            }) {
+              Button({ type: ButtonType.Circle, stateEffect: true }) {
+                Image($r('app.media.orbit_agent_bot'))
+                  .width(18)
+                  .height(18)
+                  .objectFit(ImageFit.Contain)
+                  .fillColor($r('app.color.icon_primary'))
+                  .draggable(false)
+              }
+              .width(OrbitTokens.HIT_COMPACT)
+              .height(OrbitTokens.HIT_COMPACT)
+              .padding(0)
+              .backgroundColor(
+                (this.isExpandedDesktopLayout() ? this.store.showBriefingPanel : this.store.showBriefingSheet)
+                  ? this.store.palette.accentPrimarySoft
+                  : this.store.palette.subtleSurface
+              )
+              .accessibilityText(
+                (this.isExpandedDesktopLayout() ? this.store.showBriefingPanel : this.store.showBriefingSheet)
+                  ? $r('app.string.briefing_hideBriefing')
+                  : $r('app.string.briefing_showBriefing')
+              )
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                if (this.isExpandedDesktopLayout()) {
+                  this.store.toggleBriefingPanel();
+                } else {
+                  this.store.openBriefingSheet();
+                }
+              })
+            }
+          }
+
           if (this.hasActiveConversation()) {
             SubagentCrewMiniDock({
               hostId: this.store.selectedHostId,
@@ -776,7 +915,9 @@ export struct AdaptiveWorkspace {
                 : this.store.palette.subtleSurface
             )
             .accessibilityText(
-              this.store.sidePanelStore.isOpen ? 'Close side panel' : 'Open side panel'
+              this.store.sidePanelStore.isOpen
+                ? $r('app.string.sidebar_collapseSidebarAria')
+                : $r('app.string.sidebar_expandSidebarAria')
             )
             .onClick(() => {
               dismissHarmonyKeyboard(this.getUIContext());
@@ -795,7 +936,7 @@ export struct AdaptiveWorkspace {
           .height(OrbitTokens.HIT_COMPACT)
           .padding(0)
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText('More actions')
+          .accessibilityText($r('app.string.sidebar_moreActionsAria'))
           .bindMenu(this.renderMoreMenu())
 
           if (this.hasActiveConversation()) {
@@ -809,7 +950,7 @@ export struct AdaptiveWorkspace {
             .height(OrbitTokens.HIT_COMPACT)
             .padding(0)
             .backgroundColor(this.store.palette.subtleSurface)
-            .accessibilityText('New Conversation')
+            .accessibilityText($r('app.string.sidebar_newConversation'))
             .onClick(() => {
               dismissHarmonyKeyboard(this.getUIContext());
               this.store.startNewSessionDraft();
@@ -828,14 +969,14 @@ export struct AdaptiveWorkspace {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Settings')
+        .accessibilityText($r('app.string.sidebar_settings'))
         .onClick(() => {
           this.store.openHostSettings();
         })
       }
     }
     .width('100%')
-    .height(OrbitTokens.TOP_BAR_HEIGHT)
+    .constraintSize({ minHeight: OrbitTokens.TOP_BAR_HEIGHT })
     .padding({
       left: OrbitTokens.SPACE_LG,
       right: this.store.shellStore.resolvedTopBarRightPaddingVp()
@@ -879,7 +1020,7 @@ export struct AdaptiveWorkspace {
             .width(6)
             .height('100%')
             .backgroundColor(Color.Transparent)
-            .accessibilityText('Resize fleet sidebar')
+            .accessibilityText($r('app.string.sidebar_expandSidebarAria'))
             .gesture(
               PanGesture({ direction: PanDirection.Horizontal, distance: 2 })
                 .onActionStart(() => {
@@ -912,9 +1053,9 @@ export struct AdaptiveWorkspace {
         Stack({ alignContent: Alignment.Top }) {
           HdsNavigation(this.mainNavStack) {
             Row({ space: 0 }) {
-              if (this.isShowingOverview()) {
+              if (this.isShowingPaSetup()) {
                 Column() {
-                  PersonalOverviewView()
+                  PersonalAgentSetupCard()
                 }
                 .layoutWeight(1)
                 .constraintSize({ minWidth: this.isCompactLayout() ? 0 : 360 })
@@ -979,6 +1120,24 @@ export struct AdaptiveWorkspace {
                 .height('100%')
                 .alignItems(HorizontalAlign.Center)
                 .backgroundColor(this.store.palette.canvas)
+              }
+
+              // Wide (>= 1024vp) persistent 304vp Personal Agent Briefing rail (yields when side panel opens)
+              if (this.shouldDockBriefingRail() && !this.store.sidePanelStore.isOpen) {
+                Column() {
+                  PersonalAgentBriefingPanel({
+                    embedded: true,
+                    onClose: () => {
+                      this.store.closeBriefingPanel();
+                    }
+                  })
+                }
+                .width(BRIEFING_RAIL_WIDTH_VP)
+                .height('100%')
+                .border({
+                  width: { left: OrbitTokens.HAIRLINE },
+                  color: this.store.palette.hairline
+                })
               }
 
               // Single unified Side Panel Container (sm or tight insets: bottom Sheet; md/lg: inline right pane)

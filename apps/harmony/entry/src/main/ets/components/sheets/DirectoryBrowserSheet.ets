@@ -9,6 +9,10 @@ import {
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
+  resolveDirectoryBrowserCurrentPath,
+  resolveDirectoryBrowserParentPath
+} from '../../model/OrbitDiffInspectorModel';
+import {
   OrbitTokens,
   orbitButtonMeta,
   orbitButtonSubhead,
@@ -51,19 +55,13 @@ export struct DirectoryBrowserSheet {
   @Computed
   get currentPath(): string {
     const l = this.listing;
-    if (l !== null && l.current_path.trim().length > 0) {
-      return l.current_path.trim();
-    }
-    return this.store.activeCwd.trim().length > 0 ? this.store.activeCwd.trim() : '~';
+    return resolveDirectoryBrowserCurrentPath(l !== null ? l.current_path : null, this.store.activeCwd);
   }
 
   @Computed
   get parentPath(): string | null {
     const l = this.listing;
-    if (l !== null && l.parent_path !== null && l.parent_path.trim().length > 0) {
-      return l.parent_path.trim();
-    }
-    return null;
+    return resolveDirectoryBrowserParentPath(l !== null ? l.parent_path : null);
   }
 
   @Computed
@@ -167,10 +165,10 @@ export struct DirectoryBrowserSheet {
   }
 
   private submitManualPath(): void {
-    const target = this.manualPathInput.trim();
+    const target = this.manualPathInput;
     this.isEditingPath = false;
     dismissHarmonyKeyboard(this.getUIContext());
-    if (target.length > 0) {
+    if (target.trim().length > 0) {
       this.filterQuery = '';
       this.store.browseDirectory(target);
       this.store.triggerHaptic(6);

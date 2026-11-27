@@ -16,6 +16,7 @@ import { ExportTranscriptSheet } from '../sheets/ExportTranscriptSheet';
 import { GlobalSearchSheet } from '../sheets/GlobalSearchSheet';
 import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
 import { PersonalRouterMeshSheet } from '../sheets/PersonalRouterMeshSheet';
+import { PersonalAgentBriefingPanel } from '../personal-agent/PersonalAgentBriefingPanel';
 
 function buildDiagramViewerHtml(svg: string, isDark: boolean): string {
   const fgHex = isDark ? '#F1F2F7' : '#14161D';
@@ -98,7 +99,7 @@ struct OrbitImageViewerContent {
         right: OrbitTokens.SPACE_LG + this.store.safeRightVp
       })
       .backgroundColor(this.store.palette.overlay)
-      .accessibilityText('Close image preview')
+      .accessibilityText($r('app.string.action_close'))
       .onClick(() => {
         this.onClose();
       })
@@ -167,7 +168,7 @@ struct OrbitDiagramViewerContent {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Close diagram viewer')
+        .accessibilityText($r('app.string.action_close'))
         .onClick(() => {
           this.onClose();
         })
@@ -276,6 +277,15 @@ export struct OrbitModalContentRouter {
         DirectoryBrowserSheet()
       } else if (this.route.kind === 'work_picker') {
         ContextPickerSheet()
+      } else if (this.route.kind === 'pa_briefing') {
+        PersonalAgentBriefingPanel({
+          embedded: false,
+          onClose: () => {
+            this.store.closeBriefingSheet();
+            const id = this.presentationId > 0 ? this.presentationId : this.effectivePresentationId();
+            this.onClose(id);
+          }
+        })
       } else if (this.route.kind === 'image_viewer') {
         OrbitImageViewerContent({
           imageUri: this.route.imageUri ?? '',

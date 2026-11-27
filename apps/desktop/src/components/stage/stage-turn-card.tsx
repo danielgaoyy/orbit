@@ -1,14 +1,16 @@
-import { memo, useMemo, useRef } from "react";
-import { AlertTriangle } from "lucide-react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, ArrowUpRight, ChevronRight } from "lucide-react";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { AgentMessageCard } from "@/components/stage/subagents-track";
 import { ContextBanner } from "@/components/ui/context-banner";
 import { useLiveSecondClock } from "@/lib/live-clock";
-import type {
-  ArtifactSummary,
-  PromptBadge,
-  StageTurnView,
-  TimelineItemView,
+import {
+  orbitIpc,
+  type ArtifactSummary,
+  type PromptBadge,
+  type RichBlockView,
+  type StageTurnView,
+  type TimelineItemView,
 } from "@/lib/orbit-ipc";
 import {
   type ResolvedSubagentItem,
@@ -16,6 +18,7 @@ import {
   resolveDelegationDispatches,
 } from "@/lib/subagents";
 import { useI18n } from "@/lib/i18n";
+import { extractCleanAgentMessageBody } from "@/lib/agent-message-clean";
 import {
   coalescePeerFinishes,
   isDirectAgentPromptBubble,
@@ -24,7 +27,8 @@ import {
   splitStepGroupChronologically,
   summarizeWorkChunk,
 } from "@/lib/turn-delegation-split";
-import { useOrbitSelector } from "@/state/orbit-store";
+import { cn } from "@/lib/utils";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   EMPTY_ARTIFACTS,
   EMPTY_SUBAGENTS,
@@ -199,6 +203,141 @@ const StreamingTrailingActivity = memo(function StreamingTrailingActivity({
  * - Completed historical turns are strictly memoized and receive stabilized `hostArtifacts`
  *   so live streaming deltas on the active tail turn never reconcile historical turns.
  */
+const PersonalAgentReportHeader = memo(function PersonalAgentReportHeader({
+  item,
+  fallbackHostId,
+}: {
+  item: Extract<TimelineItemView, { item_type: "agent_message" }>;
+  fallbackHostId: string;
+}) {
+  const { t } = useI18n();
+  const targetHostId = item.source_host_id ?? fallbackHostId;
+  const targetAgentId = item.source_agent_id ?? null;
+  const hostName = useOrbitSelector((s) => {
+    const h = s.fleet.hosts.find((x) => x.host_id === targetHostId);
+    if (!h) return null;
+    return s.fleet.hosts.length > 1 ? (h.display_name?.trim() || h.hostname) : null;
+  });
+  const liveTitle = useOrbitSelector((s) =>
+    targetAgentId
+      ? (s.hostDetails[targetHostId]?.agents.find((a) => a.agent_id === targetAgentId)?.title ?? null)
+      : null,
+  );
+  const sourceLabel = liveTitle?.trim() || item.source_title?.trim() || targetAgentId || "Worker";
+  const isError =
+    item.event === "errored" ||
+    item.event === "failed" ||
+    /^Agent\s+\S+(?:\s+\(.*\))?\s+(?:failed|errored)\./im.test(item.text);
+
+  const labelText = hostName
+    ? `${t("personalAgent.reportFrom", { source: sourceLabel })} · ${hostName}`
+    : t("personalAgent.reportFrom", { source: sourceLabel });
+
+  if (!targetAgentId) {
+    return (
+      <div className="flex items-center gap-1.5 px-[10px] pb-0.5 text-[11px] font-medium text-ink-muted">
+        <span
+          aria-hidden="true"
+          className={cn(
+            "size-1.5 shrink-0 rounded-full",
+            isError ? "bg-signal-danger" : "bg-ink-faint",
+          )}
+        />
+        <span className="truncate">{labelText}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center px-[10px] pb-0.5">
+      <button
+        type="button"
+        onClick={() => orbitActions.selectAgent(targetHostId, targetAgentId)}
+        className="group inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md py-0.5 text-[11px] font-medium text-ink-muted transition-colors hover:text-ink-primary"
+      >
+        <span
+          aria-hidden="true"
+          className={cn(
+            "size-1.5 shrink-0 rounded-full",
+            isError ? "bg-signal-danger" : "bg-ink-faint group-hover:bg-ink-secondary",
+          )}
+        />
+        <span className="truncate">{labelText}</span>
+        <ArrowUpRight className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-80" />
+      </button>
+    </div>
+  );
+});
+
+const PersonalAgentReportDetailCard = memo(function PersonalAgentReportDetailCard({
+  item,
+  fallbackHostId,
+  cwd,
+  showSourcePrefix = false,
+}: {
+  item: Extract<TimelineItemView, { item_type: "agent_message" }>;
+  fallbackHostId: string;
+  cwd: string;
+  showSourcePrefix?: boolean;
+}) {
+  const { t } = useI18n();
+  const [expanded, setExpanded] = useState(false);
+  const [parsedBlocks, setParsedBlocks] = useState<RichBlockView[] | null>(null);
+  const cleanDetail = useMemo(() => extractCleanAgentMessageBody(item.text), [item.text]);
+  const targetHostId = item.source_host_id ?? fallbackHostId;
+  const targetAgentId = item.source_agent_id ?? null;
+  const sourceLabel = item.source_title?.trim() || targetAgentId || "Worker";
+
+  useEffect(() => {
+    if (!expanded || !cleanDetail) return;
+    let active = true;
+    void orbitIpc
+      .parseMarkdownPreview(cleanDetail, false)
+      .then((blocks) => {
+        if (active && blocks && blocks.length > 0) setParsedBlocks(blocks);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [expanded, cleanDetail]);
+
+  if (!cleanDetail) return null;
+
+  return (
+    <div className="pt-1.5">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((v) => !v)}
+        className="inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-lg border border-border-subtle/70 bg-surface-recessed/50 px-2 py-1 text-[11px] font-medium text-ink-muted transition-colors hover:border-border-subtle hover:bg-surface-recessed hover:text-ink-primary"
+      >
+        <ChevronRight
+          className={cn(
+            "size-3 shrink-0 transition-transform duration-150 ease-[var(--ease-out-expo)]",
+            expanded && "rotate-90",
+          )}
+        />
+        <span className="truncate">
+          {showSourcePrefix ? `${sourceLabel} · ` : ""}
+          {expanded ? t("personalAgent.reportHideDetails") : t("personalAgent.reportDetails")}
+        </span>
+      </button>
+      {expanded && (
+        <div className="mt-1.5 rounded-xl border border-border-subtle bg-surface-recessed px-3 py-2.5 text-[13px] leading-[1.55] text-ink-secondary selectable-text">
+          {parsedBlocks && parsedBlocks.length > 0 ? (
+            <MarkdownLinkProvider hostId={targetHostId} cwd={cwd}>
+              <MarkdownBlocksView blocks={parsedBlocks} streaming={false} />
+            </MarkdownLinkProvider>
+          ) : (
+            <div className="whitespace-pre-wrap break-words">{cleanDetail}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
 export const TurnStageSection = memo(function TurnStageSection({
   turn,
   dispatches,
@@ -226,6 +365,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   sessionSubagentMatcher,
   onOpenSubagent,
   parentMessageLabel,
+  isPersonalAgentSession = false,
 }: {
   turn: StageTurnView;
   dispatches?: ReturnType<typeof resolveDelegationDispatches>;
@@ -253,6 +393,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   sessionSubagentMatcher?: SubagentNameMatcher | null;
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
   parentMessageLabel?: string | null;
+  isPersonalAgentSession?: boolean;
 }) {
   const { t, locale } = useI18n();
   const rawSegments = useMemo(() => {
@@ -287,8 +428,10 @@ export const TurnStageSection = memo(function TurnStageSection({
       }
       out.push(seg);
     }
-    return coalescePeerFinishes(turn.agent_message, out, hostId);
-  }, [rawSegments, turn.agent_message, hostId]);
+    return coalescePeerFinishes(turn.agent_message, out, hostId, {
+      preserveFinishReports: isPersonalAgentSession,
+    });
+  }, [rawSegments, turn.agent_message, hostId, isPersonalAgentSession]);
 
   const isWaitingOnlyOnBackgroundTasks =
     hasLiveBackgroundTasks &&
@@ -355,7 +498,14 @@ export const TurnStageSection = memo(function TurnStageSection({
     lastRawSeg.item.item_type === "assistant_message" &&
     lastRawSeg.item.streaming;
 
-  const hasBody = segments.length > 0 || finishStatuses.size > 0 || needsTrailingActivity;
+  const hasBody =
+    segments.length > 0 ||
+    finishStatuses.size > 0 ||
+    needsTrailingActivity ||
+    (isPersonalAgentSession &&
+      turn.agent_message?.item_type === "agent_message" &&
+      !turn.agent_message.permission_context &&
+      turn.agent_message.kind !== "heartbeat");
   const hasBodyContent = segments.length > 0 || needsTrailingActivity ||
     turnToolArtifactRefs.length > 0 || turn.turn_diffs.length > 0;
   const liveStartedAtMs = timing?.startedAtMs ?? turn.started_at_ms ?? null;
@@ -382,12 +532,54 @@ export const TurnStageSection = memo(function TurnStageSection({
         : null,
     [historicalParentAgentId, historicalParentHostId, hostId],
   );
+  const personalAgentReport =
+    isPersonalAgentSession &&
+    turn.agent_message?.item_type === "agent_message" &&
+    !turn.agent_message.permission_context &&
+    turn.agent_message.kind !== "heartbeat"
+      ? turn.agent_message
+      : null;
+  // When multiple background workers finish in one coalesced batch, hoist leading
+  // finish_notification segments so all source tags sit together above PA's prose
+  // and all default-collapsed detail cards sit cleanly below PA's prose.
+  const { personalAgentReports, displaySegments } = useMemo(() => {
+    if (!personalAgentReport) {
+      return {
+        personalAgentReports: [] as Extract<TimelineItemView, { item_type: "agent_message" }>[],
+        displaySegments: segments,
+      };
+    }
+    const reports: Extract<TimelineItemView, { item_type: "agent_message" }>[] = [
+      personalAgentReport,
+    ];
+    let splitIdx = 0;
+    while (splitIdx < segments.length) {
+      const seg = segments[splitIdx];
+      if (
+        seg.kind === "agent_message" &&
+        seg.item.item_type === "agent_message" &&
+        !seg.item.permission_context &&
+        seg.item.kind !== "heartbeat"
+      ) {
+        reports.push(seg.item);
+        splitIdx += 1;
+      } else {
+        break;
+      }
+    }
+    return {
+      personalAgentReports: reports,
+      displaySegments: splitIdx > 0 ? segments.slice(splitIdx) : segments,
+    };
+  }, [personalAgentReport, segments]);
   const openingDirectBubble =
+    !isPersonalAgentSession &&
     turn.agent_message?.item_type === "agent_message" &&
     isDirectAgentPromptBubble(turn.agent_message)
       ? turn.agent_message
       : null;
   const visibleOpeningMessage =
+    !personalAgentReport &&
     !openingDirectBubble &&
     turn.agent_message?.item_type === "agent_message" &&
     !isTimelineAgentMessageHidden(turn.agent_message)
@@ -411,7 +603,7 @@ export const TurnStageSection = memo(function TurnStageSection({
     );
   }
 
-  if (!promptItem && !openingDirectBubble && !visibleOpeningMessage && !hasBody && !footer) {
+  if (!promptItem && !personalAgentReport && !openingDirectBubble && !visibleOpeningMessage && !hasBody && !footer) {
     return null;
   }
 
@@ -438,6 +630,18 @@ export const TurnStageSection = memo(function TurnStageSection({
           onRequestRewind={onRequestRewind}
           onPreviewImage={onPreviewImage}
         />
+      )}
+
+      {personalAgentReports.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+          {personalAgentReports.map((rep) => (
+            <PersonalAgentReportHeader
+              key={rep.message_id || rep.seq}
+              item={rep}
+              fallbackHostId={hostId}
+            />
+          ))}
+        </div>
       )}
 
       {openingDirectBubble && (
@@ -468,8 +672,8 @@ export const TurnStageSection = memo(function TurnStageSection({
           <div className="min-w-0 space-y-3">
             {(() => {
               let nextWorkOrdinal = 0;
-              const renderSegment = (seg: (typeof segments)[number], idx: number) => {
-                const isLastSeg = idx === segments.length - 1;
+              const renderSegment = (seg: (typeof displaySegments)[number], idx: number) => {
+                const isLastSeg = idx === displaySegments.length - 1;
 
                 if (seg.kind === "compaction") {
                   return isTurnActive && isLiveCompactionSegment(seg) ? (
@@ -510,7 +714,21 @@ export const TurnStageSection = memo(function TurnStageSection({
 
                 if (seg.kind === "agent_message") {
                   if (seg.item.item_type !== "agent_message") return null;
-                  if (isDirectAgentPromptBubble(seg.item)) {
+                  if (isPersonalAgentSession && !seg.item.permission_context && seg.item.kind !== "heartbeat") {
+                    return (
+                      <div key={seg.key} className="pt-1">
+                        <div className="-mx-[10px]">
+                          <PersonalAgentReportHeader item={seg.item} fallbackHostId={hostId} />
+                        </div>
+                        <PersonalAgentReportDetailCard
+                          item={seg.item}
+                          fallbackHostId={hostId}
+                          cwd={cwd}
+                        />
+                      </div>
+                    );
+                  }
+                  if (!isPersonalAgentSession && isDirectAgentPromptBubble(seg.item)) {
                     return (
                       <div key={seg.key} className="-mx-[10px]">
                         <UserPromptBubble
@@ -682,9 +900,9 @@ export const TurnStageSection = memo(function TurnStageSection({
                 });
               };
 
-              const lastSeg = segments[segments.length - 1] ?? null;
+              const lastSeg = displaySegments[displaySegments.length - 1] ?? null;
               const workFold = resolveCompletedTurnWorkFold({
-                segments,
+                segments: displaySegments,
                 isTurnActive,
                 turnHasUnrecoveredError: turn.has_unrecovered_error,
                 locale,
@@ -734,12 +952,12 @@ export const TurnStageSection = memo(function TurnStageSection({
                         />
                       )}
                     </TurnWorkedDisclosure>
-                    {renderSegment(lastSeg, segments.length - 1)}
+                    {renderSegment(lastSeg, displaySegments.length - 1)}
                   </>
                 );
               }
 
-              return segments.map((seg, idx) => renderSegment(seg, idx));
+              return displaySegments.map((seg, idx) => renderSegment(seg, idx));
             })()}
 
             {turnToolArtifactRefs.length > 0 && (
@@ -806,6 +1024,19 @@ export const TurnStageSection = memo(function TurnStageSection({
 
             {!isTurnActive && <TurnChangesBar diffs={turn.turn_diffs} cwd={cwd} />}
           </div>
+          {personalAgentReports.length > 0 && (
+            <div className="flex flex-col gap-1">
+              {personalAgentReports.map((rep) => (
+                <PersonalAgentReportDetailCard
+                  key={rep.message_id || rep.seq}
+                  item={rep}
+                  fallbackHostId={hostId}
+                  cwd={cwd}
+                  showSourcePrefix={personalAgentReports.length > 1}
+                />
+              ))}
+            </div>
+          )}
           {footer && (
             <TurnFooter
               {...footer}
@@ -823,6 +1054,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.turn === next.turn &&
   prev.isTurnActive === next.isTurnActive &&
   prev.isLastTurn === next.isLastTurn &&
+  prev.isPersonalAgentSession === next.isPersonalAgentSession &&
   prev.agentStatusLabel === next.agentStatusLabel &&
   prev.hasLiveBackgroundTasks === next.hasLiveBackgroundTasks &&
   prev.hasPlanSteps === next.hasPlanSteps &&

@@ -589,7 +589,6 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
             draftMode:
               prefs.draftMode === "default" ||
               prefs.draftMode === "auto" ||
-              prefs.draftMode === "plan" ||
               prefs.draftMode === "accept_edits" ||
               prefs.draftMode === "full_access"
                 ? prefs.draftMode
@@ -601,6 +600,18 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           }),
           true,
         );
+        const cloudUpdatedAt =
+          typeof prefs.draftModeUpdatedAtMs === "number" && Number.isFinite(prefs.draftModeUpdatedAtMs)
+            ? Math.trunc(prefs.draftModeUpdatedAtMs)
+            : 0;
+        if (
+          prefs.draftMode === "default" ||
+          prefs.draftMode === "auto" ||
+          prefs.draftMode === "accept_edits" ||
+          prefs.draftMode === "full_access"
+        ) {
+          void orbitIpc.setAccountDefaultMode(prefs.draftMode, cloudUpdatedAt);
+        }
       } catch {
         // Ignore preference hydration errors
       }

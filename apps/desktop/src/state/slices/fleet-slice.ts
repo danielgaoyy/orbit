@@ -500,6 +500,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         );
       }
       ctx.actions.refreshSidebarView();
+      void orbitIpc.setAccountDefaultMode(getState().draftMode, 0);
       await subscribePromise;
     },
 
@@ -523,6 +524,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         );
       }
       ctx.actions.refreshSidebarView();
+      void orbitIpc.setAccountDefaultMode(getState().draftMode, 0);
       await subscribePromise;
     },
 

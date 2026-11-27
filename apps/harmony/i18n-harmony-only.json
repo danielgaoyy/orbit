@@ -1,0 +1,1317 @@
+{
+  "module_desc": {
+    "en": "Orbit Multi-Host AI Coding Agent Control Plane (HarmonyOS NEXT)",
+    "zh-CN": "Orbit 多主机 AI 编程智能体控制面（HarmonyOS NEXT）",
+    "ja": "Orbit マルチホスト AI コーディングエージェント制御プレーン (HarmonyOS NEXT)"
+  },
+  "EntryAbility_desc": {
+    "en": "Orbit Native ArkUI V2 Control Plane",
+    "zh-CN": "Orbit 原生 ArkUI V2 控制面",
+    "ja": "Orbit ネイティブ ArkUI V2 制御プレーン"
+  },
+  "EntryAbility_label": {
+    "en": "Orbit",
+    "zh-CN": "Orbit",
+    "ja": "Orbit"
+  },
+  "permission_microphone_reason": {
+    "en": "Dictate prompts to coding agents using on-device speech recognition.",
+    "zh-CN": "使用端侧语音识别向编程智能体口述指令。",
+    "ja": "デバイス上の音声認識を使用してエージェントへプロンプトを入力します。"
+  },
+  "nav_overview": {
+    "en": "Overview",
+    "zh-CN": "全局概览",
+    "ja": "概要"
+  },
+  "nav_new_conversation": {
+    "en": "New Conversation",
+    "zh-CN": "新建对话",
+    "ja": "新しい会話"
+  },
+  "nav_settings": {
+    "en": "Settings",
+    "zh-CN": "设置",
+    "ja": "設定"
+  },
+  "nav_search_fleet": {
+    "en": "Search Fleet",
+    "zh-CN": "全机群搜索",
+    "ja": "フリート検索"
+  },
+  "nav_file_explorer": {
+    "en": "Files",
+    "zh-CN": "文件浏览",
+    "ja": "ファイル"
+  },
+  "nav_git_review": {
+    "en": "Git Review",
+    "zh-CN": "Git 变更审阅",
+    "ja": "Git レビュー"
+  },
+  "nav_terminal": {
+    "en": "Terminal",
+    "zh-CN": "终端",
+    "ja": "ターミナル"
+  },
+  "nav_automations": {
+    "en": "Automations",
+    "zh-CN": "自动化任务",
+    "ja": "オートメーション"
+  },
+  "nav_workspace_board": {
+    "en": "Board & Peers",
+    "zh-CN": "协作白板与同伴",
+    "ja": "ボードとピア"
+  },
+  "nav_side_question": {
+    "en": "Side Question (/btw)",
+    "zh-CN": "旁白追问 (/btw)",
+    "ja": "サイド質問 (/btw)"
+  },
+  "nav_personal_router": {
+    "en": "Personal Agent & Mesh",
+    "zh-CN": "个人代理与互联",
+    "ja": "パーソナルエージェント＆メッシュ"
+  },
+  "nav_archived_sessions": {
+    "en": "Archived Sessions",
+    "zh-CN": "已归档会话",
+    "ja": "アーカイブ済み"
+  },
+  "nav_export_transcript": {
+    "en": "Export Transcript",
+    "zh-CN": "导出对话记录",
+    "ja": "履歴をエクスポート"
+  },
+  "overview_title": {
+    "en": "Overview",
+    "zh-CN": "全局概览",
+    "ja": "概要"
+  },
+  "overview_all_quiet": {
+    "en": "All quiet across your fleet · Ready when you are",
+    "zh-CN": "所有主机运转平稳 · 随时准备待命",
+    "ja": "すべてのホストは安定稼働中 · いつでも指示できます"
+  },
+  "overview_needs_decision": {
+    "en": "Needs Your Decision",
+    "zh-CN": "需要你做决定",
+    "ja": "承認が必要です"
+  },
+  "overview_batch_approve_safe": {
+    "en": "Approve Safe Batch",
+    "zh-CN": "批量批准低风险项",
+    "ja": "低リスクを一括承認"
+  },
+  "overview_live_fleet": {
+    "en": "Live Fleet",
+    "zh-CN": "在线主机",
+    "ja": "オンラインホスト"
+  },
+  "overview_active_sessions": {
+    "en": "Active Sessions",
+    "zh-CN": "进行中的会话",
+    "ja": "アクティブなセッション"
+  },
+  "overview_no_active_sessions": {
+    "en": "No active sessions running right now.",
+    "zh-CN": "当前没有运行中的会话。",
+    "ja": "現在実行中のセッションはありません。"
+  },
+  "overview_router_placeholder": {
+    "en": "Ask your Personal Agent across any host…",
+    "zh-CN": "向个人代理下达跨主机任务…",
+    "ja": "パーソナルエージェントに任意のホストで依頼…"
+  },
+  "overview_open_router_settings": {
+    "en": "Configure Personal Agent",
+    "zh-CN": "配置个人代理",
+    "ja": "パーソナルエージェント設定"
+  },
+  "overview_no_hosts_title": {
+    "en": "Pair Your First Host",
+    "zh-CN": "配对首台主机",
+    "ja": "最初のホストをペアリング"
+  },
+  "overview_no_hosts_body": {
+    "en": "Connect to orbit daemon on your workstation, Linux devbox, or Mac mini over LAN, SSH, or E2EE Noise Relay.",
+    "zh-CN": "通过局域网、SSH 或端到端加密 Noise 中继连接到工作站、Linux 开发机或 Mac mini 上的 orbit daemon。",
+    "ja": "LAN、SSH、または E2EE Noise リレー経由でワークステーションや Mac mini の orbit daemon に接続します。"
+  },
+  "action_cancel": {
+    "en": "Cancel",
+    "zh-CN": "取消",
+    "ja": "キャンセル"
+  },
+  "action_confirm": {
+    "en": "Confirm",
+    "zh-CN": "确认",
+    "ja": "確認"
+  },
+  "action_save": {
+    "en": "Save",
+    "zh-CN": "保存",
+    "ja": "保存"
+  },
+  "action_delete": {
+    "en": "Delete",
+    "zh-CN": "删除",
+    "ja": "削除"
+  },
+  "action_rename": {
+    "en": "Rename",
+    "zh-CN": "重命名",
+    "ja": "名前変更"
+  },
+  "action_create": {
+    "en": "Create",
+    "zh-CN": "创建",
+    "ja": "作成"
+  },
+  "action_refresh": {
+    "en": "Refresh",
+    "zh-CN": "刷新",
+    "ja": "更新"
+  },
+  "action_reconnect": {
+    "en": "Reconnect",
+    "zh-CN": "重新连接",
+    "ja": "再接続"
+  },
+  "action_copy": {
+    "en": "Copy",
+    "zh-CN": "复制",
+    "ja": "コピー"
+  },
+  "action_quote": {
+    "en": "Quote",
+    "zh-CN": "引用",
+    "ja": "引用"
+  },
+  "action_open": {
+    "en": "Open",
+    "zh-CN": "打开",
+    "ja": "開く"
+  },
+  "action_close": {
+    "en": "Close",
+    "zh-CN": "关闭",
+    "ja": "閉じる"
+  },
+  "action_send": {
+    "en": "Send",
+    "zh-CN": "发送",
+    "ja": "送信"
+  },
+  "action_stop": {
+    "en": "Stop",
+    "zh-CN": "停止",
+    "ja": "停止"
+  },
+  "action_edit": {
+    "en": "Edit",
+    "zh-CN": "编辑",
+    "ja": "編集"
+  },
+  "action_done": {
+    "en": "Done",
+    "zh-CN": "完成",
+    "ja": "完了"
+  },
+  "action_pause": {
+    "en": "Pause",
+    "zh-CN": "暂停",
+    "ja": "一時停止"
+  },
+  "action_resume": {
+    "en": "Resume",
+    "zh-CN": "恢复",
+    "ja": "再開"
+  },
+  "action_run_now": {
+    "en": "Run",
+    "zh-CN": "立即运行",
+    "ja": "実行"
+  },
+  "action_allow_once": {
+    "en": "Allow Once",
+    "zh-CN": "仅本次允许",
+    "ja": "1回のみ許可"
+  },
+  "action_allow_session": {
+    "en": "Allow for Session",
+    "zh-CN": "本会话允许",
+    "ja": "セッション中許可"
+  },
+  "action_decline": {
+    "en": "Decline",
+    "zh-CN": "拒绝",
+    "ja": "拒否"
+  },
+  "composer_placeholder": {
+    "en": "Ask anything, @ to mention, / for actions",
+    "zh-CN": "输入指令，@ 引用上下文，/ 执行操作",
+    "ja": "質問や指示を入力、@ で参照、/ で操作"
+  },
+  "composer_voice_listening": {
+    "en": "Listening…",
+    "zh-CN": "正在聆听…",
+    "ja": "聞き取り中…"
+  },
+  "composer_voice_tap_done": {
+    "en": "Tap check to insert transcript",
+    "zh-CN": "点击对勾写入识别文本",
+    "ja": "チェックを押してテキストを挿入"
+  },
+  "composer_voice_start": {
+    "en": "Start voice dictation",
+    "zh-CN": "开始语音输入",
+    "ja": "音声入力を開始"
+  },
+  "composer_voice_stop": {
+    "en": "Finish voice dictation",
+    "zh-CN": "完成语音输入",
+    "ja": "音声入力を完了"
+  },
+  "composer_voice_cancel": {
+    "en": "Cancel voice dictation",
+    "zh-CN": "取消语音输入",
+    "ja": "音声入力をキャンセル"
+  },
+  "composer_plan_progress": {
+    "en": "Plan Progress",
+    "zh-CN": "计划进度",
+    "ja": "プラン進捗"
+  },
+  "stage_load_older": {
+    "en": "Load earlier history",
+    "zh-CN": "加载更早历史",
+    "ja": "以前の履歴を読み込む"
+  },
+  "stage_loading_older": {
+    "en": "Loading earlier turns…",
+    "zh-CN": "正在加载更早轮次…",
+    "ja": "以前のターンを読み込み中…"
+  },
+  "stage_offline_banner": {
+    "en": "Host is offline · Changes will sync when reconnected",
+    "zh-CN": "主机已离线 · 重连后自动同步",
+    "ja": "ホストはオフラインです · 再接続時に同期されます"
+  },
+  "stage_reconnecting_banner": {
+    "en": "Reconnecting to host…",
+    "zh-CN": "正在重连主机…",
+    "ja": "ホストへ再接続中…"
+  },
+  "stage_lineage_parent": {
+    "en": "Parent",
+    "zh-CN": "父会话",
+    "ja": "親スレッド"
+  },
+  "stage_lineage_subagents": {
+    "en": "Subagents",
+    "zh-CN": "子代理",
+    "ja": "サブエージェント"
+  },
+  "stage_lineage_peers": {
+    "en": "Peers",
+    "zh-CN": "同伴",
+    "ja": "ピア"
+  },
+  "stage_delivery_queued": {
+    "en": "Queued",
+    "zh-CN": "排队中",
+    "ja": "待機中"
+  },
+  "stage_delivery_dispatched": {
+    "en": "Dispatched",
+    "zh-CN": "已投递",
+    "ja": "配信済み"
+  },
+  "stage_delivery_settled": {
+    "en": "Settled",
+    "zh-CN": "已处理",
+    "ja": "完了"
+  },
+  "stage_delivery_dropped": {
+    "en": "Dropped",
+    "zh-CN": "已丢弃",
+    "ja": "破棄"
+  },
+  "stage_interrupt_and_continue": {
+    "en": "Interrupt & Continue",
+    "zh-CN": "打断并继续",
+    "ja": "中断して続行"
+  },
+  "stage_interrupt_and_deliver": {
+    "en": "Interrupt & Deliver",
+    "zh-CN": "打断并投递",
+    "ja": "中断して配信"
+  },
+  "plan_review_title": {
+    "en": "Plan Ready for Review",
+    "zh-CN": "实施计划待审阅",
+    "ja": "実装プランのレビュー"
+  },
+  "plan_approve_build": {
+    "en": "Approve & Build",
+    "zh-CN": "批准并开始构建",
+    "ja": "承認してビルド開始"
+  },
+  "plan_request_changes": {
+    "en": "Request Changes",
+    "zh-CN": "要求修改",
+    "ja": "修正を依頼"
+  },
+  "plan_dismiss": {
+    "en": "Dismiss",
+    "zh-CN": "暂不执行",
+    "ja": "却下"
+  },
+  "plan_edit_markdown": {
+    "en": "Edit Plan",
+    "zh-CN": "编辑计划",
+    "ja": "プラン編集"
+  },
+  "plan_preview_markdown": {
+    "en": "Preview",
+    "zh-CN": "预览",
+    "ja": "プレビュー"
+  },
+  "plan_feedback_placeholder": {
+    "en": "Optional feedback or adjustments…",
+    "zh-CN": "输入可选修改建议…",
+    "ja": "修正指示やコメント（任意）…"
+  },
+  "terminal_title": {
+    "en": "PTY Terminal",
+    "zh-CN": "PTY 终端",
+    "ja": "PTY ターミナル"
+  },
+  "terminal_mode_raw": {
+    "en": "Raw",
+    "zh-CN": "原始键",
+    "ja": "Raw"
+  },
+  "terminal_mode_line": {
+    "en": "Line",
+    "zh-CN": "行输入",
+    "ja": "行入力"
+  },
+  "terminal_raw_placeholder": {
+    "en": "Type raw keystrokes…",
+    "zh-CN": "实时发送原始按键…",
+    "ja": "生のキー入力を送信…"
+  },
+  "terminal_line_placeholder": {
+    "en": "Send command line…",
+    "zh-CN": "输入命令行并发送…",
+    "ja": "コマンドを入力して送信…"
+  },
+  "terminal_spawn_shell": {
+    "en": "Spawn Shell Session",
+    "zh-CN": "新建终端会话",
+    "ja": "シェルセッションを開始"
+  },
+  "files_title": {
+    "en": "File Explorer",
+    "zh-CN": "文件浏览器",
+    "ja": "ファイルエクスプローラー"
+  },
+  "files_search_placeholder": {
+    "en": "Filter workspace files…",
+    "zh-CN": "筛选工作区文件…",
+    "ja": "ワークスペースのファイルを絞り込む…"
+  },
+  "files_new_entry": {
+    "en": "New",
+    "zh-CN": "新建",
+    "ja": "新規"
+  },
+  "files_empty": {
+    "en": "No files loaded for this workspace.",
+    "zh-CN": "当前工作区暂无已加载文件。",
+    "ja": "このワークスペースに読み込まれたファイルはありません。"
+  },
+  "files_truncated_notice": {
+    "en": "Showing prefix preview (file truncated)",
+    "zh-CN": "仅显示前缀预览（文件已截断）",
+    "ja": "先頭プレビューを表示中（ファイルは省略されました）"
+  },
+  "files_edit_mode": {
+    "en": "Edit",
+    "zh-CN": "编辑",
+    "ja": "編集"
+  },
+  "files_save_file": {
+    "en": "Save File",
+    "zh-CN": "保存文件",
+    "ja": "ファイルを保存"
+  },
+  "files_new_path_placeholder": {
+    "en": "relative/path/to/file.ts",
+    "zh-CN": "相对路径，例如 src/main.ts",
+    "ja": "相対パス（例: src/main.ts）"
+  },
+  "files_create_as_dir": {
+    "en": "Create directory",
+    "zh-CN": "创建目录",
+    "ja": "ディレクトリを作成"
+  },
+  "git_stage_all": {
+    "en": "Stage All",
+    "zh-CN": "全部暂存",
+    "ja": "すべてステージ"
+  },
+  "git_unstage_all": {
+    "en": "Unstage All",
+    "zh-CN": "全部取消暂存",
+    "ja": "すべて解除"
+  },
+  "git_stage": {
+    "en": "Stage",
+    "zh-CN": "暂存",
+    "ja": "ステージ"
+  },
+  "git_unstage": {
+    "en": "Unstage",
+    "zh-CN": "取消暂存",
+    "ja": "解除"
+  },
+  "git_commit": {
+    "en": "Commit",
+    "zh-CN": "提交",
+    "ja": "コミット"
+  },
+  "git_commit_placeholder": {
+    "en": "Commit message…",
+    "zh-CN": "输入提交信息…",
+    "ja": "コミットメッセージ…"
+  },
+  "git_generate_message": {
+    "en": "AI Message",
+    "zh-CN": "AI 生成",
+    "ja": "AI 生成"
+  },
+  "git_amend": {
+    "en": "Amend last commit",
+    "zh-CN": "追加到上次提交 (Amend)",
+    "ja": "直前のコミットを修正 (Amend)"
+  },
+  "git_pr_section": {
+    "en": "Pull Request",
+    "zh-CN": "Pull Request",
+    "ja": "Pull Request"
+  },
+  "git_create_pr": {
+    "en": "Create PR",
+    "zh-CN": "创建 PR",
+    "ja": "PR を作成"
+  },
+  "git_pr_title_placeholder": {
+    "en": "Pull request title",
+    "zh-CN": "Pull Request 标题",
+    "ja": "Pull Request タイトル"
+  },
+  "git_pr_body_placeholder": {
+    "en": "Summary of changes…",
+    "zh-CN": "变更说明…",
+    "ja": "変更の概要…"
+  },
+  "git_pr_draft": {
+    "en": "Draft PR",
+    "zh-CN": "草稿 PR",
+    "ja": "ドラフト PR"
+  },
+  "git_stash_save": {
+    "en": "Stash",
+    "zh-CN": "储藏变更",
+    "ja": "スタッシュ"
+  },
+  "git_stash_pop": {
+    "en": "Pop Stash",
+    "zh-CN": "弹出储藏",
+    "ja": "スタッシュ適用"
+  },
+  "git_rebase_continue": {
+    "en": "Continue Rebase",
+    "zh-CN": "继续变基",
+    "ja": "リベース続行"
+  },
+  "git_rebase_abort": {
+    "en": "Abort Rebase",
+    "zh-CN": "中止变基",
+    "ja": "リベース中止"
+  },
+  "git_conflicts_detected": {
+    "en": "Merge Conflicts Detected",
+    "zh-CN": "检测到合并冲突",
+    "ja": "マージ競合を検出"
+  },
+  "search_title": {
+    "en": "Global Search",
+    "zh-CN": "全局搜索",
+    "ja": "グローバル検索"
+  },
+  "search_placeholder": {
+    "en": "Search messages across all hosts…",
+    "zh-CN": "跨主机搜索全部历史消息…",
+    "ja": "全ホストのメッセージを検索…"
+  },
+  "search_remote_action": {
+    "en": "Search Remote Daemons",
+    "zh-CN": "检索远端主机",
+    "ja": "リモートホストも検索"
+  },
+  "search_empty_hint": {
+    "en": "Type keywords to search full-history FTS5 transcripts across your fleet.",
+    "zh-CN": "输入关键词即可跨机群全文检索 FTS5 历史对话。",
+    "ja": "キーワードを入力して全フリートの FTS5 履歴を検索します。"
+  },
+  "search_no_results": {
+    "en": "No matching conversations found.",
+    "zh-CN": "未找到匹配的对话记录。",
+    "ja": "一致する会話は見つかりませんでした。"
+  },
+  "automations_schedules": {
+    "en": "Schedules",
+    "zh-CN": "定时任务",
+    "ja": "スケジュール"
+  },
+  "automations_timers": {
+    "en": "Timers",
+    "zh-CN": "条件计时器",
+    "ja": "タイマー"
+  },
+  "automations_goals": {
+    "en": "Goals",
+    "zh-CN": "目标循环",
+    "ja": "ゴール"
+  },
+  "automations_monitors": {
+    "en": "Monitors",
+    "zh-CN": "监控守望",
+    "ja": "モニター"
+  },
+  "automations_workflows": {
+    "en": "Workflows",
+    "zh-CN": "工作流",
+    "ja": "ワークフロー"
+  },
+  "automations_new_timer": {
+    "en": "New Timer",
+    "zh-CN": "新建计时器",
+    "ja": "新規タイマー"
+  },
+  "automations_new_goal": {
+    "en": "New Goal",
+    "zh-CN": "新建目标",
+    "ja": "新規ゴール"
+  },
+  "automations_new_monitor": {
+    "en": "New Monitor",
+    "zh-CN": "新建监控",
+    "ja": "新規モニター"
+  },
+  "automations_new_workflow": {
+    "en": "New Workflow",
+    "zh-CN": "新建工作流",
+    "ja": "新規ワークフロー"
+  },
+  "automations_verify_now": {
+    "en": "Verify Now",
+    "zh-CN": "立即验收",
+    "ja": "今すぐ検証"
+  },
+  "router_mesh_title": {
+    "en": "Personal Agent & Mesh",
+    "zh-CN": "个人代理与互联",
+    "ja": "パーソナルエージェント＆メッシュ"
+  },
+  "router_section_hosts": {
+    "en": "Candidate Hosts",
+    "zh-CN": "候选主机",
+    "ja": "候補ホスト"
+  },
+  "router_section_config": {
+    "en": "Personal Agent Policy",
+    "zh-CN": "个人代理策略",
+    "ja": "パーソナルエージェントポリシー"
+  },
+  "router_section_mesh": {
+    "en": "Connected Host Peers",
+    "zh-CN": "直连主机节点",
+    "ja": "接続済みホストピア"
+  },
+  "router_enable_toggle": {
+    "en": "Enable Personal Agent",
+    "zh-CN": "启用个人代理",
+    "ja": "パーソナルエージェントを有効化"
+  },
+  "router_share_hermes": {
+    "en": "Share Host External Memory",
+    "zh-CN": "共享宿主机外部记忆",
+    "ja": "ホストの外部メモリを共有"
+  },
+  "router_apply": {
+    "en": "Save Policy",
+    "zh-CN": "保存策略",
+    "ja": "ポリシーを保存"
+  },
+  "sync_title": {
+    "en": "Cloud Sync",
+    "zh-CN": "云同步",
+    "ja": "クラウド同期"
+  },
+  "sync_device_link_qr": {
+    "en": "Device Link QR",
+    "zh-CN": "设备配对二维码",
+    "ja": "デバイス連携 QR"
+  },
+  "sync_scan_device_link": {
+    "en": "Scan Device Link QR",
+    "zh-CN": "扫码关联设备",
+    "ja": "連携 QR をスキャン"
+  },
+  "sync_export_qr": {
+    "en": "Show Device Link QR",
+    "zh-CN": "显示设备配对二维码",
+    "ja": "デバイス連携 QR を表示"
+  },
+  "sync_zero_passphrase": {
+    "en": "Zero-Passphrase Instant Unlock",
+    "zh-CN": "免口令即时解锁",
+    "ja": "パスフレーズ不要の即時解除"
+  },
+  "sync_manual_passphrase": {
+    "en": "Require Manual Passphrase",
+    "zh-CN": "强制手动输入口令",
+    "ja": "手動パスフレーズを必須にする"
+  },
+  "sync_github_device_flow": {
+    "en": "Sign in with GitHub",
+    "zh-CN": "使用 GitHub 登录",
+    "ja": "GitHub でサインイン"
+  },
+  "sync_huks_security": {
+    "en": "Key Protection",
+    "zh-CN": "密钥保护",
+    "ja": "鍵保護"
+  },
+  "sync_huks_hardware": {
+    "en": "HUKS Hardware AES-256",
+    "zh-CN": "HUKS 硬件级 AES-256",
+    "ja": "HUKS ハードウェア AES-256"
+  },
+  "sync_huks_fallback": {
+    "en": "App Sandbox Key",
+    "zh-CN": "应用沙箱密钥",
+    "ja": "アプリサンドボックス鍵"
+  },
+  "push_title": {
+    "en": "Push Kit & Notifications",
+    "zh-CN": "推送与通知",
+    "ja": "Push Kit と通知"
+  },
+  "push_test_button": {
+    "en": "Send Test Push",
+    "zh-CN": "发送测试推送",
+    "ja": "テスト通知を送信"
+  },
+  "push_sync_hosts": {
+    "en": "Sync Push Registration to Hosts",
+    "zh-CN": "同步推送令牌到所有主机",
+    "ja": "全ホストへトークン同期"
+  },
+  "push_pref_permissions": {
+    "en": "Approval Requests",
+    "zh-CN": "审批请求提醒",
+    "ja": "承認リクエスト"
+  },
+  "push_pref_turns": {
+    "en": "Turn Completed",
+    "zh-CN": "轮次完成提醒",
+    "ja": "ターン完了"
+  },
+  "push_pref_errors": {
+    "en": "Agent Errors",
+    "zh-CN": "智能体错误提醒",
+    "ja": "エージェントエラー"
+  },
+  "push_pref_goals": {
+    "en": "Goal & Timer Events",
+    "zh-CN": "目标与计时器事件",
+    "ja": "ゴール・タイマー通知"
+  },
+  "push_pref_preview": {
+    "en": "Include Message Preview",
+    "zh-CN": "包含消息摘要",
+    "ja": "メッセージ概要を含める"
+  },
+  "export_title": {
+    "en": "Export Transcript",
+    "zh-CN": "导出对话记录",
+    "ja": "履歴をエクスポート"
+  },
+  "export_format_md": {
+    "en": "Markdown",
+    "zh-CN": "Markdown",
+    "ja": "Markdown"
+  },
+  "export_format_json": {
+    "en": "JSON",
+    "zh-CN": "JSON",
+    "ja": "JSON"
+  },
+  "export_format_html": {
+    "en": "HTML",
+    "zh-CN": "HTML",
+    "ja": "HTML"
+  },
+  "export_include_thinking": {
+    "en": "Include Thinking",
+    "zh-CN": "包含思考过程",
+    "ja": "思考ログを含める"
+  },
+  "export_include_tools": {
+    "en": "Include Tool Calls",
+    "zh-CN": "包含工具调用",
+    "ja": "ツール呼び出しを含める"
+  },
+  "export_include_timestamps": {
+    "en": "Include Timestamps",
+    "zh-CN": "包含时间戳",
+    "ja": "タイムスタンプを含める"
+  },
+  "export_copy_action": {
+    "en": "Copy Exported Transcript",
+    "zh-CN": "复制导出内容",
+    "ja": "エクスポート結果をコピー"
+  },
+  "settings_upgrade_daemon": {
+    "en": "Upgrade Daemon Over Wire",
+    "zh-CN": "远程热升级守护进程",
+    "ja": "デーモンをリモート更新"
+  },
+  "sidebar_search": {
+    "en": "Search",
+    "zh-CN": "搜索",
+    "ja": "検索"
+  },
+  "sidebar_selectProject": {
+    "en": "Select project",
+    "zh-CN": "选择项目",
+    "ja": "プロジェクトを選択"
+  },
+  "sidebar_noHostsTitle": {
+    "en": "No Hosts Paired",
+    "zh-CN": "尚未配对主机",
+    "ja": "ホスト未ペアリング"
+  },
+  "sidebar_noHostsBody": {
+    "en": "Pair a remote Orbit daemon or connect a local daemon to browse workspaces and sessions.",
+    "zh-CN": "配对远端 Orbit 守护进程或连接本机守护进程，以浏览工作区和会话。",
+    "ja": "リモートの Orbit デーモンをペアリングするかローカルデーモンに接続してワークスペースとセッションを表示します。"
+  },
+  "sidebar_connectLocalDaemon": {
+    "en": "Connect Local Daemon",
+    "zh-CN": "连接本机守护进程",
+    "ja": "ローカルデーモンに接続"
+  },
+  "sidebar_pairRemoteHost": {
+    "en": "Pair Remote Host (QR / URI)",
+    "zh-CN": "配对远端主机 (QR / URI)",
+    "ja": "リモートホストをペアリング (QR / URI)"
+  },
+  "sidebar_pairNewHost": {
+    "en": "Pair New Host",
+    "zh-CN": "配对新主机",
+    "ja": "新しいホストをペアリング"
+  },
+  "sidebar_connectLocalHost": {
+    "en": "Connect Local Host",
+    "zh-CN": "连接本机主机",
+    "ja": "ローカルホストに接続"
+  },
+  "sidebar_newSessionHere": {
+    "en": "New Session Here",
+    "zh-CN": "在此新建会话",
+    "ja": "ここで新規セッション"
+  },
+  "sidebar_selectWorkspace": {
+    "en": "Select Workspace",
+    "zh-CN": "选择工作区",
+    "ja": "ワークスペースを選択"
+  },
+  "sidebar_pinProject": {
+    "en": "Pin Project",
+    "zh-CN": "置顶项目",
+    "ja": "プロジェクトをピン留め"
+  },
+  "sidebar_unpinProject": {
+    "en": "Unpin Project",
+    "zh-CN": "取消置顶项目",
+    "ja": "プロジェクトのピン留めを解除"
+  },
+  "sidebar_noHostShort": {
+    "en": "No Host",
+    "zh-CN": "无主机",
+    "ja": "ホストなし"
+  },
+  "sidebar_tapToPairHost": {
+    "en": "Tap to pair host",
+    "zh-CN": "点击配对主机",
+    "ja": "タップしてホストをペアリング"
+  },
+  "sidebar_switchHostAria": {
+    "en": "Switch active host",
+    "zh-CN": "切换当前主机",
+    "ja": "アクティブホストを切り替え"
+  },
+  "sidebar_pairHostAria": {
+    "en": "Pair host",
+    "zh-CN": "配对主机",
+    "ja": "ホストをペアリング"
+  },
+  "sidebar_browseDirectoryAria": {
+    "en": "Browse remote directory",
+    "zh-CN": "浏览远端目录",
+    "ja": "リモートディレクトリを参照"
+  },
+  "sidebar_openDrawerAria": {
+    "en": "Open navigation drawer",
+    "zh-CN": "打开侧栏导航",
+    "ja": "ナビゲーションドロワーを開く"
+  },
+  "sidebar_closeDrawerAria": {
+    "en": "Close navigation drawer",
+    "zh-CN": "关闭侧栏导航",
+    "ja": "ナビゲーションドロワーを閉じる"
+  },
+  "sidebar_expandSidebarAria": {
+    "en": "Expand fleet sidebar",
+    "zh-CN": "展开侧栏",
+    "ja": "サイドバーを展開"
+  },
+  "sidebar_collapseSidebarAria": {
+    "en": "Collapse fleet sidebar",
+    "zh-CN": "收起侧栏",
+    "ja": "サイドバーを折りたたむ"
+  },
+  "sidebar_moreActionsAria": {
+    "en": "More actions",
+    "zh-CN": "更多操作",
+    "ja": "その他の操作"
+  },
+  "sidebar_hideDiffReview": {
+    "en": "Hide Diff Review",
+    "zh-CN": "隐藏变更审阅",
+    "ja": "差分レビューを隠す"
+  },
+  "sidebar_fullDiff": {
+    "en": "Full Diff",
+    "zh-CN": "完整变更",
+    "ja": "フル差分"
+  },
+  "sidebar_showAllConversations": {
+    "en": "Show all conversations",
+    "zh-CN": "显示全部对话",
+    "ja": "すべての会話を表示"
+  },
+  "sidebar_copiedPath": {
+    "en": "Copied path",
+    "zh-CN": "已复制路径",
+    "ja": "パスをコピーしました"
+  },
+  "sidebar_hostsCount": {
+    "en": "%d host(s)",
+    "zh-CN": "%d 台主机",
+    "ja": "%d 台のホスト"
+  },
+  "sidebar_filesCountOne": {
+    "en": "1 file",
+    "zh-CN": "1 个文件",
+    "ja": "1 件のファイル"
+  },
+  "sidebar_filesCountMany": {
+    "en": "%d files",
+    "zh-CN": "%d 个文件",
+    "ja": "%d 件のファイル"
+  },
+  "sidebar_activeCount": {
+    "en": "%d active",
+    "zh-CN": "%d 个运行中",
+    "ja": "%d 件実行中"
+  },
+  "sidebar_settingsAndHostsAria": {
+    "en": "Settings and hosts",
+    "zh-CN": "设置与主机",
+    "ja": "設定とホスト"
+  },
+  "briefing_confirmBatchTitle": {
+    "en": "Approve %d low-risk request(s)?",
+    "zh-CN": "确认批准 %d 项低风险请求？",
+    "ja": "低リスクのリクエスト %d 件を一括許可しますか？"
+  },
+  "briefing_confirmBatchMessage": {
+    "en": "All batch-eligible low-risk permissions will be approved. High-risk and human-only actions stay excluded.",
+    "zh-CN": "将批准所有可批量处理的低风险权限请求；高风险与仅限人工审批项将被排除。",
+    "ja": "一括承認対象の低リスク権限リクエストをすべて許可します。高リスクや手動確認必須の項目は除外されます。"
+  },
+  "briefing_approveAll": {
+    "en": "Approve All (%d)",
+    "zh-CN": "全部批准 (%d)",
+    "ja": "すべて許可 (%d)"
+  },
+  "briefing_lowRisk": {
+    "en": "Low risk",
+    "zh-CN": "低风险",
+    "ja": "低リスク"
+  },
+  "briefing_setupSelectHost": {
+    "en": "Primary Host",
+    "zh-CN": "主主机",
+    "ja": "プライマリホスト"
+  },
+  "briefing_setupSelectProvider": {
+    "en": "Provider",
+    "zh-CN": "引擎",
+    "ja": "プロバイダー"
+  },
+  "briefing_setupSelectModel": {
+    "en": "Model",
+    "zh-CN": "模型",
+    "ja": "モデル"
+  },
+  "briefing_setupDefaultModel": {
+    "en": "Provider default",
+    "zh-CN": "默认模型",
+    "ja": "プロバイダー既定"
+  },
+  "briefing_setupCreateOneClick": {
+    "en": "Create & Enable Personal Agent",
+    "zh-CN": "一键创建并启用个人代理",
+    "ja": "ワンクリックで作成して有効化"
+  },
+  "briefing_agentFallback": {
+    "en": "Agent",
+    "zh-CN": "智能体",
+    "ja": "エージェント"
+  },
+  "briefing_openDiffPreview": {
+    "en": "Diff",
+    "zh-CN": "差异",
+    "ja": "差分"
+  },
+  "briefing_collapseSection": {
+    "en": "Collapse section",
+    "zh-CN": "折叠分区",
+    "ja": "セクションを折りたたむ"
+  },
+  "briefing_expandSection": {
+    "en": "Expand section",
+    "zh-CN": "展开分区",
+    "ja": "セクションを展開"
+  },
+  "notify_permission_title": {
+    "en": "Approval Needed",
+    "zh-CN": "需要审批",
+    "ja": "承認が必要です"
+  },
+  "notify_turn_completed_title": {
+    "en": "Turn Completed",
+    "zh-CN": "轮次已完成",
+    "ja": "ターンが完了しました"
+  },
+  "notify_agent_error_title": {
+    "en": "Agent Error",
+    "zh-CN": "智能体出错",
+    "ja": "エージェントエラー"
+  },
+  "notify_goal_finished_title": {
+    "en": "Goal Finished",
+    "zh-CN": "目标已完成",
+    "ja": "ゴールが完了しました"
+  },
+  "notify_timer_fired_title": {
+    "en": "Timer Fired",
+    "zh-CN": "定时器已触发",
+    "ja": "タイマーが作動しました"
+  },
+  "notify_permission_body": {
+    "en": "An agent is waiting for your approval.",
+    "zh-CN": "有智能体正在等待您的审批。",
+    "ja": "エージェントが承認を待っています。"
+  },
+  "notify_turn_completed_body": {
+    "en": "An agent finished its background turn.",
+    "zh-CN": "有智能体已完成后台轮次。",
+    "ja": "エージェントのバックグラウンドターンが完了しました。"
+  },
+  "notify_agent_error_body": {
+    "en": "An agent stopped with an error.",
+    "zh-CN": "有智能体因错误停止。",
+    "ja": "エージェントがエラーで停止しました。"
+  },
+  "notify_goal_finished_body": {
+    "en": "An autonomous goal reached a terminal state.",
+    "zh-CN": "有自主目标已到达终态。",
+    "ja": "自律ゴールが終了状態に到達しました。"
+  },
+  "notify_timer_fired_body": {
+    "en": "A scheduled timer triggered.",
+    "zh-CN": "定时任务已触发。",
+    "ja": "スケジュールされたタイマーが作動しました。"
+  },
+  "time_justNow": {
+    "en": "now",
+    "zh-CN": "刚刚",
+    "ja": "たった今"
+  },
+  "conn_direct": {
+    "en": "Direct",
+    "zh-CN": "直连",
+    "ja": "直接"
+  },
+  "conn_ssh": {
+    "en": "SSH",
+    "zh-CN": "SSH",
+    "ja": "SSH"
+  },
+  "conn_relay": {
+    "en": "Relay",
+    "zh-CN": "中继",
+    "ja": "リレー"
+  },
+  "conn_connecting": {
+    "en": "Connecting",
+    "zh-CN": "连接中",
+    "ja": "接続中"
+  },
+  "conn_offline": {
+    "en": "Offline",
+    "zh-CN": "离线",
+    "ja": "オフライン"
+  },
+  "sidebar_hostSelectProject": {
+    "en": "%s · Select project",
+    "zh-CN": "%s · 选择项目",
+    "ja": "%s · プロジェクトを選択"
+  },
+  "briefing_batchApprovedCount": {
+    "en": "Approved %d safe request(s)",
+    "zh-CN": "已批准 %d 项安全请求",
+    "ja": "%d 件の安全なリクエストを許可しました"
+  },
+  "briefing_batchAllSkipped": {
+    "en": "Skipped %d request(s); none approved",
+    "zh-CN": "已跳过 %d 项请求，未批准任何项",
+    "ja": "%d 件スキップされ、許可された項目はありません"
+  },
+  "briefing_batchNothingEligible": {
+    "en": "No confirmed requests remain eligible",
+    "zh-CN": "已确认的请求均不再符合条件",
+    "ja": "確認済みの対象リクエストは残っていません"
+  },
+  "briefing_batchFailed": {
+    "en": "Batch approval failed",
+    "zh-CN": "批量批准失败",
+    "ja": "一括許可に失敗しました"
+  },
+  "briefing_batchPartialFailure": {
+    "en": "Approved %1$d, skipped %2$d; %3$d host(s) failed",
+    "zh-CN": "已批准 %1$d 项，跳过 %2$d 项；%3$d 台主机失败",
+    "ja": "%1$d 件許可・%2$d 件スキップ（%3$d 台のホストで失敗）"
+  },
+  "briefing_batchSkippedAndFailed": {
+    "en": "Skipped %1$d request(s); %2$d host(s) failed",
+    "zh-CN": "已跳过 %1$d 项请求；%2$d 台主机失败",
+    "ja": "%1$d 件スキップ（%2$d 台のホストで失敗）"
+  },
+  "time_secondsShort": {
+    "en": "%ds",
+    "zh-CN": "%d秒",
+    "ja": "%d秒"
+  },
+  "time_minutesShort": {
+    "en": "%dm",
+    "zh-CN": "%d分钟",
+    "ja": "%d分"
+  },
+  "time_hoursShort": {
+    "en": "%dh",
+    "zh-CN": "%d小时",
+    "ja": "%d時間"
+  },
+  "time_daysShort": {
+    "en": "%dd",
+    "zh-CN": "%d天",
+    "ja": "%d日"
+  },
+  "time_weeksShort": {
+    "en": "%dw",
+    "zh-CN": "%d周",
+    "ja": "%d週間"
+  },
+  "time_minutesSecondsShort": {
+    "en": "%1$dm %2$ds",
+    "zh-CN": "%1$d分%2$d秒",
+    "ja": "%1$d分%2$d秒"
+  },
+  "time_hoursMinutesShort": {
+    "en": "%1$dh %2$dm",
+    "zh-CN": "%1$d小时%2$d分",
+    "ja": "%1$d時間%2$d分"
+  },
+  "briefing_setupLoadConfigFailed": {
+    "en": "Failed to load existing host configuration. Please retry before saving.",
+    "zh-CN": "读取目标主机既有配置失败，请重试后再保存以免覆盖现有策略。",
+    "ja": "対象ホストの既存設定の読み込みに失敗しました。上書きを防ぐため再試行してください。"
+  },
+  "briefing_diffTargetUnavailable": {
+    "en": "Workspace path unavailable for this request",
+    "zh-CN": "无法定位该请求对应的工作区路径",
+    "ja": "このリクエストのワークスペースパスを特定できません"
+  },
+  "briefing_sessionNotFound": {
+    "en": "Session not found",
+    "zh-CN": "未找到该会话",
+    "ja": "セッションが見つかりません"
+  },
+  "briefing_approvalWaiting": {
+    "en": "Approval waiting for your decision",
+    "zh-CN": "有审批正在等待您的确认",
+    "ja": "承認の確認待ちです"
+  },
+  "briefing_agentStoppedError": {
+    "en": "Agent stopped with an error",
+    "zh-CN": "智能体因错误已停止",
+    "ja": "エージェントがエラーで停止しました"
+  },
+  "briefing_settingsSaved": {
+    "en": "Personal Agent settings saved",
+    "zh-CN": "个人代理设置已保存",
+    "ja": "パーソナルエージェント設定を保存しました"
+  },
+  "avatar_name_red_fox": {
+    "en": "Red Fox",
+    "zh-CN": "红狐",
+    "ja": "アカギツネ"
+  },
+  "avatar_name_shiba_inu": {
+    "en": "Shiba Inu",
+    "zh-CN": "柴犬",
+    "ja": "柴犬"
+  },
+  "avatar_name_orange_tabby": {
+    "en": "Orange Tabby",
+    "zh-CN": "橘猫",
+    "ja": "茶トラ猫"
+  },
+  "avatar_name_giant_panda": {
+    "en": "Giant Panda",
+    "zh-CN": "大熊猫",
+    "ja": "ジャイアントパンダ"
+  },
+  "avatar_name_sea_otter": {
+    "en": "Sea Otter",
+    "zh-CN": "海獭",
+    "ja": "ラッコ"
+  },
+  "avatar_name_barn_owl": {
+    "en": "Barn Owl",
+    "zh-CN": "仓鸮",
+    "ja": "メンフクロウ"
+  },
+  "avatar_name_emperor_penguin": {
+    "en": "Emperor Penguin",
+    "zh-CN": "帝企鹅",
+    "ja": "コウテイペンギン"
+  },
+  "avatar_name_capybara": {
+    "en": "Capybara",
+    "zh-CN": "水豚",
+    "ja": "カピバラ"
+  },
+  "avatar_name_red_panda": {
+    "en": "Red Panda",
+    "zh-CN": "小熊猫",
+    "ja": "レッサーパンダ"
+  },
+  "avatar_name_holland_lop": {
+    "en": "Holland Lop",
+    "zh-CN": "垂耳兔",
+    "ja": "ホーランドロップ"
+  },
+  "avatar_name_corgi": {
+    "en": "Corgi",
+    "zh-CN": "柯基",
+    "ja": "コーギー"
+  },
+  "avatar_name_sika_deer": {
+    "en": "Sika Deer",
+    "zh-CN": "梅花鹿",
+    "ja": "ニホンジカ"
+  },
+  "avatar_name_koala": {
+    "en": "Koala",
+    "zh-CN": "考拉",
+    "ja": "コアラ"
+  },
+  "avatar_name_raccoon": {
+    "en": "Raccoon",
+    "zh-CN": "浣熊",
+    "ja": "アライグマ"
+  },
+  "avatar_name_arctic_fox": {
+    "en": "Arctic Fox",
+    "zh-CN": "北极狐",
+    "ja": "ホッキョクギツネ"
+  },
+  "avatar_name_russian_blue": {
+    "en": "Russian Blue",
+    "zh-CN": "俄罗斯蓝猫",
+    "ja": "ロシアンブルー"
+  },
+  "avatar_name_husky": {
+    "en": "Husky",
+    "zh-CN": "哈士奇",
+    "ja": "ハスキー"
+  },
+  "avatar_name_cream_alpaca": {
+    "en": "Cream Alpaca",
+    "zh-CN": "奶油羊驼",
+    "ja": "アルパカ"
+  },
+  "avatar_name_european_hedgehog": {
+    "en": "Hedgehog",
+    "zh-CN": "刺猬",
+    "ja": "ハリネズミ"
+  },
+  "avatar_name_red_squirrel": {
+    "en": "Red Squirrel",
+    "zh-CN": "红松鼠",
+    "ja": "キタリス"
+  },
+  "avatar_name_harbor_seal": {
+    "en": "Harbor Seal",
+    "zh-CN": "港海豹",
+    "ja": "ゼニガタアザラシ"
+  },
+  "avatar_name_snowy_owl": {
+    "en": "Snowy Owl",
+    "zh-CN": "雪鸮",
+    "ja": "シロフクロウ"
+  },
+  "avatar_name_mallard_duck": {
+    "en": "Mallard Duck",
+    "zh-CN": "绿头鸭",
+    "ja": "マガモ"
+  },
+  "avatar_name_gray_chinchilla": {
+    "en": "Chinchilla",
+    "zh-CN": "龙猫",
+    "ja": "チンチラ"
+  }
+}

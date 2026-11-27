@@ -132,6 +132,12 @@ impl OrbitHarmonyCore {
     }
 
     #[napi]
+    pub fn mark_agent_read(&self, host_id: String, agent_id: String) -> Result<()> {
+        self.facade.mark_agent_read(&host_id, &agent_id);
+        Ok(())
+    }
+
+    #[napi]
     pub fn mark_agent_unread(&self, host_id: String, agent_id: String) {
         self.facade.mark_agent_unread(&host_id, &agent_id);
     }

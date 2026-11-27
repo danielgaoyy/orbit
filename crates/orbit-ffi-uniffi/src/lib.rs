@@ -1386,6 +1386,8 @@ pub struct FfiAgentCard {
     pub seen_seq: u64,
     pub is_unread: bool,
     pub queued_prompts: Vec<FfiQueuedPrompt>,
+    pub labels: std::collections::HashMap<String, String>,
+    pub is_personal_router: bool,
 }
 
 impl From<AgentCardView> for FfiAgentCard {
@@ -1397,6 +1399,14 @@ impl From<AgentCardView> for FfiAgentCard {
             AttentionState::Permission => Some("permission".into()),
             AttentionState::ManualUnread => Some("manual_unread".into()),
         };
+        let is_personal_router = v
+            .labels
+            .get(orbit_protocol::LABEL_AGENT_ROLE)
+            .map(|r| r.trim().to_ascii_lowercase())
+            .is_some_and(|r| matches!(r.as_str(), "personal_router" | "router" | "chief_of_staff"))
+            || v.handle
+                .as_deref()
+                .is_some_and(|h| h.trim().eq_ignore_ascii_case("router"));
         Self {
             agent_id: v.agent_id,
             workspace_id: v.workspace_id,
@@ -1431,6 +1441,8 @@ impl From<AgentCardView> for FfiAgentCard {
             seen_seq: v.seen_seq,
             is_unread: v.is_unread,
             queued_prompts: v.queued_prompts.into_iter().map(Into::into).collect(),
+            labels: v.labels,
+            is_personal_router,
         }
     }
 }
@@ -5803,6 +5815,11 @@ impl OrbitMobileCore {
 
     pub fn send_prompt(&self, host_id: String, agent_id: String, prompt: String) {
         self.inner.send_prompt(&host_id, &agent_id, &prompt);
+    }
+
+    pub fn set_account_default_mode(&self, mode: FfiSessionMode, updated_at_ms: i64) {
+        self.inner
+            .set_account_default_mode(mode.into(), updated_at_ms);
     }
 
     pub fn send_prompt_with_meta(

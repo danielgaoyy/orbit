@@ -419,11 +419,13 @@ pub struct AskSideQuestionRequest {
 }
 
 pub(crate) fn normalize_cwd_trim(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if trimmed == "/" {
+    if raw.trim().is_empty() {
+        return "";
+    }
+    if raw == "/" {
         "/"
     } else {
-        trimmed.trim_end_matches('/')
+        raw.trim_end_matches('/')
     }
 }
 
@@ -446,6 +448,122 @@ pub(crate) fn cwd_paths_equivalent(stored_cwd: &str, query_cwd: &str) -> bool {
         }
     }
     false
+}
+
+/// Collapses consecutive `/` characters into a single `/` without trimming spaces or touching `\`.
+#[cfg(all(feature = "native", test))]
+fn collapse_slashes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_slash = false;
+    for ch in raw.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                out.push('/');
+                prev_slash = true;
+            }
+        } else {
+            out.push(ch);
+            prev_slash = false;
+        }
+    }
+    out
+}
+
+/// Normalizes a filesystem path for strict Git cache lookups WITHOUT calling `.trim()`:
+/// - Preserves significant leading/trailing spaces in legal POSIX directory names
+///   (e.g. `/tmp/project` vs `/tmp/project ` remain distinct).
+/// - Preserves POSIX literal backslashes (`team\project` vs `team/project`).
+/// - Normalizes Windows UNC paths (`\\server\share\p` and `//server/share/p` -> `//server/share/p`)
+///   idempotently.
+/// - Preserves Windows drive roots (`C:\` and `C:/` -> `C:/`) distinct from drive-relative `C:`.
+#[cfg(all(feature = "native", test))]
+fn normalize_git_cache_path(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let bytes = raw.as_bytes();
+    let is_unc = (raw.starts_with("\\\\") || raw.starts_with("//"))
+        && bytes.len() >= 3
+        && bytes[2] != b'/'
+        && bytes[2] != b'\\';
+    let is_win_drive = bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
+
+    if is_unc {
+        let slashed = raw.replace('\\', "/");
+        let rest = collapse_slashes(&slashed[2..]);
+        let trimmed = rest.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "//".to_string()
+        } else {
+            format!("//{trimmed}")
+        }
+    } else if is_win_drive {
+        let slashed = raw.replace('\\', "/");
+        let drive_prefix = &slashed[..2];
+        if slashed.len() == 2 {
+            return drive_prefix.to_string();
+        }
+        let rest = collapse_slashes(&slashed[2..]);
+        if rest == "/" {
+            format!("{drive_prefix}/")
+        } else {
+            let trimmed = rest.trim_end_matches('/');
+            format!("{drive_prefix}{trimmed}")
+        }
+    } else {
+        let collapsed = collapse_slashes(raw);
+        if collapsed == "/" {
+            "/".to_string()
+        } else {
+            collapsed.trim_end_matches('/').to_string()
+        }
+    }
+}
+
+/// Strict path equivalence for Git diff/status cache lookups.
+///
+/// Unlike display-oriented `cwd_paths_equivalent`, this NEVER fuzzy-matches `~/rel` against an
+/// arbitrary absolute path ending in `/rel` (which would falsely equate daemon `~/project` with
+/// `/home/worker/project`) and NEVER trims significant filesystem spaces (such as `/tmp/project `).
+/// Leading `~` is expanded ONLY when `authoritative_home_dir` for that host is explicitly known.
+/// POSIX literal backslashes (`team\project`) are preserved verbatim.
+#[cfg(all(feature = "native", test))]
+pub(crate) fn git_cache_paths_equivalent(
+    stored_cwd: &str,
+    query_cwd: &str,
+    authoritative_home_dir: Option<&str>,
+) -> bool {
+    let a = normalize_git_cache_path(stored_cwd);
+    let b = normalize_git_cache_path(query_cwd);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let Some(home) = authoritative_home_dir
+        .map(normalize_git_cache_path)
+        .filter(|h| !h.is_empty() && h != "~")
+    else {
+        return false;
+    };
+    let expand = |p: &str| -> String {
+        if p == "~" {
+            home.clone()
+        } else if let Some(rel) = p.strip_prefix("~/") {
+            if home == "/" {
+                format!("/{rel}")
+            } else {
+                format!("{home}/{rel}")
+            }
+        } else {
+            p.to_string()
+        }
+    };
+    normalize_git_cache_path(&expand(&a)) == normalize_git_cache_path(&expand(&b))
 }
 
 pub(crate) fn truncate_utf8_prefix(text: &str, max_bytes: usize) -> String {
@@ -746,6 +864,7 @@ pub(crate) struct AgentMessageDeliveryFold {
     pub(crate) delivery_status: Option<AgentMessageDeliveryStatus>,
     pub(crate) delivery_turn_id: Option<String>,
     pub(crate) blocking_turn_id: Option<String>,
+    pub(crate) blocking_turn_cleared: bool,
     pub(crate) queued_at_ms: Option<i64>,
     pub(crate) dispatched_at_ms: Option<i64>,
     pub(crate) settled_at_ms: Option<i64>,
@@ -786,7 +905,20 @@ pub(crate) fn collect_delivery_updates(
                 if entry.delivery_turn_id.is_none() && delivery_turn_id.is_some() {
                     entry.delivery_turn_id = delivery_turn_id.clone();
                 }
-                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                if matches!(
+                    delivery_status,
+                    Some(
+                        AgentMessageDeliveryStatus::Dispatched
+                            | AgentMessageDeliveryStatus::Settled
+                            | AgentMessageDeliveryStatus::Dropped
+                    )
+                ) {
+                    entry.blocking_turn_id = None;
+                    entry.blocking_turn_cleared = true;
+                } else if !entry.blocking_turn_cleared
+                    && entry.blocking_turn_id.is_none()
+                    && blocking_turn_id.is_some()
+                {
                     entry.blocking_turn_id = blocking_turn_id.clone();
                 }
                 if entry.queued_at_ms.is_none() {
@@ -816,7 +948,18 @@ pub(crate) fn collect_delivery_updates(
                 if delivery_turn_id.is_some() {
                     entry.delivery_turn_id = delivery_turn_id.clone();
                 }
-                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                if matches!(
+                    status,
+                    AgentMessageDeliveryStatus::Dispatched
+                        | AgentMessageDeliveryStatus::Settled
+                        | AgentMessageDeliveryStatus::Dropped
+                ) {
+                    entry.blocking_turn_id = None;
+                    entry.blocking_turn_cleared = true;
+                } else if !entry.blocking_turn_cleared
+                    && entry.blocking_turn_id.is_none()
+                    && blocking_turn_id.is_some()
+                {
                     entry.blocking_turn_id = blocking_turn_id.clone();
                 }
                 match status {
@@ -1103,9 +1246,13 @@ pub(crate) fn render_timeline_event_view(
                 delivery_turn_id: folded
                     .and_then(|f| f.delivery_turn_id.clone())
                     .or_else(|| delivery_turn_id.clone()),
-                blocking_turn_id: folded
-                    .and_then(|f| f.blocking_turn_id.clone())
-                    .or_else(|| blocking_turn_id.clone()),
+                blocking_turn_id: if folded.is_some_and(|f| f.blocking_turn_cleared) {
+                    None
+                } else {
+                    folded
+                        .and_then(|f| f.blocking_turn_id.clone())
+                        .or_else(|| blocking_turn_id.clone())
+                },
                 queued_at_ms: queued_at_ms.or_else(|| folded.and_then(|f| f.queued_at_ms)),
                 dispatched_at_ms: folded
                     .and_then(|f| f.dispatched_at_ms)

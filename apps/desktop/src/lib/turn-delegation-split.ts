@@ -106,13 +106,20 @@ export function coalescePeerFinishes(
   _openingMessage: StageTurnView["agent_message"],
   segments: readonly TurnLiveSegmentView[],
   _hostId: string,
+  options?: { preserveFinishReports?: boolean },
 ) {
+  const preserveFinishReports = Boolean(options?.preserveFinishReports);
   const finishStatuses = new Map<AgentMessage, CoalescedFinishStatus>();
   const visible: TurnLiveSegmentView[] = [];
   for (const seg of segments) {
     if (
       seg.kind === "agent_message" &&
       seg.item.item_type === "agent_message" &&
+      !(
+        preserveFinishReports &&
+        seg.item.kind === "finish_notification" &&
+        !seg.item.permission_context
+      ) &&
       isTimelineAgentMessageHidden(seg.item)
     ) {
       continue;

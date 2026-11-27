@@ -191,6 +191,18 @@ impl OhosCoreFacade {
         self.inner.send_prompt(host_id, agent_id, prompt);
     }
 
+    pub fn set_account_default_mode(&self, mode: &str, updated_at_ms: i64) {
+        let parsed = match mode.trim() {
+            "auto" => orbit_protocol::SessionMode::Auto,
+            "plan" => orbit_protocol::SessionMode::Plan,
+            "accept_edits" => orbit_protocol::SessionMode::AcceptEdits,
+            "full_access" => orbit_protocol::SessionMode::FullAccess,
+            "default" | "" => orbit_protocol::SessionMode::Default,
+            other => orbit_protocol::SessionMode::Custom(other.to_string()),
+        };
+        self.inner.set_account_default_mode(parsed, updated_at_ms);
+    }
+
     pub fn send_prompt_with_meta(
         &self,
         host_id: &str,

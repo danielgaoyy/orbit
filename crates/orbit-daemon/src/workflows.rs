@@ -2348,11 +2348,10 @@ impl WorkflowEngine {
     }
 
     async fn authorize_cwd(&self, raw_cwd: &str) -> Result<PathBuf, String> {
-        let trimmed = raw_cwd.trim();
-        if trimmed.is_empty() {
+        if raw_cwd.trim().is_empty() {
             return Err("invalid_cwd: workspace cwd must not be empty".into());
         }
-        let expanded = crate::expand_host_path(trimmed);
+        let expanded = crate::expand_host_path(raw_cwd);
         if self.config.enforce_registered_cwd {
             crate::authorize_workspace_mutation_cwd(&self.store, &expanded).await
         } else {

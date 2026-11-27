@@ -249,8 +249,7 @@ export struct FleetSidebar {
           content: $r('app.string.nav_file_explorer')
         })
           .onClick(() => {
-            this.store.setActiveCwd(group.primary_cwd);
-            this.store.openFileExplorer();
+            this.store.openFileExplorer(undefined, group.primary_cwd, group.host_id);
           })
 
         MenuItem({
@@ -259,7 +258,7 @@ export struct FleetSidebar {
           content: $r('app.string.nav_git_review')
         })
           .onClick(() => {
-            this.store.inspectGitDiffForCwd(group.primary_cwd);
+            this.store.inspectGitDiffForCwd(group.primary_cwd, group.host_id);
           })
 
         MenuItem({
@@ -268,7 +267,7 @@ export struct FleetSidebar {
           content: 'Terminal'
         })
           .onClick(() => {
-            this.store.openPtyTerminalInCwd(group.primary_cwd);
+            this.store.openPtyTerminalInCwd(group.primary_cwd, group.host_id);
           })
 
         MenuItem({
@@ -336,7 +335,7 @@ export struct FleetSidebar {
           content: 'Diff Review'
         })
           .onClick(() => {
-            this.store.inspectGitDiffForCwd(conv.agent.cwd);
+            this.store.inspectGitDiffForCwd(conv.agent.cwd, conv.host_id);
           })
 
         MenuItem({
@@ -345,7 +344,7 @@ export struct FleetSidebar {
           content: 'Terminal'
         })
           .onClick(() => {
-            this.store.openPtyTerminalInCwd(conv.agent.cwd);
+            this.store.openPtyTerminalInCwd(conv.agent.cwd, conv.host_id);
           })
 
         MenuItem({

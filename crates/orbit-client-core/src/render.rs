@@ -1471,6 +1471,147 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
 
 /// Parse a unified diff with a caller-specified per-file rendered line cap and optional syntax
 /// highlighting + word-level intra-line diffing.
+/// Unescape a Git C-quoted path token starting with `"` and return `(decoded_path, tail)`.
+fn parse_git_c_quoted_token(input: &str) -> Option<(String, &str)> {
+    let inner = input.strip_prefix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            let decoded = String::from_utf8_lossy(&out).into_owned();
+            return Some((decoded, &inner[i + 1..]));
+        }
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+            match bytes[i] {
+                b'\\' => out.push(b'\\'),
+                b'"' => out.push(b'"'),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0c),
+                b'v' => out.push(0x0b),
+                d0 @ b'0'..=b'7'
+                    if i + 2 < bytes.len()
+                        && (b'0'..=b'7').contains(&bytes[i + 1])
+                        && (b'0'..=b'7').contains(&bytes[i + 2]) =>
+                {
+                    let val =
+                        ((d0 - b'0') << 6) | ((bytes[i + 1] - b'0') << 3) | (bytes[i + 2] - b'0');
+                    out.push(val);
+                    i += 2;
+                }
+                other => out.push(other),
+            }
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse the path from a unified diff `--- ` or `+++ ` header line, preserving leading/trailing
+/// literal spaces (e.g. `report.txt `), stripping Git's optional `\t<timestamp>` separator on
+/// unquoted paths, and decoding Git C-quoted escapes (`"..."`).
+fn parse_unified_header_path(after_marker: &str, strip_prefix: &str) -> Option<String> {
+    let raw = after_marker.trim_end_matches(['\r', '\n']);
+    let decoded = if raw.starts_with('"') {
+        let (path, _tail) = parse_git_c_quoted_token(raw)?;
+        path
+    } else {
+        raw.split('\t').next().unwrap_or(raw).to_string()
+    };
+    if decoded.is_empty() || decoded == "/dev/null" {
+        return None;
+    }
+    let stripped = decoded.strip_prefix(strip_prefix).unwrap_or(&decoded);
+    (!stripped.is_empty()).then(|| stripped.to_string())
+}
+
+/// Parse the literal path from a Git `rename from`, `rename to`, `copy from`, or `copy to`
+/// header line. Git does not prepend `a/` or `b/` and does not append a timestamp tab; if the
+/// path contains special bytes Git wraps it in C-quotes (`"..."`).
+fn parse_git_rename_copy_path(after_marker: &str) -> Option<String> {
+    let raw = after_marker.trim_end_matches(['\r', '\n']);
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('"')
+        && let Some((decoded, tail)) = parse_git_c_quoted_token(raw)
+        && tail.is_empty()
+    {
+        return (!decoded.is_empty()).then_some(decoded);
+    }
+    Some(raw.to_string())
+}
+
+/// Parse the target path from a `diff --git <a_path> <b_path>` header without stripping spaces
+/// from filenames (e.g. `diff --git a/report.txt  b/report.txt `).
+fn parse_git_diff_header_path(rest: &str) -> String {
+    let line = rest.trim_end_matches(['\r', '\n']);
+    if line.starts_with('"')
+        && let Some((a_tok, after_a)) = parse_git_c_quoted_token(line)
+    {
+        let b_part = after_a.strip_prefix(' ').unwrap_or(after_a);
+        let b_tok = if b_part.starts_with('"') {
+            parse_git_c_quoted_token(b_part).map(|(p, _)| p)
+        } else {
+            (!b_part.is_empty()).then(|| b_part.to_string())
+        };
+        if let Some(b_raw) = b_tok {
+            let clean = b_raw.strip_prefix("b/").unwrap_or(&b_raw);
+            if !clean.is_empty() {
+                return clean.to_string();
+            }
+        }
+        let clean_a = a_tok.strip_prefix("a/").unwrap_or(&a_tok);
+        if !clean_a.is_empty() {
+            return clean_a.to_string();
+        }
+    }
+    if let Some(after_a) = line.strip_prefix("a/")
+        && after_a.len() >= 3
+        && (after_a.len() - 3).is_multiple_of(2)
+    {
+        let x_len = (after_a.len() - 3) / 2;
+        if x_len > 0
+            && after_a.is_char_boundary(x_len)
+            && after_a.is_char_boundary(x_len + 3)
+            && &after_a[x_len..x_len + 3] == " b/"
+            && after_a[..x_len] == after_a[x_len + 3..]
+        {
+            return after_a[..x_len].to_string();
+        }
+    }
+    if line.ends_with('"') {
+        for (idx, _) in line.match_indices(" \"") {
+            if let Some((b_raw, tail)) = parse_git_c_quoted_token(&line[idx + 1..])
+                && tail.is_empty()
+            {
+                let clean = b_raw.strip_prefix("b/").unwrap_or(&b_raw);
+                if !clean.is_empty() {
+                    return clean.to_string();
+                }
+            }
+        }
+    }
+    if let Some((_, after_b)) = line.rsplit_once(" b/")
+        && !after_b.is_empty()
+    {
+        return after_b.to_string();
+    }
+    line.split_whitespace()
+        .last()
+        .map(|p| p.strip_prefix("b/").unwrap_or(p).to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "modified".to_string())
+}
+
 pub fn parse_unified_diff_capped(
     unified_diff: &str,
     max_lines_per_file: usize,
@@ -1480,16 +1621,13 @@ pub fn parse_unified_diff_capped(
     let mut files: Vec<DiffFileView> = Vec::new();
     let mut old_ln: u32 = 0;
     let mut new_ln: u32 = 0;
+    let mut in_hunk = false;
     let mut omitted_lines: usize = 0;
 
     for raw_line in unified_diff.lines() {
         if let Some(rest) = raw_line.strip_prefix("diff --git ") {
             flush_omitted_diff_notice(&mut files, &mut omitted_lines);
-            let path = rest
-                .split_whitespace()
-                .last()
-                .map(|p| p.strip_prefix("b/").unwrap_or(p).to_string())
-                .unwrap_or_else(|| "modified".to_string());
+            let path = parse_git_diff_header_path(rest);
             files.push(DiffFileView {
                 path,
                 additions: 0,
@@ -1498,6 +1636,7 @@ pub fn parse_unified_diff_capped(
             });
             old_ln = 0;
             new_ln = 0;
+            in_hunk = false;
             continue;
         }
 
@@ -1514,28 +1653,89 @@ pub fn parse_unified_diff_capped(
             continue;
         };
 
-        if let Some(plus_path) = raw_line.strip_prefix("+++ b/") {
-            cur_file.path = plus_path.trim().to_string();
-            continue;
-        }
-        if raw_line.starts_with("--- ")
-            || raw_line.starts_with("index ")
-            || raw_line.starts_with("new file mode")
-            || raw_line.starts_with("deleted file mode")
-        {
-            push_capped_diff_line(
-                cur_file,
-                &mut omitted_lines,
-                DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
-                max_lines,
-            );
-            continue;
+        if !in_hunk {
+            if let Some(after_plus) = raw_line.strip_prefix("+++ ") {
+                if let Some(parsed) = parse_unified_header_path(after_plus, "b/") {
+                    cur_file.path = parsed;
+                } else {
+                    push_capped_diff_line(
+                        cur_file,
+                        &mut omitted_lines,
+                        DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
+                        max_lines,
+                    );
+                }
+                continue;
+            }
+            if let Some(after_minus) = raw_line.strip_prefix("--- ") {
+                if (cur_file.path == "Working Tree" || cur_file.path == "modified")
+                    && let Some(parsed) = parse_unified_header_path(after_minus, "a/")
+                {
+                    cur_file.path = parsed;
+                }
+                push_capped_diff_line(
+                    cur_file,
+                    &mut omitted_lines,
+                    DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
+                    max_lines,
+                );
+                continue;
+            }
+            if let Some(after_to) = raw_line
+                .strip_prefix("rename to ")
+                .or_else(|| raw_line.strip_prefix("copy to "))
+            {
+                if let Some(parsed) = parse_git_rename_copy_path(after_to) {
+                    cur_file.path = parsed;
+                }
+                push_capped_diff_line(
+                    cur_file,
+                    &mut omitted_lines,
+                    DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
+                    max_lines,
+                );
+                continue;
+            }
+            if let Some(after_from) = raw_line
+                .strip_prefix("rename from ")
+                .or_else(|| raw_line.strip_prefix("copy from "))
+            {
+                if (cur_file.path == "Working Tree" || cur_file.path == "modified")
+                    && let Some(parsed) = parse_git_rename_copy_path(after_from)
+                {
+                    cur_file.path = parsed;
+                }
+                push_capped_diff_line(
+                    cur_file,
+                    &mut omitted_lines,
+                    DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
+                    max_lines,
+                );
+                continue;
+            }
+            if raw_line.starts_with("index ")
+                || raw_line.starts_with("new file mode")
+                || raw_line.starts_with("deleted file mode")
+                || raw_line.starts_with("old mode ")
+                || raw_line.starts_with("new mode ")
+                || raw_line.starts_with("similarity index ")
+                || raw_line.starts_with("dissimilarity index ")
+            {
+                push_capped_diff_line(
+                    cur_file,
+                    &mut omitted_lines,
+                    DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
+                    max_lines,
+                );
+                continue;
+            }
         }
 
         if raw_line.starts_with("@@ ") {
             let (o, n) = parse_hunk_header_numbers(raw_line);
             old_ln = o;
             new_ln = n;
+            in_hunk = true;
             push_capped_diff_line(
                 cur_file,
                 &mut omitted_lines,
@@ -2084,6 +2284,93 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert_eq!(files[0].path, "src/lib.rs");
         assert_eq!(files[0].additions, 2);
         assert_eq!(files[0].deletions, 1);
+    }
+
+    #[test]
+    fn unified_diff_parser_preserves_trailing_space_tab_delimiter_and_c_quoted_paths() {
+        // 1. Synthetic untracked diff for `report.txt ` (trailing space, no `diff --git`, no tab)
+        let synth_spaced = "--- /dev/null\n+++ b/report.txt \n@@ -0,0 +1,1 @@\n+spaced-body\n";
+        let synth_files = parse_unified_diff(synth_spaced);
+        assert_eq!(synth_files.len(), 1);
+        assert_eq!(synth_files[0].path, "report.txt ");
+        assert_eq!(synth_files[0].additions, 1);
+
+        // 2. Real git diff with coexisting `report.txt` and `report.txt ` (git appends `\t` on `---`/`+++`)
+        let multi = concat!(
+            "diff --git a/report.txt b/report.txt\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/report.txt\n",
+            "+++ b/report.txt\n",
+            "@@ -1 +1 @@\n",
+            "-old-plain\n",
+            "+new-plain\n",
+            "diff --git a/report.txt  b/report.txt \n",
+            "index 3333333..4444444 100644\n",
+            "--- a/report.txt \t\n",
+            "+++ b/report.txt \t\n",
+            "@@ -1 +1 @@\n",
+            "-old-spaced\n",
+            "+new-spaced\n",
+            "diff --git a/deleted.txt  b/deleted.txt \n",
+            "deleted file mode 100644\n",
+            "index 5555555..0000000\n",
+            "--- a/deleted.txt \t\n",
+            "+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n",
+            "-gone\n",
+            "diff --git \"a/dir/quote \\\"x\\\" \" \"b/dir/quote \\\"x\\\" \"\n",
+            "--- \"a/dir/quote \\\"x\\\" \"\t2026-11-27\n",
+            "+++ \"b/dir/quote \\\"x\\\" \"\t2026-11-27\n",
+            "@@ -0,0 +1 @@\n",
+            "+quoted-body\n",
+        );
+        let files = parse_unified_diff(multi);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].path, "report.txt");
+        assert_eq!(files[1].path, "report.txt ");
+        assert_eq!(files[2].path, "deleted.txt ");
+        assert_eq!(files[2].additions, 0);
+        assert_eq!(files[2].deletions, 1);
+        assert_eq!(files[3].path, "dir/quote \"x\" ");
+        assert_eq!(files[3].additions, 1);
+
+        // 3. R14-P1-1: Pure 100% rename (`README.md -> part b/tail`) has NO `+++` header;
+        //    `rename to` MUST override the ambiguous `diff --git` guess (`tail`), keeping it
+        //    strictly distinct from an independent staged file named `tail`. Also verify
+        //    C-quoted `rename to` and `copy to` headers.
+        let rename_and_tail = concat!(
+            "diff --git a/README.md b/part b/tail\n",
+            "similarity index 100%\n",
+            "rename from README.md\n",
+            "rename to part b/tail\n",
+            "diff --git a/tail b/tail\n",
+            "new file mode 100644\n",
+            "index 0000000..1111111\n",
+            "--- /dev/null\n",
+            "+++ b/tail\n",
+            "@@ -0,0 +1 @@\n",
+            "+independent-tail\n",
+            "diff --git \"a/old.txt\" \"b/part b/\\\"q\\\" \\t.txt \"\n",
+            "similarity index 100%\n",
+            "rename from old.txt\n",
+            "rename to \"part b/\\\"q\\\" \\t.txt \"\n",
+            "diff --git a/src.txt b/dst b/copy.txt \n",
+            "similarity index 100%\n",
+            "copy from src.txt\n",
+            "copy to dst b/copy.txt \n",
+        );
+        let rename_files = parse_unified_diff(rename_and_tail);
+        assert_eq!(rename_files.len(), 4);
+        assert_eq!(rename_files[0].path, "part b/tail");
+        assert_eq!(rename_files[1].path, "tail");
+        assert_eq!(rename_files[2].path, "part b/\"q\" \t.txt ");
+        assert_eq!(rename_files[3].path, "dst b/copy.txt ");
+
+        // 4. R14-N1: Daemon-synthesized untracked diff with C-quoted tab filename decodes verbatim.
+        let synth_tab = "--- /dev/null\n+++ \"b/budget\\t2026.txt\"\n@@ -0,0 +1,1 @@\n+q1\n";
+        let tab_files = parse_unified_diff(synth_tab);
+        assert_eq!(tab_files.len(), 1);
+        assert_eq!(tab_files[0].path, "budget\t2026.txt");
     }
 
     #[test]

@@ -289,7 +289,8 @@ pub async fn resolve_git_checkout_info(dir: &Path) -> anyhow::Result<GitCheckout
             dir.display()
         );
     }
-    let top_raw = String::from_utf8_lossy(&top_out.stdout).trim().to_string();
+    let top_stdout = String::from_utf8_lossy(&top_out.stdout);
+    let top_raw = crate::git::strip_single_line_ending(&top_stdout).to_string();
     if top_raw.is_empty() {
         anyhow::bail!(
             "not_a_git_repo: `{}` is not a Git repository",

@@ -9,11 +9,14 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
-/// Inspect git repository status using `git status --porcelain=v2 --branch`.
+/// Inspect git repository status using `git status --porcelain=v2 -z --branch`.
+/// NUL-delimited (`-z`) output disables C-quoting so UTF-8 (`说明.txt`), trailing spaces
+/// (`report.txt `), tabs, quotes, and renames/copies (`2 ... path\0origPath\0`) preserve exact
+/// literal paths even when `core.quotePath=true`.
 pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
     let cwd_str = cwd.to_string_lossy().to_string();
     let output = Command::new("git")
-        .args(["status", "--porcelain=v2", "--branch"])
+        .args(["status", "--porcelain=v2", "-z", "--branch"])
         .current_dir(cwd)
         .output()
         .await;
@@ -25,14 +28,21 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
         return empty_non_git(cwd_str);
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let mut branch = None;
     let mut upstream = None;
     let mut ahead = 0u32;
     let mut behind = 0u32;
     let mut files = Vec::new();
 
-    for line in stdout.lines() {
+    let records: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let mut idx = 0usize;
+    while idx < records.len() {
+        let rec = records[idx];
+        idx += 1;
+        if rec.is_empty() {
+            continue;
+        }
+        let line = String::from_utf8_lossy(rec);
         if let Some(head) = line.strip_prefix("# branch.head ") {
             if head != "(detached)" {
                 branch = Some(head.trim().to_string());
@@ -49,26 +59,47 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
             }
         } else if let Some(untracked_path) = line.strip_prefix("? ") {
             files.push(GitFileEntry {
-                path: untracked_path.trim().to_string(),
+                path: untracked_path.to_string(),
                 status: "??".into(),
                 staged: false,
                 untracked: true,
             });
-        } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            // Format: `1 XY sub mH mI mW hH hI path` or `2 XY sub mH mI mW hH hI Xscore path\torigPath`
+        } else if line.starts_with("1 ") {
+            // Format: `1 XY sub mH mI mW hH hI path\0`
             let parts: Vec<&str> = line.splitn(9, ' ').collect();
             if parts.len() >= 9 {
                 let xy = parts[1];
-                let raw_tail = parts[8];
-                let path = if line.starts_with("2 ") {
-                    // Rename entry has `Xscore path\torigPath` in tail
-                    raw_tail
-                        .split_once(' ')
-                        .map(|(_, rest)| rest.split('\t').next().unwrap_or(rest))
-                        .unwrap_or(raw_tail)
-                } else {
-                    raw_tail
-                };
+                let path = parts[8];
+                let mut chars = xy.chars();
+                let x = chars.next().unwrap_or('.');
+                let y = chars.next().unwrap_or('.');
+                if x != '.' {
+                    files.push(GitFileEntry {
+                        path: path.to_string(),
+                        status: x.to_string(),
+                        staged: true,
+                        untracked: false,
+                    });
+                }
+                if y != '.' {
+                    files.push(GitFileEntry {
+                        path: path.to_string(),
+                        status: y.to_string(),
+                        staged: false,
+                        untracked: false,
+                    });
+                }
+            }
+        } else if line.starts_with("2 ") {
+            // Format with `-z`: `2 XY sub mH mI mW hH hI Xscore path\0origPath\0`
+            // Consume the trailing `origPath` NUL record so it is never misparsed as a new entry.
+            if idx < records.len() {
+                idx += 1;
+            }
+            let parts: Vec<&str> = line.splitn(10, ' ').collect();
+            if parts.len() >= 10 {
+                let xy = parts[1];
+                let path = parts[9];
                 let mut chars = xy.chars();
                 let x = chars.next().unwrap_or('.');
                 let y = chars.next().unwrap_or('.');
@@ -90,7 +121,7 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
                 }
             }
         } else if line.starts_with("u ") {
-            // Unmerged (conflicted) entry: `u XY sub m1 m2 m3 mW h1 h2 h3 path`
+            // Unmerged (conflicted) entry: `u XY sub m1 m2 m3 mW h1 h2 h3 path\0`
             let parts: Vec<&str> = line.splitn(11, ' ').collect();
             if parts.len() >= 11 {
                 files.push(GitFileEntry {
@@ -103,6 +134,14 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
         }
     }
 
+    let (repo_root, repo_prefix) = match resolve_git_scope(cwd).await {
+        Some((canon_root, subdir_scope)) => (
+            Some(canon_root.to_string_lossy().into_owned()),
+            Some(subdir_scope.unwrap_or_default()),
+        ),
+        None => (None, None),
+    };
+
     GitStatusSnapshot {
         cwd: cwd_str,
         is_git_repo: true,
@@ -112,11 +151,63 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
         behind,
         files,
         nested_git_repos: Vec::new(),
+        repo_prefix,
+        repo_root,
     }
 }
 
 const MAX_GIT_DIFF_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UNTRACKED_DIFF_BYTES: usize = 256 * 1024;
+
+/// Format a unified diff header path (`b/<rel_path>`), C-quoting whenever the path contains
+/// characters that are ambiguous in unquoted `+++ ` headers (`\t`, `\n`, `\r`, `"`, `\`, or ASCII
+/// control bytes) so `parse_unified_diff` decodes the exact literal path (R14-N1).
+fn format_git_diff_header_path(prefix: &str, rel_path: &str) -> String {
+    let full = format!("{prefix}{rel_path}");
+    let needs_quote = full
+        .bytes()
+        .any(|b| matches!(b, b'\t' | b'\n' | b'\r' | b'"' | b'\\') || b < 0x20 || b == 0x7f);
+    if !needs_quote {
+        return full;
+    }
+    let mut out = String::with_capacity(full.len() + 8);
+    out.push('"');
+    for ch in full.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            '\t' => out.push_str(r"\t"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\x07' => out.push_str(r"\a"),
+            '\x08' => out.push_str(r"\b"),
+            '\x0c' => out.push_str(r"\f"),
+            '\x0b' => out.push_str(r"\v"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\{:03o}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Normalize a cwd-relative Git path by stripping redundant `./` and empty path segments while
+/// preserving every literal character (including `[...]`, spaces, and UTF-8) without glob expansion.
+fn normalize_git_rel_path(raw: &str) -> String {
+    if raw.starts_with('/') {
+        return raw.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        parts.push(seg);
+    }
+    parts.join("/")
+}
 
 /// Compute unified diff for an entire workspace or a single file (including untracked file preview).
 pub async fn compute_git_diff(
@@ -124,11 +215,14 @@ pub async fn compute_git_diff(
     rel_path: Option<&str>,
     staged: bool,
 ) -> anyhow::Result<String> {
-    let mut args = vec!["diff", "--no-color"];
+    let normalized_rel = rel_path.map(normalize_git_rel_path);
+    let canonical_rel = normalized_rel.as_deref().filter(|p| !p.is_empty());
+
+    let mut args = vec!["--literal-pathspecs", "diff", "--no-color"];
     if staged {
         args.push("--cached");
     }
-    if let Some(p) = rel_path {
+    if let Some(p) = canonical_rel {
         args.push("--");
         args.push(p);
     }
@@ -154,26 +248,56 @@ pub async fn compute_git_diff(
         return Ok(diff_text);
     }
 
-    // If diff is empty for a requested untracked file, synthesize an added-file unified diff
-    if let Some(p) = rel_path {
-        let candidate = cwd.join(p);
-        if candidate.is_file()
-            && let Ok(file) = tokio::fs::File::open(&candidate).await
-        {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::with_capacity(64 * 1024);
-            let mut limited = file.take(MAX_UNTRACKED_DIFF_BYTES as u64);
-            if limited.read_to_end(&mut buf).await.is_ok() {
-                let content = String::from_utf8_lossy(&buf);
-                let mut synth = format!("--- /dev/null\n+++ b/{p}\n");
-                let lines: Vec<&str> = content.lines().collect();
-                synth.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
-                for l in lines.into_iter().take(500) {
-                    synth.push('+');
-                    synth.push_str(l);
-                    synth.push('\n');
+    // If diff is empty for a requested untracked file, synthesize an added-file unified diff.
+    // Use `--literal-pathspecs`, NUL-delimited `-z`, and normalized cwd-relative matching so
+    // `./daily1.txt` matches `daily1.txt` while literal metacharacters (`daily[1].txt` /
+    // `./daily[1].txt`) never glob-match unrelated untracked files (`daily1.txt`).
+    if let Some(p) = canonical_rel {
+        let untracked_check = Command::new("git")
+            .args([
+                "--literal-pathspecs",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                p,
+            ])
+            .current_dir(cwd)
+            .output()
+            .await;
+        let is_untracked = matches!(
+            untracked_check,
+            Ok(ref out)
+                if out.status.success()
+                    && out.stdout.split(|b| *b == 0).any(|entry| {
+                        !entry.is_empty()
+                            && std::str::from_utf8(entry)
+                                .map(|s| normalize_git_rel_path(s) == p)
+                                .unwrap_or_else(|_| entry == p.as_bytes())
+                    })
+        );
+        if is_untracked {
+            let candidate = cwd.join(p);
+            if candidate.is_file()
+                && let Ok(file) = tokio::fs::File::open(&candidate).await
+            {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::with_capacity(64 * 1024);
+                let mut limited = file.take(MAX_UNTRACKED_DIFF_BYTES as u64);
+                if limited.read_to_end(&mut buf).await.is_ok() {
+                    let content = String::from_utf8_lossy(&buf);
+                    let header_path = format_git_diff_header_path("b/", p);
+                    let mut synth = format!("--- /dev/null\n+++ {header_path}\n");
+                    let lines: Vec<&str> = content.lines().collect();
+                    synth.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+                    for l in lines.into_iter().take(500) {
+                        synth.push('+');
+                        synth.push_str(l);
+                        synth.push('\n');
+                    }
+                    return Ok(synth);
                 }
-                return Ok(synth);
             }
         }
     }
@@ -302,6 +426,8 @@ fn empty_non_git(cwd: String) -> GitStatusSnapshot {
         behind: 0,
         files: Vec::new(),
         nested_git_repos,
+        repo_prefix: None,
+        repo_root: None,
     }
 }
 
@@ -1086,6 +1212,22 @@ fn is_valid_git_oid(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Strip ONLY the single trailing record terminator emitted by `git rev-parse --show-toplevel`
+/// (`\n` on Unix, `\r\n` or `\n` on Windows), preserving any literal trailing space, `\r`, or
+/// `\n` that is part of the POSIX directory name itself (R15-P1-1 / R16-N1).
+pub(crate) fn strip_single_line_ending(raw: &str) -> &str {
+    #[cfg(windows)]
+    {
+        raw.strip_suffix("\r\n")
+            .or_else(|| raw.strip_suffix('\n'))
+            .unwrap_or(raw)
+    }
+    #[cfg(not(windows))]
+    {
+        raw.strip_suffix('\n').unwrap_or(raw)
+    }
+}
+
 /// Resolve Git repo root and optional relative subdir scope when `cwd` is nested inside a monorepo.
 pub(crate) async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
     let out = tokio::time::timeout(
@@ -1102,7 +1244,8 @@ pub(crate) async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<Str
     if !out.status.success() {
         return None;
     }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let raw = strip_single_line_ending(&stdout);
     if raw.is_empty() {
         return None;
     }
@@ -1117,7 +1260,17 @@ pub(crate) async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<Str
         .strip_prefix(&canon_root)
         .ok()
         .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+        .map(|rel| {
+            let parts: Vec<String> = rel
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            parts.join("/")
+        })
+        .filter(|s| !s.is_empty());
     Some((canon_root, subdir_scope))
 }
 
@@ -2696,5 +2849,690 @@ mod tests {
         assert!(!dir.join("c.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn compute_git_diff_only_synthesizes_patch_for_untracked_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_untracked_diff_guard_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        run_git(&["config", "core.autocrlf", "false"]);
+
+        // 1. Committed clean file must return empty unstaged diff (never synthetic `--- /dev/null`).
+        tokio::fs::write(dir.join("clean.txt"), "committed-body\n")
+            .await
+            .expect("write clean");
+        run_git(&["add", "clean.txt"]);
+        run_git(&["commit", "-m", "init"]);
+        let clean_diff = compute_git_diff(&dir, Some("clean.txt"), false)
+            .await
+            .expect("clean diff");
+        assert!(
+            clean_diff.is_empty(),
+            "clean committed file should have empty unstaged diff, got: {clean_diff}"
+        );
+
+        // 2. Staged-only file (`A  f`, matching index & worktree) must return empty unstaged diff
+        //    while staged diff still returns `+index-only`.
+        tokio::fs::write(dir.join("f"), "index-only\n")
+            .await
+            .expect("write staged file");
+        run_git(&["add", "f"]);
+        let staged_only_unstaged_diff = compute_git_diff(&dir, Some("f"), false)
+            .await
+            .expect("unstaged diff for A  f");
+        assert!(
+            staged_only_unstaged_diff.is_empty(),
+            "staged-only tracked file (`A  f`) must return empty unstaged diff, got: {staged_only_unstaged_diff}"
+        );
+        let staged_only_cached_diff = compute_git_diff(&dir, Some("f"), true)
+            .await
+            .expect("staged diff for A  f");
+        assert!(
+            staged_only_cached_diff.contains("+index-only"),
+            "staged diff for `A  f` should include +index-only, got: {staged_only_cached_diff}"
+        );
+
+        // 3. Genuinely untracked file must still synthesize `--- /dev/null\n+++ b/...` patch.
+        tokio::fs::write(dir.join("untracked.txt"), "brand-new\nsecond-line\n")
+            .await
+            .expect("write untracked");
+        let untracked_diff = compute_git_diff(&dir, Some("untracked.txt"), false)
+            .await
+            .expect("untracked diff");
+        assert!(
+            untracked_diff.starts_with("--- /dev/null\n+++ b/untracked.txt\n"),
+            "untracked file should synthesize added-file header, got: {untracked_diff}"
+        );
+        assert!(untracked_diff.contains("+brand-new\n"));
+        assert!(untracked_diff.contains("+second-line\n"));
+
+        // 4. Literal bracket pathspec guard: tracked-and-clean `daily[1].txt` coexisting with
+        //    untracked `daily1.txt` MUST return empty diff for `daily[1].txt` while `daily1.txt`
+        //    still gets a synthesized untracked preview.
+        tokio::fs::write(dir.join("daily[1].txt"), "tracked-literal\n")
+            .await
+            .expect("write daily[1].txt");
+        run_git(&["add", "--", "daily[1].txt"]);
+        tokio::fs::write(dir.join("daily1.txt"), "untracked-sibling\n")
+            .await
+            .expect("write daily1.txt");
+        let literal_bracket_diff = compute_git_diff(&dir, Some("daily[1].txt"), false)
+            .await
+            .expect("unstaged diff for daily[1].txt");
+        assert!(
+            literal_bracket_diff.is_empty(),
+            "tracked literal `daily[1].txt` must not glob-match untracked `daily1.txt`, got: {literal_bracket_diff}"
+        );
+        let sibling_untracked_diff = compute_git_diff(&dir, Some("daily1.txt"), false)
+            .await
+            .expect("unstaged diff for daily1.txt");
+        assert!(
+            sibling_untracked_diff.starts_with("--- /dev/null\n+++ b/daily1.txt\n"),
+            "untracked `daily1.txt` must still synthesize added-file diff, got: {sibling_untracked_diff}"
+        );
+        assert!(sibling_untracked_diff.contains("+untracked-sibling\n"));
+
+        // 5. Redundant `./` relative path normalization: `./daily1.txt` MUST match `daily1.txt`
+        //    byte-for-byte, and `./daily[1].txt` MUST still return empty diff.
+        let dot_slash_untracked_diff = compute_git_diff(&dir, Some("./daily1.txt"), false)
+            .await
+            .expect("unstaged diff for ./daily1.txt");
+        assert_eq!(
+            dot_slash_untracked_diff, sibling_untracked_diff,
+            "`./daily1.txt` must produce the exact same synthetic diff as `daily1.txt`"
+        );
+        let dot_slash_bracket_diff = compute_git_diff(&dir, Some("./daily[1].txt"), false)
+            .await
+            .expect("unstaged diff for ./daily[1].txt");
+        assert!(
+            dot_slash_bracket_diff.is_empty(),
+            "`./daily[1].txt` must still return empty diff without glob-matching `daily1.txt`, got: {dot_slash_bracket_diff}"
+        );
+
+        // 6. R14-P1-6: `inspect_git_status` uses `--porcelain=v2 -z --branch` so even with
+        //    `core.quotePath=true`, non-ASCII filenames (`说明.txt`) and pure 100% renames
+        //    (`README.md -> part b/tail`) return unquoted exact literal paths and never misparse
+        //    the rename's trailing `origPath` NUL record as a separate file!
+        run_git(&["config", "core.quotePath", "true"]);
+        tokio::fs::write(dir.join("说明.txt"), "utf8-v1\n")
+            .await
+            .expect("write 说明.txt");
+        run_git(&["add", "--", "说明.txt"]);
+        run_git(&["commit", "-m", "add utf8 file"]);
+        tokio::fs::write(dir.join("说明.txt"), "utf8-v2-working\n")
+            .await
+            .expect("edit 说明.txt");
+
+        tokio::fs::write(dir.join("README.md"), "rename-source-body\n")
+            .await
+            .expect("write README.md");
+        run_git(&["add", "--", "README.md"]);
+        run_git(&["commit", "-m", "add README.md"]);
+        tokio::fs::create_dir_all(dir.join("part b"))
+            .await
+            .expect("mkdir part b");
+        run_git(&["mv", "README.md", "part b/tail"]);
+        tokio::fs::write(dir.join("tail"), "independent-tail\n")
+            .await
+            .expect("write independent tail");
+        run_git(&["add", "--", "tail"]);
+
+        let quoted_status = inspect_git_status(&dir).await;
+        assert!(
+            quoted_status
+                .files
+                .iter()
+                .any(|f| f.path == "说明.txt" && !f.staged),
+            "porcelain=v2 -z must preserve literal UTF-8 path under core.quotePath=true, got: {:?}",
+            quoted_status.files
+        );
+        assert!(
+            quoted_status
+                .files
+                .iter()
+                .any(|f| f.path == "part b/tail" && f.staged && f.status == "R"),
+            "porcelain=v2 -z must parse rename destination `part b/tail`, got: {:?}",
+            quoted_status.files
+        );
+        assert!(
+            !quoted_status.files.iter().any(|f| f.path == "README.md"),
+            "porcelain=v2 -z must consume rename origPath NUL record (`README.md`), got: {:?}",
+            quoted_status.files
+        );
+        assert!(
+            quoted_status
+                .files
+                .iter()
+                .any(|f| f.path == "tail" && f.staged && f.status == "A"),
+            "independent staged `tail` must remain distinct from `part b/tail`, got: {:?}",
+            quoted_status.files
+        );
+
+        // Unstaging ONLY `part b/tail` must reset BOTH `part b/tail` and `README.md` (no orphan
+        // `D README.md`) while leaving independent staged `tail` untouched in the index!
+        crate::git_write::unstage_files(&dir, &["part b/tail".to_string()], false)
+            .await
+            .expect("unstage pure rename part b/tail");
+        let after_unstage_rename = inspect_git_status(&dir).await;
+        assert!(
+            after_unstage_rename
+                .files
+                .iter()
+                .any(|f| f.path == "tail" && f.staged && f.status == "A"),
+            "unstaging `part b/tail` must NOT unstage independent `tail`, got: {:?}",
+            after_unstage_rename.files
+        );
+        assert!(
+            !after_unstage_rename
+                .files
+                .iter()
+                .any(|f| (f.path == "README.md" || f.path == "part b/tail") && f.staged),
+            "unstaging rename `part b/tail` must NOT leave staged `D README.md` or `A part b/tail`, got: {:?}",
+            after_unstage_rename.files
+        );
+
+        // 7. Trailing-space & tab filenames (Unix only: Windows forbids trailing spaces / tabs in paths)
+        #[cfg(unix)]
+        {
+            tokio::fs::write(dir.join("report.txt"), "trimmed-sibling-v1\n")
+                .await
+                .expect("write report.txt");
+            run_git(&["add", "--", "report.txt"]);
+            run_git(&["commit", "-m", "add report.txt"]);
+            tokio::fs::write(dir.join("report.txt"), "trimmed-sibling-v2\n")
+                .await
+                .expect("edit report.txt");
+            tokio::fs::write(dir.join("report.txt "), "trailing-space-body\n")
+                .await
+                .expect("write report.txt ");
+
+            let trimmed_diff = compute_git_diff(&dir, Some("report.txt"), false)
+                .await
+                .expect("unstaged diff for report.txt");
+            assert!(
+                trimmed_diff.contains("+trimmed-sibling-v2"),
+                "trimmed `report.txt` should contain its own unstaged edit, got: {trimmed_diff}"
+            );
+            assert!(
+                !trimmed_diff.contains("trailing-space-body"),
+                "trimmed `report.txt` must not include `report.txt `, got: {trimmed_diff}"
+            );
+
+            let trailing_space_diff = compute_git_diff(&dir, Some("report.txt "), false)
+                .await
+                .expect("unstaged diff for report.txt ");
+            assert!(
+                trailing_space_diff.starts_with("--- /dev/null\n+++ b/report.txt \n"),
+                "untracked `report.txt ` must preserve trailing space in synthetic diff, got: {trailing_space_diff}"
+            );
+            assert!(trailing_space_diff.contains("+trailing-space-body\n"));
+            assert!(!trailing_space_diff.contains("trimmed-sibling-v2"));
+
+            let dot_slash_trailing_diff = compute_git_diff(&dir, Some("./report.txt "), false)
+                .await
+                .expect("unstaged diff for ./report.txt ");
+            assert_eq!(
+                dot_slash_trailing_diff, trailing_space_diff,
+                "`./report.txt ` must preserve trailing space and match `report.txt `"
+            );
+
+            let status_snap = inspect_git_status(&dir).await;
+            assert!(
+                status_snap.files.iter().any(|f| f.path == "report.txt "),
+                "inspect_git_status must preserve trailing space in untracked path"
+            );
+            assert!(
+                status_snap.files.iter().any(|f| f.path == "report.txt"),
+                "inspect_git_status must preserve trimmed sibling path"
+            );
+
+            // Stage ONLY `report.txt ` and verify the real Git index stages `report.txt ` while
+            // leaving `report.txt` unstaged, then unstage `report.txt ` cleanly.
+            crate::git_write::stage_files(&dir, &["report.txt ".to_string()], false)
+                .await
+                .expect("stage trailing-space file");
+            let after_stage_spaced = compute_git_diff(&dir, Some("report.txt "), true)
+                .await
+                .expect("staged diff for report.txt ");
+            assert!(
+                after_stage_spaced.contains("+trailing-space-body"),
+                "staging `report.txt ` must stage the trailing-space file in Git index, got: {after_stage_spaced}"
+            );
+            let after_stage_trimmed = compute_git_diff(&dir, Some("report.txt"), true)
+                .await
+                .expect("staged diff for report.txt");
+            assert!(
+                after_stage_trimmed.is_empty(),
+                "staging `report.txt ` must NOT stage sibling `report.txt`, got: {after_stage_trimmed}"
+            );
+
+            crate::git_write::unstage_files(&dir, &["report.txt ".to_string()], false)
+                .await
+                .expect("unstage trailing-space file");
+            let after_unstage_spaced = compute_git_diff(&dir, Some("report.txt "), true)
+                .await
+                .expect("staged diff after unstage");
+            assert!(
+                after_unstage_spaced.is_empty(),
+                "unstaging `report.txt ` must clear its staged diff, got: {after_unstage_spaced}"
+            );
+
+            // R14-N1: Untracked filename containing a literal tab MUST emit a Git-compatible
+            // C-quoted header so downstream unified diff parsers recover `budget\t2026.txt`!
+            tokio::fs::write(dir.join("budget\t2026.txt"), "q1-plan\n")
+                .await
+                .expect("write tabbed untracked file");
+            let tabbed_diff = compute_git_diff(&dir, Some("budget\t2026.txt"), false)
+                .await
+                .expect("untracked diff for budget\\t2026.txt");
+            assert!(
+                tabbed_diff.starts_with("--- /dev/null\n+++ \"b/budget\\t2026.txt\"\n"),
+                "untracked filename with tab must C-quote synthesized +++ header, got: {tabbed_diff}"
+            );
+            let tabbed_status = inspect_git_status(&dir).await;
+            assert!(
+                tabbed_status
+                    .files
+                    .iter()
+                    .any(|f| f.path == "budget\t2026.txt" && f.untracked),
+                "porcelain=v2 -z must preserve literal tab in untracked filename"
+            );
+        }
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn unstage_files_resets_staged_rename_pair_without_leaving_source_deletion_and_spares_copies()
+     {
+        let dir = std::env::temp_dir().join(format!("orbit_unstage_rename_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir temp");
+
+        let run_git = |args: &[&str]| -> Vec<u8> {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        tokio::fs::write(
+            dir.join("README.md"),
+            "rename-body-line-1\nrename-body-line-2\n",
+        )
+        .await
+        .expect("write README.md");
+        tokio::fs::write(dir.join("copy_src.txt"), "copied-source-content\n")
+            .await
+            .expect("write copy_src.txt");
+        run_git(&["add", "--", "README.md", "copy_src.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+
+        // 1. Stage pure rename `README.md -> part b/tail` alongside independent `A tail`.
+        tokio::fs::create_dir_all(dir.join("part b"))
+            .await
+            .expect("mkdir part b");
+        run_git(&["mv", "README.md", "part b/tail"]);
+        tokio::fs::write(dir.join("tail"), "independent-tail\n")
+            .await
+            .expect("write tail");
+        run_git(&["add", "--", "tail"]);
+
+        let before = run_git(&["diff", "--cached", "--name-status", "-M", "-z"]);
+        let before_fields: Vec<String> = before
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        assert!(
+            before_fields
+                .windows(3)
+                .any(|w| w[0].starts_with('R') && w[1] == "README.md" && w[2] == "part b/tail"),
+            "expected staged rename R100 README.md -> part b/tail, got: {before_fields:?}"
+        );
+
+        // Unstage ONLY `part b/tail` -> index MUST contain ONLY `A tail` (NO `D README.md`!)
+        crate::git_write::unstage_files(&dir, &["part b/tail".to_string()], false)
+            .await
+            .expect("unstage rename target");
+        let after = run_git(&["diff", "--cached", "--name-status", "-M", "-z"]);
+        assert_eq!(
+            after,
+            b"A\0tail\0",
+            "index after unstaging rename must contain ONLY `A tail`, got: {:?}",
+            String::from_utf8_lossy(&after)
+        );
+
+        // 2. Control: copy (`copy_src.txt` modified & staged + `copy_dst.txt` staged as copy)
+        //    -> unstaging `copy_dst.txt` MUST NOT reset staged changes on `copy_src.txt`!
+        run_git(&["config", "diff.renames", "copies"]);
+        tokio::fs::write(dir.join("copy_dst.txt"), "copied-source-content\n")
+            .await
+            .expect("write copy_dst.txt");
+        tokio::fs::write(
+            dir.join("copy_src.txt"),
+            "copied-source-content\n+src-edit\n",
+        )
+        .await
+        .expect("edit copy_src.txt");
+        run_git(&["add", "--", "copy_src.txt", "copy_dst.txt"]);
+        crate::git_write::unstage_files(&dir, &["copy_dst.txt".to_string()], false)
+            .await
+            .expect("unstage copy_dst.txt");
+        let after_copy = run_git(&["diff", "--cached", "--name-status", "-M", "-z"]);
+        assert_eq!(
+            after_copy,
+            b"M\0copy_src.txt\0A\0tail\0",
+            "unstaging copy must spare `copy_src.txt` and `tail`, got: {:?}",
+            String::from_utf8_lossy(&after_copy)
+        );
+
+        // 3. Control: ordinary file `tail` unstages ONLY `tail`, sparing `M copy_src.txt`!
+        crate::git_write::unstage_files(&dir, &["tail".to_string()], false)
+            .await
+            .expect("unstage ordinary tail");
+        let after_ordinary = run_git(&["diff", "--cached", "--name-status", "-M", "-z"]);
+        assert_eq!(
+            after_ordinary,
+            b"M\0copy_src.txt\0",
+            "unstaging ordinary file must only reset that file, got: {:?}",
+            String::from_utf8_lossy(&after_ordinary)
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn unstage_files_respects_diff_renames_false_and_aborts_cross_subdir_rename_atomically() {
+        // 1. R16-P1-3: Under `diff.renames = false`, unstaging `A pkg/moved` MUST NOT also reset
+        //    an unselected staged `D README.md`!
+        let dir = std::env::temp_dir().join(format!("orbit_unstage_r16_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(dir.join("pkg"))
+            .await
+            .expect("mkdir pkg");
+
+        let run_git = |cwd: &Path, args: &[&str]| -> Vec<u8> {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+
+        run_git(&dir, &["init", "-b", "main"]);
+        run_git(&dir, &["config", "user.email", "test@orbit.local"]);
+        run_git(&dir, &["config", "user.name", "Orbit Test"]);
+        tokio::fs::write(
+            dir.join("README.md"),
+            "same-content-line-1\nsame-content-line-2\n",
+        )
+        .await
+        .expect("write README.md");
+        tokio::fs::write(dir.join("pkg/a"), "inside-pkg-rename-body\n")
+            .await
+            .expect("write pkg/a");
+        run_git(&dir, &["add", "--", "README.md", "pkg/a"]);
+        run_git(&dir, &["commit", "-m", "initial"]);
+
+        // Disable rename detection in repo config, then stage D README.md + A pkg/moved + A tail.
+        run_git(&dir, &["config", "diff.renames", "false"]);
+        run_git(&dir, &["mv", "README.md", "pkg/moved"]);
+        tokio::fs::write(dir.join("tail"), "independent-tail\n")
+            .await
+            .expect("write tail");
+        run_git(&dir, &["add", "--", "tail"]);
+
+        crate::git_write::unstage_files(&dir, &["pkg/moved".to_string()], false)
+            .await
+            .expect("unstage pkg/moved under diff.renames=false");
+        let after_no_renames = run_git(&dir, &["diff", "--cached", "--name-status", "-z"]);
+        assert_eq!(
+            after_no_renames,
+            b"D\0README.md\0A\0tail\0",
+            "under diff.renames=false, unstaging pkg/moved must keep D README.md and A tail, got: {:?}",
+            String::from_utf8_lossy(&after_no_renames)
+        );
+
+        // 2. R16-P1-4: With rename detection enabled (`diff.renames = true`), stage
+        //    `R100 README.md -> pkg/moved` + `A tail`. Unstaging `pkg/moved` from inside the
+        //    `pkg` subdirectory MUST return Err and leave the index COMPLETELY UNCHANGED!
+        run_git(&dir, &["config", "diff.renames", "true"]);
+        run_git(&dir, &["add", "--", "pkg/moved"]);
+        let before_sub = run_git(&dir, &["diff", "--cached", "--name-status", "-z"]);
+        assert!(
+            String::from_utf8_lossy(&before_sub).contains("R100\0README.md\0pkg/moved\0"),
+            "expected R100 README.md -> pkg/moved before subdir unstage, got: {:?}",
+            String::from_utf8_lossy(&before_sub)
+        );
+
+        let pkg_dir = dir.join("pkg");
+        let err_repo_rel =
+            crate::git_write::unstage_files(&pkg_dir, &["pkg/moved".to_string()], false)
+                .await
+                .expect_err("cross-subdir rename unstage from pkg MUST fail atomically");
+        assert!(
+            matches!(
+                err_repo_rel,
+                crate::git_write::GitWriteError::InvalidInput(_)
+            ),
+            "expected InvalidInput for out-of-scope rename source, got: {err_repo_rel:?}"
+        );
+        let err_cwd_rel = crate::git_write::unstage_files(&pkg_dir, &["moved".to_string()], false)
+            .await
+            .expect_err("non-repo-rel path from pkg MUST also fail without touching index");
+        assert!(matches!(
+            err_cwd_rel,
+            crate::git_write::GitWriteError::InvalidPath { .. }
+        ));
+        let after_sub_err = run_git(&dir, &["diff", "--cached", "--name-status", "-z"]);
+        assert_eq!(
+            after_sub_err, before_sub,
+            "failed cross-subdir rename unstage MUST NOT modify index"
+        );
+
+        // Verify `inspect_git_status` sets exact `repo_prefix` for root (`Some("")`) vs subdir (`Some("pkg")`).
+        let root_snap = inspect_git_status(&dir).await;
+        assert_eq!(root_snap.repo_prefix.as_deref(), Some(""));
+        let pkg_snap = inspect_git_status(&pkg_dir).await;
+        assert_eq!(pkg_snap.repo_prefix.as_deref(), Some("pkg"));
+
+        // Control: rename ENTIRELY inside `pkg` (`pkg/a -> pkg/b`) CAN be atomically unstaged from `pkg`!
+        run_git(&dir, &["mv", "pkg/a", "pkg/b"]);
+        crate::git_write::unstage_files(&pkg_dir, &["pkg/b".to_string()], false)
+            .await
+            .expect("in-scope rename inside pkg must unstage atomically");
+        let after_in_scope = run_git(&dir, &["diff", "--cached", "--name-status", "-z"]);
+        assert_eq!(
+            after_in_scope, before_sub,
+            "in-scope pkg/a -> pkg/b unstage must cleanly remove both without touching R100 README.md -> pkg/moved or A tail"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strip_single_line_ending_preserves_literal_cr_and_lf_in_posix_repo_dirs() {
+        // R16-N1: POSIX repo directories ending with a literal `\r` or `\n` MUST resolve their
+        // top-level root cleanly and support diff + stage without false "outside repo root" errors.
+        for (label, suffix) in [("cr", "\r"), ("lf", "\n")] {
+            let root = std::env::temp_dir().join(format!("orbit_ctrl_{label}_{}", Uuid::new_v4()));
+            let repo = root.join(format!("repo{suffix}"));
+            tokio::fs::create_dir_all(&repo)
+                .await
+                .expect("mkdir repo with literal cr/lf");
+
+            let run_git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .expect("run git");
+                assert!(
+                    out.status.success(),
+                    "git {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            run_git(&["init", "-b", "main"]);
+            run_git(&["config", "user.email", "test@orbit.local"]);
+            run_git(&["config", "user.name", "Orbit Test"]);
+            tokio::fs::write(repo.join("f"), "base\n")
+                .await
+                .expect("write base");
+            run_git(&["add", "--", "f"]);
+            run_git(&["commit", "-m", "init"]);
+            tokio::fs::write(repo.join("f"), format!("updated-{label}\n"))
+                .await
+                .expect("edit f");
+
+            let diff = compute_git_diff(&repo, Some("f"), false)
+                .await
+                .expect("diff on cr/lf repo");
+            assert!(diff.contains(&format!("+updated-{label}")));
+
+            let snap = inspect_git_status(&repo).await;
+            assert!(snap.is_git_repo);
+            assert_eq!(snap.repo_prefix.as_deref(), Some(""));
+
+            crate::git_write::stage_files(&repo, &["f".to_string()], false)
+                .await
+                .expect("stage inside repo with literal trailing cr/lf");
+            let staged_diff = compute_git_diff(&repo, Some("f"), true)
+                .await
+                .expect("staged diff on cr/lf repo");
+            assert!(staged_diff.contains(&format!("+updated-{label}")));
+
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn posix_symlink_nested_vendor_and_trailing_space_repos_emit_authoritative_repo_root() {
+        let base = std::env::temp_dir().join(format!(
+            "orbit-git-repo-root-identity-{}",
+            Uuid::new_v4().simple()
+        ));
+        let real_repo = base.join("repo");
+        let pkg_dir = real_repo.join("pkg");
+        let vendor_repo = real_repo.join("vendor");
+        let spaced_repo = base.join("repo ");
+        let symlink_repo = base.join("repo_link");
+
+        tokio::fs::create_dir_all(&pkg_dir)
+            .await
+            .expect("mkdir pkg");
+        tokio::fs::create_dir_all(&vendor_repo)
+            .await
+            .expect("mkdir vendor");
+        tokio::fs::create_dir_all(&spaced_repo)
+            .await
+            .expect("mkdir spaced");
+        std::os::unix::fs::symlink(&real_repo, &symlink_repo).expect("symlink repo_link -> repo");
+
+        let init_repo = |dir: &Path, body: &str| {
+            let run = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .expect("run git");
+                assert!(
+                    out.status.success(),
+                    "git {:?} failed in {:?}: {}",
+                    args,
+                    dir,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            run(&["init", "-b", "main"]);
+            run(&["config", "user.email", "test@orbit.local"]);
+            run(&["config", "user.name", "Orbit Test"]);
+            std::fs::write(dir.join("f"), body).expect("write f");
+            run(&["add", "--", "f"]);
+            run(&["commit", "-m", "init"]);
+        };
+
+        init_repo(&real_repo, "outer-base\n");
+        std::fs::write(real_repo.join(".gitignore"), "vendor/\n").expect("gitignore vendor");
+        init_repo(&vendor_repo, "vendor-base\n");
+        init_repo(&spaced_repo, "spaced-base\n");
+
+        let real_status = inspect_git_status(&real_repo).await;
+        let pkg_status = inspect_git_status(&pkg_dir).await;
+        let link_status = inspect_git_status(&symlink_repo).await;
+        let link_pkg_status = inspect_git_status(&symlink_repo.join("pkg")).await;
+        let vendor_status = inspect_git_status(&vendor_repo).await;
+        let spaced_status = inspect_git_status(&spaced_repo).await;
+
+        assert!(real_status.repo_root.is_some());
+        assert_eq!(real_status.repo_prefix.as_deref(), Some(""));
+        assert_eq!(
+            link_status.repo_root, real_status.repo_root,
+            "R18-P1-2: POSIX directory symlink MUST resolve to exact same canonical repo_root"
+        );
+        assert_eq!(link_status.repo_prefix.as_deref(), Some(""));
+        assert_eq!(pkg_status.repo_root, real_status.repo_root);
+        assert_eq!(pkg_status.repo_prefix.as_deref(), Some("pkg"));
+        assert_eq!(link_pkg_status.repo_root, real_status.repo_root);
+        assert_eq!(link_pkg_status.repo_prefix.as_deref(), Some("pkg"));
+
+        assert!(vendor_status.repo_root.is_some());
+        assert_ne!(
+            vendor_status.repo_root, real_status.repo_root,
+            "R18-P1-1: independent nested vendor repo MUST carry its own distinct repo_root"
+        );
+        assert_eq!(vendor_status.repo_prefix.as_deref(), Some(""));
+
+        assert!(spaced_status.repo_root.is_some());
+        assert_ne!(
+            spaced_status.repo_root, real_status.repo_root,
+            "trailing-space sibling repo MUST carry its own distinct repo_root"
+        );
+        assert_eq!(spaced_status.repo_prefix.as_deref(), Some(""));
+
+        let (link_scope_root, link_scope_prefix) = resolve_git_scope(&symlink_repo)
+            .await
+            .expect("resolve symlink scope");
+        assert_eq!(
+            Some(link_scope_root.to_string_lossy().into_owned()),
+            real_status.repo_root
+        );
+        assert_eq!(link_scope_prefix, None);
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

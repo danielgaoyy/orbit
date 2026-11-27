@@ -5,7 +5,9 @@ use orbit_client_core::stage::{
     AgentStageDeltaView, PendingPlanApprovalView, StageTurnView, describe_tool_step,
     process_timeline_turns_slice,
 };
-use orbit_client_core::viewmodel::{FleetOverviewView, HostDetailView, TimelineItemView};
+use orbit_client_core::viewmodel::{
+    FleetOverviewView, HostDetailView, TimelineItemView, project_git_review_for_mode,
+};
 use orbit_protocol::{
     AgentMessageDeliveryStatus, AgentMessageKind, BackgroundTaskInfo, GuardianAssessment,
     GuardianDecision, GuardianRiskLevel, PermissionCheckpointRef, PlanApprovalPayload,
@@ -250,6 +252,12 @@ pub(super) fn contracts() -> Result<Vec<(String, Value)>, Box<dyn Error>> {
                 cursor_col: 0,
                 rows_data: vec![],
             })?,
+        ),
+        (
+            "GitReviewView".into(),
+            to_value(project_git_review_for_mode(
+                1, HOST, "/repo", None, "", None, false, 0,
+            ))?,
         ),
     ];
     for item in timeline_examples() {

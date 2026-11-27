@@ -8011,13 +8011,14 @@ public struct FfiGitReview: Equatable, Hashable {
     public var ahead: UInt32
     public var behind: UInt32
     public var selectedPath: String?
+    public var statusReverifyPending: Bool
     public var rawDiff: String
     public var changedFiles: [FfiGitFileEntry]
     public var diffFiles: [FfiDiffFile]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(revision: UInt64, hostId: String, cwd: String, isGitRepo: Bool, branch: String?, upstream: String?, ahead: UInt32, behind: UInt32, selectedPath: String?, rawDiff: String, changedFiles: [FfiGitFileEntry], diffFiles: [FfiDiffFile]) {
+    public init(revision: UInt64, hostId: String, cwd: String, isGitRepo: Bool, branch: String?, upstream: String?, ahead: UInt32, behind: UInt32, selectedPath: String?, statusReverifyPending: Bool, rawDiff: String, changedFiles: [FfiGitFileEntry], diffFiles: [FfiDiffFile]) {
         self.revision = revision
         self.hostId = hostId
         self.cwd = cwd
@@ -8027,6 +8028,7 @@ public struct FfiGitReview: Equatable, Hashable {
         self.ahead = ahead
         self.behind = behind
         self.selectedPath = selectedPath
+        self.statusReverifyPending = statusReverifyPending
         self.rawDiff = rawDiff
         self.changedFiles = changedFiles
         self.diffFiles = diffFiles
@@ -8057,6 +8059,7 @@ public struct FfiConverterTypeFfiGitReview: FfiConverterRustBuffer {
                 ahead: FfiConverterUInt32.read(from: &buf), 
                 behind: FfiConverterUInt32.read(from: &buf), 
                 selectedPath: FfiConverterOptionString.read(from: &buf), 
+                statusReverifyPending: FfiConverterBool.read(from: &buf), 
                 rawDiff: FfiConverterString.read(from: &buf), 
                 changedFiles: FfiConverterSequenceTypeFfiGitFileEntry.read(from: &buf), 
                 diffFiles: FfiConverterSequenceTypeFfiDiffFile.read(from: &buf)
@@ -8073,6 +8076,7 @@ public struct FfiConverterTypeFfiGitReview: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.ahead, into: &buf)
         FfiConverterUInt32.write(value.behind, into: &buf)
         FfiConverterOptionString.write(value.selectedPath, into: &buf)
+        FfiConverterBool.write(value.statusReverifyPending, into: &buf)
         FfiConverterString.write(value.rawDiff, into: &buf)
         FfiConverterSequenceTypeFfiGitFileEntry.write(value.changedFiles, into: &buf)
         FfiConverterSequenceTypeFfiDiffFile.write(value.diffFiles, into: &buf)

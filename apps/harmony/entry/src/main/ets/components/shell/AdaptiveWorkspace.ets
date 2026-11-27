@@ -7,7 +7,28 @@ import {
 } from '@kit.UIDesignKit';
 import { HostCardDto, basenameOfPath, formatCompactTopBarConnectionLabel } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { orbitRuntime } from '../../model/OrbitRuntime';
 import { orbitLogWarn } from '../../model/OrbitLogger';
+import {
+  ORBIT_KEYCODE_ALT_LEFT,
+  ORBIT_KEYCODE_ALT_RIGHT,
+  ORBIT_KEYCODE_BACKSLASH,
+  ORBIT_KEYCODE_CTRL_LEFT,
+  ORBIT_KEYCODE_CTRL_RIGHT,
+  ORBIT_KEYCODE_K,
+  ORBIT_KEYCODE_META_LEFT,
+  ORBIT_KEYCODE_META_RIGHT,
+  ORBIT_KEYCODE_N,
+  ORBIT_KEYCODE_SHIFT_LEFT,
+  ORBIT_KEYCODE_SHIFT_RIGHT,
+  ORBIT_KEYCODE_T,
+  ORBIT_KEYCODE_W,
+  OrbitShellLayoutGeometry,
+  OrbitShellStore,
+  OrbitShortcutAction,
+  OrbitShortcutContext,
+  resolveOrbitKeyboardShortcut
+} from '../../model/stores/OrbitShellStore';
 import {
   OrbitTokens,
   orbitTextMeta,
@@ -19,30 +40,37 @@ import {
   resolveSelectedHost
 } from '../common/OrbitCommonControls';
 import { FleetSidebar } from './FleetSidebar';
+import { OrbitModalContentRouter } from './OrbitModalContentRouter';
 import { PersonalOverviewView } from './PersonalOverviewView';
+import { OrbitSidePanelContainer } from '../panel/OrbitSidePanelContainer';
+import { SubagentCrewMiniDock } from '../panel/SubagentCrewMiniDock';
 import { StreamStage } from '../stage/StreamStage';
 import { PlanReviewCard } from '../stage/PlanReviewCard';
 import { StickyDecisionDock } from '../stage/StickyDecisionDock';
 import { OmniComposer } from '../composer/OmniComposer';
-import { ContextPickerSheet } from '../composer/ContextPickerSheet';
-import { GitDiffSheet } from '../sheets/GitDiffSheet';
-import { OrbitTerminalView } from '../sheets/OrbitTerminalView';
-import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
-import { DirectoryBrowserSheet } from '../sheets/DirectoryBrowserSheet';
-import { AutomationsSheet } from '../sheets/AutomationsSheet';
-import { WorkspaceBoardSheet } from '../sheets/WorkspaceBoardSheet';
-import { SideQuestionSheet } from '../sheets/SideQuestionSheet';
-import { ArchivedSessionsSheet } from '../sheets/ArchivedSessionsSheet';
-import { FileExplorerSheet } from '../sheets/FileExplorerSheet';
-import { GlobalSearchSheet } from '../sheets/GlobalSearchSheet';
-import { PersonalRouterMeshSheet } from '../sheets/PersonalRouterMeshSheet';
-import { ExportTranscriptSheet } from '../sheets/ExportTranscriptSheet';
-import { SubagentTimelineSheet } from '../sheets/SubagentTimelineSheet';
 
+/**
+ * Three-form-factor responsive workspace shell + single-modal router:
+ * - `sm` (`< 680 vp`): Overlay sidebar drawer + bottom-Sheet side panel (with unread dot on auto open)
+ * - `md` (`680–1023 vp`): Embed sidebar (260 vp, auto-yields when right panel opens) + inline right panel (320–420 vp), Stage >= 360 vp
+ * - `lg` (`>= 1024 vp`): Three panes side-by-side with persisted draggable sidebar (240–360 vp) and right panel (320–680 vp), Stage >= 360 vp
+ * - Half-folded hover: `FolderStack` (upper Stage, lower Composer, honoring `reducedMotion`)
+ * - Single `bindSheet` for `shellStore.modalRoute` + single unified `OrbitSidePanelContainer`
+ * - External keyboard shortcuts on `md`/`lg`
+ */
 @ComponentV2
 export struct AdaptiveWorkspace {
-  @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private store: OrbitHarmonyStore = orbitRuntime();
+  @Local private shellStore: OrbitShellStore = orbitRuntime().shellStore;
   private mainNavStack: NavPathStack = new NavPathStack();
+  @Local private isDraggingSidebarWidth: boolean = false;
+  private sidebarDragStartWidthVp: number = 280;
+  private pressedCtrl: boolean = false;
+  private pressedMeta: boolean = false;
+  private pressedShift: boolean = false;
+  private pressedAlt: boolean = false;
+  private lastShortcutSig: string = '';
+  private lastShortcutTs: number = 0;
 
   @Monitor('store.toastRevision')
   onToastRevisionChanged(_mon: IMonitor): void {
@@ -62,33 +90,21 @@ export struct AdaptiveWorkspace {
     }
   }
 
-  private isPhoneLayout(): boolean {
-    if (this.store.foldPosture === 'folded') {
-      return true;
-    }
-    if (this.store.foldPosture === 'expanded' && this.store.windowWidthVp >= 540) {
-      return false;
-    }
-    return this.store.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN;
+  @Computed
+  get shellLayout(): OrbitShellLayoutGeometry {
+    return this.store.shellStore.resolveLayout(this.store.sidePanelStore.isOpen);
+  }
+
+  private isCompactLayout(): boolean {
+    return this.store.shellStore.breakpoint === 'sm';
   }
 
   private isHalfFoldedHover(): boolean {
-    return this.store.isFoldableDevice && this.store.foldPosture === 'half_folded';
+    return this.store.shellStore.isHalfFoldedHover;
   }
 
   private isShowingOverview(): boolean {
     return this.hasPairedHosts() && this.store.showGlobalOverview;
-  }
-
-  private resolvedSideBarWidth(): number {
-    if (this.isPhoneLayout()) {
-      return Math.min(320, Math.max(280, Math.floor(this.store.windowWidthVp * 0.82)));
-    }
-    return OrbitTokens.SIDEBAR_FOLD_WIDTH;
-  }
-
-  private canShowInlineDiff(): boolean {
-    return this.store.canShowInlineDiffInspector();
   }
 
   private hasPairedHosts(): boolean {
@@ -104,7 +120,7 @@ export struct AdaptiveWorkspace {
   }
 
   private hasActiveConversation(): boolean {
-    return this.hasPairedHosts() && this.store.currentAgent !== null;
+    return this.hasPairedHosts() && this.store.currentAgent !== null && !this.store.isNewSessionDraft;
   }
 
   private isDraftTitle(): boolean {
@@ -144,7 +160,12 @@ export struct AdaptiveWorkspace {
     if (this.store.activeCwd.length > 0 && this.store.activeCwd !== '~') {
       return basenameOfPath(this.store.activeCwd);
     }
-    return '~';
+    const host = this.selectedHost();
+    if (host !== null) {
+      const name = host.display_name.trim();
+      return name.length > 0 ? name : host.host_id;
+    }
+    return 'Select project';
   }
 
   private topStatusDotColor(): ResourceColor {
@@ -164,7 +185,7 @@ export struct AdaptiveWorkspace {
       const target = isMultiHost ? hostName : repo;
       return `${this.topBarConnectionLabel()} · ${target}`;
     }
-    if (isMultiHost) {
+    if (isMultiHost && repo !== hostName) {
       return `${hostName} / ${repo}`;
     }
     const branch = this.store.resolveWorkspaceBranch(this.store.activeCwd);
@@ -192,88 +213,238 @@ export struct AdaptiveWorkspace {
     this.store.browseDirectory(this.store.activeCwd === '~' ? null : this.store.activeCwd);
   }
 
-  private buildSheetOptions(
-    detents: [(SheetSize | Length), (SheetSize | Length)?, (SheetSize | Length)?],
-    onClose: () => void,
-    bgColor?: ResourceColor
-  ): SheetOptions {
+  private modalSheetDetents(): [(SheetSize | Length), (SheetSize | Length)?, (SheetSize | Length)?] {
+    const kind = this.store.shellStore.modalRoute?.kind;
+    if (kind === 'host_settings' || kind === 'image_viewer' || kind === 'diagram_viewer') {
+      return [SheetSize.LARGE];
+    }
+    if (kind === 'work_picker' || kind === 'archived') {
+      return [SheetSize.MEDIUM, SheetSize.LARGE];
+    }
+    return [SheetSize.LARGE, SheetSize.MEDIUM];
+  }
+
+  private modalSheetBgColor(): ResourceColor {
+    const kind = this.store.shellStore.modalRoute?.kind;
+    if (kind === 'image_viewer') {
+      return this.store.palette.scrim;
+    }
+    if (kind === 'global_search' || kind === 'export_transcript' || kind === 'diagram_viewer') {
+      return this.store.palette.canvas;
+    }
+    return this.store.palette.drawer;
+  }
+
+  private closeCurrentPanelTabShortcut(): void {
+    if (!this.store.isSidePanelActuallyVisible()) {
+      return;
+    }
+    const activeId = this.store.sidePanelStore.activeTabId;
+    if (activeId.length > 0) {
+      this.store.sidePanelStore.close(activeId);
+    } else if (this.store.sidePanelStore.isOpen) {
+      this.store.sidePanelStore.dismissPanel();
+    }
+  }
+
+  private buildShortcutContext(): OrbitShortcutContext {
     return {
-      detents: detents,
-      dragBar: true,
-      showClose: false,
-      backgroundColor: bgColor !== undefined ? bgColor : this.store.palette.drawer,
-      onDisappear: onClose
+      breakpoint: this.store.shellStore.breakpoint,
+      isModalOpen: this.store.shellStore.isModalSheetPresented,
+      isTextInputFocused: this.store.shellStore.isTextInputFocused,
+      isTerminalFocused: this.store.shellStore.isTerminalFocused,
+      isSidePanelVisible: this.store.isSidePanelActuallyVisible()
     };
   }
 
-  @Builder
-  private buildGitDiffSheet() {
-    GitDiffSheet({ isEmbeddedPane: false })
+  private executeShortcutAction(action: OrbitShortcutAction): boolean {
+    if (action === 'none') {
+      return false;
+    }
+    const now = Date.now();
+    if (this.lastShortcutSig === action && now - this.lastShortcutTs < 45) {
+      return true;
+    }
+    this.lastShortcutSig = action;
+    this.lastShortcutTs = now;
+    if (action === 'toggle_sidebar') {
+      this.store.toggleSidebar();
+      return true;
+    }
+    if (action === 'open_launchpad') {
+      this.store.sidePanelStore.openLaunchpad();
+      return true;
+    }
+    if (action === 'reopen_last_tab') {
+      this.store.sidePanelStore.reopenLast();
+      return true;
+    }
+    if (action === 'close_panel_tab') {
+      this.closeCurrentPanelTabShortcut();
+      return true;
+    }
+    if (action === 'global_search') {
+      this.store.openGlobalSearch();
+      return true;
+    }
+    if (action === 'new_session') {
+      this.store.startNewSessionDraft();
+      return true;
+    }
+    return false;
+  }
+
+  private dispatchAnchoredCtrlShortcut(keyCode: number, hasShift: boolean): void {
+    const action = resolveOrbitKeyboardShortcut(
+      keyCode,
+      true,
+      false,
+      hasShift,
+      false,
+      this.buildShortcutContext()
+    );
+    this.executeShortcutAction(action);
+  }
+
+  private queryModifierState(event: KeyEvent, modName: string, fallback: boolean): boolean {
+    if (event.getModifierKeyState !== undefined) {
+      try {
+        return event.getModifierKeyState([modName]);
+      } catch (_err) {
+        return fallback;
+      }
+    }
+    return fallback;
+  }
+
+  private handleWorkspaceKeyEvent(event: KeyEvent): void {
+    const kc = event.keyCode;
+    const isDown = event.type === KeyType.Down;
+    if (kc === ORBIT_KEYCODE_CTRL_LEFT || kc === ORBIT_KEYCODE_CTRL_RIGHT) {
+      this.pressedCtrl = isDown;
+      return;
+    }
+    if (kc === ORBIT_KEYCODE_META_LEFT || kc === ORBIT_KEYCODE_META_RIGHT) {
+      this.pressedMeta = isDown;
+      return;
+    }
+    if (kc === ORBIT_KEYCODE_SHIFT_LEFT || kc === ORBIT_KEYCODE_SHIFT_RIGHT) {
+      this.pressedShift = isDown;
+      return;
+    }
+    if (kc === ORBIT_KEYCODE_ALT_LEFT || kc === ORBIT_KEYCODE_ALT_RIGHT) {
+      this.pressedAlt = isDown;
+      return;
+    }
+    if (!isDown) {
+      return;
+    }
+
+    const hasCtrl = this.queryModifierState(event, 'Ctrl', this.pressedCtrl);
+    const hasShift = this.queryModifierState(event, 'Shift', this.pressedShift);
+    const hasAlt = this.queryModifierState(event, 'Alt', this.pressedAlt);
+    const hasMeta = event.metaKey === 1 || this.pressedMeta;
+
+    const action = resolveOrbitKeyboardShortcut(
+      kc,
+      hasCtrl,
+      hasMeta,
+      hasShift,
+      hasAlt,
+      this.buildShortcutContext()
+    );
+    if (this.executeShortcutAction(action)) {
+      event.stopPropagation();
+    }
+  }
+
+  private sheetPresentationIds(): number[] {
+    return this.shellStore.activeSheetPresentationId > 0
+      ? [this.shellStore.activeSheetPresentationId]
+      : [];
+  }
+
+  private lightboxPresentationIds(): number[] {
+    return this.shellStore.activeLightboxPresentationId > 0
+      ? [this.shellStore.activeLightboxPresentationId]
+      : [];
   }
 
   @Builder
-  private buildPtyTerminalSheet() {
-    OrbitTerminalView()
+  private buildSingleModalSheet() {
+    ForEach(
+      this.sheetPresentationIds(),
+      (sheetId: number) => {
+        OrbitModalContentRouter({
+          route: this.shellStore.modalRoute,
+          presentationId: sheetId,
+          onClose: (id: number) => {
+            this.shellStore.closeModalByPresentationId(id);
+          },
+          onNativeAppear: (id: number) => {
+            this.shellStore.onModalSheetAppear(id);
+          },
+          onNativeDisappear: (id: number) => {
+            this.shellStore.onModalSheetDisappear(id);
+          }
+        })
+      },
+      (sheetId: number): string => `sheet_${sheetId}`
+    )
   }
 
   @Builder
-  private buildContextPickerSheet() {
-    ContextPickerSheet()
-  }
+  private renderKeyboardShortcutAnchors() {
+    // Dedicated one-shortcut-per-node host active on md/lg external keyboards for Ctrl combos
+    // (paired with root `onKeyEvent` handling both Meta and Ctrl with full focus/modal/panel guards).
+    if (!this.isCompactLayout()) {
+      Row() {
+        Blank()
+          .width(0)
+          .height(0)
+          .keyboardShortcut('\\', [ModifierKey.CTRL], () => {
+            this.dispatchAnchoredCtrlShortcut(ORBIT_KEYCODE_BACKSLASH, false);
+          })
 
-  @Builder
-  private buildHostSettingsSheet() {
-    HostSettingsSheet()
-  }
+        Blank()
+          .width(0)
+          .height(0)
+          .keyboardShortcut('t', [ModifierKey.CTRL], () => {
+            this.dispatchAnchoredCtrlShortcut(ORBIT_KEYCODE_T, false);
+          })
 
-  @Builder
-  private buildDirectoryBrowserSheet() {
-    DirectoryBrowserSheet()
-  }
+        Blank()
+          .width(0)
+          .height(0)
+          .keyboardShortcut('t', [ModifierKey.CTRL, ModifierKey.SHIFT], () => {
+            this.dispatchAnchoredCtrlShortcut(ORBIT_KEYCODE_T, true);
+          })
 
-  @Builder
-  private buildAutomationsSheet() {
-    AutomationsSheet()
-  }
+        Blank()
+          .width(0)
+          .height(0)
+          .keyboardShortcut('w', [ModifierKey.CTRL], () => {
+            this.dispatchAnchoredCtrlShortcut(ORBIT_KEYCODE_W, false);
+          })
 
-  @Builder
-  private buildWorkspaceBoardSheet() {
-    WorkspaceBoardSheet()
-  }
+        Blank()
+          .width(0)
+          .height(0)
+          .keyboardShortcut('k', [ModifierKey.CTRL], () => {
+            this.dispatchAnchoredCtrlShortcut(ORBIT_KEYCODE_K, false);
+          })
 
-  @Builder
-  private buildSideQuestionSheet() {
-    SideQuestionSheet()
-  }
-
-  @Builder
-  private buildArchivedSessionsSheet() {
-    ArchivedSessionsSheet()
-  }
-
-  @Builder
-  private buildFileExplorerSheet() {
-    FileExplorerSheet()
-  }
-
-  @Builder
-  private buildGlobalSearchSheet() {
-    GlobalSearchSheet()
-  }
-
-  @Builder
-  private buildPersonalRouterMeshSheet() {
-    PersonalRouterMeshSheet()
-  }
-
-  @Builder
-  private buildExportTranscriptSheet() {
-    ExportTranscriptSheet()
-  }
-
-  @Builder
-  private buildSubagentTimelineSheet() {
-    SubagentTimelineSheet()
+        Blank()
+          .width(0)
+          .height(0)
+          .keyboardShortcut('n', [ModifierKey.CTRL], () => {
+            this.dispatchAnchoredCtrlShortcut(ORBIT_KEYCODE_N, false);
+          })
+      }
+      .width(0)
+      .height(0)
+      .hitTestBehavior(HitTestMode.None)
+    }
   }
 
   @Builder
@@ -335,26 +506,13 @@ export struct AdaptiveWorkspace {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: this.canShowInlineDiff() && this.store.showInlineDiffInspector
-            ? 'Hide Diff Review'
-            : 'Diff Review',
+          content: 'Diff Review',
           labelInfo: this.diffFileSubtitle()
         })
           .labelFontColor(this.store.palette.fgMuted)
           .onClick(() => {
             this.store.toggleTopBarGitDiff();
           })
-
-        if (this.canShowInlineDiff() && this.store.showInlineDiffInspector) {
-          MenuItem({
-            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_up_left_and_arrow_down_right'))
-              .fontColor([this.store.palette.iconPrimary]),
-            content: 'Full Diff'
-          })
-            .onClick(() => {
-              this.store.openFullGitDiffSheet();
-            })
-        }
 
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
@@ -392,6 +550,15 @@ export struct AdaptiveWorkspace {
         })
           .onClick(() => {
             this.store.openAutomationsSheet();
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.house'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Briefing Panel'
+        })
+          .onClick(() => {
+            this.store.openBriefingPanelTab();
           })
 
         MenuItem({
@@ -464,7 +631,9 @@ export struct AdaptiveWorkspace {
   private renderHdsTitleBarContent() {
     Row({ space: OrbitTokens.SPACE_SM }) {
       Badge({
-        count: (this.isPhoneLayout() || this.store.isSidebarCollapsed) ? this.store.totalPendingApprovals : 0,
+        count: (this.isCompactLayout() || this.store.shellStore.isSidebarCollapsed)
+          ? this.store.totalPendingApprovals
+          : 0,
         style: {
           badgeColor: this.store.palette.statusWarning,
           badgeSize: 8
@@ -476,7 +645,7 @@ export struct AdaptiveWorkspace {
             .fontSize(20)
             .renderingStrategy(SymbolRenderingStrategy.SINGLE)
             .fontColor([
-              !this.isPhoneLayout() && this.store.isSidebarCollapsed
+              !this.isCompactLayout() && this.store.shellStore.isSidebarCollapsed
                 ? this.store.palette.iconSecondary
                 : this.store.palette.iconPrimary
             ])
@@ -486,9 +655,9 @@ export struct AdaptiveWorkspace {
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
         .accessibilityText(
-          this.isPhoneLayout()
-            ? (this.store.sidebarOpen ? 'Close navigation drawer' : 'Open navigation drawer')
-            : (this.store.isSidebarCollapsed ? 'Expand fleet sidebar' : 'Collapse fleet sidebar')
+          this.isCompactLayout()
+            ? (this.store.shellStore.sidebarOpen ? 'Close navigation drawer' : 'Open navigation drawer')
+            : (this.store.shellStore.isSidebarCollapsed ? 'Expand fleet sidebar' : 'Collapse fleet sidebar')
         )
         .onClick(() => {
           dismissHarmonyKeyboard(this.getUIContext());
@@ -571,7 +740,51 @@ export struct AdaptiveWorkspace {
       }
 
       if (this.hasPairedHosts()) {
-        Row({ space: OrbitTokens.SPACE_SM }) {
+        Row({ space: OrbitTokens.SPACE_XS }) {
+          if (this.hasActiveConversation()) {
+            SubagentCrewMiniDock({
+              hostId: this.store.selectedHostId,
+              rootAgentId: this.store.selectedAgentId
+            })
+          }
+
+          // Side Panel toggle with unseen-tab red dot indicator (critical for sm auto-open)
+          Badge({
+            count: this.store.sidePanelStore.activeSnapshot.unseenTabIds.length,
+            style: {
+              badgeColor: this.store.palette.unreadBadge,
+              badgeSize: 8
+            },
+            position: BadgePosition.RightTop
+          }) {
+            Button({ type: ButtonType.Circle, stateEffect: true }) {
+              SymbolGlyph($r('sys.symbol.square_grid_2x2'))
+                .fontSize(18)
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .fontColor([
+                  this.store.sidePanelStore.isOpen
+                    ? this.store.palette.accentPrimary
+                    : this.store.palette.iconPrimary
+                ])
+            }
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding(0)
+            .backgroundColor(
+              this.store.sidePanelStore.isOpen
+                ? this.store.palette.accentPrimarySoft
+                : this.store.palette.subtleSurface
+            )
+            .accessibilityText(
+              this.store.sidePanelStore.isOpen ? 'Close side panel' : 'Open side panel'
+            )
+            .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+              this.store.sidePanelStore.togglePanel();
+              this.store.triggerHaptic(8);
+            })
+          }
+
           Button({ type: ButtonType.Circle, stateEffect: true }) {
             SymbolGlyph($r('sys.symbol.more'))
               .fontSize(20)
@@ -623,7 +836,10 @@ export struct AdaptiveWorkspace {
     }
     .width('100%')
     .height(OrbitTokens.TOP_BAR_HEIGHT)
-    .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+    .padding({
+      left: OrbitTokens.SPACE_LG,
+      right: this.store.shellStore.resolvedTopBarRightPaddingVp()
+    })
     .alignItems(VerticalAlign.Center)
     .parallelGesture(
       TapGesture({ count: 1 }).onAction(() => {
@@ -637,20 +853,71 @@ export struct AdaptiveWorkspace {
   build() {
     Stack() {
       SideBarContainer(
-        this.isPhoneLayout()
+        this.isCompactLayout()
           ? SideBarContainerType.Overlay
           : SideBarContainerType.Embed
       ) {
-        FleetSidebar()
+        // Left Pane: FleetSidebar + lg draggable right-edge resize sash (240–360 vp persisted)
+        Row({ space: 0 }) {
+          Column() {
+            FleetSidebar()
+          }
+          .layoutWeight(1)
+          .height('100%')
 
+          if (this.store.shellStore.breakpoint === 'lg') {
+            Stack({ alignContent: Alignment.Center }) {
+              Column()
+                .width(this.isDraggingSidebarWidth ? 2 : OrbitTokens.HAIRLINE)
+                .height('100%')
+                .backgroundColor(
+                  this.isDraggingSidebarWidth
+                    ? this.store.palette.borderStrong
+                    : this.store.palette.hairline
+                )
+            }
+            .width(6)
+            .height('100%')
+            .backgroundColor(Color.Transparent)
+            .accessibilityText('Resize fleet sidebar')
+            .gesture(
+              PanGesture({ direction: PanDirection.Horizontal, distance: 2 })
+                .onActionStart(() => {
+                  this.isDraggingSidebarWidth = true;
+                  this.sidebarDragStartWidthVp = this.store.shellStore.sidebarWidthLgVp;
+                })
+                .onActionUpdate((event: GestureEvent) => {
+                  this.store.shellStore.setSidebarWidthLgVp(
+                    this.sidebarDragStartWidthVp + event.offsetX,
+                    false
+                  );
+                })
+                .onActionEnd(() => {
+                  this.isDraggingSidebarWidth = false;
+                  this.store.shellStore.setSidebarWidthLgVp(
+                    this.store.shellStore.sidebarWidthLgVp,
+                    true
+                  );
+                })
+                .onActionCancel(() => {
+                  this.isDraggingSidebarWidth = false;
+                })
+            )
+          }
+        }
+        .width('100%')
+        .height('100%')
+
+        // Center + Right Pane Host
         Stack({ alignContent: Alignment.Top }) {
           HdsNavigation(this.mainNavStack) {
-            Row() {
+            Row({ space: 0 }) {
               if (this.isShowingOverview()) {
                 Column() {
                   PersonalOverviewView()
                 }
                 .layoutWeight(1)
+                .constraintSize({ minWidth: this.isCompactLayout() ? 0 : 360 })
                 .height('100%')
                 .backgroundColor(this.store.palette.canvas)
               } else if (this.isHalfFoldedHover()) {
@@ -679,10 +946,11 @@ export struct AdaptiveWorkspace {
                   .width('100%')
                   .alignItems(HorizontalAlign.Center)
                 }
-                .enableAnimation(true)
+                .enableAnimation(!this.store.shellStore.reducedMotion)
                 .autoHalfFold(true)
                 .alignContent(Alignment.Bottom)
                 .layoutWeight(1)
+                .constraintSize({ minWidth: this.isCompactLayout() ? 0 : 360 })
                 .height('100%')
                 .backgroundColor(this.store.palette.canvas)
               } else {
@@ -707,24 +975,22 @@ export struct AdaptiveWorkspace {
                   }
                 }
                 .layoutWeight(1)
+                .constraintSize({ minWidth: this.isCompactLayout() ? 0 : 360 })
                 .height('100%')
                 .alignItems(HorizontalAlign.Center)
                 .backgroundColor(this.store.palette.canvas)
               }
 
-              if (
-                this.canShowInlineDiff() &&
-                this.hasPairedHosts() &&
-                this.store.showInlineDiffInspector
-              ) {
-                Column() {
-                  GitDiffSheet({ isEmbeddedPane: true })
-                }
-                .width(OrbitTokens.DIFF_PANE_EXPANDED_WIDTH)
-                .height('100%')
-                .border({
-                  width: { left: OrbitTokens.HAIRLINE },
-                  color: this.store.palette.hairline
+              // Single unified Side Panel Container (sm or tight insets: bottom Sheet; md/lg: inline right pane)
+              if (this.hasPairedHosts()) {
+                OrbitSidePanelContainer({
+                  inlineWidthVp: this.shellLayout.sidePanelWidthVp,
+                  sidePanelInline: this.shellLayout.sidePanelInline,
+                  launchpadHostId: this.store.selectedHostId,
+                  launchpadAgentId: this.store.isNewSessionDraft
+                    ? null
+                    : (this.store.selectedAgentId.length > 0 ? this.store.selectedAgentId : null),
+                  launchpadCwd: this.store.activeCwd
                 })
               }
             }
@@ -765,14 +1031,19 @@ export struct AdaptiveWorkspace {
           .height('100%')
           .backgroundColor(this.store.palette.canvas)
 
-          if (this.isPhoneLayout() && this.store.sidebarOpen) {
+          // Compact Overlay Drawer Scrim — extends edge-to-edge across SYSTEM + CUTOUT safe areas
+          if (this.isCompactLayout() && this.store.shellStore.sidebarOpen) {
             Column()
               .width('100%')
               .height('100%')
               .backgroundColor(this.store.palette.scrim)
+              .expandSafeArea(
+                [SafeAreaType.SYSTEM, SafeAreaType.CUTOUT],
+                [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END]
+              )
               .onClick(() => {
                 dismissHarmonyKeyboard(this.getUIContext());
-                this.store.sidebarOpen = false;
+                this.store.shellStore.sidebarOpen = false;
               })
           }
         }
@@ -781,201 +1052,82 @@ export struct AdaptiveWorkspace {
         .backgroundColor(this.store.palette.canvas)
       }
       .showControlButton(false)
-      .showSideBar(
-        this.isPhoneLayout()
-          ? this.store.sidebarOpen
-          : !this.store.isSidebarCollapsed
-      )
-      .sideBarWidth(this.resolvedSideBarWidth())
-      .minSideBarWidth(240)
-      .maxSideBarWidth(340)
+      .showSideBar(this.shellLayout.sidebarVisible)
+      .sideBarWidth(this.shellLayout.sidebarWidthVp)
+      .minSideBarWidth(this.store.shellStore.resolvedMinSideBarWidth())
+      .maxSideBarWidth(this.store.shellStore.resolvedMaxSideBarWidth())
       .divider({
-        strokeWidth: this.isPhoneLayout() ? 0 : OrbitTokens.HAIRLINE,
+        strokeWidth: this.isCompactLayout() || this.store.shellStore.breakpoint === 'lg' ? 0 : OrbitTokens.HAIRLINE,
         color: this.store.palette.hairline
       })
       .onChange((isOpen: boolean) => {
-        if (this.isPhoneLayout()) {
-          this.store.sidebarOpen = isOpen;
+        if (this.isCompactLayout()) {
+          this.store.shellStore.sidebarOpen = isOpen;
         } else {
-          this.store.isSidebarCollapsed = !isOpen;
-          this.store.sidebarOpen = isOpen;
+          this.store.shellStore.isSidebarCollapsed = !isOpen;
+          this.store.shellStore.sidebarOpen = isOpen;
         }
       })
       .width('100%')
       .height('100%')
 
-      // Transparent pass-through bindSheet anchors with `$$` two-way binding
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showGitDiffSheet, this.buildGitDiffSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showGitDiffSheet = false;
-          },
-          this.store.palette.drawer
-        ))
+      // External keyboard shortcut host (md / lg)
+      this.renderKeyboardShortcutAnchors()
 
+      // Sole bindSheet in AdaptiveWorkspace: Standard Single Modal Sheet Router.
+      // Exit confirmation is routed EXCLUSIVELY through the mounted `OrbitModalContentRouter`'s
+      // immutable `presentationId` (`aboutToAppear` / `aboutToDisappear`) — NO secondary mutable
+      // `bindSheet.onDisappear` callback reading live state (R3-P1-8).
       Column()
         .width('100%')
         .height('100%')
         .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showPtySheet, this.buildPtyTerminalSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showPtySheet = false;
-          },
-          this.store.palette.drawer
-        ))
+        .bindSheet($$this.store.shellStore.isSheetModalPresented, this.buildSingleModalSheet(), {
+          detents: this.modalSheetDetents(),
+          dragBar: true,
+          showClose: false,
+          backgroundColor: this.modalSheetBgColor()
+        })
 
-      Column()
+      // True Full-Screen Edge-to-Edge Lightbox Host for `image_viewer` & `diagram_viewer` (P1-9 + R3-P1-8).
+      // Keyed by `activeLightboxPresentationId` via `ForEach` so consecutive image->diagram swaps
+      // mount a fresh `OrbitModalContentRouter` capturing the new immutable `presentationId`.
+      if (this.store.shellStore.isLightboxPresented && this.store.shellStore.modalRoute !== null) {
+        Column() {
+          ForEach(
+            this.lightboxPresentationIds(),
+            (lbId: number) => {
+              OrbitModalContentRouter({
+                route: this.store.shellStore.modalRoute,
+                presentationId: lbId,
+                onClose: (id: number) => {
+                  this.shellStore.closeModalByPresentationId(id);
+                }
+              })
+            },
+            (lbId: number): string => `lb_${lbId}`
+          )
+        }
         .width('100%')
         .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showContextPickerSheet, this.buildContextPickerSheet(), this.buildSheetOptions(
-          [SheetSize.MEDIUM, SheetSize.LARGE],
-          () => {
-            this.store.showContextPickerSheet = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showHostSettingsSheet, this.buildHostSettingsSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE],
-          () => {
-            this.store.showHostSettingsSheet = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showDirBrowser, this.buildDirectoryBrowserSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showDirBrowser = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showAutomationsSheet, this.buildAutomationsSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showAutomationsSheet = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showWorkspaceBoardSheet, this.buildWorkspaceBoardSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showWorkspaceBoardSheet = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showSideQuestionSheet, this.buildSideQuestionSheet(), this.buildSheetOptions(
-          [SheetSize.MEDIUM, SheetSize.LARGE],
-          () => {
-            this.store.showSideQuestionSheet = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showArchivedSessionsSheet, this.buildArchivedSessionsSheet(), this.buildSheetOptions(
-          [SheetSize.MEDIUM, SheetSize.LARGE],
-          () => {
-            this.store.showArchivedSessionsSheet = false;
-          },
-          this.store.palette.drawer
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showFileExplorerSheet, this.buildFileExplorerSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showFileExplorerSheet = false;
-          },
-          this.store.palette.canvas
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showGlobalSearchSheet, this.buildGlobalSearchSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showGlobalSearchSheet = false;
-          },
-          this.store.palette.canvas
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showRouterMeshSheet, this.buildPersonalRouterMeshSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showRouterMeshSheet = false;
-          },
-          this.store.palette.canvas
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showExportTranscriptSheet, this.buildExportTranscriptSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showExportTranscriptSheet = false;
-          },
-          this.store.palette.canvas
-        ))
-
-      Column()
-        .width('100%')
-        .height('100%')
-        .hitTestBehavior(HitTestMode.None)
-        .bindSheet($$this.store.showSubagentSheet, this.buildSubagentTimelineSheet(), this.buildSheetOptions(
-          [SheetSize.LARGE, SheetSize.MEDIUM],
-          () => {
-            this.store.showSubagentSheet = false;
-          },
-          this.store.palette.canvas
-        ))
+        .zIndex(999)
+        .backgroundColor(
+          this.store.shellStore.modalRoute.kind === 'image_viewer'
+            ? this.store.palette.scrim
+            : this.store.palette.canvas
+        )
+        .expandSafeArea(
+          [SafeAreaType.SYSTEM, SafeAreaType.CUTOUT],
+          [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END]
+        )
+      }
     }
     .width('100%')
     .height('100%')
     .backgroundColor(this.store.palette.canvas)
+    .onKeyEvent((event: KeyEvent) => {
+      this.handleWorkspaceKeyEvent(event);
+    })
     .onAreaChange((_oldArea: Area, newArea: Area) => {
       const w = Number(newArea.width);
       const h = Number(newArea.height);

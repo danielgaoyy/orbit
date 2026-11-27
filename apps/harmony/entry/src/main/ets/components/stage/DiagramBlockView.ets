@@ -38,14 +38,10 @@ export struct DiagramBlockView {
   @Local renderedView: RenderDiagramViewDto | null = null;
   @Local isLoading: boolean = true;
   @Local viewMode: string = 'diagram'; // 'diagram' | 'code'
-  @Local showFullSheet: boolean = false;
 
   private inlineWebCtrl: webview.WebviewController = new webview.WebviewController();
-  private fullWebCtrl: webview.WebviewController = new webview.WebviewController();
   private inlineAttached: boolean = false;
-  private fullAttached: boolean = false;
   private lastInlineHtml: string = '';
-  private lastFullHtml: string = '';
   private requestSeq: number = 0;
 
   @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
@@ -96,26 +92,6 @@ export struct DiagramBlockView {
     }
   }
 
-  private syncFullWebHtml(): void {
-    if (!this.fullAttached || this.renderedView === null || this.renderedView.svg === null) {
-      return;
-    }
-    const nextHtml = buildHarmonyDiagramHtml(
-      this.renderedView.svg,
-      this.store.palette.isDark,
-      true
-    );
-    if (nextHtml === this.lastFullHtml) {
-      return;
-    }
-    this.lastFullHtml = nextHtml;
-    try {
-      this.fullWebCtrl.loadData(nextHtml, 'text/html', 'UTF-8');
-    } catch (_err) {
-      // Ignore transient lifecycle errors
-    }
-  }
-
   @Computed
   get kindBaseTitle(): string {
     if (this.diagramKind === 'graphviz') {
@@ -154,63 +130,6 @@ export struct DiagramBlockView {
     const ratio = this.renderedView.width / Math.max(1, this.renderedView.height);
     const est = Math.round(320 / Math.max(0.45, Math.min(2.8, ratio)));
     return Math.max(130, Math.min(400, est));
-  }
-
-  @Builder
-  private renderFullSheetBuilder() {
-    Column() {
-      Row({ space: OrbitTokens.SPACE_SM }) {
-        Text(this.headerLabel)
-          .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Medium))
-          .layoutWeight(1)
-
-        OrbitCopyIconButton({
-          content: this.diagramSource,
-          toastLabel: 'Copied diagram source',
-          accessibilityLabel: 'Copy diagram source',
-          buttonSize: OrbitTokens.HIT_COMPACT
-        })
-
-        Button({ type: ButtonType.Circle, stateEffect: true }) {
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(16)
-            .fontColor([this.store.palette.iconPrimary])
-        }
-        .width(OrbitTokens.HIT_COMPACT)
-        .height(OrbitTokens.HIT_COMPACT)
-        .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Close diagram')
-        .onClick(() => {
-          this.showFullSheet = false;
-        })
-      }
-      .width('100%')
-      .padding({
-        left: OrbitTokens.SPACE_LG,
-        right: OrbitTokens.SPACE_MD,
-        top: OrbitTokens.SPACE_SM,
-        bottom: OrbitTokens.SPACE_SM
-      })
-      .border({
-        width: { bottom: OrbitTokens.HAIRLINE },
-        color: this.store.palette.hairline
-      })
-
-      Web({ src: '', controller: this.fullWebCtrl })
-        .javaScriptAccess(false)
-        .zoomAccess(true)
-        .backgroundColor(Color.Transparent)
-        .layoutWeight(1)
-        .width('100%')
-        .onControllerAttached(() => {
-          this.fullAttached = true;
-          this.lastFullHtml = '';
-          this.syncFullWebHtml();
-        })
-    }
-    .width('100%')
-    .height('100%')
-    .backgroundColor(this.store.palette.canvas)
   }
 
   build() {
@@ -276,8 +195,13 @@ export struct DiagramBlockView {
           .backgroundColor(Color.Transparent)
           .accessibilityText('Expand diagram')
           .onClick(() => {
-            this.showFullSheet = true;
-            this.store.triggerHaptic(6);
+            this.store.openDiagramViewerModal(
+              this.diagramKind,
+              this.diagramLanguage,
+              this.diagramSource,
+              this.renderedView?.svg ?? '',
+              this.headerLabel
+            );
           })
         } else if (this.renderedView !== null && this.renderedView.error !== null) {
           Text('Code view')
@@ -318,7 +242,13 @@ export struct DiagramBlockView {
         .width('100%')
         .height(this.inlineCardHeightVp)
         .onClick(() => {
-          this.showFullSheet = true;
+          this.store.openDiagramViewerModal(
+            this.diagramKind,
+            this.diagramLanguage,
+            this.diagramSource,
+            this.renderedView?.svg ?? '',
+            this.headerLabel
+          );
         })
       } else if (this.isLoading && this.viewMode === 'diagram') {
         Row({ space: OrbitTokens.SPACE_SM }) {
@@ -352,10 +282,5 @@ export struct DiagramBlockView {
       color: this.store.palette.hairline
     })
     .clip(true)
-    .bindSheet($$this.showFullSheet, this.renderFullSheetBuilder, {
-      detents: [SheetSize.LARGE],
-      dragBar: true,
-      backgroundColor: this.store.palette.canvas
-    })
   }
 }

@@ -1,5 +1,7 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { accessibility } from '@kit.AccessibilityKit';
 import { display, FrameCallback, KeyboardAvoidMode, ThemeControl, window } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { connection } from '@kit.NetworkKit';
 import { OrbitHarmonyStore } from '../model/OrbitHarmonyStore';
@@ -12,7 +14,7 @@ import {
   orbitBindThemeApplicationContext,
   orbitBindThemeWindow
 } from '../model/OrbitWindowTheme';
-import { ORBIT_DEFAULT_THEME } from '../theme/OrbitTokens';
+import { ORBIT_DEFAULT_THEME, OrbitTokens } from '../theme/OrbitTokens';
 
 class OrbitFirstFrameCallback extends FrameCallback {
   private readonly onFirstFrame: () => void;
@@ -125,7 +127,9 @@ export default class EntryAbility extends UIAbility {
 
   private avoidAreaHandler: ((opts: window.AvoidAreaOptions) => void) | null = null;
   private windowSizeHandler: ((size: window.Size) => void) | null = null;
+  private titleButtonRectHandler: ((rect: window.TitleButtonRect) => void) | null = null;
   private foldStatusHandler: ((status: display.FoldStatus) => void) | null = null;
+  private animationReduceHandler: ((state: boolean) => void) | null = null;
   private coldLoadContentMarked: boolean = false;
   private coldFirstFrameMarked: boolean = false;
 
@@ -165,6 +169,7 @@ export default class EntryAbility extends UIAbility {
     this.applyLaunchWant(want);
     this.registerNetworkObserver();
     this.registerFoldableObserver();
+    this.registerReducedMotionObserver();
     store.registerPushTokenSilently();
   }
 
@@ -280,6 +285,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    this.unregisterWindowListeners();
     if (this.netConn !== null) {
       try {
         this.netConn.unregister((err) => {
@@ -299,6 +305,16 @@ export default class EntryAbility extends UIAbility {
         orbitLogWarn('OrbitEntry', 'foldStatusChange unregister failed', err as Object);
       }
       this.foldStatusHandler = null;
+    }
+    if (this.animationReduceHandler !== null) {
+      try {
+        if (canIUse('SystemCapability.BarrierFree.Accessibility.Core')) {
+          accessibility.offAnimationReduceStateChange(this.animationReduceHandler);
+        }
+      } catch (err) {
+        orbitLogWarn('OrbitEntry', 'animationReduceStateChange unregister failed', err as Object);
+      }
+      this.animationReduceHandler = null;
     }
     OrbitHarmonyStore.getInstance().dispose();
   }
@@ -342,27 +358,87 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
+  onWindowStageWillDestroy(_windowStage: window.WindowStage): void {
+    this.unregisterWindowListeners();
+  }
+
   onWindowStageDestroy(): void {
-    if (this.mainWin !== null) {
-      try {
-        if (this.avoidAreaHandler !== null) {
-          this.mainWin.off('avoidAreaChange', this.avoidAreaHandler);
-        }
-      } catch (err) {
-        orbitLogWarn('OrbitEntry', 'Failed to unregister avoidAreaChange', err as Object);
+    this.unregisterWindowListeners();
+  }
+
+  private unregisterWindowListeners(): void {
+    if (this.mainWin === null) {
+      return;
+    }
+    const win = this.mainWin;
+    try {
+      if (this.avoidAreaHandler !== null) {
+        win.off('avoidAreaChange', this.avoidAreaHandler);
       }
-      try {
-        if (this.windowSizeHandler !== null) {
-          this.mainWin.off('windowSizeChange', this.windowSizeHandler);
-        }
-      } catch (err) {
-        orbitLogWarn('OrbitEntry', 'Failed to unregister windowSizeChange', err as Object);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'Failed to unregister avoidAreaChange', err as Object);
+    }
+    try {
+      if (this.windowSizeHandler !== null) {
+        win.off('windowSizeChange', this.windowSizeHandler);
       }
-      this.avoidAreaHandler = null;
-      this.windowSizeHandler = null;
-      this.mainWin = null;
-      orbitBindThemeWindow(null);
-      OrbitHarmonyStore.getInstance().bindUIContext(null);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'Failed to unregister windowSizeChange', err as Object);
+    }
+    try {
+      if (this.titleButtonRectHandler !== null && canIUse('SystemCapability.Window.SessionManager')) {
+        win.off('windowTitleButtonRectChange', this.titleButtonRectHandler);
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'Failed to unregister windowTitleButtonRectChange', err as Object);
+    }
+    this.avoidAreaHandler = null;
+    this.windowSizeHandler = null;
+    this.titleButtonRectHandler = null;
+    this.mainWin = null;
+    orbitBindThemeWindow(null);
+    OrbitHarmonyStore.getInstance().bindUIContext(null);
+  }
+
+  private publishTitleButtonRect(rect: window.TitleButtonRect): void {
+    const rightVp = Number.isFinite(rect.right) ? Math.max(0, rect.right) : 0;
+    const widthVp = Number.isFinite(rect.width) ? Math.max(0, rect.width) : 0;
+    const avoidVp = widthVp > 0 ? rightVp + widthVp + 8 : 0;
+    OrbitHarmonyStore.getInstance().updateTitleButtonAvoidWidth(avoidVp, true);
+  }
+
+  private setupFreeWindowDecorFor2in1(mainWin: window.Window): void {
+    if (deviceInfo.deviceType !== '2in1' || !canIUse('SystemCapability.Window.SessionManager')) {
+      OrbitHarmonyStore.getInstance().updateTitleButtonAvoidWidth(0, false);
+      return;
+    }
+    try {
+      mainWin.setWindowDecorVisible(false);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'setWindowDecorVisible(false) unavailable', err as Object);
+      OrbitHarmonyStore.getInstance().updateTitleButtonAvoidWidth(0, false);
+      return;
+    }
+    try {
+      mainWin.setWindowDecorHeight(OrbitTokens.TOP_BAR_HEIGHT);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'setWindowDecorHeight unavailable', err as Object);
+    }
+    try {
+      const initialRect = mainWin.getTitleButtonRect();
+      this.publishTitleButtonRect(initialRect);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'getTitleButtonRect failed', err as Object);
+      OrbitHarmonyStore.getInstance().updateTitleButtonAvoidWidth(0, true);
+    }
+    try {
+      this.titleButtonRectHandler = (nextRect: window.TitleButtonRect): void => {
+        this.publishTitleButtonRect(nextRect);
+      };
+      mainWin.on('windowTitleButtonRectChange', this.titleButtonRectHandler);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'windowTitleButtonRectChange observer unavailable', err as Object);
+      this.titleButtonRectHandler = null;
     }
   }
 
@@ -431,38 +507,67 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
-  private queryAndPublishAllAvoidAreas(mainWin: window.Window, uiCtx: UIContext): void {
-    let screenW = 0;
-    let screenH = 0;
+  private registerReducedMotionObserver(): void {
+    if (!canIUse('SystemCapability.BarrierFree.Accessibility.Core')) {
+      return;
+    }
+    try {
+      const enabled = accessibility.isAnimationReduceEnabledSync();
+      OrbitHarmonyStore.getInstance().setReducedMotion(enabled);
+      this.animationReduceHandler = (nextState: boolean): void => {
+        OrbitHarmonyStore.getInstance().setReducedMotion(nextState);
+      };
+      accessibility.onAnimationReduceStateChange(this.animationReduceHandler);
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'Reduced-motion observer unavailable', err as Object);
+      this.animationReduceHandler = null;
+    }
+  }
+
+  private resolveWindowPixelBounds(mainWin: window.Window): [number, number] {
+    try {
+      const props = mainWin.getWindowProperties();
+      if (props.windowRect.width > 0 && props.windowRect.height > 0) {
+        return [props.windowRect.width, props.windowRect.height];
+      }
+    } catch (_winErr) {
+      // Fall back to default display bounds when window properties are unavailable
+    }
     try {
       const disp = display.getDefaultDisplaySync();
-      screenW = disp.width;
-      screenH = disp.height;
+      return [disp.width, disp.height];
     } catch (err) {
       orbitLogWarn('OrbitEntry', 'Failed to query display dimensions', err as Object);
+      return [0, 0];
     }
+  }
+
+  private queryAndPublishAllAvoidAreas(mainWin: window.Window, uiCtx: UIContext): void {
+    const bounds = this.resolveWindowPixelBounds(mainWin);
+    const windowW = bounds[0];
+    const windowH = bounds[1];
 
     try {
       this.systemInsets = extractAvoidInsetsPx(
         mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM),
-        screenW,
-        screenH
+        windowW,
+        windowH
       );
       this.navIndicatorInsets = extractAvoidInsetsPx(
         mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR),
-        screenW,
-        screenH
+        windowW,
+        windowH
       );
       this.cutoutInsets = extractAvoidInsetsPx(
         mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT),
-        screenW,
-        screenH
+        windowW,
+        windowH
       );
       try {
         this.floatNavInsets = extractAvoidInsetsPx(
           mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_FLOAT_NAVIGATION),
-          screenW,
-          screenH
+          windowW,
+          windowH
         );
       } catch (_floatErr) {
         this.floatNavInsets = zeroInsets();
@@ -494,18 +599,23 @@ export default class EntryAbility extends UIAbility {
       const mainWin = windowStage.getMainWindowSync();
       this.mainWin = mainWin;
       orbitBindThemeWindow(mainWin);
-      try {
-        await mainWin.setWindowLayoutFullScreen(true);
-      } catch (err) {
-        orbitLogWarn('OrbitEntry', 'setWindowLayoutFullScreen not applied', err as Object);
+      if (deviceInfo.deviceType !== '2in1') {
+        try {
+          await mainWin.setWindowLayoutFullScreen(true);
+        } catch (err) {
+          orbitLogWarn('OrbitEntry', 'setWindowLayoutFullScreen not applied', err as Object);
+        }
       }
 
       orbitApplySystemBarTheme(OrbitHarmonyStore.getInstance().palette.isDark);
+      this.setupFreeWindowDecorFor2in1(mainWin);
 
-      try {
-        await mainWin.setFloatNavigationAvoidAreaEnabled(true);
-      } catch (err) {
-        orbitLogWarn('OrbitEntry', 'setFloatNavigationAvoidAreaEnabled unavailable', err as Object);
+      if (deviceInfo.deviceType !== '2in1') {
+        try {
+          await mainWin.setFloatNavigationAvoidAreaEnabled(true);
+        } catch (err) {
+          orbitLogWarn('OrbitEntry', 'setFloatNavigationAvoidAreaEnabled unavailable', err as Object);
+        }
       }
 
       const uiCtx = mainWin.getUIContext();
@@ -528,24 +638,18 @@ export default class EntryAbility extends UIAbility {
 
       this.avoidAreaHandler = (opts: window.AvoidAreaOptions): void => {
         try {
-          let screenW = 0;
-          let screenH = 0;
-          try {
-            const disp = display.getDefaultDisplaySync();
-            screenW = disp.width;
-            screenH = disp.height;
-          } catch (_dErr) {
-            // Keep 0 fallback
-          }
+          const bounds = this.resolveWindowPixelBounds(mainWin);
+          const windowW = bounds[0];
+          const windowH = bounds[1];
 
           if (opts.type === window.AvoidAreaType.TYPE_SYSTEM) {
-            this.systemInsets = extractAvoidInsetsPx(opts.area, screenW, screenH);
+            this.systemInsets = extractAvoidInsetsPx(opts.area, windowW, windowH);
           } else if (opts.type === window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR) {
-            this.navIndicatorInsets = extractAvoidInsetsPx(opts.area, screenW, screenH);
+            this.navIndicatorInsets = extractAvoidInsetsPx(opts.area, windowW, windowH);
           } else if (opts.type === window.AvoidAreaType.TYPE_CUTOUT) {
-            this.cutoutInsets = extractAvoidInsetsPx(opts.area, screenW, screenH);
+            this.cutoutInsets = extractAvoidInsetsPx(opts.area, windowW, windowH);
           } else if (opts.type === window.AvoidAreaType.TYPE_FLOAT_NAVIGATION) {
-            this.floatNavInsets = extractAvoidInsetsPx(opts.area, screenW, screenH);
+            this.floatNavInsets = extractAvoidInsetsPx(opts.area, windowW, windowH);
           } else if (opts.type === window.AvoidAreaType.TYPE_KEYBOARD) {
             this.keyboardVp = opts.area.bottomRect.height > 0
               ? uiCtx.px2vp(opts.area.bottomRect.height)

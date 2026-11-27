@@ -17,9 +17,10 @@ impl OrbitHarmonyCore {
         host_id: String,
         cwd: String,
         path: Option<String>,
+        staged: Option<bool>,
     ) -> Result<String> {
         self.facade
-            .git_review_json(&host_id, &cwd, path.as_deref())
+            .git_review_json(&host_id, &cwd, path.as_deref(), staged)
             .map_err(Error::from_reason)
     }
 

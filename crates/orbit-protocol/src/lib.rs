@@ -631,6 +631,14 @@ pub struct GitStatusSnapshot {
     pub files: Vec<GitFileEntry>,
     #[serde(default)]
     pub nested_git_repos: Vec<NestedGitRepo>,
+    /// Repository-root-relative subdirectory prefix for `cwd` (empty string `""` at repo root,
+    /// e.g. `"pkg"` inside `<repo>/pkg`). `None` only for non-git directories or legacy daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_prefix: Option<String>,
+    /// Canonicalized host-side Git working-tree root (resolving directory symlinks).
+    /// `None` only for non-git directories or legacy daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
 }
 
 /// Result payload returned after committing staged changes in a Git repository.
@@ -1914,6 +1922,12 @@ pub enum WireMessage {
         cwd: String,
         path: Option<String>,
         unified_diff: String,
+        /// Canonicalized host-side Git working-tree root (resolving directory symlinks).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_root: Option<String>,
+        /// Repository-root-relative subdirectory prefix for `cwd` (`""` at repo root, `"pkg"` in `<repo>/pkg`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_prefix: Option<String>,
     },
     GitStageFiles {
         request_id: Uuid,
@@ -6838,6 +6852,8 @@ mod tests {
                 untracked: false,
             }],
             nested_git_repos: Vec::new(),
+            repo_prefix: Some(String::new()),
+            repo_root: Some("/workspace/repo".into()),
         };
         let commit_res = GitCommitResult {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),

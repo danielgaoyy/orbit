@@ -36,7 +36,7 @@ export class OrbitHarmonyCore {
   agentTimelineJson(hostId: string, agentId: string): string;
   agentTimelineDeltaJson(hostId: string, agentId: string, sinceSeq: number): string;
   describeToolItemJson(itemJson: string, cwd?: string | null): string | null;
-  gitReviewJson(hostId: string, cwd: string, path?: string | null): string;
+  gitReviewJson(hostId: string, cwd: string, path?: string | null, staged?: boolean | null): string;
   terminalScreenJson(hostId: string): string;
   terminalScreenSlotJson(hostId: string, slot: number): string;
   pairHostJson(pairingUri: string): string;

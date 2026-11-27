@@ -6,8 +6,13 @@ impl OhosCoreFacade {
         host_id: &str,
         cwd: &str,
         path: Option<&str>,
+        staged: Option<bool>,
     ) -> Result<String, String> {
-        serde_json::to_string(&self.inner.git_review(host_id, cwd, path)).map_err(|e| e.to_string())
+        let view = match staged {
+            Some(mode) => self.inner.git_review_for_mode(host_id, cwd, path, mode),
+            None => self.inner.git_review(host_id, cwd, path),
+        };
+        serde_json::to_string(&view).map_err(|e| e.to_string())
     }
 
     pub fn terminal_screen_json(&self, host_id: &str) -> Result<String, String> {

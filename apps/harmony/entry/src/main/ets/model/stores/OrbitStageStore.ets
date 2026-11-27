@@ -41,8 +41,9 @@ export class OrbitStageSession {
   readonly key: string;
   readonly hostId: string;
   readonly agentId: string;
-  @Trace revision: number = 0;
-  @Trace auxRevision: number = 0;
+  @Trace public revision: number = 0;
+  @Trace public commitRevision: number = 0;
+  @Trace public auxRevision: number = 0;
   @Trace turns: OrbitStageTurnModel[] = [];
   @Trace totalTurnCount: number = 0;
   @Trace windowStartTurnIndex: number = 0;
@@ -179,6 +180,7 @@ export class OrbitStageStore {
   private accessClock: number = 0;
   private currentTailLimit: number = ORBIT_STAGE_TAIL_LIMIT_COMPACT;
   private inFlightGenByKey: Map<string, number> = new Map<string, number>();
+  private inFlightPromiseByKey: Map<string, Promise<boolean>> = new Map<string, Promise<boolean>>();
   private pendingRefetchByKey: Set<string> = new Set<string>();
   private appliedCallback: OrbitStageDeltaAppliedCallback | null = null;
 
@@ -376,6 +378,7 @@ export class OrbitStageStore {
         }
       }
       session.activeTurnKey = lastActiveKey;
+      session.commitRevision += 1;
 
       if (this.activeSession !== null && this.activeSession.key === session.key) {
         this.syncActiveSessionMirrors(session);
@@ -457,6 +460,7 @@ export class OrbitStageStore {
           session.hasOlderHistory = false;
         }
         session.loadingOlder = false;
+        session.commitRevision += 1;
         if (this.activeSession !== null && this.activeSession.key === session.key) {
           this.syncActiveSessionMirrors(session);
         }
@@ -495,6 +499,10 @@ export class OrbitStageStore {
     }
     if (!forceFull && this.inFlightGenByKey.has(session.key)) {
       this.pendingRefetchByKey.add(session.key);
+      const existingPromise = this.inFlightPromiseByKey.get(session.key);
+      if (existingPromise !== undefined) {
+        return await existingPromise;
+      }
       return false;
     }
 
@@ -521,32 +529,40 @@ export class OrbitStageStore {
     }
 
     this.inFlightGenByKey.set(session.key, reqGeneration);
-    try {
-      const rawJson = await this.bridge.agentStageDeltaByRequestJsonAsync(JSON.stringify(req));
-      if (reqGeneration !== session.generation) {
+    const runPromise = (async (): Promise<boolean> => {
+      try {
+        if (this.bridge === null) {
+          return false;
+        }
+        const rawJson = await this.bridge.agentStageDeltaByRequestJsonAsync(JSON.stringify(req));
+        if (reqGeneration !== session.generation) {
+          return false;
+        }
+        const delta = JSON.parse(rawJson) as AgentStageDeltaDto;
+        if (delta.aux_unchanged === true) {
+          OrbitPerfProbe.recordBytes('stage.delta.aux_unchanged', rawJson.length);
+        }
+        return this.applyDelta(session, delta, reqGeneration);
+      } catch (err) {
+        orbitLogWarn('OrbitStageStore', 'agentStageDeltaByRequestJsonAsync failed', err as Object);
         return false;
-      }
-      const delta = JSON.parse(rawJson) as AgentStageDeltaDto;
-      if (delta.aux_unchanged === true) {
-        OrbitPerfProbe.recordBytes('stage.delta.aux_unchanged', rawJson.length);
-      }
-      return this.applyDelta(session, delta, reqGeneration);
-    } catch (err) {
-      orbitLogWarn('OrbitStageStore', 'agentStageDeltaByRequestJsonAsync failed', err as Object);
-      return false;
-    } finally {
-      if (this.inFlightGenByKey.get(session.key) === reqGeneration) {
-        this.inFlightGenByKey.delete(session.key);
-      }
-      if (this.pendingRefetchByKey.has(session.key) && !this.inFlightGenByKey.has(session.key)) {
-        this.pendingRefetchByKey.delete(session.key);
-        if (this.activeSession !== null && this.activeSession.key === session.key) {
-          this.fetchIncremental(session, this.currentTailLimit).catch((err: Object) => {
-            orbitLogWarn('OrbitStageStore', 'Coalesced stage refetch failed', err);
-          });
+      } finally {
+        if (this.inFlightGenByKey.get(session.key) === reqGeneration) {
+          this.inFlightGenByKey.delete(session.key);
+          this.inFlightPromiseByKey.delete(session.key);
+        }
+        if (this.pendingRefetchByKey.has(session.key) && !this.inFlightGenByKey.has(session.key)) {
+          this.pendingRefetchByKey.delete(session.key);
+          if (this.sessionByKey.has(session.key) && reqGeneration === session.generation) {
+            this.fetchIncremental(session, boundedLimit).catch((err: Object) => {
+              orbitLogWarn('OrbitStageStore', 'Coalesced stage refetch failed', err);
+            });
+          }
         }
       }
-    }
+    })();
+    this.inFlightPromiseByKey.set(session.key, runPromise);
+    return await runPromise;
   }
 
   private syncActiveSessionMirrors(session: OrbitStageSession): void {

@@ -5,12 +5,15 @@ import {
   GitCreatePrResultDto,
   GitReviewDto,
   GitStashEntryDto,
+  HighlightedCodeDto,
   HighlightedLineDto,
   HighlightedTokenDto,
   WorkspaceFileViewDto,
   basenameOfPath,
   isAutoCollapsedDiffPath,
   isWorkspaceFileEditable,
+  matchesGitDiscardConfirmation,
+  mergeWorkspaceFileChunk,
   nonBlankPath,
   resolveGitDiffRowActionPath
 } from '../../model/OrbitTypes';
@@ -94,6 +97,14 @@ export struct OrbitScopedGitTabView {
   @Local private prTitleInput: string = '';
   @Local private prBodyInput: string = '';
   @Local private prDraft: boolean = false;
+  @Local private showPushPanel: boolean = false;
+  @Local private pushRemoteInput: string = '';
+  @Local private pushBranchInput: string = '';
+  @Local private pushSetUpstream: boolean = false;
+  @Local private showStashListPanel: boolean = false;
+  @Local private discardTargetPath: string = '';
+  @Local private discardConfirmInput: string = '';
+  @Local private discardIncludeUntracked: boolean = false;
   @Local private diffModeState: OrbitGitDiffModeState = 'idle';
 
   private lastTargetKey: string = '';
@@ -180,6 +191,14 @@ export struct OrbitScopedGitTabView {
       this.prTitleInput = '';
       this.prBodyInput = '';
       this.prDraft = false;
+      this.showPushPanel = false;
+      this.pushRemoteInput = '';
+      this.pushBranchInput = '';
+      this.pushSetUpstream = false;
+      this.showStashListPanel = false;
+      this.discardTargetPath = '';
+      this.discardConfirmInput = '';
+      this.discardIncludeUntracked = false;
       this.reloadScopedGit(true, true);
       void this.refreshCollabStatus();
       return;
@@ -439,6 +458,30 @@ export struct OrbitScopedGitTabView {
     );
   }
 
+  private isUntrackedPath(targetPath: string): boolean {
+    const files = this.reviewData?.status?.files ?? [];
+    for (let i = 0; i < files.length; i++) {
+      if (files[i].path === targetPath) {
+        return files[i].status.indexOf('?') >= 0;
+      }
+    }
+    return false;
+  }
+
+  private openDiscardConfirmForFile(targetPath: string): void {
+    this.discardTargetPath = targetPath;
+    this.discardConfirmInput = '';
+    this.discardIncludeUntracked = this.isUntrackedPath(targetPath);
+    this.showCommitPanel = false;
+    this.showPrPanel = false;
+    this.showPushPanel = false;
+    this.showStashListPanel = false;
+  }
+
+  private canConfirmDiscard(): boolean {
+    return !this.writeBusy && matchesGitDiscardConfirmation(this.discardTargetPath, this.discardConfirmInput);
+  }
+
   private formatLineGutter(ln: DiffLineDto): string {
     if (ln.kind === 'hunk_header' || ln.kind === 'meta') {
       return '';
@@ -470,6 +513,20 @@ export struct OrbitScopedGitTabView {
           if (row.deletions > 0) {
             Text(`-${row.deletions}`)
               .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Bold))
+          }
+
+          if (!this.stagedMode) {
+            Button($r('app.string.git_discard'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(
+                orbitButtonMeta(this.store.palette.statusDanger, this.store.palette.statusDangerSoft)
+              )
+              .height(26)
+              .padding({ left: 8, right: 8 })
+              .enabled(!this.writeBusy)
+              .onClick(() => {
+                const targetPath = this.resolveRowActionPath(row.filePath);
+                this.openDiscardConfirmForFile(targetPath);
+              })
           }
 
           Button(
@@ -629,7 +686,7 @@ export struct OrbitScopedGitTabView {
         .height(32)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Refresh Git review')
+        .accessibilityText($r('app.string.git_refresh_review_aria'))
         .onClick(() => {
           this.reloadScopedGit(true);
           void this.refreshCollabStatus();
@@ -677,6 +734,28 @@ export struct OrbitScopedGitTabView {
               this.showCommitPanel = !this.showCommitPanel;
               if (this.showCommitPanel) {
                 this.showPrPanel = false;
+                this.showPushPanel = false;
+                this.showStashListPanel = false;
+              }
+            })
+
+          Button($r('app.string.git_push'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showPushPanel ? this.store.palette.onAccent : this.store.palette.fgPrimary,
+                this.showPushPanel ? this.store.palette.accentPrimaryFill : this.store.palette.listCard
+              )
+            )
+            .height(30)
+            .padding({ left: 10, right: 10 })
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .enabled(!this.writeBusy && this.tab.hostId.length > 0 && (this.tab.cwd ?? '').length > 0)
+            .onClick(() => {
+              this.showPushPanel = !this.showPushPanel;
+              if (this.showPushPanel) {
+                this.showCommitPanel = false;
+                this.showPrPanel = false;
+                this.showStashListPanel = false;
               }
             })
 
@@ -694,6 +773,8 @@ export struct OrbitScopedGitTabView {
               this.showPrPanel = !this.showPrPanel;
               if (this.showPrPanel) {
                 this.showCommitPanel = false;
+                this.showPushPanel = false;
+                this.showStashListPanel = false;
                 void this.refreshCollabStatus();
               }
             })
@@ -711,16 +792,28 @@ export struct OrbitScopedGitTabView {
             })
 
           if (this.collabData.stashes.length > 0) {
-            Button($r('app.string.git_stash_pop'), { type: ButtonType.Capsule, stateEffect: true })
-              .attributeModifier(orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft))
+            Button(
+              $r('app.string.git_stashes_count', this.collabData.stashes.length),
+              { type: ButtonType.Capsule, stateEffect: true }
+            )
+              .attributeModifier(
+                orbitButtonMeta(
+                  this.showStashListPanel ? this.store.palette.onAccent : this.store.palette.accentPrimary,
+                  this.showStashListPanel
+                    ? this.store.palette.accentPrimaryFill
+                    : this.store.palette.accentPrimarySoft
+                )
+              )
               .height(30)
               .padding({ left: 10, right: 10 })
               .enabled(!this.writeBusy)
               .onClick(() => {
-                const top: GitStashEntryDto = this.collabData.stashes[0];
-                void this.runScopedWrite((h: string, c: string): Promise<boolean> =>
-                  this.store.gitPopScopedStash(h, c, top.stash_ref, top.oid ?? null)
-                );
+                this.showStashListPanel = !this.showStashListPanel;
+                if (this.showStashListPanel) {
+                  this.showCommitPanel = false;
+                  this.showPrPanel = false;
+                  this.showPushPanel = false;
+                }
               })
           }
         }
@@ -779,6 +872,272 @@ export struct OrbitScopedGitTabView {
         .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
         .backgroundColor(this.store.palette.statusDangerSoft)
         .borderRadius(OrbitTokens.RADIUS_MD)
+      }
+
+      // Two-Step Destructive Discard Confirmation Dialog (requires exact filename input)
+      if (this.discardTargetPath.length > 0) {
+        Column({ space: OrbitTokens.SPACE_XS }) {
+          Text($r('app.string.git_discard_title'))
+            .attributeModifier(orbitTextSubhead(this.store.palette.statusDanger, FontWeight.Bold))
+            .width('100%')
+          Text($r('app.string.git_discard_warning', this.discardTargetPath))
+            .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary))
+            .width('100%')
+
+          TextInput({
+            placeholder: $r('app.string.git_discard_input_placeholder'),
+            text: this.discardConfirmInput
+          })
+            .attributeModifier(
+              orbitInputMono(
+                this.store.palette.fgPrimary,
+                this.store.palette.fgMuted,
+                this.store.palette.recessed
+              )
+            )
+            .height(36)
+            .borderRadius(OrbitTokens.RADIUS_MD)
+            .width('100%')
+            .onFocus(() => {
+              this.store.shellStore.setTextInputFocused(true);
+            })
+            .onBlur(() => {
+              this.store.shellStore.setTextInputFocused(false);
+            })
+            .onChange((val: string) => {
+              this.discardConfirmInput = val;
+            })
+
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            Toggle({ type: ToggleType.Switch, isOn: this.discardIncludeUntracked })
+              .selectedColor(this.store.palette.statusDanger)
+              .onChange((on: boolean) => {
+                this.discardIncludeUntracked = on;
+              })
+            Text($r('app.string.git_discard_include_untracked'))
+              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+              .layoutWeight(1)
+
+            Button($r('app.string.action_cancel'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
+              .height(30)
+              .padding({ left: 10, right: 10 })
+              .onClick(() => {
+                this.discardTargetPath = '';
+                this.discardConfirmInput = '';
+              })
+
+            Button($r('app.string.git_discard_confirm_action'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.statusDanger))
+              .height(30)
+              .padding({ left: 10, right: 10 })
+              .enabled(this.canConfirmDiscard())
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                const target = this.discardTargetPath;
+                const includeUntracked = this.discardIncludeUntracked;
+                const tv = this.targetVersion;
+                const tKey = this.currentTargetKey();
+                void this.runScopedWrite(async (h: string, c: string): Promise<boolean> => {
+                  const res = await this.store.gitDiscardScopedFiles(h, c, [target], includeUntracked);
+                  if (!this.disposed && tv === this.targetVersion && tKey === this.currentTargetKey()) {
+                    if (res.ok && res.data !== null) {
+                      this.store.showToastResource($r('app.string.git_discard_success', res.data), false);
+                      this.store.triggerHaptic(12);
+                    } else {
+                      this.store.showToastResource(
+                        res.errorDetail.length > 0
+                          ? $r('app.string.git_discard_failed_detail', res.errorDetail)
+                          : $r('app.string.git_discard_failed'),
+                        true,
+                        res.errorDetail
+                      );
+                    }
+                  }
+                  return res.ok;
+                }).then((ok: boolean) => {
+                  if (ok && !this.disposed && tv === this.targetVersion && tKey === this.currentTargetKey()) {
+                    this.discardTargetPath = '';
+                    this.discardConfirmInput = '';
+                    this.discardIncludeUntracked = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        }
+        .width('100%')
+        .padding(OrbitTokens.SPACE_SM)
+        .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+        .backgroundColor(this.store.palette.statusDangerSoft)
+        .borderRadius(OrbitTokens.RADIUS_MD)
+      }
+
+      // Collapsible Push Panel
+      if (this.showPushPanel) {
+        Column({ space: OrbitTokens.SPACE_XS }) {
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            TextInput({
+              placeholder: $r('app.string.git_push_remote_placeholder'),
+              text: this.pushRemoteInput
+            })
+              .attributeModifier(
+                orbitInputMono(
+                  this.store.palette.fgPrimary,
+                  this.store.palette.fgMuted,
+                  this.store.palette.recessed
+                )
+              )
+              .height(36)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .layoutWeight(1)
+              .onFocus(() => {
+                this.store.shellStore.setTextInputFocused(true);
+              })
+              .onBlur(() => {
+                this.store.shellStore.setTextInputFocused(false);
+              })
+              .onChange((val: string) => {
+                this.pushRemoteInput = val;
+              })
+
+            TextInput({
+              placeholder: $r('app.string.git_push_branch_placeholder'),
+              text: this.pushBranchInput
+            })
+              .attributeModifier(
+                orbitInputMono(
+                  this.store.palette.fgPrimary,
+                  this.store.palette.fgMuted,
+                  this.store.palette.recessed
+                )
+              )
+              .height(36)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .layoutWeight(1)
+              .onFocus(() => {
+                this.store.shellStore.setTextInputFocused(true);
+              })
+              .onBlur(() => {
+                this.store.shellStore.setTextInputFocused(false);
+              })
+              .onChange((val: string) => {
+                this.pushBranchInput = val;
+              })
+          }
+          .width('100%')
+
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            Toggle({ type: ToggleType.Switch, isOn: this.pushSetUpstream })
+              .selectedColor(this.store.palette.accentPrimaryFill)
+              .onChange((on: boolean) => {
+                this.pushSetUpstream = on;
+              })
+            Text($r('app.string.git_push_set_upstream'))
+              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+              .layoutWeight(1)
+
+            Button($r('app.string.git_push'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .height(30)
+              .padding({ left: 12, right: 12 })
+              .enabled(!this.writeBusy)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                const remote = this.pushRemoteInput.trim().length > 0 ? this.pushRemoteInput.trim() : null;
+                const branch = this.pushBranchInput.trim().length > 0 ? this.pushBranchInput.trim() : null;
+                const setUpstream = this.pushSetUpstream;
+                const tv = this.targetVersion;
+                const tKey = this.currentTargetKey();
+                void this.runScopedWrite(async (h: string, c: string): Promise<boolean> => {
+                  const res = await this.store.gitPushScoped(
+                    h,
+                    c,
+                    remote,
+                    branch,
+                    setUpstream
+                  );
+                  if (!this.disposed && tv === this.targetVersion && tKey === this.currentTargetKey()) {
+                    if (res.ok && res.data !== null) {
+                      this.store.showToastResource(
+                        $r('app.string.git_push_success', res.data.branch, res.data.remote),
+                        false
+                      );
+                      this.store.triggerHaptic(10);
+                    } else {
+                      this.store.showToastResource(
+                        res.errorDetail.length > 0
+                          ? $r('app.string.git_push_failed_detail', res.errorDetail)
+                          : $r('app.string.git_push_failed'),
+                        true,
+                        res.errorDetail
+                      );
+                    }
+                  }
+                  return res.ok;
+                }).then((ok: boolean) => {
+                  if (ok && !this.disposed && tv === this.targetVersion && tKey === this.currentTargetKey()) {
+                    this.showPushPanel = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        }
+        .padding(OrbitTokens.SPACE_SM)
+        .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+        .borderRadius(OrbitTokens.RADIUS_MD)
+        .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+      }
+
+      // Collapsible Stash List Panel
+      if (this.showStashListPanel && this.collabData.stashes.length > 0) {
+        Column({ space: OrbitTokens.SPACE_XS }) {
+          Text($r('app.string.git_stash_list_title'))
+            .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Bold))
+            .width('100%')
+          ForEach(
+            this.collabData.stashes,
+            (entry: GitStashEntryDto) => {
+              Row({ space: OrbitTokens.SPACE_XS }) {
+                Column({ space: 2 }) {
+                  Text(entry.stash_ref)
+                    .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Bold))
+                    .maxLines(1)
+                  Text(entry.message)
+                    .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
+
+                Button($r('app.string.git_stash_pop'), { type: ButtonType.Capsule, stateEffect: true })
+                  .attributeModifier(
+                    orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+                  )
+                  .height(28)
+                  .padding({ left: 10, right: 10 })
+                  .enabled(!this.writeBusy)
+                  .onClick(() => {
+                    void this.runScopedWrite((h: string, c: string): Promise<boolean> =>
+                      this.store.gitPopScopedStash(h, c, entry.stash_ref, entry.oid ?? null)
+                    );
+                  })
+              }
+              .width('100%')
+              .padding({ top: 4, bottom: 4 })
+              .alignItems(VerticalAlign.Center)
+            },
+            (entry: GitStashEntryDto): string => `gst_${entry.stash_ref}_${entry.oid ?? ''}`
+          )
+        }
+        .padding(OrbitTokens.SPACE_SM)
+        .margin({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+        .borderRadius(OrbitTokens.RADIUS_MD)
+        .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
       }
 
       // Collapsible Commit Panel
@@ -1023,7 +1382,7 @@ export struct OrbitScopedGitTabView {
         .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
       }
 
-      Search({ value: this.filterQuery, placeholder: 'Filter changed files…' })
+      Search({ value: this.filterQuery, placeholder: $r('app.string.git_filter_changed_placeholder') })
         .width('100%')
         .height(36)
         .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
@@ -1067,11 +1426,11 @@ export struct OrbitScopedGitTabView {
           )
             .attributeModifier(orbitTextBody(this.store.palette.fgPrimary))
             .textAlign(TextAlign.Center)
-          Text('A concurrent mode switch or status-only refresh left diff ownership unconfirmed.')
+          Text($r('app.string.git_diff_unconfirmed_notice'))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
             .textAlign(TextAlign.Center)
             .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
-          Button('Refresh Diff', { type: ButtonType.Capsule, stateEffect: true })
+          Button($r('app.string.git_refresh_diff'), { type: ButtonType.Capsule, stateEffect: true })
             .attributeModifier(
               orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
             )
@@ -1091,7 +1450,7 @@ export struct OrbitScopedGitTabView {
           SymbolGlyph($r('sys.symbol.checkmark_circle'))
             .fontSize(26)
             .fontColor([this.store.palette.fgMuted])
-          Text('Working tree is clean for this scope')
+          Text($r('app.string.git_working_tree_clean_scope'))
             .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
           Blank()
         }
@@ -1111,7 +1470,7 @@ export struct OrbitScopedGitTabView {
         }
         .width('100%')
         .layoutWeight(1)
-        .cachedCount(12)
+        .cachedCount(8)
         .padding({
           left: OrbitTokens.SPACE_MD,
           right: OrbitTokens.SPACE_MD,
@@ -1262,7 +1621,7 @@ export struct OrbitScopedFilesTabView {
     Column({ space: OrbitTokens.SPACE_SM }) {
       Row({ space: OrbitTokens.SPACE_XS }) {
         Column({ space: 2 }) {
-          Text('Workspace Files')
+          Text($r('app.string.files_panel_title'))
             .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
             .maxLines(1)
           Text(this.tab.cwd !== null && this.tab.cwd.length > 0 ? basenameOfPath(this.tab.cwd) : 'No directory')
@@ -1295,7 +1654,7 @@ export struct OrbitScopedFilesTabView {
         .height(32)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Refresh file list')
+        .accessibilityText($r('app.string.files_refresh_list_aria'))
         .onClick(() => {
           this.reloadFiles(true);
         })
@@ -1354,7 +1713,7 @@ export struct OrbitScopedFilesTabView {
         .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
       }
 
-      Search({ value: this.query, placeholder: 'Filter files…' })
+      Search({ value: this.query, placeholder: $r('app.string.files_filter_placeholder') })
         .width('100%')
         .height(36)
         .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
@@ -1377,7 +1736,7 @@ export struct OrbitScopedFilesTabView {
           SymbolGlyph($r('sys.symbol.folder'))
             .fontSize(26)
             .fontColor([this.store.palette.fgMuted])
-          Text('No workspace files indexed for this directory')
+          Text($r('app.string.files_empty_indexed'))
             .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
           Blank()
         }
@@ -1484,6 +1843,13 @@ export struct OrbitScopedFileViewerTabView {
   @Local private showRenameForm: boolean = false;
   @Local private renameInput: string = '';
   @Local private confirmDelete: boolean = false;
+  @Local private cappedHighlight: HighlightedCodeDto | null = null;
+  @Local private showFullFile: boolean = false;
+  @Local private loadingChunk: boolean = false;
+  @Local private chunkConflictError: boolean = false;
+  @Local private chunkBinaryTailLocked: boolean = false;
+  @Local private chunkSequenceLocked: boolean = false;
+  @Local private loadedByteOffset: number = 0;
 
   private lastScopeKey: string = '';
   private lastTabId: string = '';
@@ -1534,6 +1900,13 @@ export struct OrbitScopedFileViewerTabView {
     this.showRenameForm = false;
     this.renameInput = '';
     this.confirmDelete = false;
+    this.cappedHighlight = null;
+    this.showFullFile = false;
+    this.loadingChunk = false;
+    this.chunkConflictError = false;
+    this.chunkBinaryTailLocked = false;
+    this.chunkSequenceLocked = false;
+    this.loadedByteOffset = 0;
   }
 
   aboutToAppear(): void {
@@ -1592,6 +1965,36 @@ export struct OrbitScopedFileViewerTabView {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  private fastCountLines(text: string): number {
+    if (text.length === 0) {
+      return 0;
+    }
+    let newlines = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10) {
+        newlines += 1;
+      }
+    }
+    return text.charCodeAt(text.length - 1) === 10 ? newlines : newlines + 1;
+  }
+
+  private get canLoadNextChunk(): boolean {
+    if (
+      this.fileView === null ||
+      !this.fileView.truncated ||
+      this.loadingChunk ||
+      this.chunkConflictError ||
+      this.chunkBinaryTailLocked ||
+      this.chunkSequenceLocked
+    ) {
+      return false;
+    }
+    const etag = (this.fileView.etag ?? '').trim();
+    const maxChunkedCap = 16 * 1024 * 1024;
+    return etag.length > 0 && this.loadedByteOffset > 0 && this.loadedByteOffset < maxChunkedCap &&
+      this.loadedByteOffset < this.fileView.size_bytes;
+  }
+
   private async loadFile(): Promise<void> {
     const target = this.currentTarget();
     this.loadSeq += 1;
@@ -1599,6 +2002,11 @@ export struct OrbitScopedFileViewerTabView {
     this.fileView = null;
     this.loadedTarget = null;
     this.conflictNotice = '';
+    this.chunkConflictError = false;
+    this.chunkBinaryTailLocked = false;
+    this.chunkSequenceLocked = false;
+    this.loadingChunk = false;
+    this.loadedByteOffset = 0;
 
     if (target.hostId.length === 0 || target.cwd.length === 0 || target.path.length === 0) {
       this.loading = false;
@@ -1606,12 +2014,127 @@ export struct OrbitScopedFileViewerTabView {
     }
 
     this.loading = true;
+    this.cappedHighlight = null;
+    this.showFullFile = false;
     const view = await this.store.readScopedWorkspaceFile(target.hostId, target.cwd, target.path);
     if (!this.disposed && seq === this.loadSeq && this.matchesCurrentTarget(target)) {
       this.fileView = view;
       this.loadedTarget = view !== null ? target : null;
+      if (view !== null) {
+        this.loadedByteOffset = view.next_offset_bytes !== undefined && view.next_offset_bytes > 0
+          ? view.next_offset_bytes
+          : view.content.length;
+      }
+      if (
+        view !== null &&
+        view.content_kind === 'text' &&
+        view.language.toLowerCase() !== 'markdown' &&
+        view.content.length > 0
+      ) {
+        // P1-2 / R2-P1-3: Reuse bounded pre-highlighted prefix already computed on the async worker
+        // thread, preserving `highlight_truncated` when per-line/total byte budgets clipped a line.
+        if (view.highlighted_lines.length > 0) {
+          const previewLines = view.highlighted_lines.length > 250
+            ? view.highlighted_lines.slice(0, 250)
+            : view.highlighted_lines;
+          const totalLines = this.fastCountLines(view.content);
+          this.cappedHighlight = {
+            language: view.language,
+            lines: previewLines,
+            total_lines: Math.max(totalLines, previewLines.length),
+            total_lines_exact: !view.truncated,
+            truncated: view.highlight_truncated === true || totalLines > previewLines.length
+          };
+        } else if (view.language.toLowerCase() !== 'text') {
+          this.cappedHighlight = this.store.highlightScopedWorkspaceCode(view.language, view.content, 250);
+        }
+      }
       this.loading = false;
     }
+  }
+
+  private async loadNextFileChunk(): Promise<void> {
+    if (!this.isTargetReady || !this.canLoadNextChunk || this.fileView === null) {
+      return;
+    }
+    const target = this.currentTarget();
+    const seq = this.loadSeq;
+    const expectedEtag = (this.fileView.etag ?? '').trim();
+    const offset = this.loadedByteOffset;
+    this.loadingChunk = true;
+    const res = await this.store.readScopedWorkspaceFileChunk({
+      host_id: target.hostId,
+      cwd: target.cwd,
+      path: target.path,
+      offset_bytes: offset,
+      max_bytes: 2 * 1024 * 1024,
+      expected_etag: expectedEtag
+    });
+    if (this.disposed || seq !== this.loadSeq || !this.matchesCurrentTarget(target) || this.fileView === null) {
+      return;
+    }
+    this.loadingChunk = false;
+    if (!res.ok || res.data === null) {
+      this.store.showToastResource($r('app.string.files_chunk_load_failed'), true, res.errorDetail);
+      return;
+    }
+    // R2-P0-C: Strictly validate continuation chunk content kind, ETag, offset continuity, and
+    // raw-byte forward progress before merging; any binary tail or mismatch locks read-only.
+    const mergeRes = mergeWorkspaceFileChunk(
+      this.fileView,
+      offset,
+      res.data,
+      target.hostId,
+      target.cwd,
+      target.path,
+      expectedEtag
+    );
+    this.fileView = mergeRes.mergedView;
+    this.loadedByteOffset = mergeRes.nextLoadedRawBytes;
+    if (!mergeRes.ok) {
+      if (mergeRes.etagMismatch) {
+        this.chunkConflictError = true;
+        this.store.showToastResource($r('app.string.files_chunk_etag_conflict'), true);
+      } else if (mergeRes.binaryTail) {
+        this.chunkBinaryTailLocked = true;
+        this.store.showToastResource($r('app.string.files_chunk_binary_tail_locked'), true);
+      } else {
+        this.chunkSequenceLocked = true;
+        this.store.showToastResource($r('app.string.files_chunk_incomplete_locked'), true);
+      }
+      return;
+    }
+    if (this.cappedHighlight !== null) {
+      const totalLines = this.fastCountLines(mergeRes.mergedView.content);
+      this.cappedHighlight = {
+        language: this.cappedHighlight.language,
+        lines: this.cappedHighlight.lines,
+        total_lines: Math.max(totalLines, this.cappedHighlight.lines.length),
+        total_lines_exact: !mergeRes.mergedView.truncated,
+        truncated: this.cappedHighlight.truncated ||
+          mergeRes.mergedView.highlight_truncated === true ||
+          totalLines > this.cappedHighlight.lines.length
+      };
+    }
+    this.showFullFile = true;
+  }
+
+  private effectiveHighlightedLines(): HighlightedLineDto[] {
+    if (this.showFullFile) {
+      return [];
+    }
+    if (this.cappedHighlight !== null && this.cappedHighlight.lines.length > 0) {
+      return this.cappedHighlight.lines;
+    }
+    return this.fileView !== null ? this.fileView.highlighted_lines : [];
+  }
+
+  private tokenColorForTheme(tok: HighlightedTokenDto): ResourceColor {
+    if (this.store.palette.isDark) {
+      return tok.fg_hex.length > 0 ? tok.fg_hex : this.store.palette.fgPrimary;
+    }
+    const light = tok.light_fg_hex !== undefined && tok.light_fg_hex.length > 0 ? tok.light_fg_hex : tok.fg_hex;
+    return light.length > 0 ? light : this.store.palette.fgPrimary;
   }
 
   private beginEdit(): void {
@@ -1766,7 +2289,7 @@ export struct OrbitScopedFileViewerTabView {
 
         if (this.isTargetReady && this.fileView !== null) {
           if (this.editing) {
-            Button('Cancel', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.action_cancel'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
               .height(30)
               .padding({ left: 10, right: 10 })
@@ -1786,7 +2309,7 @@ export struct OrbitScopedFileViewerTabView {
               })
           } else {
             if (this.canEditCurrentFile) {
-              Button('Edit', { type: ButtonType.Capsule, stateEffect: true })
+              Button($r('app.string.action_edit'), { type: ButtonType.Capsule, stateEffect: true })
                 .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
                 .height(30)
                 .padding({ left: 10, right: 10 })
@@ -1794,7 +2317,7 @@ export struct OrbitScopedFileViewerTabView {
                   this.beginEdit();
                 })
             }
-            Button('Quote', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.files_action_quote'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft))
               .height(30)
               .padding({ left: 10, right: 10 })
@@ -1862,7 +2385,7 @@ export struct OrbitScopedFileViewerTabView {
           .height(28)
           .padding(0)
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText('Reload file')
+          .accessibilityText($r('app.string.files_reload_file_aria'))
           .onClick(() => {
             void this.loadFile();
           })
@@ -1938,7 +2461,7 @@ export struct OrbitScopedFileViewerTabView {
             .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium))
             .width('100%')
           Row({ space: OrbitTokens.SPACE_XS }) {
-            Button('Reload Disk', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.files_reload_disk'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.listCard))
               .height(28)
               .padding({ left: 10, right: 10 })
@@ -1949,7 +2472,7 @@ export struct OrbitScopedFileViewerTabView {
                 this.conflictNotice = '';
                 void this.loadFile();
               })
-            Button('Overwrite Anyway', { type: ButtonType.Capsule, stateEffect: true })
+            Button($r('app.string.files_overwrite_anyway'), { type: ButtonType.Capsule, stateEffect: true })
               .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.statusDanger))
               .height(28)
               .padding({ left: 10, right: 10 })
@@ -1984,7 +2507,7 @@ export struct OrbitScopedFileViewerTabView {
             .width('100%')
             .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
         } else if (this.fileView.writable !== true) {
-          Text('Read-only file (editing disabled)')
+          Text($r('app.string.files_readonly_notice'))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
             .width('100%')
             .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
@@ -2006,7 +2529,7 @@ export struct OrbitScopedFileViewerTabView {
       } else if (!this.isTargetReady || this.fileView === null) {
         Column() {
           Blank()
-          Text('File unavailable in this tab scope')
+          Text($r('app.string.files_unavailable_scope'))
             .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
           Blank()
         }
@@ -2063,60 +2586,292 @@ export struct OrbitScopedFileViewerTabView {
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Auto)
-      } else if (this.fileView.highlighted_lines.length > 0) {
-        List({ space: 2 }) {
-          Repeat<HighlightedLineDto>(this.fileView.highlighted_lines)
-            .each((ri: RepeatItem<HighlightedLineDto>) => {
-              ListItem() {
-                Row({ space: OrbitTokens.SPACE_SM }) {
-                  Text(ri.item.line_number.toString().padStart(4, ' '))
-                    .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
-                    .width(34)
-                    .textAlign(TextAlign.End)
-                  Text() {
-                    ForEach(
-                      ri.item.tokens,
-                      (tok: HighlightedTokenDto) => {
-                        Span(tok.text)
-                          .font(orbitSpanMonoFont(tok.bold ? FontWeight.Bold : FontWeight.Normal))
-                          .fontColor(tok.fg_hex.length > 0 ? tok.fg_hex : this.store.palette.fgPrimary)
-                      },
-                      (tok: HighlightedTokenDto, tIdx: number): string =>
-                        `${ri.item.line_number}_${tIdx}_${tok.text.length}`
-                    )
-                  }
-                  .copyOption(CopyOptions.LocalDevice)
-                  .layoutWeight(1)
-                }
-                .width('100%')
-                .alignItems(VerticalAlign.Top)
-              }
-            })
-            .key((ln: HighlightedLineDto): string => `shl_${fileTargetRenderSig(this.loadedTarget)}_${ln.line_number}`)
-            .virtualScroll()
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .padding({
-          left: OrbitTokens.SPACE_SM,
-          right: OrbitTokens.SPACE_SM,
-          top: OrbitTokens.SPACE_SM,
-          bottom: Math.max(OrbitTokens.SPACE_MD, this.store.safeBottomVp)
-        })
-        .backgroundColor(this.store.palette.code)
-        .scrollBar(BarState.Auto)
-      } else {
-        Scroll() {
-          Text(this.fileView.content)
-            .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
-            .copyOption(CopyOptions.LocalDevice)
+      } else if (this.effectiveHighlightedLines().length > 0) {
+        Column({ space: 0 }) {
+          if (this.chunkConflictError) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text($r('app.string.files_chunk_etag_conflict'))
+                .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
+                .layoutWeight(1)
+              Button($r('app.string.files_reload_disk'), { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.statusDanger))
+                .height(26)
+                .padding({ left: 10, right: 10 })
+                .onClick(() => {
+                  void this.loadFile();
+                })
+            }
             .width('100%')
-            .padding(OrbitTokens.SPACE_MD)
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.statusDangerSoft)
+            .alignItems(VerticalAlign.Center)
+          } else if (this.chunkBinaryTailLocked || this.chunkSequenceLocked) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text(
+                this.chunkBinaryTailLocked
+                  ? $r('app.string.files_chunk_binary_tail_locked')
+                  : $r('app.string.files_chunk_incomplete_locked')
+              )
+                .attributeModifier(orbitTextMeta(this.store.palette.statusWarning))
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.statusWarningSoft)
+            .alignItems(VerticalAlign.Center)
+          } else if (this.fileView.truncated) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text(
+                this.canLoadNextChunk || this.loadingChunk
+                  ? $r(
+                      'app.string.files_source_truncated_banner',
+                      this.formatBytes(this.loadedByteOffset),
+                      this.formatBytes(this.fileView.size_bytes)
+                    )
+                  : $r(
+                      'app.string.files_chunk_limit_reached',
+                      this.formatBytes(this.loadedByteOffset),
+                      this.formatBytes(this.fileView.size_bytes)
+                    )
+              )
+                .attributeModifier(orbitTextMeta(this.store.palette.statusWarning))
+                .layoutWeight(1)
+              if (this.canLoadNextChunk || this.loadingChunk) {
+                Button(
+                  this.loadingChunk
+                    ? $r('app.string.files_loading_chunk')
+                    : $r('app.string.files_load_next_chunk'),
+                  { type: ButtonType.Capsule, stateEffect: true }
+                )
+                  .attributeModifier(
+                    orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+                  )
+                  .height(26)
+                  .padding({ left: 10, right: 10 })
+                  .enabled(!this.loadingChunk)
+                  .onClick(() => {
+                    void this.loadNextFileChunk();
+                  })
+              }
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.subtleSurface)
+            .alignItems(VerticalAlign.Center)
+          }
+
+          if (this.cappedHighlight !== null && this.cappedHighlight.truncated) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text(
+                this.cappedHighlight.total_lines_exact === false
+                  ? $r(
+                    'app.string.files_preview_capped_lower_bound',
+                    this.cappedHighlight.lines.length,
+                    this.cappedHighlight.total_lines
+                  )
+                  : $r(
+                    'app.string.files_preview_capped',
+                    this.cappedHighlight.lines.length,
+                    this.cappedHighlight.total_lines
+                  )
+              )
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                .layoutWeight(1)
+              Button($r('app.string.files_load_full'), { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(
+                  orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+                )
+                .height(26)
+                .padding({ left: 10, right: 10 })
+                .onClick(() => {
+                  this.showFullFile = true;
+                })
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.subtleSurface)
+            .alignItems(VerticalAlign.Center)
+          }
+
+          List({ space: 2 }) {
+            Repeat<HighlightedLineDto>(this.effectiveHighlightedLines())
+              .each((ri: RepeatItem<HighlightedLineDto>) => {
+                ListItem() {
+                  Row({ space: OrbitTokens.SPACE_SM }) {
+                    Text(ri.item.line_number.toString().padStart(4, ' '))
+                      .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+                      .width(34)
+                      .textAlign(TextAlign.End)
+                    Text() {
+                      ForEach(
+                        ri.item.tokens,
+                        (tok: HighlightedTokenDto) => {
+                          Span(tok.text)
+                            .font(orbitSpanMonoFont(tok.bold ? FontWeight.Bold : FontWeight.Normal))
+                            .fontColor(this.tokenColorForTheme(tok))
+                        },
+                        (tok: HighlightedTokenDto, tIdx: number): string =>
+                          `${ri.item.line_number}_${tIdx}_${tok.text.length}`
+                      )
+                    }
+                    .copyOption(CopyOptions.LocalDevice)
+                    .layoutWeight(1)
+                  }
+                  .width('100%')
+                  .alignItems(VerticalAlign.Top)
+                }
+              })
+              .key((ln: HighlightedLineDto): string => `shl_${fileTargetRenderSig(this.loadedTarget)}_${ln.line_number}`)
+              .virtualScroll()
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .cachedCount(8)
+          .padding({
+            left: OrbitTokens.SPACE_SM,
+            right: OrbitTokens.SPACE_SM,
+            top: OrbitTokens.SPACE_SM,
+            bottom: Math.max(OrbitTokens.SPACE_MD, this.store.safeBottomVp)
+          })
+          .backgroundColor(this.store.palette.code)
+          .scrollBar(BarState.Auto)
         }
         .width('100%')
         .layoutWeight(1)
-        .backgroundColor(this.store.palette.code)
-        .scrollBar(BarState.Auto)
+      } else {
+        Column({ space: 0 }) {
+          if (this.chunkConflictError) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text($r('app.string.files_chunk_etag_conflict'))
+                .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
+                .layoutWeight(1)
+              Button($r('app.string.files_reload_disk'), { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(orbitButtonMeta(this.store.palette.onAccent, this.store.palette.statusDanger))
+                .height(26)
+                .padding({ left: 10, right: 10 })
+                .onClick(() => {
+                  void this.loadFile();
+                })
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.statusDangerSoft)
+            .alignItems(VerticalAlign.Center)
+          } else if (this.chunkBinaryTailLocked || this.chunkSequenceLocked) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text(
+                this.chunkBinaryTailLocked
+                  ? $r('app.string.files_chunk_binary_tail_locked')
+                  : $r('app.string.files_chunk_incomplete_locked')
+              )
+                .attributeModifier(orbitTextMeta(this.store.palette.statusWarning))
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.statusWarningSoft)
+            .alignItems(VerticalAlign.Center)
+          } else if (this.fileView.truncated) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text(
+                $r(
+                  'app.string.files_showing_partial',
+                  this.formatBytes(this.loadedByteOffset),
+                  this.formatBytes(this.fileView.size_bytes)
+                )
+              )
+                .attributeModifier(orbitTextMeta(this.store.palette.statusWarning))
+                .layoutWeight(1)
+              if (this.canLoadNextChunk || this.loadingChunk) {
+                Button(
+                  this.loadingChunk
+                    ? $r('app.string.files_loading_chunk')
+                    : $r('app.string.files_load_next_chunk'),
+                  { type: ButtonType.Capsule, stateEffect: true }
+                )
+                  .attributeModifier(
+                    orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+                  )
+                  .height(26)
+                  .padding({ left: 10, right: 10 })
+                  .enabled(!this.loadingChunk)
+                  .onClick(() => {
+                    void this.loadNextFileChunk();
+                  })
+              }
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.subtleSurface)
+            .alignItems(VerticalAlign.Center)
+          } else if (this.showFullFile && this.cappedHighlight !== null) {
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Text(
+                this.cappedHighlight.total_lines_exact === false
+                  ? $r('app.string.files_showing_full_lower_bound', this.cappedHighlight.total_lines)
+                  : $r('app.string.files_showing_full', this.cappedHighlight.total_lines)
+              )
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .padding({
+              left: OrbitTokens.SPACE_MD,
+              right: OrbitTokens.SPACE_MD,
+              top: OrbitTokens.SPACE_XS,
+              bottom: OrbitTokens.SPACE_XS
+            })
+            .backgroundColor(this.store.palette.subtleSurface)
+          }
+          Scroll() {
+            Text(this.fileView.content)
+              .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
+              .copyOption(CopyOptions.LocalDevice)
+              .width('100%')
+              .padding(OrbitTokens.SPACE_MD)
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .backgroundColor(this.store.palette.code)
+          .scrollBar(BarState.Auto)
+        }
+        .width('100%')
+        .layoutWeight(1)
       }
     }
     .width('100%')

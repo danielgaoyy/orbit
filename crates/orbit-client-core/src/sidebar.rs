@@ -82,6 +82,10 @@ pub struct SidebarProjectGroupView {
     pub conversations: Vec<SidebarConversationView>,
     #[serde(default)]
     pub workspaces: Vec<SidebarWorkspaceGroupView>,
+    /// Authoritative workspace IDs (both active and archived, non-background) belonging to this
+    /// project group, computed by `resolve_workspace_project_group_index` for project menus.
+    #[serde(default)]
+    pub workspace_ids: Vec<String>,
     #[serde(default)]
     pub unclassified_conversations: Vec<SidebarConversationView>,
 }
@@ -201,6 +205,67 @@ fn path_is_inside_directory(dir: &str, candidate: &str) -> bool {
     clean_cand == clean_dir
         || cwd_paths_equivalent(&clean_dir, &clean_cand)
         || clean_cand.starts_with(&format!("{clean_dir}/"))
+}
+
+/// Authoritative single-owner workspace-to-project-group matcher shared across `build_fleet_sidebar`
+/// (curated active workspaces AND archived/named workspaces for project menus):
+/// 1. Resolves single authoritative root (`project_root ?? source_cwd ?? cwd`).
+/// 2. Matches `matches_project_directory` (exact / equivalent / legacy `/worktrees/<repo>-`) on
+///    `clean_root` first, then falls back to `matches_project_directory` on `ws.cwd`.
+/// 3. Finally falls back to longest enclosing directory prefix (`path_is_inside_directory`) on `clean_root`.
+/// 4. On any tie (shared directory alias or equal-length prefix), deterministically selects the
+///    group with the lexicographically smallest `(normalize_project_path(primary_cwd), id)` key so
+///    ownership is 100% independent of insertion or UI display sort order (`R4-Nit`).
+pub fn resolve_workspace_project_group_index(
+    groups: &[SidebarProjectGroupView],
+    ws: &WorkspaceSummary,
+) -> Option<usize> {
+    let ws_root = ws
+        .project_root
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| ws.source_cwd.as_deref().filter(|s| !s.trim().is_empty()))
+        .unwrap_or(&ws.cwd);
+    let clean_root = normalize_project_path(ws_root);
+    let clean_ws_cwd = normalize_project_path(&ws.cwd);
+
+    let canonical_key = |idx: usize| -> (String, &str) {
+        let g = &groups[idx];
+        (normalize_project_path(&g.primary_cwd), g.id.as_str())
+    };
+
+    groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| matches_project_directory(&g.directories, &clean_root))
+        .min_by(|(ia, _), (ib, _)| canonical_key(*ia).cmp(&canonical_key(*ib)))
+        .map(|(idx, _)| idx)
+        .or_else(|| {
+            groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| matches_project_directory(&g.directories, &clean_ws_cwd))
+                .min_by(|(ia, _), (ib, _)| canonical_key(*ia).cmp(&canonical_key(*ib)))
+                .map(|(idx, _)| idx)
+        })
+        .or_else(|| {
+            groups
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, g)| {
+                    g.directories
+                        .iter()
+                        .filter(|d| path_is_inside_directory(d, &clean_root))
+                        .map(|d| (idx, normalize_project_path(d).len()))
+                        .max_by_key(|(_, len)| *len)
+                })
+                .min_by(|(ia, len_a), (ib, len_b)| {
+                    len_b
+                        .cmp(len_a)
+                        .then_with(|| canonical_key(*ia).cmp(&canonical_key(*ib)))
+                })
+                .map(|(idx, _)| idx)
+        })
 }
 
 fn resolve_git_capability_for_path(
@@ -689,6 +754,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 sort_order_key: proj.project_id.clone(),
                 conversations: Vec::new(),
                 workspaces: Vec::new(),
+                workspace_ids: Vec::new(),
                 unclassified_conversations: Vec::new(),
             };
             group_idx_by_id.insert(group.id.clone(), host_groups.len());
@@ -900,6 +966,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                             sort_order_key: id,
                             conversations: Vec::new(),
                             workspaces: Vec::new(),
+                            workspace_ids: Vec::new(),
                             unclassified_conversations: Vec::new(),
                         });
                         matched_idx = Some(idx);
@@ -950,6 +1017,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         sort_order_key: id,
                         conversations: Vec::new(),
                         workspaces: Vec::new(),
+                        workspace_ids: Vec::new(),
                         unclassified_conversations: Vec::new(),
                     });
                     idx
@@ -973,33 +1041,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             let ws_root = ws
                 .project_root
                 .as_deref()
-                .or(ws.source_cwd.as_deref())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| ws.source_cwd.as_deref().filter(|s| !s.trim().is_empty()))
                 .unwrap_or(&ws.cwd);
             let clean_root = normalize_project_path(ws_root);
-            let clean_ws_cwd = normalize_project_path(&ws.cwd);
 
-            let matched_idx = host_groups
-                .iter()
-                .position(|g| matches_project_directory(&g.directories, &clean_root))
-                .or_else(|| {
-                    host_groups
-                        .iter()
-                        .position(|g| matches_project_directory(&g.directories, &clean_ws_cwd))
-                })
-                .or_else(|| {
-                    host_groups
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, g)| {
-                            g.directories
-                                .iter()
-                                .filter(|d| path_is_inside_directory(d, &clean_root))
-                                .map(|d| (idx, d.len()))
-                                .max_by_key(|(_, len)| *len)
-                        })
-                        .max_by_key(|(_, len)| *len)
-                        .map(|(idx, _)| idx)
-                });
+            let matched_idx = resolve_workspace_project_group_index(&host_groups, ws);
 
             let target_idx = if let Some(idx) = matched_idx {
                 idx
@@ -1044,6 +1091,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         sort_order_key: id,
                         conversations: Vec::new(),
                         workspaces: Vec::new(),
+                        workspace_ids: Vec::new(),
                         unclassified_conversations: Vec::new(),
                     });
                     idx
@@ -1058,6 +1106,25 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 .entry(target_idx)
                 .or_default()
                 .push(ws);
+        }
+
+        // 2.6 Project authoritative `workspace_ids` (both active AND archived non-background
+        //     workspaces) onto each host project group using the exact same matcher (R3-P1-2 / R4-Nit).
+        if !host_groups.is_empty() {
+            let mut assignments: Vec<(usize, String)> = Vec::new();
+            for ws in host.workspaces {
+                if ws.background {
+                    continue;
+                }
+                if let Some(idx) = resolve_workspace_project_group_index(&host_groups, ws) {
+                    assignments.push((idx, ws.workspace_id.clone()));
+                }
+            }
+            for (idx, ws_id) in assignments {
+                if !host_groups[idx].workspace_ids.contains(&ws_id) {
+                    host_groups[idx].workspace_ids.push(ws_id);
+                }
+            }
         }
 
         // 3. Collect fallback discovered repositories only for hosts with neither pinned projects
@@ -1103,6 +1170,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         sort_order_key: id,
                         conversations: Vec::new(),
                         workspaces: Vec::new(),
+                        workspace_ids: Vec::new(),
                         unclassified_conversations: Vec::new(),
                     },
                 ));
@@ -2913,5 +2981,257 @@ mod tests {
         assert_eq!(view.needs_attention.len(), 1);
         assert_eq!(view.needs_attention[0].host_id, "h1");
         assert_eq!(view.needs_attention[0].agent.agent_id, "conv_root");
+    }
+
+    #[test]
+    fn build_fleet_sidebar_projects_authoritative_workspace_ids_including_unmatched_root_legacy_worktree_and_archived()
+     {
+        let now = chrono::Utc::now();
+        let make_ws = |id: &str,
+                       title: &str,
+                       cwd: &str,
+                       source_cwd: Option<&str>,
+                       project_root: Option<&str>,
+                       is_worktree: bool,
+                       archived: bool| WorkspaceSummary {
+            workspace_id: id.into(),
+            title: title.into(),
+            cwd: cwd.into(),
+            git_branch: Some("main".into()),
+            is_worktree,
+            updated_at: now,
+            source_cwd: source_cwd.map(str::to_string),
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: archived.then_some(now),
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+            mission_goal: None,
+            board_revision: 0,
+            is_curated: true,
+            title_locked: false,
+            project_root: project_root.map(str::to_string),
+            auto_clustered: false,
+        };
+        let workspaces = vec![
+            make_ws("ws_a", "Dup A", "/repo", None, None, false, false),
+            make_ws("ws_b", "Dup B", "/repo", None, None, false, false),
+            make_ws(
+                "ws_c_alias",
+                "Alias C",
+                "/wt/c",
+                Some("/repo"),
+                None,
+                true,
+                false,
+            ),
+            make_ws(
+                "ws_d_arch",
+                "Archived D",
+                "/wt/d",
+                None,
+                Some("/repo"),
+                true,
+                true,
+            ),
+            make_ws(
+                "ws_legacy_wt",
+                "Legacy WT",
+                "/home/me/.orbit/worktrees/repo-branch",
+                None,
+                None,
+                true,
+                false,
+            ),
+            make_ws(
+                "ws_nested",
+                "Nested",
+                "/repo/nested",
+                None,
+                None,
+                false,
+                false,
+            ),
+            make_ws(
+                "ws_unmatched_root",
+                "UnmatchedRoot",
+                "/repo/nested",
+                None,
+                Some("/outside/declared"),
+                false,
+                false,
+            ),
+            make_ws(
+                "ws_root_wins",
+                "RootWins",
+                "/repo/wt-x",
+                Some("/repo"),
+                Some("/other"),
+                true,
+                false,
+            ),
+            make_ws(
+                "ws_shared_child",
+                "SharedChild",
+                "/common/child",
+                None,
+                None,
+                false,
+                false,
+            ),
+        ];
+        let pinned = vec![
+            ClientProjectView {
+                project_id: "proj_repo".into(),
+                host_id: "h1".into(),
+                name: "repo".into(),
+                directories: vec!["/repo".into(), "/common".into()],
+                updated_at_ms: 100,
+            },
+            ClientProjectView {
+                project_id: "proj_nested".into(),
+                host_id: "h1".into(),
+                name: "nested".into(),
+                directories: vec!["/repo/nested".into()],
+                updated_at_ms: 90,
+            },
+            ClientProjectView {
+                project_id: "proj_other".into(),
+                host_id: "h1".into(),
+                name: "other".into(),
+                directories: vec!["/other".into(), "/common".into()],
+                updated_at_ms: 80,
+            },
+        ];
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        for (order_label, pinned_list, sort_mode) in [
+            (
+                "repo_first_recent",
+                pinned.clone(),
+                SidebarProjectSort::Recent,
+            ),
+            (
+                "repo_first_alpha",
+                pinned.clone(),
+                SidebarProjectSort::Alphabetical,
+            ),
+            (
+                "other_first_alpha",
+                vec![pinned[2].clone(), pinned[1].clone(), pinned[0].clone()],
+                SidebarProjectSort::Alphabetical,
+            ),
+        ] {
+            let view = build_fleet_sidebar(FleetSidebarParams {
+                revision: 1,
+                hosts: vec![SidebarHostInput {
+                    host_id: "h1",
+                    host_name: "Host1",
+                    workspaces: &workspaces,
+                    discovered_projects: &[],
+                    agents: vec![],
+                    active_git_branch: None,
+                    git_repos_by_cwd: &empty_git_repos,
+                    workspace_conflict_ids: &empty_conflicts,
+                }],
+                pinned_projects: &pinned_list,
+                project_order: &[],
+                sort: sort_mode,
+                filter: SidebarThreadFilter::All,
+                query: "",
+                active_host_id: None,
+                active_agent_id: None,
+                active_cwd: None,
+            });
+
+            let ids_for = |proj_id: &str| -> Vec<String> {
+                view.projects
+                    .iter()
+                    .find(|p| p.id == proj_id)
+                    .map(|p| p.workspace_ids.clone())
+                    .unwrap_or_default()
+            };
+            assert_eq!(
+                ids_for("proj_repo"),
+                vec!["ws_a", "ws_b", "ws_c_alias", "ws_d_arch", "ws_legacy_wt"],
+                "{order_label}"
+            );
+            assert_eq!(
+                ids_for("proj_nested"),
+                vec!["ws_nested", "ws_unmatched_root"],
+                "{order_label}"
+            );
+            assert_eq!(
+                ids_for("proj_other"),
+                vec!["ws_root_wins", "ws_shared_child"],
+                "{order_label}: equal-length /common tie must deterministically resolve to /other"
+            );
+        }
+
+        // R5-Nit-2: Unicode path tie-break (`/ＡＰＰ` U+FF21 vs `/🚀工具` U+1F680) sharing `/common`
+        // resolves deterministically to `/ＡＰＰ` in UTF-8 / Unicode scalar order regardless of input order.
+        let unicode_ws = vec![make_ws(
+            "ws_unicode_shared",
+            "SharedChild",
+            "/common/child",
+            None,
+            None,
+            false,
+            false,
+        )];
+        let unicode_pinned_a = vec![
+            ClientProjectView {
+                project_id: "proj_rocket".into(),
+                host_id: "h1".into(),
+                name: "rocket".into(),
+                directories: vec!["/🚀工具".into(), "/common".into()],
+                updated_at_ms: 200,
+            },
+            ClientProjectView {
+                project_id: "proj_fullwidth".into(),
+                host_id: "h1".into(),
+                name: "fullwidth".into(),
+                directories: vec!["/ＡＰＰ".into(), "/common".into()],
+                updated_at_ms: 100,
+            },
+        ];
+        let unicode_pinned_b = vec![unicode_pinned_a[1].clone(), unicode_pinned_a[0].clone()];
+        for pinned_list in [unicode_pinned_a, unicode_pinned_b] {
+            let uview = build_fleet_sidebar(FleetSidebarParams {
+                revision: 1,
+                hosts: vec![SidebarHostInput {
+                    host_id: "h1",
+                    host_name: "Host1",
+                    workspaces: &unicode_ws,
+                    discovered_projects: &[],
+                    agents: vec![],
+                    active_git_branch: None,
+                    git_repos_by_cwd: &empty_git_repos,
+                    workspace_conflict_ids: &empty_conflicts,
+                }],
+                pinned_projects: &pinned_list,
+                project_order: &[],
+                sort: SidebarProjectSort::Alphabetical,
+                filter: SidebarThreadFilter::All,
+                query: "",
+                active_host_id: None,
+                active_agent_id: None,
+                active_cwd: None,
+            });
+            let fw_ids: Vec<String> = uview
+                .projects
+                .iter()
+                .find(|p| p.id == "proj_fullwidth")
+                .map(|p| p.workspace_ids.clone())
+                .unwrap_or_default();
+            let rk_ids: Vec<String> = uview
+                .projects
+                .iter()
+                .find(|p| p.id == "proj_rocket")
+                .map(|p| p.workspace_ids.clone())
+                .unwrap_or_default();
+            assert_eq!(fw_ids, vec!["ws_unicode_shared"]);
+            assert!(rk_ids.is_empty());
+        }
     }
 }

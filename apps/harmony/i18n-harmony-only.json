@@ -1313,5 +1313,840 @@
     "en": "Chinchilla",
     "zh-CN": "龙猫",
     "ja": "チンチラ"
+  },
+  "git_push": {
+    "en": "Push",
+    "zh-CN": "推送",
+    "ja": "プッシュ"
+  },
+  "git_push_remote_placeholder": {
+    "en": "Remote (default: origin)",
+    "zh-CN": "远程仓库（默认 origin）",
+    "ja": "リモート（既定: origin）"
+  },
+  "git_push_branch_placeholder": {
+    "en": "Branch (default: current)",
+    "zh-CN": "分支（默认当前分支）",
+    "ja": "ブランチ（既定: 現在のブランチ）"
+  },
+  "git_push_set_upstream": {
+    "en": "Set upstream (-u)",
+    "zh-CN": "设置上游跟踪 (-u)",
+    "ja": "アップストリームを設定 (-u)"
+  },
+  "git_discard": {
+    "en": "Discard",
+    "zh-CN": "丢弃更改",
+    "ja": "変更を破棄"
+  },
+  "git_discard_title": {
+    "en": "Discard Changes",
+    "zh-CN": "确认丢弃更改",
+    "ja": "変更の破棄を確認"
+  },
+  "git_discard_warning": {
+    "en": "This permanently reverts local edits to %s. Type the exact filename to confirm:",
+    "zh-CN": "此操作将永久还原 %s 的本地更改，请输入准确文件名以解锁确认：",
+    "ja": "%s のローカル変更を完全に破棄します。確定するにはファイル名を正確に入力してください："
+  },
+  "git_discard_input_placeholder": {
+    "en": "Type filename to confirm…",
+    "zh-CN": "输入文件名以确认…",
+    "ja": "確認のためファイル名を入力…"
+  },
+  "git_discard_include_untracked": {
+    "en": "Delete untracked file",
+    "zh-CN": "同时删除未跟踪文件",
+    "ja": "未追跡ファイルも削除"
+  },
+  "git_discard_confirm_action": {
+    "en": "Confirm Discard",
+    "zh-CN": "确认丢弃",
+    "ja": "破棄を確定"
+  },
+  "git_stashes_count": {
+    "en": "Stashes (%d)",
+    "zh-CN": "暂存 (%d)",
+    "ja": "スタッシュ (%d)"
+  },
+  "git_stash_list_title": {
+    "en": "Saved Stashes",
+    "zh-CN": "已保存的暂存",
+    "ja": "保存済みスタッシュ"
+  },
+  "git_show_all_lines": {
+    "en": "Show all %d lines",
+    "zh-CN": "展开全部 %d 行",
+    "ja": "全 %d 行を表示"
+  },
+  "files_preview_capped": {
+    "en": "Syntax-highlighted first %1$d of %2$d lines",
+    "zh-CN": "已语法高亮前 %1$d / %2$d 行",
+    "ja": "全 %2$d 行中、先頭 %1$d 行をハイライト表示中"
+  },
+  "files_preview_capped_lower_bound": {
+    "en": "Syntax-highlighted first %1$d of %2$d+ lines",
+    "zh-CN": "已语法高亮前 %1$d / %2$d+ 行",
+    "ja": "%2$d+ 行中、先頭 %1$d 行をハイライト表示中"
+  },
+  "files_load_full": {
+    "en": "Load Full File",
+    "zh-CN": "加载全文",
+    "ja": "全文を読み込む"
+  },
+  "files_showing_full": {
+    "en": "Showing full file (%d lines)",
+    "zh-CN": "正在显示全文（共 %d 行）",
+    "ja": "全文を表示中（全 %d 行）"
+  },
+  "files_showing_full_lower_bound": {
+    "en": "Showing full file (%d+ lines)",
+    "zh-CN": "正在显示全文（%d+ 行）",
+    "ja": "全文を表示中（%d+ 行）"
+  },
+  "files_reload_disk": {
+    "en": "Reload Disk",
+    "zh-CN": "重新加载磁盘版本",
+    "ja": "ディスクから再読込"
+  },
+  "files_overwrite_anyway": {
+    "en": "Overwrite Anyway",
+    "zh-CN": "仍要覆盖",
+    "ja": "強制上書き"
+  },
+  "terminal_slot_label": {
+    "en": "S%d",
+    "zh-CN": "槽%d",
+    "ja": "S%d"
+  },
+  "terminal_new_shell": {
+    "en": "+ New",
+    "zh-CN": "+ 新建",
+    "ja": "+ 新規"
+  },
+  "terminal_empty_slot": {
+    "en": "No active terminal buffer in this slot.",
+    "zh-CN": "当前槽位暂无活跃终端缓冲区。",
+    "ja": "このスロットにアクティブな端末バッファはありません。"
+  },
+  "terminal_delta_rev": {
+    "en": "rev %d",
+    "zh-CN": "版本 %d",
+    "ja": "rev %d"
+  },
+  "board_revision_badge": {
+    "en": "rev %d",
+    "zh-CN": "修订 %d",
+    "ja": "rev %d"
+  },
+  "board_cas_conflict_title": {
+    "en": "BOARD.md Revision Conflict",
+    "zh-CN": "BOARD.md 修订冲突",
+    "ja": "BOARD.md リビジョン競合"
+  },
+  "board_cas_conflict_body": {
+    "en": "Remote board advanced to rev %1$d while you edited from rev %2$d. Choose how to resolve:",
+    "zh-CN": "编辑期间远端白板已更新至修订 %1$d（草稿基于修订 %2$d），请选择处理方式：",
+    "ja": "編集中にリモートボードが rev %1$d へ更新されました（編集中は rev %2$d 基準）。解決方法を選択してください："
+  },
+  "board_cas_reload_merge": {
+    "en": "Reload & Merge",
+    "zh-CN": "重新加载合并",
+    "ja": "再読込してマージ"
+  },
+  "board_cas_force_overwrite": {
+    "en": "Force Overwrite",
+    "zh-CN": "强制覆盖",
+    "ja": "強制上書き"
+  },
+  "board_peer_aliases": {
+    "en": "aka %s",
+    "zh-CN": "曾用 %s",
+    "ja": "旧名 %s"
+  },
+  "board_dev_scripts": {
+    "en": "Scripts",
+    "zh-CN": "脚本",
+    "ja": "スクリプト"
+  },
+  "handoff_title": {
+    "en": "Worktree Handoff",
+    "zh-CN": "Worktree 变更交接",
+    "ja": "ワークツリー引き継ぎ"
+  },
+  "handoff_capsule": {
+    "en": "Worktree",
+    "zh-CN": "Worktree",
+    "ja": "Worktree"
+  },
+  "handoff_dir_to_local": {
+    "en": "Worktree → Local",
+    "zh-CN": "Worktree → 本地",
+    "ja": "Worktree → ローカル"
+  },
+  "handoff_dir_to_worktree": {
+    "en": "Local → Worktree",
+    "zh-CN": "本地 → Worktree",
+    "ja": "ローカル → Worktree"
+  },
+  "handoff_mode_apply": {
+    "en": "Apply (Keep Source)",
+    "zh-CN": "应用（保留源更改）",
+    "ja": "適用（元を維持）"
+  },
+  "handoff_mode_move": {
+    "en": "Move (Reset Source)",
+    "zh-CN": "移动（清理源更改）",
+    "ja": "移動（元をリセット）"
+  },
+  "handoff_include_committed": {
+    "en": "Include committed changes",
+    "zh-CN": "包含已提交的变更",
+    "ja": "コミット済み変更を含める"
+  },
+  "handoff_allow_three_way": {
+    "en": "Allow 3-way conflict markers",
+    "zh-CN": "允许 3-way 冲突标记",
+    "ja": "3-way コンフリクトマーカーを許可"
+  },
+  "handoff_branch_placeholder": {
+    "en": "Target branch (optional)",
+    "zh-CN": "目标分支（可选）",
+    "ja": "対象ブランチ（任意）"
+  },
+  "handoff_preview_refresh": {
+    "en": "Preview",
+    "zh-CN": "预览变更",
+    "ja": "プレビュー"
+  },
+  "handoff_execute": {
+    "en": "Execute Handoff",
+    "zh-CN": "确认执行交接",
+    "ja": "引き継ぎを実行"
+  },
+  "handoff_conflicts_warning": {
+    "en": "%d file conflict(s) detected",
+    "zh-CN": "检测到 %d 个文件冲突",
+    "ja": "%d 件のファイル競合を検出"
+  },
+  "handoff_clean_preview": {
+    "en": "Ready to apply cleanly (%d file(s))",
+    "zh-CN": "可无冲突应用（共 %d 个文件）",
+    "ja": "競合なしで適用可能（%d ファイル）"
+  },
+  "handoff_empty_preview": {
+    "en": "No transferable changes detected",
+    "zh-CN": "未检测到可交接的变更",
+    "ja": "引き継ぎ可能な変更はありません"
+  },
+  "handoff_backup_ref": {
+    "en": "Backup ref: %s",
+    "zh-CN": "安全备份引用：%s",
+    "ja": "バックアップ参照: %s"
+  },
+  "workspace_new_v2": {
+    "en": "New Workspace",
+    "zh-CN": "新建工作区",
+    "ja": "新規ワークスペース"
+  },
+  "workspace_title_placeholder": {
+    "en": "Workspace title (optional)",
+    "zh-CN": "工作区名称（可选）",
+    "ja": "ワークスペース名（任意）"
+  },
+  "workspace_isolation_local": {
+    "en": "Local",
+    "zh-CN": "本地目录",
+    "ja": "ローカル"
+  },
+  "workspace_isolation_worktree": {
+    "en": "Git Worktree",
+    "zh-CN": "Git Worktree",
+    "ja": "Git Worktree"
+  },
+  "workspace_mode_branch_off": {
+    "en": "New Branch",
+    "zh-CN": "新建分支",
+    "ja": "新規ブランチ"
+  },
+  "workspace_mode_checkout_branch": {
+    "en": "Checkout Branch",
+    "zh-CN": "检出已有分支",
+    "ja": "既存ブランチ"
+  },
+  "workspace_mode_checkout_pr": {
+    "en": "Checkout PR",
+    "zh-CN": "检出 PR",
+    "ja": "PR をチェックアウト"
+  },
+  "workspace_branch_placeholder": {
+    "en": "Branch name (optional)",
+    "zh-CN": "分支名（可选）",
+    "ja": "ブランチ名（任意）"
+  },
+  "workspace_base_ref_placeholder": {
+    "en": "Base ref (e.g. main)",
+    "zh-CN": "基线引用（如 main）",
+    "ja": "ベース参照（例: main）"
+  },
+  "workspace_pr_number_placeholder": {
+    "en": "PR number",
+    "zh-CN": "PR 编号",
+    "ja": "PR 番号"
+  },
+  "workspace_archive": {
+    "en": "Archive Workspace",
+    "zh-CN": "归档工作区",
+    "ja": "ワークスペースをアーカイブ"
+  },
+  "workspace_archive_keep_unclassified": {
+    "en": "Archive (Keep Agents Unclassified)",
+    "zh-CN": "归档工作区（保留智能体未分类）",
+    "ja": "アーカイブ（エージェントを未分類で維持）"
+  },
+  "workspace_unarchive": {
+    "en": "Restore Workspace",
+    "zh-CN": "取消归档工作区",
+    "ja": "ワークスペースを復元"
+  },
+  "scripts_title": {
+    "en": "Dev Scripts",
+    "zh-CN": "开发脚本",
+    "ja": "開発スクリプト"
+  },
+  "scripts_empty": {
+    "en": "No scripts configured in orbit.json for this workspace.",
+    "zh-CN": "当前工作区的 orbit.json 未配置开发脚本。",
+    "ja": "このワークスペースの orbit.json にスクリプト設定がありません。"
+  },
+  "scripts_start": {
+    "en": "Start",
+    "zh-CN": "启动",
+    "ja": "開始"
+  },
+  "scripts_stop": {
+    "en": "Stop",
+    "zh-CN": "停止",
+    "ja": "停止"
+  },
+  "scripts_status_running": {
+    "en": "Running",
+    "zh-CN": "运行中",
+    "ja": "実行中"
+  },
+  "scripts_status_failed": {
+    "en": "Failed",
+    "zh-CN": "失败",
+    "ja": "失敗"
+  },
+  "scripts_status_stopped": {
+    "en": "Stopped",
+    "zh-CN": "已停止",
+    "ja": "停止中"
+  },
+  "scripts_status_summary_label": {
+    "en": "Status / Endpoint / Command",
+    "zh-CN": "状态 / 入口 / 命令",
+    "ja": "状態 / エンドポイント / コマンド"
+  },
+  "scripts_start_failed": {
+    "en": "Start script failed",
+    "zh-CN": "启动脚本失败",
+    "ja": "スクリプトの開始に失敗しました"
+  },
+  "scripts_start_failed_detail": {
+    "en": "Start script failed: %s",
+    "zh-CN": "启动脚本失败：%s",
+    "ja": "スクリプトの開始に失敗しました: %s"
+  },
+  "scripts_stop_failed": {
+    "en": "Stop script failed",
+    "zh-CN": "停止脚本失败",
+    "ja": "スクリプトの停止に失敗しました"
+  },
+  "scripts_stop_failed_detail": {
+    "en": "Stop script failed: %s",
+    "zh-CN": "停止脚本失败：%s",
+    "ja": "スクリプトの停止に失敗しました: %s"
+  },
+  "git_push_success": {
+    "en": "Pushed %1$s → %2$s",
+    "zh-CN": "已推送 %1$s → %2$s",
+    "ja": "%1$s → %2$s をプッシュしました"
+  },
+  "git_push_failed": {
+    "en": "Push failed",
+    "zh-CN": "推送失败",
+    "ja": "プッシュに失敗しました"
+  },
+  "git_push_failed_detail": {
+    "en": "Push failed: %s",
+    "zh-CN": "推送失败：%s",
+    "ja": "プッシュに失敗しました: %s"
+  },
+  "git_discard_success": {
+    "en": "Discarded %d file(s)",
+    "zh-CN": "已丢弃 %d 个文件的更改",
+    "ja": "%d 件のファイル変更を破棄しました"
+  },
+  "git_discard_failed": {
+    "en": "Discard failed",
+    "zh-CN": "丢弃更改失败",
+    "ja": "変更の破棄に失敗しました"
+  },
+  "git_discard_failed_detail": {
+    "en": "Discard failed: %s",
+    "zh-CN": "丢弃更改失败：%s",
+    "ja": "変更の破棄に失敗しました: %s"
+  },
+  "files_source_truncated_banner": {
+    "en": "Source file truncated (%1$s / %2$s loaded · read-only)",
+    "zh-CN": "源文件已截断（已加载 %1$s / %2$s · 只读）",
+    "ja": "ソースファイルは省略されています（%1$s / %2$s 読込済・読み取り専用）"
+  },
+  "files_load_next_chunk": {
+    "en": "Load more",
+    "zh-CN": "加载后续分块",
+    "ja": "続きを読み込む"
+  },
+  "files_loading_chunk": {
+    "en": "Loading…",
+    "zh-CN": "加载中…",
+    "ja": "読み込み中…"
+  },
+  "files_chunk_etag_conflict": {
+    "en": "File changed on host while loading remaining chunks. Reload to view the latest file.",
+    "zh-CN": "加载剩余分块期间远端文件已变更，请重新加载最新版本。",
+    "ja": "続きの読み込み中にホスト側のファイルが変更されました。最新を再読み込みしてください。"
+  },
+  "files_chunk_limit_reached": {
+    "en": "Read limit reached (%1$s / %2$s loaded · read-only)",
+    "zh-CN": "已达读取上限（已加载 %1$s / %2$s · 只读）",
+    "ja": "読み込み上限に達しました（%1$s / %2$s 読込済・読み取り専用）"
+  },
+  "files_chunk_load_failed": {
+    "en": "Failed to load next file chunk",
+    "zh-CN": "加载文件分块失败",
+    "ja": "ファイル分塊の読み込みに失敗しました"
+  },
+  "files_showing_partial": {
+    "en": "Showing loaded prefix (%1$s / %2$s · source truncated)",
+    "zh-CN": "显示已加载前缀（%1$s / %2$s · 源文件已截断）",
+    "ja": "読込済み先頭を表示中（%1$s / %2$s・ソース省略あり）"
+  },
+  "handoff_hard_blocker": {
+    "en": "Cannot apply cleanly — resolve target workspace state first",
+    "zh-CN": "无法无冲突应用，请先处理目标工作区状态",
+    "ja": "安全に適用できません。先に対象ワークスペースの状態を確認してください"
+  },
+  "handoff_untracked_conflict": {
+    "en": "Untracked file conflict cannot be merged with 3-way markers",
+    "zh-CN": "未跟踪文件冲突不支持三方合并",
+    "ja": "未追跡ファイルの競合は 3-way マージで解決できません"
+  },
+  "handoff_preview_failed": {
+    "en": "Handoff preview failed",
+    "zh-CN": "交接预览失败",
+    "ja": "引き継ぎプレビューに失敗しました"
+  },
+  "handoff_preview_failed_detail": {
+    "en": "Handoff preview failed: %s",
+    "zh-CN": "交接预览失败：%s",
+    "ja": "引き継ぎプレビューに失敗しました: %s"
+  },
+  "handoff_execute_success": {
+    "en": "Worktree handoff complete",
+    "zh-CN": "Worktree 交接完成",
+    "ja": "Worktree の引き継ぎが完了しました"
+  },
+  "handoff_execute_failed": {
+    "en": "Worktree handoff failed",
+    "zh-CN": "Worktree 交接失败",
+    "ja": "Worktree の引き継ぎに失敗しました"
+  },
+  "handoff_execute_failed_detail": {
+    "en": "Worktree handoff failed: %s",
+    "zh-CN": "Worktree 交接失败：%s",
+    "ja": "Worktree の引き継ぎに失敗しました: %s"
+  },
+  "workspace_create_dispatched": {
+    "en": "Workspace creation dispatched",
+    "zh-CN": "已提交创建工作区",
+    "ja": "ワークスペース作成を送信しました"
+  },
+  "workspace_create_failed": {
+    "en": "Create workspace failed",
+    "zh-CN": "创建工作区失败",
+    "ja": "ワークスペースの作成に失敗しました"
+  },
+  "workspace_create_failed_detail": {
+    "en": "Create workspace failed: %s",
+    "zh-CN": "创建工作区失败：%s",
+    "ja": "ワークスペースの作成に失敗しました: %s"
+  },
+  "workspace_archived_toast": {
+    "en": "Workspace archived",
+    "zh-CN": "工作区已归档",
+    "ja": "ワークスペースをアーカイブしました"
+  },
+  "workspace_archive_failed": {
+    "en": "Archive workspace failed",
+    "zh-CN": "归档工作区失败",
+    "ja": "ワークスペースのアーカイブに失敗しました"
+  },
+  "workspace_archive_failed_detail": {
+    "en": "Archive workspace failed: %s",
+    "zh-CN": "归档工作区失败：%s",
+    "ja": "ワークスペースのアーカイブに失敗しました: %s"
+  },
+  "workspace_restored_toast": {
+    "en": "Workspace restored",
+    "zh-CN": "工作区已恢复",
+    "ja": "ワークスペースを復元しました"
+  },
+  "workspace_restore_failed": {
+    "en": "Restore workspace failed",
+    "zh-CN": "恢复工作区失败",
+    "ja": "ワークスペースの復元に失敗しました"
+  },
+  "workspace_restore_failed_detail": {
+    "en": "Restore workspace failed: %s",
+    "zh-CN": "恢复工作区失败：%s",
+    "ja": "ワークスペースの復元に失敗しました: %s"
+  },
+  "workspace_menu_active_group": {
+    "en": "Active Workspaces",
+    "zh-CN": "活跃工作区",
+    "ja": "アクティブなワークスペース"
+  },
+  "workspace_menu_archived_group": {
+    "en": "Archived Workspaces",
+    "zh-CN": "已归档工作区",
+    "ja": "アーカイブ済みワークスペース"
+  },
+  "workspace_menu_scripts_item": {
+    "en": "Dev Scripts · %s",
+    "zh-CN": "开发脚本 · %s",
+    "ja": "開発スクリプト · %s"
+  },
+  "workspace_menu_archive_item": {
+    "en": "Archive · %s",
+    "zh-CN": "归档 · %s",
+    "ja": "アーカイブ · %s"
+  },
+  "workspace_menu_archive_keep_item": {
+    "en": "Archive (Keep Unclassified) · %s",
+    "zh-CN": "归档（保留未分类）· %s",
+    "ja": "アーカイブ（未分類維持）· %s"
+  },
+  "workspace_menu_restore_item": {
+    "en": "Restore · %s",
+    "zh-CN": "恢复 · %s",
+    "ja": "復元 · %s"
+  },
+  "board_saved_toast": {
+    "en": "Saved BOARD.md",
+    "zh-CN": "已保存 BOARD.md",
+    "ja": "BOARD.md を保存しました"
+  },
+  "board_save_failed": {
+    "en": "Failed to save BOARD.md",
+    "zh-CN": "保存 BOARD.md 失败",
+    "ja": "BOARD.md の保存に失敗しました"
+  },
+  "board_save_failed_detail": {
+    "en": "Failed to save BOARD.md: %s",
+    "zh-CN": "保存 BOARD.md 失败：%s",
+    "ja": "BOARD.md の保存に失敗しました: %s"
+  },
+  "board_snapshot_not_loaded": {
+    "en": "Board snapshot has not finished loading yet",
+    "zh-CN": "BOARD.md 快照尚未加载完成",
+    "ja": "BOARD.md スナップショットの読み込みが完了していません"
+  },
+  "board_workspace_unbound": {
+    "en": "No workspace bound to this tab",
+    "zh-CN": "当前标签页未绑定工作区",
+    "ja": "このタブにワークスペースが紐づいていません"
+  },
+  "board_workspace_loading": {
+    "en": "Workspace metadata is still loading — please wait",
+    "zh-CN": "工作区元数据仍在加载，请稍候",
+    "ja": "ワークスペース情報を読み込み中です"
+  },
+  "board_workspace_changed": {
+    "en": "Workspace changed or no longer matches this tab",
+    "zh-CN": "工作区已变更或与当前标签页不匹配",
+    "ja": "ワークスペースが変更されたかタブと一致しません"
+  },
+  "terminal_start_failed": {
+    "en": "Failed to start terminal",
+    "zh-CN": "启动终端失败",
+    "ja": "ターミナルの起動に失敗しました"
+  },
+  "terminal_closed_toast": {
+    "en": "Terminal closed",
+    "zh-CN": "终端已关闭",
+    "ja": "ターミナルを閉じました"
+  },
+  "terminal_close_failed": {
+    "en": "Failed to close terminal",
+    "zh-CN": "关闭终端失败",
+    "ja": "ターミナルの終了に失敗しました"
+  },
+  "terminal_buffer_empty": {
+    "en": "Terminal buffer is empty",
+    "zh-CN": "终端缓冲区为空",
+    "ja": "ターミナルバッファが空です"
+  },
+  "terminal_copied_toast": {
+    "en": "Copied terminal output",
+    "zh-CN": "已复制终端输出",
+    "ja": "ターミナル出力をコピーしました"
+  },
+  "terminal_no_buffer": {
+    "en": "No active terminal buffer in this slot.",
+    "zh-CN": "当前终端槽暂无活跃输出。",
+    "ja": "このスロットにアクティブな出力がありません。"
+  },
+  "board_empty_notice": {
+    "en": "BOARD.md is empty for this workspace.",
+    "zh-CN": "当前工作区的 BOARD.md 为空。",
+    "ja": "このワークスペースの BOARD.md は空です。"
+  },
+  "peers_empty_notice": {
+    "en": "No active sibling peers in this workspace yet.",
+    "zh-CN": "当前工作区暂无活跃同伴。",
+    "ja": "このワークスペースにアクティブなピアはいません。"
+  },
+  "peers_spawn_title": {
+    "en": "Spawn Peer",
+    "zh-CN": "派生同伴",
+    "ja": "ピアを起動"
+  },
+  "peers_handle_placeholder": {
+    "en": "Optional @handle (e.g. reviewer)",
+    "zh-CN": "可选 @handle（如 reviewer）",
+    "ja": "任意の @handle（例: reviewer）"
+  },
+  "peers_prompt_placeholder": {
+    "en": "Task brief for the new peer…",
+    "zh-CN": "输入给新同伴的任务说明…",
+    "ja": "新しいピアへのタスク説明…"
+  },
+  "board_cas_unsupported_banner": {
+    "en": "Connected daemon does not support conflict-safe saves (CAS). Upgrade daemon or use Force Overwrite.",
+    "zh-CN": "当前主机守护进程不支持冲突安全保存（CAS），请升级守护进程或显式强制覆盖。",
+    "ja": "接続中のデーモンは競合安全な保存（CAS）に未対応です。更新するか強制上書きを使用してください。"
+  },
+  "board_cas_unsupported_toast": {
+    "en": "Normal save disabled on older daemon — draft preserved. Upgrade daemon or use Force Overwrite.",
+    "zh-CN": "旧版守护进程已禁用普通保存（草稿已保留），请升级守护进程或使用强制覆盖",
+    "ja": "旧デーモンでは通常保存が無効です（下書き保持）。更新または強制上書きしてください"
+  },
+  "files_chunk_binary_tail_locked": {
+    "en": "Binary data detected in later chunk — file locked read-only to prevent truncation.",
+    "zh-CN": "后续分块检测到二进制数据，已锁定为只读以防覆盖截断源文件。",
+    "ja": "後続チャンクにバイナリデータを検出したため、切り詰め防止のため読み取り専用にロックしました。"
+  },
+  "files_chunk_incomplete_locked": {
+    "en": "Chunk sequence could not be verified — file locked read-only.",
+    "zh-CN": "分块内容校验未通过，已锁定为只读。",
+    "ja": "チャンクの整合性を確認できないため、読み取り専用にロックしました。"
+  },
+  "workspace_menu_rename_item": {
+    "en": "Rename · %s",
+    "zh-CN": "重命名 · %s",
+    "ja": "名前変更 · %s"
+  },
+  "workspace_rename_title": {
+    "en": "Rename Workspace",
+    "zh-CN": "重命名工作区",
+    "ja": "ワークスペース名を変更"
+  },
+  "workspace_rename_placeholder": {
+    "en": "Workspace title",
+    "zh-CN": "输入工作区名称",
+    "ja": "ワークスペース名を入力"
+  },
+  "workspace_rename_confirm": {
+    "en": "Rename",
+    "zh-CN": "确认重命名",
+    "ja": "名前を変更"
+  },
+  "workspace_renamed_toast": {
+    "en": "Workspace renamed",
+    "zh-CN": "工作区已重命名",
+    "ja": "ワークスペース名を変更しました"
+  },
+  "workspace_rename_failed": {
+    "en": "Failed to rename workspace",
+    "zh-CN": "重命名工作区失败",
+    "ja": "ワークスペース名の変更に失敗しました"
+  },
+  "workspace_rename_failed_detail": {
+    "en": "Failed to rename workspace: %s",
+    "zh-CN": "重命名工作区失败：%s",
+    "ja": "ワークスペース名の変更に失敗しました: %s"
+  },
+  "handoff_success_apply": {
+    "en": "Applied %d file(s) successfully",
+    "zh-CN": "已成功应用 %d 个文件变更",
+    "ja": "%d 件のファイル変更を適用しました"
+  },
+  "handoff_success_move": {
+    "en": "Moved %d file(s) successfully",
+    "zh-CN": "已成功移动 %d 个文件变更",
+    "ja": "%d 件のファイル変更を移動しました"
+  },
+  "handoff_success_apply_branch": {
+    "en": "Applied %1$d file(s) to %2$s",
+    "zh-CN": "已将 %1$d 个文件变更应用到 %2$s",
+    "ja": "%1$d 件のファイル変更を %2$s に適用しました"
+  },
+  "handoff_success_move_branch": {
+    "en": "Moved %1$d file(s) to %2$s",
+    "zh-CN": "已将 %1$d 个文件变更移动到 %2$s",
+    "ja": "%1$d 件のファイル変更を %2$s に移動しました"
+  },
+  "git_filter_changed_placeholder": {
+    "en": "Filter changed files…",
+    "zh-CN": "筛选变更文件…",
+    "ja": "変更ファイルを絞り込む…"
+  },
+  "git_refresh_review_aria": {
+    "en": "Refresh Git review",
+    "zh-CN": "刷新 Git 变更",
+    "ja": "Git レビューを更新"
+  },
+  "git_diff_unconfirmed_notice": {
+    "en": "A concurrent mode switch or status-only refresh left diff ownership unconfirmed.",
+    "zh-CN": "并发切换或仅状态刷新导致 Diff 归属待确认。",
+    "ja": "並列切替または状態更新により Diff の帰属が未確定です。"
+  },
+  "git_refresh_diff": {
+    "en": "Refresh Diff",
+    "zh-CN": "刷新 Diff",
+    "ja": "Diff を更新"
+  },
+  "git_working_tree_clean_scope": {
+    "en": "Working tree is clean for this scope",
+    "zh-CN": "当前作用域工作区干净无变更",
+    "ja": "このスコープの作業ツリーはクリーンです"
+  },
+  "files_panel_title": {
+    "en": "Workspace Files",
+    "zh-CN": "工作区文件",
+    "ja": "ワークスペースファイル"
+  },
+  "files_refresh_list_aria": {
+    "en": "Refresh file list",
+    "zh-CN": "刷新文件列表",
+    "ja": "ファイル一覧を更新"
+  },
+  "files_filter_placeholder": {
+    "en": "Filter files…",
+    "zh-CN": "筛选文件…",
+    "ja": "ファイルを絞り込む…"
+  },
+  "files_empty_indexed": {
+    "en": "No workspace files indexed for this directory",
+    "zh-CN": "当前目录暂无已索引工作区文件",
+    "ja": "このディレクトリにインデックス済みファイルがありません"
+  },
+  "files_reload_file_aria": {
+    "en": "Reload file",
+    "zh-CN": "重新加载文件",
+    "ja": "ファイルを再読み込み"
+  },
+  "files_readonly_notice": {
+    "en": "Read-only file (editing disabled)",
+    "zh-CN": "只读文件（已禁用编辑）",
+    "ja": "読み取り専用ファイル（編集無効）"
+  },
+  "files_unavailable_scope": {
+    "en": "File unavailable in this tab scope",
+    "zh-CN": "当前标签作用域无法访问该文件",
+    "ja": "このタブスコープではファイルを利用できません"
+  },
+  "files_action_quote": {
+    "en": "Quote",
+    "zh-CN": "引用",
+    "ja": "引用"
+  },
+  "board_loading_metadata": {
+    "en": "Loading workspace metadata…",
+    "zh-CN": "正在加载工作区元数据…",
+    "ja": "ワークスペース情報を読み込み中…"
+  },
+  "board_loading_metadata_hint": {
+    "en": "Editing stays locked until this host confirms workspace ownership.",
+    "zh-CN": "主机确认工作区归属前将保持锁定。",
+    "ja": "ホストがワークスペース帰属を確認するまで編集はロックされます。"
+  },
+  "board_unbound_title": {
+    "en": "No workspace bound to this directory",
+    "zh-CN": "当前目录未绑定工作区",
+    "ja": "このディレクトリに紐づくワークスペースがありません"
+  },
+  "board_unbound_hint": {
+    "en": "BOARD.md editing and peer spawning stay disabled until this tab matches a Mission Workspace on its host.",
+    "zh-CN": "匹配到主机上的工作区前，BOARD.md 编辑与派生同伴保持禁用。",
+    "ja": "ホスト上のワークスペースに一致するまで BOARD.md 編集とピア起動は無効です。"
+  },
+  "board_loading_snapshot": {
+    "en": "Loading BOARD.md snapshot…",
+    "zh-CN": "正在加载 BOARD.md 快照…",
+    "ja": "BOARD.md スナップショットを読み込み中…"
+  },
+  "board_loading_snapshot_hint": {
+    "en": "Editing unlocks once the initial snapshot loads from the host.",
+    "zh-CN": "从主机加载初始快照后自动解锁编辑。",
+    "ja": "ホストから初期スナップショットを読み込むと編集できます。"
+  },
+  "board_refresh_aria": {
+    "en": "Refresh board",
+    "zh-CN": "刷新 BOARD.md",
+    "ja": "BOARD.md を更新"
+  },
+  "board_editor_placeholder": {
+    "en": "## Goal\n\n## Contracts",
+    "zh-CN": "## 目标\n\n## 契约",
+    "ja": "## 目標\n\n## 契約"
+  },
+  "board_recent_activity": {
+    "en": "Recent Activity",
+    "zh-CN": "最近动态",
+    "ja": "最近のアクティビティ"
+  },
+  "board_peers_tab_count": {
+    "en": "Peers (%d)",
+    "zh-CN": "同伴 (%d)",
+    "ja": "ピア (%d)"
+  },
+  "board_spawn_peer_action": {
+    "en": "Spawn Workspace Peer",
+    "zh-CN": "派生工作区同伴",
+    "ja": "ワークスペースピアを起動"
+  },
+  "side_question_title": {
+    "en": "Side Question (/btw)",
+    "zh-CN": "旁路提问 (/btw)",
+    "ja": "サイド質問 (/btw)"
+  },
+  "side_question_empty_hint": {
+    "en": "Ask a side question using this conversation context without interrupting the active turn.",
+    "zh-CN": "基于当前会话上下文进行旁路提问，不打断正在进行的回合。",
+    "ja": "現在の会話コンテキストを使って進行中のターンを中断せずに質問します。"
+  },
+  "side_question_input_placeholder": {
+    "en": "Ask without interrupting…",
+    "zh-CN": "输入旁路问题，不打断当前对话…",
+    "ja": "中断せずに質問を入力…"
+  },
+  "side_question_clear": {
+    "en": "Clear",
+    "zh-CN": "清空",
+    "ja": "クリア"
   }
 }

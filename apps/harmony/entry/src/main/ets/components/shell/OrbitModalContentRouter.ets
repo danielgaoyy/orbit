@@ -16,6 +16,10 @@ import { ExportTranscriptSheet } from '../sheets/ExportTranscriptSheet';
 import { GlobalSearchSheet } from '../sheets/GlobalSearchSheet';
 import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
 import { PersonalRouterMeshSheet } from '../sheets/PersonalRouterMeshSheet';
+import { WorktreeHandoffSheet } from '../sheets/WorktreeHandoffSheet';
+import { WorkspaceScriptsSheet } from '../sheets/WorkspaceScriptsSheet';
+import { CreateWorkspaceV2Sheet } from '../sheets/CreateWorkspaceV2Sheet';
+import { RenameWorkspaceSheet } from '../sheets/RenameWorkspaceSheet';
 import { PersonalAgentBriefingPanel } from '../personal-agent/PersonalAgentBriefingPanel';
 
 function buildDiagramViewerHtml(svg: string, isDark: boolean): string {
@@ -282,6 +286,48 @@ export struct OrbitModalContentRouter {
           embedded: false,
           onClose: () => {
             this.store.closeBriefingSheet();
+            const id = this.presentationId > 0 ? this.presentationId : this.effectivePresentationId();
+            this.onClose(id);
+          }
+        })
+      } else if (this.route.kind === 'worktree_handoff') {
+        WorktreeHandoffSheet({
+          hostId: this.route.hostId ?? '',
+          workspaceId: this.route.workspaceId ?? '',
+          sourceAgentId: this.route.agentId ?? '',
+          cwd: this.route.cwd ?? '',
+          title: this.route.title ?? '',
+          onClose: () => {
+            const id = this.presentationId > 0 ? this.presentationId : this.effectivePresentationId();
+            this.onClose(id);
+          }
+        })
+      } else if (this.route.kind === 'workspace_scripts') {
+        WorkspaceScriptsSheet({
+          hostId: this.route.hostId ?? '',
+          workspaceId: this.route.workspaceId ?? '',
+          title: this.route.title ?? '',
+          onClose: () => {
+            const id = this.presentationId > 0 ? this.presentationId : this.effectivePresentationId();
+            this.onClose(id);
+          }
+        })
+      } else if (this.route.kind === 'create_workspace_v2') {
+        CreateWorkspaceV2Sheet({
+          hostId: this.route.hostId ?? '',
+          sourceCwd: this.route.cwd ?? '',
+          projectTitle: this.route.title ?? '',
+          onClose: () => {
+            const id = this.presentationId > 0 ? this.presentationId : this.effectivePresentationId();
+            this.onClose(id);
+          }
+        })
+      } else if (this.route.kind === 'rename_workspace') {
+        RenameWorkspaceSheet({
+          hostId: this.route.hostId ?? '',
+          workspaceId: this.route.workspaceId ?? '',
+          initialTitle: this.route.title ?? '',
+          onClose: () => {
             const id = this.presentationId > 0 ? this.presentationId : this.effectivePresentationId();
             this.onClose(id);
           }

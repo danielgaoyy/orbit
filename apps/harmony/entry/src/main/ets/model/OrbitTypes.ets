@@ -68,6 +68,7 @@ export interface HostCardDto {
   agent_count: number;
   pending_approval_count: number;
   supports_server_queue?: boolean;
+  board_cas_supported?: boolean;
   is_local?: boolean;
 }
 
@@ -175,6 +176,8 @@ export interface WorkspaceDto {
   git_branch: string | null;
   is_worktree: boolean;
   updated_at?: string;
+  source_cwd?: string | null;
+  project_root?: string | null;
   archived_at?: string | null;
   mission_goal?: string | null;
   board_revision?: number;
@@ -600,6 +603,8 @@ export interface WorkspaceScriptInfoDto {
   last_error?: string | null;
 }
 
+export type OrbitWorkspaceScriptInfoDto = WorkspaceScriptInfoDto;
+
 export interface RouterRecommendationDto {
   decision: string;
   reason: string;
@@ -785,6 +790,7 @@ export interface InlineSpanDto {
 export interface HighlightedTokenDto {
   text: string;
   fg_hex: string;
+  light_fg_hex?: string;
   bold: boolean;
   italic: boolean;
 }
@@ -793,6 +799,16 @@ export interface HighlightedLineDto {
   line_number: number;
   tokens: HighlightedTokenDto[];
 }
+
+export interface HighlightedCodeDto {
+  language: string;
+  lines: HighlightedLineDto[];
+  total_lines: number;
+  total_lines_exact?: boolean;
+  truncated: boolean;
+}
+
+export type HighlightedCodeViewDto = HighlightedCodeDto;
 
 export interface TableCellDto {
   spans: InlineSpanDto[];
@@ -1193,6 +1209,7 @@ export interface SidebarProjectGroupDto {
   is_home_workspace: boolean;
   sort_weight_ms: number;
   conversations: SidebarConversationDto[];
+  workspace_ids?: string[];
 }
 
 export interface FleetSidebarDto {
@@ -1324,8 +1341,65 @@ export interface WorkspaceFileViewDto {
   mtime_unix_ms?: number | null;
   writable?: boolean;
   line_ending?: string | null;
+  offset_bytes?: number;
+  next_offset_bytes?: number;
+  etag_mismatch?: boolean;
+  highlight_truncated?: boolean;
   highlighted_lines: HighlightedLineDto[];
   markdown_blocks: RichBlockDto[];
+}
+
+export interface ReadWorkspaceFileRequestDto {
+  host_id: string;
+  cwd: string;
+  path: string;
+  offset_bytes?: number | null;
+  max_bytes?: number | null;
+  expected_etag?: string | null;
+}
+
+export interface UpdateWorkspaceBoardCasRequestDto {
+  host_id: string;
+  workspace_id: string;
+  content: string;
+  section?: string | null;
+  updated_by?: string | null;
+  expected_revision?: number | null;
+}
+
+export interface WorkspaceBoardCasResultDto {
+  ok: boolean;
+  conflict: boolean;
+  board: WorkspaceBoardSnapshotDto;
+}
+
+export interface OrbitWorkspaceBoardDraft {
+  content: string;
+  baseRevision: number;
+}
+
+export interface OrbitTerminalSlotViewState {
+  screen: TerminalScreenDto | null;
+  revision: number;
+  lastRequestedRevision: number;
+  lineInput: string;
+  rawMode: boolean;
+  ctrlSticky: boolean;
+  altSticky: boolean;
+}
+
+export interface OrbitScopedActionOutcome<T> {
+  ok: boolean;
+  data: T | null;
+  errorDetail: string;
+}
+
+export interface OrbitHandoffGuardState {
+  hasConflicts: boolean;
+  hasHardBlocker: boolean;
+  hasUntrackedConflict: boolean;
+  canOfferThreeWay: boolean;
+  canExecute: boolean;
 }
 
 export interface WorkspaceFileConflictDto {
@@ -1452,6 +1526,120 @@ export interface TerminalScreenDto {
   cursor_row: number;
   cursor_col: number;
   rows_data: TerminalRowDto[];
+}
+
+export interface TerminalScreenDeltaDto {
+  revision: number;
+  slot: number;
+  reset: boolean;
+  cols: number;
+  rows: number;
+  cursor_row: number;
+  cursor_col: number;
+  changed_rows: TerminalRowDto[];
+}
+
+export interface OrbitTerminalDeltaApplyResult {
+  screen: TerminalScreenDto;
+  revision: number;
+  updatedRowCount: number;
+}
+
+export interface GitPushRequestDto {
+  host_id: string;
+  cwd: string;
+  remote?: string | null;
+  branch?: string | null;
+  set_upstream: boolean;
+}
+
+export interface GitPushResultDto {
+  remote: string;
+  branch: string;
+  output: string;
+}
+
+export interface GitDiscardFilesRequestDto {
+  host_id: string;
+  cwd: string;
+  paths: string[];
+  include_untracked: boolean;
+}
+
+export interface HighlightWorkspaceCodeRequestDto {
+  language: string;
+  code: string;
+  max_lines?: number;
+  plain_line_numbers?: number[];
+}
+
+export interface CreateWorkspaceV2RequestDto {
+  host_id: string;
+  source_cwd: string;
+  title?: string | null;
+  isolation?: string | null;
+  worktree_mode?: string | null;
+  worktree_branch?: string | null;
+  base_ref?: string | null;
+  pr_number?: number | null;
+}
+
+export interface HandoffFileChangeDto {
+  path: string;
+  status: string;
+  insertions: number;
+  deletions: number;
+  is_untracked?: boolean;
+  has_conflict?: boolean;
+}
+
+export interface WorktreeHandoffPreviewDto {
+  direction: string;
+  source_cwd: string;
+  target_cwd: string;
+  source_branch?: string | null;
+  target_branch?: string | null;
+  commit_count: number;
+  files: HandoffFileChangeDto[];
+  total_insertions: number;
+  total_deletions: number;
+  target_dirty: boolean;
+  conflicts: string[];
+  can_apply_cleanly: boolean;
+  warning?: string | null;
+}
+
+export interface WorktreeHandoffOutcomeDto {
+  direction: string;
+  mode: string;
+  applied_files: number;
+  backup_ref?: string | null;
+  target_workspace?: WorkspaceDto | null;
+  target_cwd: string;
+  had_conflicts: boolean;
+  conflict_files: string[];
+  summary: string;
+}
+
+export interface PreviewWorktreeHandoffRequestDto {
+  host_id: string;
+  workspace_id: string;
+  source_agent_id?: string | null;
+  direction: string;
+  target_workspace_id?: string | null;
+  include_committed: boolean;
+}
+
+export interface ExecuteWorktreeHandoffRequestDto {
+  host_id: string;
+  workspace_id: string;
+  source_agent_id?: string | null;
+  direction: string;
+  mode: string;
+  target_workspace_id?: string | null;
+  include_committed: boolean;
+  branch?: string | null;
+  allow_three_way_conflicts: boolean;
 }
 
 export interface StagedAttachmentDto {
@@ -2776,4 +2964,748 @@ export interface PersistedScopeDraftDto {
 export interface PersistedDraftPayloadV1Dto {
   version: number;
   drafts: Record<string, PersistedScopeDraftDto>;
+}
+
+/**
+ * Applies an incremental `TerminalScreenDeltaDto` onto an existing per-slot `TerminalScreenDto`.
+ * - Full reset (`delta.reset === true`, missing prior screen, or dimension mismatch): rebuilds rows 0..rows-1.
+ * - Incremental (`!delta.reset`): clones row slots and patches ONLY `delta.changed_rows` by `row_index`.
+ */
+export function applyTerminalScreenDelta(
+  prev: TerminalScreenDto | null,
+  prevRevision: number,
+  delta: TerminalScreenDeltaDto
+): OrbitTerminalDeltaApplyResult {
+  const rowCount = Math.max(0, Math.floor(delta.rows));
+  const dimsMatch = prev !== null && prev.cols === delta.cols && prev.rows === delta.rows && prev.rows_data.length === rowCount;
+  if (delta.reset || !dimsMatch || prev === null) {
+    const nextRows: TerminalRowDto[] = [];
+    for (let r = 0; r < rowCount; r++) {
+      nextRows.push({ row_index: r, spans: [] });
+    }
+    for (let i = 0; i < delta.changed_rows.length; i++) {
+      const ch = delta.changed_rows[i];
+      if (ch.row_index >= 0 && ch.row_index < nextRows.length) {
+        nextRows[ch.row_index] = ch;
+      }
+    }
+    return {
+      screen: {
+        cols: delta.cols,
+        rows: delta.rows,
+        cursor_row: delta.cursor_row,
+        cursor_col: delta.cursor_col,
+        rows_data: nextRows
+      },
+      revision: delta.revision,
+      updatedRowCount: delta.changed_rows.length
+    };
+  }
+
+  if (delta.revision === prevRevision && delta.changed_rows.length === 0) {
+    if (prev.cursor_row === delta.cursor_row && prev.cursor_col === delta.cursor_col) {
+      return {
+        screen: prev,
+        revision: prevRevision,
+        updatedRowCount: 0
+      };
+    }
+    return {
+      screen: {
+        cols: delta.cols,
+        rows: delta.rows,
+        cursor_row: delta.cursor_row,
+        cursor_col: delta.cursor_col,
+        rows_data: prev.rows_data
+      },
+      revision: delta.revision,
+      updatedRowCount: 0
+    };
+  }
+
+  const patchedRows: TerminalRowDto[] = prev.rows_data.slice();
+  let updated = 0;
+  for (let i = 0; i < delta.changed_rows.length; i++) {
+    const ch = delta.changed_rows[i];
+    if (ch.row_index >= 0 && ch.row_index < patchedRows.length) {
+      patchedRows[ch.row_index] = ch;
+      updated += 1;
+    }
+  }
+  return {
+    screen: {
+      cols: delta.cols,
+      rows: delta.rows,
+      cursor_row: delta.cursor_row,
+      cursor_col: delta.cursor_col,
+      rows_data: patchedRows
+    },
+    revision: delta.revision,
+    updatedRowCount: updated
+  };
+}
+
+/**
+ * Strict confirmation gate for destructive `git discard` actions:
+ * requires typing either the exact target path or its exact basename (preserving literal trailing spaces).
+ */
+export function matchesGitDiscardConfirmation(targetPath: string, userInput: string): boolean {
+  if (targetPath.length === 0 || userInput.length === 0 || targetPath.trim().length === 0) {
+    return false;
+  }
+  if (userInput === targetPath) {
+    return true;
+  }
+  const base = basenameOfPath(targetPath);
+  return base.length > 0 && userInput === base;
+}
+
+/**
+ * Extracts historical peer `@handle` aliases from `agent.labels['orbit.handle_aliases']`,
+ * normalized without leading `@`, deduplicated, and excluding the agent's current active handle.
+ */
+export function parsePeerHandleAliases(agent: AgentCardDto): string[] {
+  const labels = agent.labels;
+  if (labels === undefined || labels === null) {
+    return [];
+  }
+  const raw = labels['orbit.handle_aliases'];
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return [];
+  }
+  const currentLower = (agent.handle ?? '').trim().replace(/^@+/, '').toLowerCase();
+  const seen = new Set<string>();
+  const aliases: string[] = [];
+  const parts = raw.split(',');
+  for (let i = 0; i < parts.length; i++) {
+    const clean = parts[i].trim().replace(/^@+/, '');
+    const lower = clean.toLowerCase();
+    if (clean.length === 0 || lower === currentLower || seen.has(lower)) {
+      continue;
+    }
+    seen.add(lower);
+    aliases.push(clean);
+  }
+  return aliases;
+}
+
+export function hasBoardCasConflict(editBaseRevision: number, liveRevision: number): boolean {
+  return editBaseRevision >= 0 && liveRevision >= 0 && liveRevision !== editBaseRevision;
+}
+
+export function mergeBoardCasDraft(remoteContent: string, localDraft: string): string {
+  if (remoteContent === localDraft) {
+    return remoteContent;
+  }
+  return `<<<<<<< Local Draft\n${localDraft}\n=======\n${remoteContent}\n>>>>>>> Remote BOARD.md`;
+}
+
+/**
+ * Exact parity with Desktop `worktree-handoff-modal.tsx`:
+ * - Hard blocker (`!can_apply_cleanly && conflicts.length === 0`) always blocks execution.
+ * - Untracked file conflict (`files.some(f => f.is_untracked && f.has_conflict)`) cannot be resolved by 3-way merge.
+ * - Only tracked conflicts with no hard blocker can opt into `allowThreeWay`.
+ */
+export function evaluateWorktreeHandoffGuards(
+  preview: WorktreeHandoffPreviewDto | null,
+  handoffDirection: string,
+  targetWorkspaceId: string | null,
+  allowThreeWay: boolean,
+  loadingPreview: boolean,
+  executing: boolean
+): OrbitHandoffGuardState {
+  if (preview === null) {
+    return {
+      hasConflicts: false,
+      hasHardBlocker: false,
+      hasUntrackedConflict: false,
+      canOfferThreeWay: false,
+      canExecute: false
+    };
+  }
+  const hasConflicts = preview.conflicts.length > 0;
+  const hasHardBlocker = !preview.can_apply_cleanly && preview.conflicts.length === 0;
+  let hasUntrackedConflict = false;
+  for (let i = 0; i < preview.files.length; i++) {
+    if (preview.files[i].is_untracked === true && preview.files[i].has_conflict === true) {
+      hasUntrackedConflict = true;
+      break;
+    }
+  }
+  const canOfferThreeWay = hasConflicts && !hasUntrackedConflict && !hasHardBlocker;
+  const creatingNewWorktree = handoffDirection === 'local_to_worktree' &&
+    (targetWorkspaceId === null || targetWorkspaceId.trim().length === 0);
+  const hasTransferableWork = preview.files.length > 0 || creatingNewWorktree;
+  const canExecute = !loadingPreview &&
+    !executing &&
+    !hasHardBlocker &&
+    !hasUntrackedConflict &&
+    hasTransferableWork &&
+    (!hasConflicts || (canOfferThreeWay && allowThreeWay));
+  return {
+    hasConflicts: hasConflicts,
+    hasHardBlocker: hasHardBlocker,
+    hasUntrackedConflict: hasUntrackedConflict,
+    canOfferThreeWay: canOfferThreeWay,
+    canExecute: canExecute
+  };
+}
+
+/**
+ * Formats a concise status/endpoint/error/command summary strictly from `WorkspaceScriptInfoDto`
+ * fields (`last_error`, `proxy_url`, `port`, `command`). Note: `WorkspaceScriptInfoDto` carries
+ * script runtime metadata rather than raw stdout logs.
+ */
+export function formatWorkspaceScriptStatusSummary(script: WorkspaceScriptInfoDto): string {
+  const err = (script.last_error ?? '').trim();
+  if (err.length > 0) {
+    return err;
+  }
+  const url = (script.proxy_url ?? '').trim();
+  if (url.length > 0) {
+    return url;
+  }
+  if (script.port !== undefined && script.port !== null && script.port > 0) {
+    return `:${script.port} · ${script.command}`;
+  }
+  return script.command;
+}
+
+export function formatWorkspaceScriptSummary(script: WorkspaceScriptInfoDto): string {
+  return formatWorkspaceScriptStatusSummary(script);
+}
+
+/**
+ * Result of strictly validating and merging a chunked continuation into an existing
+ * `WorkspaceFileViewDto` (R2-P0-C).
+ * Any non-text chunk (binary tail), ETag mismatch, zero/backward byte progress, or offset
+ * discontinuity locks the file read-only (`truncated: true`, `writable: false`) so editing
+ * can NEVER unlock on a partial/binary file and truncate source bytes on disk.
+ */
+export interface OrbitFileChunkMergeResult {
+  ok: boolean;
+  etagMismatch: boolean;
+  binaryTail: boolean;
+  readOnlyLocked: boolean;
+  mergedView: WorkspaceFileViewDto;
+  nextLoadedRawBytes: number;
+}
+
+function lockWorkspaceFileReadOnly(view: WorkspaceFileViewDto, loadedRawBytes: number): WorkspaceFileViewDto {
+  return {
+    host_id: view.host_id,
+    cwd: view.cwd,
+    path: view.path,
+    resolved_path: view.resolved_path,
+    language: view.language,
+    content_kind: view.content_kind,
+    mime_type: view.mime_type,
+    content: view.content,
+    size_bytes: view.size_bytes,
+    truncated: true,
+    etag: view.etag,
+    mtime_unix_ms: view.mtime_unix_ms,
+    writable: false,
+    line_ending: view.line_ending,
+    offset_bytes: 0,
+    next_offset_bytes: loadedRawBytes,
+    etag_mismatch: view.etag_mismatch,
+    highlight_truncated: view.highlight_truncated,
+    highlighted_lines: view.highlighted_lines,
+    markdown_blocks: view.markdown_blocks
+  };
+}
+
+export function mergeWorkspaceFileChunk(
+  current: WorkspaceFileViewDto,
+  currentLoadedRawBytes: number,
+  chunk: WorkspaceFileViewDto,
+  expectedHostId: string,
+  expectedCwd: string,
+  expectedPath: string,
+  expectedEtag: string
+): OrbitFileChunkMergeResult {
+  const cleanExpectedEtag = expectedEtag.trim();
+  const cleanChunkEtag = (chunk.etag ?? '').trim();
+  if (chunk.etag_mismatch === true) {
+    return {
+      ok: false,
+      etagMismatch: true,
+      binaryTail: false,
+      readOnlyLocked: true,
+      mergedView: lockWorkspaceFileReadOnly(current, currentLoadedRawBytes),
+      nextLoadedRawBytes: currentLoadedRawBytes
+    };
+  }
+  const sameTarget =
+    chunk.host_id === expectedHostId &&
+    chunk.cwd === expectedCwd &&
+    chunk.path === expectedPath;
+  const sameEtag = cleanExpectedEtag.length > 0 && cleanChunkEtag === cleanExpectedEtag;
+  const isText = chunk.content_kind === 'text';
+  const chunkOffset = typeof chunk.offset_bytes === 'number' ? chunk.offset_bytes : -1;
+  const chunkNextOffset = typeof chunk.next_offset_bytes === 'number' ? chunk.next_offset_bytes : -1;
+  const totalSourceBytes = chunk.size_bytes > 0 ? chunk.size_bytes : current.size_bytes;
+  const strictForwardProgress =
+    chunkOffset === currentLoadedRawBytes &&
+    chunkNextOffset > currentLoadedRawBytes &&
+    chunkNextOffset <= totalSourceBytes;
+
+  if (!sameTarget || !sameEtag || !isText || !strictForwardProgress) {
+    return {
+      ok: false,
+      etagMismatch: !sameEtag && cleanExpectedEtag.length > 0 && cleanChunkEtag.length > 0,
+      binaryTail: !isText,
+      readOnlyLocked: true,
+      mergedView: lockWorkspaceFileReadOnly(current, currentLoadedRawBytes),
+      nextLoadedRawBytes: currentLoadedRawBytes
+    };
+  }
+
+  const nextLoadedRawBytes = chunkNextOffset;
+  const isCompleteText = chunk.truncated !== true && nextLoadedRawBytes === totalSourceBytes;
+  const mergedView: WorkspaceFileViewDto = {
+    host_id: current.host_id,
+    cwd: current.cwd,
+    path: current.path,
+    resolved_path: current.resolved_path,
+    language: current.language,
+    content_kind: 'text',
+    mime_type: current.mime_type,
+    content: current.content + chunk.content,
+    size_bytes: totalSourceBytes,
+    truncated: !isCompleteText,
+    etag: chunk.etag ?? current.etag,
+    mtime_unix_ms: chunk.mtime_unix_ms ?? current.mtime_unix_ms,
+    writable: current.writable !== false && chunk.writable !== false,
+    line_ending: current.line_ending,
+    offset_bytes: 0,
+    next_offset_bytes: nextLoadedRawBytes,
+    etag_mismatch: false,
+    highlight_truncated: current.highlight_truncated,
+    highlighted_lines: current.highlighted_lines,
+    markdown_blocks: current.markdown_blocks
+  };
+  return {
+    ok: true,
+    etagMismatch: false,
+    binaryTail: false,
+    readOnlyLocked: false,
+    mergedView: mergedView,
+    nextLoadedRawBytes: nextLoadedRawBytes
+  };
+}
+
+/**
+ * Result of pre-clipping oversized source strings on safe UTF-16 surrogate boundaries BEFORE
+ * JSON serialization across N-API (R2-P1-3), keeping 16 MiB single-line sync highlight `< 5 ms`.
+ */
+export interface OrbitSyncHighlightClipResult {
+  clippedCode: string;
+  preTruncated: boolean;
+  totalLines: number;
+  totalLinesExact: boolean;
+  plainLineNumbers: number[];
+}
+
+const ORBIT_SYNC_HIGHLIGHT_LINE_UNITS_CAP: number = 4096;
+const ORBIT_SYNC_HIGHLIGHT_TOTAL_UNITS_CAP: number = 128 * 1024;
+const ORBIT_SYNC_HIGHLIGHT_MAX_SCAN_UNITS: number = 512 * 1024;
+
+function sliceUtf16Safe(text: string, start: number, maxUnits: number): string {
+  let end = Math.min(text.length, start + maxUnits);
+  if (end > start && end < text.length) {
+    const codeUnit = text.charCodeAt(end - 1);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      end -= 1;
+    }
+  }
+  return text.slice(start, end);
+}
+
+export function clipCodeForSyncHighlightPreview(
+  code: string,
+  maxLines: number = 250
+): OrbitSyncHighlightClipResult {
+  if (code.length === 0) {
+    return {
+      clippedCode: '',
+      preTruncated: false,
+      totalLines: 0,
+      totalLinesExact: true,
+      plainLineNumbers: []
+    };
+  }
+  const effectiveMaxLines = Math.max(1, Math.min(250, Math.floor(maxLines)));
+  if (code.length <= ORBIT_SYNC_HIGHLIGHT_TOTAL_UNITS_CAP) {
+    return {
+      clippedCode: code,
+      preTruncated: false,
+      totalLines: -1,
+      totalLinesExact: true,
+      plainLineNumbers: []
+    };
+  }
+
+  // R3-P1-3 / R4-P1-2 / R5-P1: Scan strictly within the bounded 512 KiB synchronous prefix
+  // window (never scanning a full 16 MiB string):
+  // - 16 MiB single-line bundles (no `\n` anywhere in 512 KiB) immediately degrade in O(1) to a
+  //   single 4,096 B plain-text span (`totalLinesExact = false`), staying well under 5 ms.
+  // - Multi-line files with any oversized line (including >= 65,536 chars on line 1 or mid-file)
+  //   find its real `\n` terminator inside the 512 KiB scan budget, emit that line as a 4,096 B
+  //   plain-text span, and continue extracting & syntax-highlighting subsequent lines up to 250.
+  const maxScanEnd = Math.min(code.length, ORBIT_SYNC_HIGHLIGHT_MAX_SCAN_UNITS);
+  let scannedComplete = maxScanEnd >= code.length;
+  // R6-P1: Always slice the bounded scan window on a valid UTF-16 boundary so a surrogate pair
+  // (e.g. `🚀`) straddling the 512 Ki boundary can never leave a lone high surrogate (`U+D83D`).
+  const scanWindow = scannedComplete ? code : sliceUtf16Safe(code, 0, maxScanEnd);
+  if (scanWindow.indexOf('\n') < 0) {
+    return {
+      clippedCode: sliceUtf16Safe(scanWindow, 0, ORBIT_SYNC_HIGHLIGHT_LINE_UNITS_CAP),
+      preTruncated: true,
+      totalLines: 1,
+      totalLinesExact: scannedComplete,
+      plainLineNumbers: [1]
+    };
+  }
+
+  const parts: string[] = [];
+  const plainLineNumbers: number[] = [];
+  let pos = 0;
+  let lineCount = 0;
+  let capturedUnits = 0;
+  let preTruncated = false;
+  let budgetExhausted = false;
+
+  while (pos < scanWindow.length) {
+    if (!budgetExhausted && lineCount < effectiveMaxLines) {
+      const remainingTotal = ORBIT_SYNC_HIGHLIGHT_TOTAL_UNITS_CAP - capturedUnits;
+      if (remainingTotal <= 0) {
+        budgetExhausted = true;
+        preTruncated = true;
+        continue;
+      }
+      const takeLimit = Math.min(ORBIT_SYNC_HIGHLIGHT_LINE_UNITS_CAP, remainingTotal);
+      // R7-Nit: Keep even the internal newline-search probe strictly UTF-16 surrogate-safe so
+      // zero intermediate slices anywhere in `clipCodeForSyncHighlightPreview` can ever be ill-formed.
+      const probe = sliceUtf16Safe(scanWindow, pos, takeLimit + 2);
+      const probeEnd = pos + probe.length;
+      const relNl = probe.indexOf('\n');
+      lineCount += 1;
+
+      if (relNl >= 0) {
+        const rawLineEnd = pos + relNl;
+        const contentEnd = rawLineEnd > pos && scanWindow.charCodeAt(rawLineEnd - 1) === 13
+          ? rawLineEnd - 1
+          : rawLineEnd;
+        const lineLen = contentEnd - pos;
+        if (lineLen > takeLimit) {
+          parts.push(sliceUtf16Safe(scanWindow, pos, takeLimit));
+          plainLineNumbers.push(lineCount);
+          preTruncated = true;
+        } else {
+          parts.push(scanWindow.slice(pos, contentEnd));
+        }
+        capturedUnits += parts[parts.length - 1].length;
+        // R5-Nit-1: Always preserve the source `\n` terminator for every extracted line
+        // (including when line 250 itself is an empty line `""`) so `render.rs` never drops
+        // a trailing empty line at the 250-line preview boundary.
+        parts.push('\n');
+        capturedUnits += 1;
+        pos = rawLineEnd + 1;
+      } else if (probeEnd >= scanWindow.length) {
+        const contentEnd = scanWindow.length > pos && scanWindow.charCodeAt(scanWindow.length - 1) === 13
+          ? scanWindow.length - 1
+          : scanWindow.length;
+        const lineLen = contentEnd - pos;
+        if (lineLen > takeLimit) {
+          parts.push(sliceUtf16Safe(scanWindow, pos, takeLimit));
+          plainLineNumbers.push(lineCount);
+          preTruncated = true;
+        } else {
+          parts.push(scanWindow.slice(pos, contentEnd));
+        }
+        capturedUnits += parts[parts.length - 1].length;
+        pos = scanWindow.length;
+      } else {
+        // Oversized line (> takeLimit without a newline in the 4 KiB probe): clip to plain text
+        // and continue searching within the full 512 KiB `scanWindow` budget for its `\n` boundary.
+        parts.push(sliceUtf16Safe(scanWindow, pos, takeLimit));
+        plainLineNumbers.push(lineCount);
+        preTruncated = true;
+        capturedUnits += parts[parts.length - 1].length;
+        const nextNl = scanWindow.indexOf('\n', probeEnd);
+        if (nextNl < 0) {
+          if (scanWindow.length < code.length) {
+            scannedComplete = false;
+          }
+          pos = scanWindow.length;
+          break;
+        }
+        parts.push('\n');
+        capturedUnits += 1;
+        pos = nextNl + 1;
+      }
+    } else {
+      preTruncated = true;
+      const nextNl = scanWindow.indexOf('\n', pos);
+      lineCount += 1;
+      if (nextNl < 0) {
+        pos = scanWindow.length;
+        break;
+      }
+      pos = nextNl + 1;
+    }
+  }
+
+  if (!scannedComplete) {
+    preTruncated = true;
+  }
+
+  return {
+    clippedCode: parts.join(''),
+    preTruncated: preTruncated,
+    totalLines: lineCount,
+    totalLinesExact: scannedComplete,
+    plainLineNumbers: plainLineNumbers
+  };
+}
+
+export interface OrbitProjectDirectoryGroupInput {
+  id: string;
+  primaryCwd: string;
+  directories: string[];
+}
+
+function collectNormalizedGroupDirs(group: OrbitProjectDirectoryGroupInput): string[] {
+  const dirs: string[] = [];
+  const pushDir = (raw: string): void => {
+    const clean = nonBlankPath(raw);
+    if (clean.length === 0) {
+      return;
+    }
+    const norm = normalizeAbsoluteCwd(clean);
+    if (norm.length > 0 && dirs.indexOf(norm) < 0) {
+      dirs.push(norm);
+    }
+  };
+  pushDir(group.primaryCwd);
+  for (let i = 0; i < group.directories.length; i++) {
+    pushDir(group.directories[i]);
+  }
+  return dirs;
+}
+
+function isBareHomeProjectDir(normPath: string): boolean {
+  if (normPath === '~' || normPath === '/' || normPath === '/root') {
+    return true;
+  }
+  if (normPath.startsWith('/Users/')) {
+    const rest = normPath.slice('/Users/'.length);
+    return rest.length > 0 && rest.indexOf('/') < 0;
+  }
+  if (normPath.startsWith('/home/')) {
+    const rest = normPath.slice('/home/'.length);
+    return rest.length > 0 && rest.indexOf('/') < 0;
+  }
+  return false;
+}
+
+/**
+ * Exact parity with `crates/orbit-client-core/src/sidebar.rs::matches_project_directory` (line 177):
+ * matches exact/equivalent paths AND legacy `/worktrees/<repoBase>-` worktree naming.
+ */
+function matchesSidebarProjectDirectory(groupDirs: string[], candidateNorm: string): boolean {
+  if (candidateNorm.length === 0) {
+    return false;
+  }
+  for (let i = 0; i < groupDirs.length; i++) {
+    const dir = groupDirs[i];
+    if (dir === candidateNorm || cwdPathsEquivalent(dir, candidateNorm, null)) {
+      return true;
+    }
+    const repoBase = basenameOfPath(dir);
+    if (
+      repoBase.length > 0 &&
+      repoBase !== '~' &&
+      repoBase !== '/' &&
+      candidateNorm.indexOf(`/worktrees/${repoBase}-`) >= 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pathIsInsideNormDirectory(normDir: string, normPath: string): boolean {
+  if (normDir.length === 0 || normPath.length === 0 || isBareHomeProjectDir(normDir)) {
+    return false;
+  }
+  if (normPath === normDir || cwdPathsEquivalent(normDir, normPath, null)) {
+    return true;
+  }
+  return normPath.startsWith(`${normDir}/`);
+}
+
+/**
+ * Compare two strings in Unicode scalar value (`codePointAt`) order, which is mathematically
+ * identical to Rust `str::cmp` (UTF-8 lexicographical byte order) — avoiding UTF-16 surrogate
+ * inversions such as `🚀` (`0xD83D < 0xFF21` in UTF-16, but `U+1F680 > U+FF21` in UTF-8) (`R5-Nit-2`).
+ */
+export function compareUnicodeCodePoints(a: string, b: string): number {
+  let i = 0;
+  let j = 0;
+  const lenA = a.length;
+  const lenB = b.length;
+  while (i < lenA && j < lenB) {
+    const cpA = a.codePointAt(i) ?? 0;
+    const cpB = b.codePointAt(j) ?? 0;
+    if (cpA !== cpB) {
+      return cpA < cpB ? -1 : 1;
+    }
+    i += cpA > 0xFFFF ? 2 : 1;
+    j += cpB > 0xFFFF ? 2 : 1;
+  }
+  if (i < lenA) {
+    return 1;
+  }
+  if (j < lenB) {
+    return -1;
+  }
+  return 0;
+}
+
+function isCanonicalGroupKeyLess(
+  candPrimary: string,
+  candId: string,
+  bestPrimary: string,
+  bestId: string
+): boolean {
+  const primaryCmp = compareUnicodeCodePoints(candPrimary, bestPrimary);
+  if (primaryCmp !== 0) {
+    return primaryCmp < 0;
+  }
+  return compareUnicodeCodePoints(candId, bestId) < 0;
+}
+
+/**
+ * Authoritative single-owner project-to-workspace matcher mirroring
+ * `crates/orbit-client-core/src/sidebar.rs::resolve_workspace_project_group_index` verbatim (R3-P1-2 / R4-Nit):
+ * 1. Computes each workspace's single authoritative root (`project_root ?? source_cwd ?? cwd`).
+ * 2. Matches `matchesSidebarProjectDirectory` on `wsRoot` first, then falls back to
+ *    `matchesSidebarProjectDirectory` on `ws.cwd`, then longest enclosing directory prefix on `wsRoot`.
+ * 3. Breaks any equal-score tie deterministically by lexicographically smallest
+ *    `(normalizeAbsoluteCwd(primaryCwd), id)`, completely independent of UI display sort order.
+ * 4. Assigns every workspace (active or archived) to AT MOST ONE project group.
+ */
+export function resolveAuthoritativeProjectWorkspaces(
+  workspaces: WorkspaceDto[],
+  hostGroups: OrbitProjectDirectoryGroupInput[],
+  targetGroupId: string
+): WorkspaceDto[] {
+  if (workspaces.length === 0 || hostGroups.length === 0 || targetGroupId.trim().length === 0) {
+    return [];
+  }
+  const groupDirsList: string[][] = [];
+  const groupPrimaryList: string[] = [];
+  let targetIndex = -1;
+  for (let g = 0; g < hostGroups.length; g++) {
+    groupDirsList.push(collectNormalizedGroupDirs(hostGroups[g]));
+    groupPrimaryList.push(normalizeAbsoluteCwd(nonBlankPath(hostGroups[g].primaryCwd)));
+    if (hostGroups[g].id === targetGroupId) {
+      targetIndex = g;
+    }
+  }
+  if (targetIndex < 0) {
+    return [];
+  }
+
+  const out: WorkspaceDto[] = [];
+  for (let i = 0; i < workspaces.length; i++) {
+    const ws = workspaces[i];
+    const explicitProjectRoot = nonBlankPath(ws.project_root);
+    const sourceCwd = nonBlankPath(ws.source_cwd);
+    const wsCwd = nonBlankPath(ws.cwd);
+    const rawRoot = explicitProjectRoot.length > 0
+      ? explicitProjectRoot
+      : (sourceCwd.length > 0 ? sourceCwd : wsCwd);
+    const normRoot = normalizeAbsoluteCwd(rawRoot);
+    const normCwd = normalizeAbsoluteCwd(wsCwd);
+    if (normRoot.length === 0 && normCwd.length === 0) {
+      continue;
+    }
+
+    let winnerIdx = -1;
+    // Pass 1: `matches_project_directory` on authoritative `ws_root` (canonical tie-break)
+    if (normRoot.length > 0) {
+      for (let g = 0; g < groupDirsList.length; g++) {
+        if (matchesSidebarProjectDirectory(groupDirsList[g], normRoot)) {
+          if (
+            winnerIdx < 0 ||
+            isCanonicalGroupKeyLess(
+              groupPrimaryList[g],
+              hostGroups[g].id,
+              groupPrimaryList[winnerIdx],
+              hostGroups[winnerIdx].id
+            )
+          ) {
+            winnerIdx = g;
+          }
+        }
+      }
+    }
+    // Pass 2: `matches_project_directory` on `ws.cwd` (canonical tie-break)
+    if (winnerIdx < 0 && normCwd.length > 0) {
+      for (let g = 0; g < groupDirsList.length; g++) {
+        if (matchesSidebarProjectDirectory(groupDirsList[g], normCwd)) {
+          if (
+            winnerIdx < 0 ||
+            isCanonicalGroupKeyLess(
+              groupPrimaryList[g],
+              hostGroups[g].id,
+              groupPrimaryList[winnerIdx],
+              hostGroups[winnerIdx].id
+            )
+          ) {
+            winnerIdx = g;
+          }
+        }
+      }
+    }
+    // Pass 3: longest enclosing directory prefix on `ws_root` (canonical tie-break on equal len)
+    if (winnerIdx < 0 && normRoot.length > 0) {
+      let bestLen = -1;
+      for (let g = 0; g < groupDirsList.length; g++) {
+        const dirs = groupDirsList[g];
+        let groupBestLen = -1;
+        for (let d = 0; d < dirs.length; d++) {
+          const dir = dirs[d];
+          if (pathIsInsideNormDirectory(dir, normRoot) && dir.length > groupBestLen) {
+            groupBestLen = dir.length;
+          }
+        }
+        if (groupBestLen >= 0) {
+          if (
+            groupBestLen > bestLen ||
+            (groupBestLen === bestLen &&
+              (winnerIdx < 0 ||
+                isCanonicalGroupKeyLess(
+                  groupPrimaryList[g],
+                  hostGroups[g].id,
+                  groupPrimaryList[winnerIdx],
+                  hostGroups[winnerIdx].id
+                )))
+          ) {
+            bestLen = groupBestLen;
+            winnerIdx = g;
+          }
+        }
+      }
+    }
+
+    if (winnerIdx === targetIndex) {
+      out.push(ws);
+    }
+  }
+  return out;
 }

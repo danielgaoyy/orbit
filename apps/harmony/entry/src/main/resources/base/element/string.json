@@ -293,6 +293,118 @@
       "value": "Snowy Owl"
     },
     {
+      "name": "board_cas_conflict_body",
+      "value": "Remote board advanced to rev %1$d while you edited from rev %2$d. Choose how to resolve:"
+    },
+    {
+      "name": "board_cas_conflict_title",
+      "value": "BOARD.md Revision Conflict"
+    },
+    {
+      "name": "board_cas_force_overwrite",
+      "value": "Force Overwrite"
+    },
+    {
+      "name": "board_cas_reload_merge",
+      "value": "Reload & Merge"
+    },
+    {
+      "name": "board_cas_unsupported_banner",
+      "value": "Connected daemon does not support conflict-safe saves (CAS). Upgrade daemon or use Force Overwrite."
+    },
+    {
+      "name": "board_cas_unsupported_toast",
+      "value": "Normal save disabled on older daemon — draft preserved. Upgrade daemon or use Force Overwrite."
+    },
+    {
+      "name": "board_dev_scripts",
+      "value": "Scripts"
+    },
+    {
+      "name": "board_editor_placeholder",
+      "value": "## Goal\n\n## Contracts"
+    },
+    {
+      "name": "board_empty_notice",
+      "value": "BOARD.md is empty for this workspace."
+    },
+    {
+      "name": "board_loading_metadata",
+      "value": "Loading workspace metadata…"
+    },
+    {
+      "name": "board_loading_metadata_hint",
+      "value": "Editing stays locked until this host confirms workspace ownership."
+    },
+    {
+      "name": "board_loading_snapshot",
+      "value": "Loading BOARD.md snapshot…"
+    },
+    {
+      "name": "board_loading_snapshot_hint",
+      "value": "Editing unlocks once the initial snapshot loads from the host."
+    },
+    {
+      "name": "board_peer_aliases",
+      "value": "aka %s"
+    },
+    {
+      "name": "board_peers_tab_count",
+      "value": "Peers (%d)"
+    },
+    {
+      "name": "board_recent_activity",
+      "value": "Recent Activity"
+    },
+    {
+      "name": "board_refresh_aria",
+      "value": "Refresh board"
+    },
+    {
+      "name": "board_revision_badge",
+      "value": "rev %d"
+    },
+    {
+      "name": "board_save_failed",
+      "value": "Failed to save BOARD.md"
+    },
+    {
+      "name": "board_save_failed_detail",
+      "value": "Failed to save BOARD.md: %s"
+    },
+    {
+      "name": "board_saved_toast",
+      "value": "Saved BOARD.md"
+    },
+    {
+      "name": "board_snapshot_not_loaded",
+      "value": "Board snapshot has not finished loading yet"
+    },
+    {
+      "name": "board_spawn_peer_action",
+      "value": "Spawn Workspace Peer"
+    },
+    {
+      "name": "board_unbound_hint",
+      "value": "BOARD.md editing and peer spawning stay disabled until this tab matches a Mission Workspace on its host."
+    },
+    {
+      "name": "board_unbound_title",
+      "value": "No workspace bound to this directory"
+    },
+    {
+      "name": "board_workspace_changed",
+      "value": "Workspace changed or no longer matches this tab"
+    },
+    {
+      "name": "board_workspace_loading",
+      "value": "Workspace metadata is still loading — please wait"
+    },
+    {
+      "name": "board_workspace_unbound",
+      "value": "No workspace bound to this tab"
+    },
+    {
       "name": "briefing_actorGuardian",
       "value": "Guardian"
     },
@@ -789,6 +901,30 @@
       "value": "Export Transcript"
     },
     {
+      "name": "files_action_quote",
+      "value": "Quote"
+    },
+    {
+      "name": "files_chunk_binary_tail_locked",
+      "value": "Binary data detected in later chunk — file locked read-only to prevent truncation."
+    },
+    {
+      "name": "files_chunk_etag_conflict",
+      "value": "File changed on host while loading remaining chunks. Reload to view the latest file."
+    },
+    {
+      "name": "files_chunk_incomplete_locked",
+      "value": "Chunk sequence could not be verified — file locked read-only."
+    },
+    {
+      "name": "files_chunk_limit_reached",
+      "value": "Read limit reached (%1$s / %2$s loaded · read-only)"
+    },
+    {
+      "name": "files_chunk_load_failed",
+      "value": "Failed to load next file chunk"
+    },
+    {
       "name": "files_create_as_dir",
       "value": "Create directory"
     },
@@ -801,12 +937,64 @@
       "value": "No files loaded for this workspace."
     },
     {
+      "name": "files_empty_indexed",
+      "value": "No workspace files indexed for this directory"
+    },
+    {
+      "name": "files_filter_placeholder",
+      "value": "Filter files…"
+    },
+    {
+      "name": "files_load_full",
+      "value": "Load Full File"
+    },
+    {
+      "name": "files_load_next_chunk",
+      "value": "Load more"
+    },
+    {
+      "name": "files_loading_chunk",
+      "value": "Loading…"
+    },
+    {
       "name": "files_new_entry",
       "value": "New"
     },
     {
       "name": "files_new_path_placeholder",
       "value": "relative/path/to/file.ts"
+    },
+    {
+      "name": "files_overwrite_anyway",
+      "value": "Overwrite Anyway"
+    },
+    {
+      "name": "files_panel_title",
+      "value": "Workspace Files"
+    },
+    {
+      "name": "files_preview_capped",
+      "value": "Syntax-highlighted first %1$d of %2$d lines"
+    },
+    {
+      "name": "files_preview_capped_lower_bound",
+      "value": "Syntax-highlighted first %1$d of %2$d+ lines"
+    },
+    {
+      "name": "files_readonly_notice",
+      "value": "Read-only file (editing disabled)"
+    },
+    {
+      "name": "files_refresh_list_aria",
+      "value": "Refresh file list"
+    },
+    {
+      "name": "files_reload_disk",
+      "value": "Reload Disk"
+    },
+    {
+      "name": "files_reload_file_aria",
+      "value": "Reload file"
     },
     {
       "name": "files_save_file",
@@ -817,12 +1005,32 @@
       "value": "Filter workspace files…"
     },
     {
+      "name": "files_showing_full",
+      "value": "Showing full file (%d lines)"
+    },
+    {
+      "name": "files_showing_full_lower_bound",
+      "value": "Showing full file (%d+ lines)"
+    },
+    {
+      "name": "files_showing_partial",
+      "value": "Showing loaded prefix (%1$s / %2$s · source truncated)"
+    },
+    {
+      "name": "files_source_truncated_banner",
+      "value": "Source file truncated (%1$s / %2$s loaded · read-only)"
+    },
+    {
       "name": "files_title",
       "value": "File Explorer"
     },
     {
       "name": "files_truncated_notice",
       "value": "Showing prefix preview (file truncated)"
+    },
+    {
+      "name": "files_unavailable_scope",
+      "value": "File unavailable in this tab scope"
     },
     {
       "name": "git_amend",
@@ -845,6 +1053,50 @@
       "value": "Create PR"
     },
     {
+      "name": "git_diff_unconfirmed_notice",
+      "value": "A concurrent mode switch or status-only refresh left diff ownership unconfirmed."
+    },
+    {
+      "name": "git_discard",
+      "value": "Discard"
+    },
+    {
+      "name": "git_discard_confirm_action",
+      "value": "Confirm Discard"
+    },
+    {
+      "name": "git_discard_failed",
+      "value": "Discard failed"
+    },
+    {
+      "name": "git_discard_failed_detail",
+      "value": "Discard failed: %s"
+    },
+    {
+      "name": "git_discard_include_untracked",
+      "value": "Delete untracked file"
+    },
+    {
+      "name": "git_discard_input_placeholder",
+      "value": "Type filename to confirm…"
+    },
+    {
+      "name": "git_discard_success",
+      "value": "Discarded %d file(s)"
+    },
+    {
+      "name": "git_discard_title",
+      "value": "Discard Changes"
+    },
+    {
+      "name": "git_discard_warning",
+      "value": "This permanently reverts local edits to %s. Type the exact filename to confirm:"
+    },
+    {
+      "name": "git_filter_changed_placeholder",
+      "value": "Filter changed files…"
+    },
+    {
       "name": "git_generate_message",
       "value": "AI Message"
     },
@@ -865,12 +1117,52 @@
       "value": "Pull request title"
     },
     {
+      "name": "git_push",
+      "value": "Push"
+    },
+    {
+      "name": "git_push_branch_placeholder",
+      "value": "Branch (default: current)"
+    },
+    {
+      "name": "git_push_failed",
+      "value": "Push failed"
+    },
+    {
+      "name": "git_push_failed_detail",
+      "value": "Push failed: %s"
+    },
+    {
+      "name": "git_push_remote_placeholder",
+      "value": "Remote (default: origin)"
+    },
+    {
+      "name": "git_push_set_upstream",
+      "value": "Set upstream (-u)"
+    },
+    {
+      "name": "git_push_success",
+      "value": "Pushed %1$s → %2$s"
+    },
+    {
       "name": "git_rebase_abort",
       "value": "Abort Rebase"
     },
     {
       "name": "git_rebase_continue",
       "value": "Continue Rebase"
+    },
+    {
+      "name": "git_refresh_diff",
+      "value": "Refresh Diff"
+    },
+    {
+      "name": "git_refresh_review_aria",
+      "value": "Refresh Git review"
+    },
+    {
+      "name": "git_show_all_lines",
+      "value": "Show all %d lines"
     },
     {
       "name": "git_stage",
@@ -881,6 +1173,10 @@
       "value": "Stage All"
     },
     {
+      "name": "git_stash_list_title",
+      "value": "Saved Stashes"
+    },
+    {
       "name": "git_stash_pop",
       "value": "Pop Stash"
     },
@@ -889,12 +1185,124 @@
       "value": "Stash"
     },
     {
+      "name": "git_stashes_count",
+      "value": "Stashes (%d)"
+    },
+    {
       "name": "git_unstage",
       "value": "Unstage"
     },
     {
       "name": "git_unstage_all",
       "value": "Unstage All"
+    },
+    {
+      "name": "git_working_tree_clean_scope",
+      "value": "Working tree is clean for this scope"
+    },
+    {
+      "name": "handoff_allow_three_way",
+      "value": "Allow 3-way conflict markers"
+    },
+    {
+      "name": "handoff_backup_ref",
+      "value": "Backup ref: %s"
+    },
+    {
+      "name": "handoff_branch_placeholder",
+      "value": "Target branch (optional)"
+    },
+    {
+      "name": "handoff_capsule",
+      "value": "Worktree"
+    },
+    {
+      "name": "handoff_clean_preview",
+      "value": "Ready to apply cleanly (%d file(s))"
+    },
+    {
+      "name": "handoff_conflicts_warning",
+      "value": "%d file conflict(s) detected"
+    },
+    {
+      "name": "handoff_dir_to_local",
+      "value": "Worktree → Local"
+    },
+    {
+      "name": "handoff_dir_to_worktree",
+      "value": "Local → Worktree"
+    },
+    {
+      "name": "handoff_empty_preview",
+      "value": "No transferable changes detected"
+    },
+    {
+      "name": "handoff_execute",
+      "value": "Execute Handoff"
+    },
+    {
+      "name": "handoff_execute_failed",
+      "value": "Worktree handoff failed"
+    },
+    {
+      "name": "handoff_execute_failed_detail",
+      "value": "Worktree handoff failed: %s"
+    },
+    {
+      "name": "handoff_execute_success",
+      "value": "Worktree handoff complete"
+    },
+    {
+      "name": "handoff_hard_blocker",
+      "value": "Cannot apply cleanly — resolve target workspace state first"
+    },
+    {
+      "name": "handoff_include_committed",
+      "value": "Include committed changes"
+    },
+    {
+      "name": "handoff_mode_apply",
+      "value": "Apply (Keep Source)"
+    },
+    {
+      "name": "handoff_mode_move",
+      "value": "Move (Reset Source)"
+    },
+    {
+      "name": "handoff_preview_failed",
+      "value": "Handoff preview failed"
+    },
+    {
+      "name": "handoff_preview_failed_detail",
+      "value": "Handoff preview failed: %s"
+    },
+    {
+      "name": "handoff_preview_refresh",
+      "value": "Preview"
+    },
+    {
+      "name": "handoff_success_apply",
+      "value": "Applied %d file(s) successfully"
+    },
+    {
+      "name": "handoff_success_apply_branch",
+      "value": "Applied %1$d file(s) to %2$s"
+    },
+    {
+      "name": "handoff_success_move",
+      "value": "Moved %d file(s) successfully"
+    },
+    {
+      "name": "handoff_success_move_branch",
+      "value": "Moved %1$d file(s) to %2$s"
+    },
+    {
+      "name": "handoff_title",
+      "value": "Worktree Handoff"
+    },
+    {
+      "name": "handoff_untracked_conflict",
+      "value": "Untracked file conflict cannot be merged with 3-way markers"
     },
     {
       "name": "module_desc",
@@ -1097,6 +1505,22 @@
       "value": "View diff"
     },
     {
+      "name": "peers_empty_notice",
+      "value": "No active sibling peers in this workspace yet."
+    },
+    {
+      "name": "peers_handle_placeholder",
+      "value": "Optional @handle (e.g. reviewer)"
+    },
+    {
+      "name": "peers_prompt_placeholder",
+      "value": "Task brief for the new peer…"
+    },
+    {
+      "name": "peers_spawn_title",
+      "value": "Spawn Peer"
+    },
+    {
       "name": "permission_microphone_reason",
       "value": "Dictate prompts to coding agents using on-device speech recognition."
     },
@@ -1189,6 +1613,54 @@
       "value": "Share Host External Memory"
     },
     {
+      "name": "scripts_empty",
+      "value": "No scripts configured in orbit.json for this workspace."
+    },
+    {
+      "name": "scripts_start",
+      "value": "Start"
+    },
+    {
+      "name": "scripts_start_failed",
+      "value": "Start script failed"
+    },
+    {
+      "name": "scripts_start_failed_detail",
+      "value": "Start script failed: %s"
+    },
+    {
+      "name": "scripts_status_failed",
+      "value": "Failed"
+    },
+    {
+      "name": "scripts_status_running",
+      "value": "Running"
+    },
+    {
+      "name": "scripts_status_stopped",
+      "value": "Stopped"
+    },
+    {
+      "name": "scripts_status_summary_label",
+      "value": "Status / Endpoint / Command"
+    },
+    {
+      "name": "scripts_stop",
+      "value": "Stop"
+    },
+    {
+      "name": "scripts_stop_failed",
+      "value": "Stop script failed"
+    },
+    {
+      "name": "scripts_stop_failed_detail",
+      "value": "Stop script failed: %s"
+    },
+    {
+      "name": "scripts_title",
+      "value": "Dev Scripts"
+    },
+    {
       "name": "search_empty_hint",
       "value": "Type keywords to search full-history FTS5 transcripts across your fleet."
     },
@@ -1211,6 +1683,22 @@
     {
       "name": "settings_upgrade_daemon",
       "value": "Upgrade Daemon Over Wire"
+    },
+    {
+      "name": "side_question_clear",
+      "value": "Clear"
+    },
+    {
+      "name": "side_question_empty_hint",
+      "value": "Ask a side question using this conversation context without interrupting the active turn."
+    },
+    {
+      "name": "side_question_input_placeholder",
+      "value": "Ask without interrupting…"
+    },
+    {
+      "name": "side_question_title",
+      "value": "Side Question (/btw)"
     },
     {
       "name": "sidebar_activeCount",
@@ -1653,6 +2141,30 @@
       "value": "Zero-Passphrase Instant Unlock"
     },
     {
+      "name": "terminal_buffer_empty",
+      "value": "Terminal buffer is empty"
+    },
+    {
+      "name": "terminal_close_failed",
+      "value": "Failed to close terminal"
+    },
+    {
+      "name": "terminal_closed_toast",
+      "value": "Terminal closed"
+    },
+    {
+      "name": "terminal_copied_toast",
+      "value": "Copied terminal output"
+    },
+    {
+      "name": "terminal_delta_rev",
+      "value": "rev %d"
+    },
+    {
+      "name": "terminal_empty_slot",
+      "value": "No active terminal buffer in this slot."
+    },
+    {
       "name": "terminal_line_placeholder",
       "value": "Send command line…"
     },
@@ -1665,12 +2177,28 @@
       "value": "Raw"
     },
     {
+      "name": "terminal_new_shell",
+      "value": "+ New"
+    },
+    {
+      "name": "terminal_no_buffer",
+      "value": "No active terminal buffer in this slot."
+    },
+    {
       "name": "terminal_raw_placeholder",
       "value": "Type raw keystrokes…"
     },
     {
+      "name": "terminal_slot_label",
+      "value": "S%d"
+    },
+    {
       "name": "terminal_spawn_shell",
       "value": "Spawn Shell Session"
+    },
+    {
+      "name": "terminal_start_failed",
+      "value": "Failed to start terminal"
     },
     {
       "name": "terminal_title",
@@ -1731,6 +2259,146 @@
     {
       "name": "topbar_showOverview",
       "value": "Show overview"
+    },
+    {
+      "name": "workspace_archive",
+      "value": "Archive Workspace"
+    },
+    {
+      "name": "workspace_archive_failed",
+      "value": "Archive workspace failed"
+    },
+    {
+      "name": "workspace_archive_failed_detail",
+      "value": "Archive workspace failed: %s"
+    },
+    {
+      "name": "workspace_archive_keep_unclassified",
+      "value": "Archive (Keep Agents Unclassified)"
+    },
+    {
+      "name": "workspace_archived_toast",
+      "value": "Workspace archived"
+    },
+    {
+      "name": "workspace_base_ref_placeholder",
+      "value": "Base ref (e.g. main)"
+    },
+    {
+      "name": "workspace_branch_placeholder",
+      "value": "Branch name (optional)"
+    },
+    {
+      "name": "workspace_create_dispatched",
+      "value": "Workspace creation dispatched"
+    },
+    {
+      "name": "workspace_create_failed",
+      "value": "Create workspace failed"
+    },
+    {
+      "name": "workspace_create_failed_detail",
+      "value": "Create workspace failed: %s"
+    },
+    {
+      "name": "workspace_isolation_local",
+      "value": "Local"
+    },
+    {
+      "name": "workspace_isolation_worktree",
+      "value": "Git Worktree"
+    },
+    {
+      "name": "workspace_menu_active_group",
+      "value": "Active Workspaces"
+    },
+    {
+      "name": "workspace_menu_archive_item",
+      "value": "Archive · %s"
+    },
+    {
+      "name": "workspace_menu_archive_keep_item",
+      "value": "Archive (Keep Unclassified) · %s"
+    },
+    {
+      "name": "workspace_menu_archived_group",
+      "value": "Archived Workspaces"
+    },
+    {
+      "name": "workspace_menu_rename_item",
+      "value": "Rename · %s"
+    },
+    {
+      "name": "workspace_menu_restore_item",
+      "value": "Restore · %s"
+    },
+    {
+      "name": "workspace_menu_scripts_item",
+      "value": "Dev Scripts · %s"
+    },
+    {
+      "name": "workspace_mode_branch_off",
+      "value": "New Branch"
+    },
+    {
+      "name": "workspace_mode_checkout_branch",
+      "value": "Checkout Branch"
+    },
+    {
+      "name": "workspace_mode_checkout_pr",
+      "value": "Checkout PR"
+    },
+    {
+      "name": "workspace_new_v2",
+      "value": "New Workspace"
+    },
+    {
+      "name": "workspace_pr_number_placeholder",
+      "value": "PR number"
+    },
+    {
+      "name": "workspace_rename_confirm",
+      "value": "Rename"
+    },
+    {
+      "name": "workspace_rename_failed",
+      "value": "Failed to rename workspace"
+    },
+    {
+      "name": "workspace_rename_failed_detail",
+      "value": "Failed to rename workspace: %s"
+    },
+    {
+      "name": "workspace_rename_placeholder",
+      "value": "Workspace title"
+    },
+    {
+      "name": "workspace_rename_title",
+      "value": "Rename Workspace"
+    },
+    {
+      "name": "workspace_renamed_toast",
+      "value": "Workspace renamed"
+    },
+    {
+      "name": "workspace_restore_failed",
+      "value": "Restore workspace failed"
+    },
+    {
+      "name": "workspace_restore_failed_detail",
+      "value": "Restore workspace failed: %s"
+    },
+    {
+      "name": "workspace_restored_toast",
+      "value": "Workspace restored"
+    },
+    {
+      "name": "workspace_title_placeholder",
+      "value": "Workspace title (optional)"
+    },
+    {
+      "name": "workspace_unarchive",
+      "value": "Restore Workspace"
     }
   ]
 }

@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use orbit_protocol::{GitFileEntry, GitStatusSnapshot, RewindPreviewFile};
-use tokio::io::AsyncReadExt;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -438,6 +439,8 @@ use crate::workspace_files::{
 
 const DEFAULT_MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const HARD_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+/// Upper bound for streaming full-file ETag verification & bounded chunked text reads (16 MiB).
+const CHUNKED_READ_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 const MEDIA_MAX_READ_BYTES: u64 = 25 * 1024 * 1024;
 const MEDIA_SNIFF_PROBE_BYTES: u64 = 4096;
@@ -454,6 +457,9 @@ pub struct WorkspaceFilePayload {
     pub mtime_unix_ms: Option<i64>,
     pub writable: bool,
     pub line_ending: Option<String>,
+    pub offset_bytes: u64,
+    pub next_offset_bytes: u64,
+    pub etag_mismatch: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1016,12 +1022,67 @@ pub async fn read_workspace_file(
     read_workspace_file_with_attachments_dir(cwd, raw_path, max_bytes, None).await
 }
 
+async fn stream_file_sha256_hex(
+    file: &mut tokio::fs::File,
+    max_hash_bytes: u64,
+    trimmed: &str,
+) -> Result<Option<String>, String> {
+    use std::fmt::Write as _;
+    file.seek(SeekFrom::Start(0))
+        .await
+        .map_err(|e| format!("Failed seeking `{trimmed}`: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("Failed hashing `{trimmed}`: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max_hash_bytes {
+            return Ok(None);
+        }
+        hasher.update(&chunk[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    Ok(Some(out))
+}
+
 /// Read a single workspace or staged attachment file safely on the host, strictly enforcing
 /// canonicalized containment inside `cwd` or managed artifact/attachment roots.
 pub async fn read_workspace_file_with_attachments_dir(
     cwd: &Path,
     raw_path: &str,
     max_bytes: Option<u64>,
+    extra_attachments_dir: Option<&Path>,
+) -> Result<WorkspaceFilePayload, String> {
+    read_workspace_file_chunk_with_attachments_dir(
+        cwd,
+        raw_path,
+        None,
+        max_bytes,
+        None,
+        extra_attachments_dir,
+    )
+    .await
+}
+
+/// Read a single workspace file or bounded UTF-8 text chunk safely on the host, supporting
+/// `offset_bytes` continuation bound to `expected_etag` for multi-megabyte text files.
+pub async fn read_workspace_file_chunk_with_attachments_dir(
+    cwd: &Path,
+    raw_path: &str,
+    offset_bytes: Option<u64>,
+    max_bytes: Option<u64>,
+    expected_etag: Option<&str>,
     extra_attachments_dir: Option<&Path>,
 ) -> Result<WorkspaceFilePayload, String> {
     let trimmed = raw_path.trim();
@@ -1032,6 +1093,140 @@ pub async fn read_workspace_file_with_attachments_dir(
     let mtime_unix_ms = metadata_mtime_unix_ms(&meta);
     let writable = compute_workspace_file_writable(cwd, trimmed, &canonical, &meta).await;
     let resolved_path = canonical.to_string_lossy().to_string();
+    let start_offset = offset_bytes.unwrap_or(0);
+    let clean_expected_etag = expected_etag.map(str::trim).filter(|s| !s.is_empty());
+
+    // Chunked text continuation (`offset_bytes > 0`): validate live full-file ETag first so
+    // disk mutations never silently stitch stale and new halves together.
+    if start_offset > 0 {
+        if start_offset > CHUNKED_READ_MAX_FILE_BYTES {
+            return Err(format!(
+                "Chunk offset `{start_offset}` exceeds maximum chunked read limit ({CHUNKED_READ_MAX_FILE_BYTES} bytes)"
+            ));
+        }
+        let live_etag = if size_bytes <= CHUNKED_READ_MAX_FILE_BYTES {
+            stream_file_sha256_hex(&mut file, CHUNKED_READ_MAX_FILE_BYTES, trimmed).await?
+        } else {
+            None
+        };
+        if let Some(exp) = clean_expected_etag
+            && live_etag.as_deref() != Some(exp)
+        {
+            return Ok(WorkspaceFilePayload {
+                resolved_path,
+                content_kind: "text".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                content: String::new(),
+                size_bytes,
+                truncated: true,
+                etag: live_etag,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
+                offset_bytes: start_offset,
+                next_offset_bytes: start_offset,
+                etag_mismatch: true,
+            });
+        }
+        if start_offset >= size_bytes {
+            return Ok(WorkspaceFilePayload {
+                resolved_path,
+                content_kind: "text".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                content: String::new(),
+                size_bytes,
+                truncated: false,
+                etag: live_etag,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
+                offset_bytes: start_offset,
+                next_offset_bytes: size_bytes,
+                etag_mismatch: false,
+            });
+        }
+        let remaining_allowed = CHUNKED_READ_MAX_FILE_BYTES.saturating_sub(start_offset);
+        let cap = max_bytes
+            .unwrap_or(DEFAULT_MAX_READ_BYTES)
+            .clamp(4096, HARD_MAX_READ_BYTES)
+            .min(remaining_allowed);
+        file.seek(SeekFrom::Start(start_offset))
+            .await
+            .map_err(|e| format!("Failed seeking `{trimmed}`: {e}"))?;
+        let mut buf = Vec::new();
+        (&mut file)
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("Failed reading chunk of `{trimmed}`: {e}"))?;
+        let has_more_raw =
+            (buf.len() as u64) > cap || start_offset.saturating_add(buf.len() as u64) < size_bytes;
+        if (buf.len() as u64) > cap {
+            buf.truncate(cap as usize);
+        }
+        if buf.contains(&0) {
+            return Ok(WorkspaceFilePayload {
+                resolved_path,
+                content_kind: "binary".to_string(),
+                mime_type: None,
+                content: String::new(),
+                size_bytes,
+                truncated: has_more_raw || start_offset > 0,
+                etag: live_etag,
+                mtime_unix_ms,
+                writable: if start_offset > 0 { false } else { writable },
+                line_ending: None,
+                offset_bytes: start_offset,
+                next_offset_bytes: start_offset,
+                etag_mismatch: false,
+            });
+        }
+        let text = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(err) => {
+                let is_incomplete_tail = err.utf8_error().error_len().is_none();
+                let valid_up_to = err.utf8_error().valid_up_to();
+                let raw = err.into_bytes();
+                if has_more_raw && is_incomplete_tail {
+                    String::from_utf8_lossy(&raw[..valid_up_to]).into_owned()
+                } else {
+                    return Ok(WorkspaceFilePayload {
+                        resolved_path,
+                        content_kind: "binary".to_string(),
+                        mime_type: None,
+                        content: String::new(),
+                        size_bytes,
+                        truncated: has_more_raw || start_offset > 0,
+                        etag: live_etag,
+                        mtime_unix_ms,
+                        writable: if start_offset > 0 { false } else { writable },
+                        line_ending: None,
+                        offset_bytes: start_offset,
+                        next_offset_bytes: start_offset,
+                        etag_mismatch: false,
+                    });
+                }
+            }
+        };
+        let next_offset_bytes = start_offset.saturating_add(text.len() as u64);
+        let truncated = next_offset_bytes < size_bytes;
+        let line_ending = Some(detect_line_ending(&text));
+        return Ok(WorkspaceFilePayload {
+            resolved_path,
+            content_kind: "text".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            content: text,
+            size_bytes,
+            truncated,
+            etag: live_etag,
+            mtime_unix_ms,
+            writable,
+            line_ending,
+            offset_bytes: start_offset,
+            next_offset_bytes,
+            etag_mismatch: false,
+        });
+    }
 
     // Read a bounded 4 KiB header first so images, PDF, audio, and video files are classified
     // by magic bytes (never blindly by extension) without allocating tens of megabytes in memory.
@@ -1070,6 +1265,9 @@ pub async fn read_workspace_file_with_attachments_dir(
                 mtime_unix_ms,
                 writable,
                 line_ending: None,
+                offset_bytes: 0,
+                next_offset_bytes: 0,
+                etag_mismatch: false,
             });
         }
         let mut bytes = header_buf;
@@ -1091,20 +1289,27 @@ pub async fn read_workspace_file_with_attachments_dir(
                 mtime_unix_ms,
                 writable,
                 line_ending: None,
+                offset_bytes: 0,
+                next_offset_bytes: 0,
+                etag_mismatch: false,
             });
         }
         let etag = Some(sha256_hex(&bytes));
+        let final_len = bytes.len() as u64;
         return Ok(WorkspaceFilePayload {
             resolved_path,
             content_kind: kind_str,
             mime_type: Some(sniffed.mime_type.to_string()),
             content: B64.encode(&bytes),
-            size_bytes: bytes.len() as u64,
+            size_bytes: final_len,
             truncated: false,
             etag,
             mtime_unix_ms,
             writable,
             line_ending: None,
+            offset_bytes: 0,
+            next_offset_bytes: final_len,
+            etag_mismatch: false,
         });
     }
 
@@ -1121,11 +1326,36 @@ pub async fn read_workspace_file_with_attachments_dir(
             .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
     }
 
-    let truncated = (buf.len() as u64) > cap || size_bytes > cap;
+    let raw_truncated = (buf.len() as u64) > cap || size_bytes > cap;
     if (buf.len() as u64) > cap {
         buf.truncate(cap as usize);
     }
-    let etag = (!truncated).then(|| sha256_hex(&buf));
+    let etag = if !raw_truncated {
+        Some(sha256_hex(&buf))
+    } else if size_bytes <= CHUNKED_READ_MAX_FILE_BYTES {
+        stream_file_sha256_hex(&mut file, CHUNKED_READ_MAX_FILE_BYTES, trimmed).await?
+    } else {
+        None
+    };
+    if let Some(exp) = clean_expected_etag
+        && etag.as_deref() != Some(exp)
+    {
+        return Ok(WorkspaceFilePayload {
+            resolved_path,
+            content_kind: "text".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            content: String::new(),
+            size_bytes,
+            truncated: true,
+            etag,
+            mtime_unix_ms,
+            writable,
+            line_ending: None,
+            offset_bytes: 0,
+            next_offset_bytes: 0,
+            etag_mismatch: true,
+        });
+    }
     let probe_len = buf.len().min(8192);
     if buf[..probe_len].contains(&0) {
         return Ok(WorkspaceFilePayload {
@@ -1134,11 +1364,14 @@ pub async fn read_workspace_file_with_attachments_dir(
             mime_type: None,
             content: String::new(),
             size_bytes,
-            truncated,
+            truncated: raw_truncated,
             etag,
             mtime_unix_ms,
             writable,
             line_ending: None,
+            offset_bytes: 0,
+            next_offset_bytes: 0,
+            etag_mismatch: false,
         });
     }
 
@@ -1149,7 +1382,7 @@ pub async fn read_workspace_file_with_attachments_dir(
             let is_incomplete_tail = err.utf8_error().error_len().is_none();
             let valid_up_to = err.utf8_error().valid_up_to();
             let raw = err.into_bytes();
-            if truncated && is_incomplete_tail {
+            if raw_truncated && is_incomplete_tail {
                 String::from_utf8_lossy(&raw[..valid_up_to]).into_owned()
             } else {
                 return Ok(WorkspaceFilePayload {
@@ -1158,15 +1391,20 @@ pub async fn read_workspace_file_with_attachments_dir(
                     mime_type: None,
                     content: String::new(),
                     size_bytes,
-                    truncated,
+                    truncated: raw_truncated,
                     etag,
                     mtime_unix_ms,
                     writable,
                     line_ending: None,
+                    offset_bytes: 0,
+                    next_offset_bytes: 0,
+                    etag_mismatch: false,
                 });
             }
         }
     };
+    let next_offset_bytes = text.len() as u64;
+    let truncated = raw_truncated || next_offset_bytes < size_bytes;
     let line_ending = Some(detect_line_ending(&text));
 
     Ok(WorkspaceFilePayload {
@@ -1180,6 +1418,9 @@ pub async fn read_workspace_file_with_attachments_dir(
         mtime_unix_ms,
         writable,
         line_ending,
+        offset_bytes: 0,
+        next_offset_bytes,
+        etag_mismatch: false,
     })
 }
 
@@ -3534,5 +3775,133 @@ mod tests {
         assert_eq!(link_scope_prefix, None);
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn read_workspace_file_chunk_loads_past_2mib_to_eof_and_detects_etag_mismatch() {
+        let dir = std::env::temp_dir().join(format!("orbit_chunk_read_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+
+        // Build a 2.4 MiB UTF-8 file containing multi-byte characters right across the 2 MiB boundary
+        // and a distinctive end marker at EOF.
+        let mut full_text = String::with_capacity(2_420_000);
+        while full_text.len() < 2_097_150 {
+            full_text.push_str("0123456789abcdef\n");
+        }
+        full_text.push_str("界边界🚀BOUNDARY\n");
+        while full_text.len() < 2_400_000 {
+            full_text.push_str("tail-line-payload-for-chunk-2\n");
+        }
+        full_text.push_str("END_MARKER_PR5_EOF\n");
+        let file_path = dir.join("large.log");
+        tokio::fs::write(&file_path, full_text.as_bytes())
+            .await
+            .expect("write 2.4 MiB file");
+
+        // 1. Initial read hits default 2 MiB cap, reports truncated=true + authoritative full-file ETag.
+        let chunk0 = read_workspace_file(&dir, "large.log", None)
+            .await
+            .expect("read initial chunk");
+        assert_eq!(chunk0.content_kind, "text");
+        assert!(chunk0.truncated);
+        assert_eq!(chunk0.offset_bytes, 0);
+        assert!(chunk0.next_offset_bytes > 0 && chunk0.next_offset_bytes < chunk0.size_bytes);
+        assert!(!chunk0.content.contains("END_MARKER_PR5_EOF"));
+        let initial_etag = chunk0
+            .etag
+            .clone()
+            .expect("truncated text file within 16 MiB must carry full-file ETag");
+        assert!(!chunk0.etag_mismatch);
+
+        // 2. Continuation chunk bound to initial ETag loads remaining bytes cleanly to EOF.
+        let chunk1 = read_workspace_file_chunk_with_attachments_dir(
+            &dir,
+            "large.log",
+            Some(chunk0.next_offset_bytes),
+            None,
+            Some(&initial_etag),
+            None,
+        )
+        .await
+        .expect("read second chunk");
+        assert!(!chunk1.etag_mismatch);
+        assert!(!chunk1.truncated);
+        assert_eq!(chunk1.offset_bytes, chunk0.next_offset_bytes);
+        assert_eq!(chunk1.next_offset_bytes, full_text.len() as u64);
+        assert_eq!(chunk1.etag.as_deref(), Some(initial_etag.as_str()));
+        let stitched = format!("{}{}", chunk0.content, chunk1.content);
+        assert_eq!(stitched, full_text);
+        assert!(stitched.ends_with("END_MARKER_PR5_EOF\n"));
+
+        // 3. Modifying the file on disk invalidates expected_etag on chunked continuation.
+        let mut modified = full_text.clone();
+        modified.push_str("MUTATED_ON_DISK\n");
+        tokio::fs::write(&file_path, modified.as_bytes())
+            .await
+            .expect("overwrite file on disk");
+        let conflict_chunk = read_workspace_file_chunk_with_attachments_dir(
+            &dir,
+            "large.log",
+            Some(chunk0.next_offset_bytes),
+            None,
+            Some(&initial_etag),
+            None,
+        )
+        .await
+        .expect("read chunk after disk edit");
+        assert!(conflict_chunk.etag_mismatch);
+        assert!(conflict_chunk.content.is_empty());
+        assert!(conflict_chunk.truncated);
+        assert_ne!(conflict_chunk.etag.as_deref(), Some(initial_etag.as_str()));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn read_workspace_file_chunk_binary_tail_keeps_truncated_true_and_readonly() {
+        let dir = std::env::temp_dir().join(format!("orbit_chunk_bin_tail_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+
+        // R2-P0-C: First 2 MiB is valid ASCII text, followed by a 13-byte binary tail with NULs.
+        let mut raw = vec![b'a'; 2 * 1024 * 1024];
+        raw.extend_from_slice(b"\n\x00\x01\x02BINARY\x00!");
+        let file_path = dir.join("mixed_tail.txt");
+        tokio::fs::write(&file_path, &raw)
+            .await
+            .expect("write mixed file");
+
+        let chunk0 = read_workspace_file(&dir, "mixed_tail.txt", None)
+            .await
+            .expect("read chunk 0");
+        assert_eq!(chunk0.content_kind, "text");
+        assert!(chunk0.truncated);
+        assert!(chunk0.writable);
+        assert_eq!(chunk0.next_offset_bytes, 2 * 1024 * 1024);
+        let etag0 = chunk0.etag.clone().expect("chunk 0 etag");
+
+        let chunk1 = read_workspace_file_chunk_with_attachments_dir(
+            &dir,
+            "mixed_tail.txt",
+            Some(chunk0.next_offset_bytes),
+            None,
+            Some(&etag0),
+            None,
+        )
+        .await
+        .expect("read binary tail chunk");
+        assert_eq!(chunk1.content_kind, "binary");
+        assert!(chunk1.content.is_empty());
+        assert!(
+            chunk1.truncated,
+            "binary continuation chunk must stay truncated=true so client never unlocks editing"
+        );
+        assert!(
+            !chunk1.writable,
+            "binary continuation chunk must lock writable=false"
+        );
+        assert_eq!(chunk1.offset_bytes, chunk0.next_offset_bytes);
+        assert_eq!(chunk1.next_offset_bytes, chunk0.next_offset_bytes);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

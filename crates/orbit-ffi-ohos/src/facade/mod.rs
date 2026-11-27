@@ -4,6 +4,8 @@ mod composer;
 mod files_workspace;
 mod fleet;
 mod git_terminal;
+#[cfg(test)]
+pub(crate) use git_terminal::validate_ohos_git_discard_path;
 mod settings;
 mod stage;
 

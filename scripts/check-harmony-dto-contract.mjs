@@ -45,6 +45,7 @@ for (const path of files) {
 const views = [
   'AgentStageDelta', 'StageTurn', 'FleetOverview', 'HostDetail',
   'FleetSidebar', 'PersonalAgentBriefing', 'TerminalScreen',
+  'TerminalScreenDelta', 'HighlightedCode', 'GitReview',
 ];
 const variants = [
   'user_prompt', 'assistant_thinking', 'assistant_message', 'tool_call',

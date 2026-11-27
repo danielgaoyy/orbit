@@ -393,7 +393,7 @@ impl CodeHighlightLruCache {
     }
 }
 
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         hash ^= u64::from(b);
@@ -428,6 +428,399 @@ pub(crate) fn code_highlight_cache_contains(lang: &str, code: &str) -> bool {
             .get(&key)
             .is_some_and(|bucket| bucket.iter().any(|e| e.raw_code.as_ref() == code))
     })
+}
+
+/// Hard upper bound for workspace file preview syntax highlighting on mobile/HarmonyOS clients.
+pub const MAX_WORKSPACE_HIGHLIGHT_LINES: usize = 250;
+/// Maximum byte length of a single line passed to `syntect` regex grammar parsing.
+/// Longer lines (e.g. minified JS/JSON bundles) gracefully fall back to a plain-text span in O(1) time.
+pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 4_096;
+/// Strict per-line regex budget for `syntect` inside bounded preview highlighting so 4 KiB
+/// minified/long-identifier lines never trigger 10–100 ms regex backtracking.
+pub const MAX_SYNTECT_REGEX_LINE_BYTES: usize = 1_024;
+/// Maximum cumulative source bytes passed through `syntect` per highlight call.
+pub const MAX_HIGHLIGHT_TOTAL_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 bytes materialized per line in `highlight_workspace_code_capped` so huge
+/// single-line minified inputs never explode synchronous FFI JSON serialization size.
+pub const MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES: usize = 4_096;
+
+/// UTF-8 safe prefix truncation returning `(slice, was_truncated)` with byte length `<= max_bytes`.
+fn truncate_utf8_floor(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text.get(..end).unwrap_or(""), true)
+}
+
+/// Fast safe SWAR byte-level newline counter (`0x0A`) — 8 bytes per step, zero `unsafe`.
+fn count_newlines(bytes: &[u8]) -> usize {
+    const LF_MASK: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const LO_BITS: u64 = 0x0101_0101_0101_0101;
+    const HI_BITS: u64 = 0x8080_8080_8080_8080;
+    let mut total = 0usize;
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let word = u64::from_ne_bytes(*chunk);
+        let xored = word ^ LF_MASK;
+        let has_lf = xored.wrapping_sub(LO_BITS) & !xored & HI_BITS;
+        total += has_lf.count_ones() as usize;
+    }
+    for &b in rem {
+        if b == b'\n' {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// Fast safe SWAR index of the first `\n` (`0x0A`) in `bytes`.
+fn find_newline(bytes: &[u8]) -> Option<usize> {
+    const LF_MASK: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const LO_BITS: u64 = 0x0101_0101_0101_0101;
+    const HI_BITS: u64 = 0x8080_8080_8080_8080;
+    let mut offset = 0usize;
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let word = u64::from_ne_bytes(*chunk);
+        let xored = word ^ LF_MASK;
+        let has_lf = xored.wrapping_sub(LO_BITS) & !xored & HI_BITS;
+        if has_lf != 0 {
+            for (i, &b) in chunk.iter().enumerate() {
+                if b == b'\n' {
+                    return Some(offset + i);
+                }
+            }
+        }
+        offset += 8;
+    }
+    for (i, &b) in rem.iter().enumerate() {
+        if b == b'\n' {
+            return Some(offset + i);
+        }
+    }
+    None
+}
+
+/// Fast byte-level line count matching `LinesWithEndings::from(code).count()` for non-empty inputs.
+fn fast_count_lines(code: &str) -> usize {
+    if code.is_empty() {
+        return 0;
+    }
+    let newlines = count_newlines(code.as_bytes());
+    if code.ends_with('\n') {
+        newlines
+    } else {
+        newlines.saturating_add(1)
+    }
+}
+
+fn default_total_lines_exact() -> bool {
+    true
+}
+
+/// Highlighted workspace file preview with hard line-cap truncation metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightedCodeView {
+    pub language: String,
+    pub lines: Vec<HighlightedLineView>,
+    pub total_lines: u32,
+    /// `true` when `total_lines` reflects the exact line count of the source buffer;
+    /// `false` when a synchronous bounded scan hit its prefix window and `total_lines`
+    /// is only a lower bound (`R4-P1-2`).
+    #[serde(default = "default_total_lines_exact")]
+    pub total_lines_exact: bool,
+    pub truncated: bool,
+}
+
+/// Highlight up to `max_lines` (capped at [`MAX_WORKSPACE_HIGHLIGHT_LINES`] = 250) lines while
+/// enforcing per-line (`MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES` = 4 KiB) and total syntax
+/// parse (`MAX_HIGHLIGHT_TOTAL_BYTES` = 64 KiB) budgets BEFORE allocating line strings.
+/// Returns `(lines, was_truncated_by_lines_or_bytes)` so both sync `highlight_workspace_code_json`
+/// and async `read_workspace_file_json` share the exact same bounded preview budget.
+pub fn highlight_code_lines_prefix_bounded(
+    language: &str,
+    code: &str,
+    max_lines: usize,
+) -> (Vec<HighlightedLineView>, bool) {
+    highlight_code_lines_prefix_bounded_with_plain_lines(language, code, max_lines, &[])
+}
+
+/// Bounded prefix highlighter with optional caller-provided 1-based `plain_line_numbers`
+/// (e.g. lines already clipped from >4 KiB source lines on the client before FFI serialization).
+/// Any pre-clipped line or line exceeding [`MAX_SYNTECT_REGEX_LINE_BYTES`] bypasses `syntect`
+/// regex parsing in O(1) time and emits a single bounded plain-text span.
+pub fn highlight_code_lines_prefix_bounded_with_plain_lines(
+    language: &str,
+    code: &str,
+    max_lines: usize,
+    plain_line_numbers: &[u32],
+) -> (Vec<HighlightedLineView>, bool) {
+    let effective_cap = max_lines.min(MAX_WORKSPACE_HIGHLIGHT_LINES);
+    if code.is_empty() {
+        return (Vec::new(), false);
+    }
+    if effective_cap == 0 {
+        return (Vec::new(), true);
+    }
+
+    let lang_token = language.trim();
+    let ps = syntax_set();
+    let syntax = if lang_token.is_empty() {
+        ps.find_syntax_plain_text()
+    } else {
+        ps.find_syntax_by_token(lang_token)
+            .or_else(|| match lang_token {
+                "ts" | "tsx" => ps.find_syntax_by_token("js"),
+                "toml" => ps.find_syntax_by_token("ini"),
+                _ => None,
+            })
+            .unwrap_or_else(|| ps.find_syntax_plain_text())
+    };
+    let themes = default_dark_theme().zip(default_light_theme());
+    let mut parse_state = ParseState::new(syntax);
+    let mut highlight_engines = themes.map(|(dark_theme, light_theme)| {
+        let dark_highlighter = Highlighter::new(dark_theme);
+        let light_highlighter = Highlighter::new(light_theme);
+        let dark_state = HighlightState::new(&dark_highlighter, ScopeStack::new());
+        let light_state = HighlightState::new(&light_highlighter, ScopeStack::new());
+        (dark_highlighter, light_highlighter, dark_state, light_state)
+    });
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    #[inline]
+    fn rgb_to_hex(r: u8, g: u8, b: u8, fallback: &str) -> String {
+        let bytes = [
+            b'#',
+            HEX[(r >> 4) as usize],
+            HEX[(r & 0x0F) as usize],
+            HEX[(g >> 4) as usize],
+            HEX[(g & 0x0F) as usize],
+            HEX[(b >> 4) as usize],
+            HEX[(b & 0x0F) as usize],
+        ];
+        String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| fallback.to_string())
+    }
+
+    fn merge_dual_theme_spans(
+        dark_ranges: &[(Style, &str)],
+        light_ranges: &[(Style, &str)],
+    ) -> Vec<HighlightedTokenView> {
+        let mut coalesced: Vec<HighlightedTokenView> =
+            Vec::with_capacity(dark_ranges.len().max(light_ranges.len()));
+        let mut di = 0usize;
+        let mut doff = 0usize;
+        let mut li = 0usize;
+        let mut loff = 0usize;
+        while di < dark_ranges.len() && li < light_ranges.len() {
+            let (d_style, d_str) = dark_ranges[di];
+            let (l_style, l_str) = light_ranges[li];
+            let d_rem = d_str.get(doff..).unwrap_or("");
+            let l_rem = l_str.get(loff..).unwrap_or("");
+            if d_rem.is_empty() {
+                di += 1;
+                doff = 0;
+                continue;
+            }
+            if l_rem.is_empty() {
+                li += 1;
+                loff = 0;
+                continue;
+            }
+            let take = d_rem.len().min(l_rem.len());
+            if let Some(piece) = d_rem.get(..take) {
+                let clean = piece.trim_end_matches(&['\r', '\n'][..]);
+                if !clean.is_empty() {
+                    let fg_hex = rgb_to_hex(
+                        d_style.foreground.r,
+                        d_style.foreground.g,
+                        d_style.foreground.b,
+                        DARK_PLAIN_FG_HEX,
+                    );
+                    let light_fg_hex = rgb_to_hex(
+                        l_style.foreground.r,
+                        l_style.foreground.g,
+                        l_style.foreground.b,
+                        LIGHT_PLAIN_FG_HEX,
+                    );
+                    let bold = d_style.font_style.contains(FontStyle::BOLD);
+                    let italic = d_style.font_style.contains(FontStyle::ITALIC);
+                    if let Some(prev) = coalesced.last_mut()
+                        && prev.fg_hex == fg_hex
+                        && prev.light_fg_hex == light_fg_hex
+                        && prev.bold == bold
+                        && prev.italic == italic
+                    {
+                        prev.text.push_str(clean);
+                    } else {
+                        coalesced.push(HighlightedTokenView {
+                            text: clean.to_string(),
+                            fg_hex,
+                            light_fg_hex,
+                            bold,
+                            italic,
+                        });
+                    }
+                }
+            }
+            doff += take;
+            if doff >= d_str.len() {
+                di += 1;
+                doff = 0;
+            }
+            loff += take;
+            if loff >= l_str.len() {
+                li += 1;
+                loff = 0;
+            }
+        }
+        coalesced
+    }
+
+    let mut out = Vec::with_capacity(effective_cap.min(64));
+    let mut cursor = 0usize;
+    let mut highlighted_bytes = 0usize;
+    let mut truncated = false;
+    let bytes = code.as_bytes();
+
+    while cursor < code.len() && out.len() < effective_cap {
+        let rest = &bytes[cursor..];
+        let (line_end, next_cursor) = match find_newline(rest) {
+            Some(rel_nl) => (cursor + rel_nl + 1, cursor + rel_nl + 1),
+            None => (code.len(), code.len()),
+        };
+        let raw_line = code.get(cursor..line_end).unwrap_or("");
+        let trimmed_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+        let line_number = (out.len() + 1) as u32;
+
+        let is_caller_clipped = plain_line_numbers.contains(&line_number);
+        let line_over_preview =
+            is_caller_clipped || trimmed_line.len() > MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES;
+        if line_over_preview {
+            truncated = true;
+            let (clipped, _) =
+                truncate_utf8_floor(trimmed_line, MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES);
+            out.push(HighlightedLineView {
+                line_number,
+                tokens: if clipped.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![HighlightedTokenView {
+                        text: clipped.to_string(),
+                        fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                        light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
+                        bold: false,
+                        italic: false,
+                    }]
+                },
+            });
+            cursor = next_cursor;
+            continue;
+        }
+
+        let within_syntax_budget = raw_line.len() <= MAX_SYNTECT_REGEX_LINE_BYTES
+            && raw_line.len() < MAX_HIGHLIGHT_LINE_BYTES
+            && highlighted_bytes.saturating_add(raw_line.len()) <= MAX_HIGHLIGHT_TOTAL_BYTES;
+        let tokens = if within_syntax_budget {
+            if let Some((dark_hl, light_hl, dark_state, light_state)) = highlight_engines.as_mut() {
+                highlighted_bytes = highlighted_bytes.saturating_add(raw_line.len());
+                match parse_state.parse_line(raw_line, ps) {
+                    Ok(ops) => {
+                        let dark_ranges: Vec<(Style, &str)> =
+                            HighlightIterator::new(dark_state, &ops, raw_line, dark_hl).collect();
+                        let light_ranges: Vec<(Style, &str)> =
+                            HighlightIterator::new(light_state, &ops, raw_line, light_hl).collect();
+                        merge_dual_theme_spans(&dark_ranges, &light_ranges)
+                    }
+                    Err(_) => vec![HighlightedTokenView {
+                        text: trimmed_line.to_string(),
+                        fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                        light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
+                        bold: false,
+                        italic: false,
+                    }],
+                }
+            } else {
+                vec![HighlightedTokenView {
+                    text: trimmed_line.to_string(),
+                    fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                    light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
+                    bold: false,
+                    italic: false,
+                }]
+            }
+        } else {
+            vec![HighlightedTokenView {
+                text: trimmed_line.to_string(),
+                fg_hex: DARK_PLAIN_FG_HEX.to_string(),
+                light_fg_hex: LIGHT_PLAIN_FG_HEX.to_string(),
+                bold: false,
+                italic: false,
+            }]
+        };
+
+        out.push(HighlightedLineView {
+            line_number,
+            tokens,
+        });
+        cursor = next_cursor;
+    }
+
+    if cursor < code.len() {
+        truncated = true;
+    }
+    (out, truncated)
+}
+
+/// Highlight up to `max_lines` (hard-capped at [`MAX_WORKSPACE_HIGHLIGHT_LINES`] = 250) lines
+/// of workspace code using `syntect` with UTF-8 boundary safety, per-line/total byte budgets,
+/// and graceful plain-text fallback on unknown languages or minified single-line bundles.
+pub fn highlight_workspace_code_capped(
+    language: &str,
+    code: &str,
+    max_lines: usize,
+) -> HighlightedCodeView {
+    highlight_workspace_code_capped_with_plain_lines(language, code, max_lines, &[])
+}
+
+/// Variant of [`highlight_workspace_code_capped`] accepting caller-supplied 1-based line numbers
+/// that were pre-clipped from oversized source lines before FFI transfer (`R3-P1-3`).
+pub fn highlight_workspace_code_capped_with_plain_lines(
+    language: &str,
+    code: &str,
+    max_lines: usize,
+    plain_line_numbers: &[u32],
+) -> HighlightedCodeView {
+    let lang_token = language.trim();
+    let effective_cap = max_lines.min(MAX_WORKSPACE_HIGHLIGHT_LINES);
+    if code.is_empty() {
+        return HighlightedCodeView {
+            language: lang_token.to_string(),
+            lines: Vec::new(),
+            total_lines: 0,
+            total_lines_exact: true,
+            truncated: false,
+        };
+    }
+    let total_lines_usize = fast_count_lines(code);
+    let total_lines = u32::try_from(total_lines_usize).unwrap_or(u32::MAX);
+    let (lines, preview_truncated) = highlight_code_lines_prefix_bounded_with_plain_lines(
+        lang_token,
+        code,
+        effective_cap,
+        plain_line_numbers,
+    );
+    let truncated = preview_truncated || total_lines_usize > effective_cap;
+    HighlightedCodeView {
+        language: lang_token.to_string(),
+        lines,
+        total_lines,
+        total_lines_exact: true,
+        truncated,
+    }
 }
 
 /// Highlight only the first `max_highlighted_lines` lines with `syntect` without materializing
@@ -618,8 +1011,13 @@ pub fn highlight_code_lines_capped(
         coalesced
     }
 
+    let mut highlighted_bytes: usize = 0;
     for (idx, line) in LinesWithEndings::from(code).enumerate() {
-        let tokens = if idx < max_highlighted_lines {
+        let within_budget = idx < max_highlighted_lines
+            && line.len() <= MAX_HIGHLIGHT_LINE_BYTES
+            && highlighted_bytes.saturating_add(line.len()) <= MAX_HIGHLIGHT_TOTAL_BYTES;
+        let tokens = if within_budget {
+            highlighted_bytes = highlighted_bytes.saturating_add(line.len());
             match parse_state.parse_line(line, ps) {
                 Ok(ops) => {
                     // Single grammar parse pass feeds both native dark (`base16-ocean.dark`) and
@@ -2049,24 +2447,273 @@ pub struct TerminalScreenView {
     pub rows_data: Vec<TerminalRowView>,
 }
 
+/// Incremental dirty-row delta for terminal screens so clients only patch modified rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalScreenDeltaView {
+    pub revision: u64,
+    pub slot: u8,
+    pub reset: bool,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub changed_rows: Vec<TerminalRowView>,
+}
+
+fn hash_terminal_row(row: &TerminalRowView) -> u64 {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&row.row_index.to_le_bytes());
+    for span in &row.spans {
+        buf.extend_from_slice(&(span.text.len() as u32).to_le_bytes());
+        buf.extend_from_slice(span.text.as_bytes());
+        buf.extend_from_slice(&(span.fg_hex.len() as u32).to_le_bytes());
+        buf.extend_from_slice(span.fg_hex.as_bytes());
+        match &span.bg_hex {
+            Some(bg) => {
+                buf.push(1);
+                buf.extend_from_slice(&(bg.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bg.as_bytes());
+            }
+            None => buf.push(0),
+        }
+        let flags =
+            u8::from(span.bold) | (u8::from(span.underline) << 1) | (u8::from(span.inverse) << 2);
+        buf.push(flags);
+    }
+    fnv1a_64(&buf)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum AnsiClearState {
+    #[default]
+    Ground,
+    Esc,
+    EscIntermediate,
+    Csi {
+        params: [u8; 32],
+        len: usize,
+        overflow: bool,
+        has_intermediate: bool,
+    },
+}
+
+/// Stateful streaming scanner that detects full-screen erase / terminal reset sequences
+/// (`CSI 2 J`, `CSI 3 J`, `ESC c`) even when split across arbitrary PTY byte chunks.
+#[derive(Debug, Clone, Default)]
+struct AnsiClearScanner {
+    state: AnsiClearState,
+}
+
+impl AnsiClearScanner {
+    fn reset(&mut self) {
+        self.state = AnsiClearState::Ground;
+    }
+
+    fn csi_params_include_full_erase(params: &[u8]) -> bool {
+        // ECMA-48 / VT100 `CSI Ps J` (ED) only evaluates the FIRST parameter (defaulting to 0 when
+        // omitted). Multi-parameter forms like `CSI 0;2 J` execute ED(0) (erase below cursor),
+        // NOT full-screen erase (`2` or `3`).
+        let Some(first) = params.split(|&b| b == b';').next() else {
+            return false;
+        };
+        if first.is_empty() || !first.iter().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let mut val: u32 = 0;
+        for &d in first {
+            val = val.saturating_mul(10).saturating_add(u32::from(d - b'0'));
+        }
+        val == 2 || val == 3
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut saw_clear = false;
+        for &b in bytes {
+            match self.state {
+                AnsiClearState::Ground => {
+                    if b == 0x1B {
+                        self.state = AnsiClearState::Esc;
+                    }
+                }
+                AnsiClearState::Esc => match b {
+                    b'[' => {
+                        self.state = AnsiClearState::Csi {
+                            params: [0u8; 32],
+                            len: 0,
+                            overflow: false,
+                            has_intermediate: false,
+                        };
+                    }
+                    b'c' => {
+                        saw_clear = true;
+                        self.state = AnsiClearState::Ground;
+                    }
+                    0x1B => {
+                        self.state = AnsiClearState::Esc;
+                    }
+                    0x20..=0x2F => {
+                        self.state = AnsiClearState::EscIntermediate;
+                    }
+                    0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
+                    _ => {
+                        self.state = AnsiClearState::Ground;
+                    }
+                },
+                AnsiClearState::EscIntermediate => match b {
+                    0x1B => {
+                        self.state = AnsiClearState::Esc;
+                    }
+                    0x20..=0x2F | 0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
+                    _ => {
+                        self.state = AnsiClearState::Ground;
+                    }
+                },
+                AnsiClearState::Csi {
+                    mut params,
+                    mut len,
+                    mut overflow,
+                    mut has_intermediate,
+                } => match b {
+                    0x1B => {
+                        self.state = AnsiClearState::Esc;
+                    }
+                    0x18 | 0x1A => {
+                        self.state = AnsiClearState::Ground;
+                    }
+                    0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
+                    0x30..=0x3F => {
+                        if !has_intermediate {
+                            if len < params.len() {
+                                params[len] = b;
+                                len += 1;
+                            } else {
+                                overflow = true;
+                            }
+                        }
+                        self.state = AnsiClearState::Csi {
+                            params,
+                            len,
+                            overflow,
+                            has_intermediate,
+                        };
+                    }
+                    0x20..=0x2F => {
+                        has_intermediate = true;
+                        self.state = AnsiClearState::Csi {
+                            params,
+                            len,
+                            overflow,
+                            has_intermediate,
+                        };
+                    }
+                    0x40..=0x7E => {
+                        if b == b'J'
+                            && !has_intermediate
+                            && !overflow
+                            && Self::csi_params_include_full_erase(&params[..len])
+                        {
+                            saw_clear = true;
+                        }
+                        self.state = AnsiClearState::Ground;
+                    }
+                    _ => {
+                        self.state = AnsiClearState::Ground;
+                    }
+                },
+            }
+        }
+        saw_clear
+    }
+}
+
 pub struct TerminalGridEmulator {
     parser: vt100::Parser,
+    clear_scanner: AnsiClearScanner,
     scrollback_lines: Vec<String>,
+    revision: u64,
+    reset_revision: u64,
+    last_cols: u16,
+    last_rows: u16,
+    last_cursor_row: u16,
+    last_cursor_col: u16,
+    row_hashes: Vec<u64>,
+    row_revisions: Vec<u64>,
 }
 
 impl TerminalGridEmulator {
     pub fn new(cols: u16, rows: u16) -> Self {
         let r = std::num::NonZeroU16::new(rows.max(4)).unwrap_or(std::num::NonZeroU16::MIN);
         let c = std::num::NonZeroU16::new(cols.max(20)).unwrap_or(std::num::NonZeroU16::MIN);
-        Self {
+        let mut emu = Self {
             parser: vt100::Parser::new(r, c, 2000),
+            clear_scanner: AnsiClearScanner::default(),
             scrollback_lines: Vec::new(),
+            revision: 1,
+            reset_revision: 1,
+            last_cols: c.get(),
+            last_rows: r.get(),
+            last_cursor_row: 0,
+            last_cursor_col: 0,
+            row_hashes: Vec::new(),
+            row_revisions: Vec::new(),
+        };
+        let snap = emu.snapshot();
+        emu.row_hashes = snap.rows_data.iter().map(hash_terminal_row).collect();
+        emu.row_revisions = vec![1; snap.rows_data.len()];
+        emu
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn sync_delta_state(&mut self, force_reset: bool) {
+        let snap = self.snapshot();
+        let dims_changed = snap.cols != self.last_cols
+            || snap.rows != self.last_rows
+            || self.row_hashes.len() != snap.rows_data.len();
+
+        if force_reset || dims_changed {
+            self.revision = self.revision.saturating_add(1);
+            self.reset_revision = self.revision;
+            self.last_cols = snap.cols;
+            self.last_rows = snap.rows;
+            self.last_cursor_row = snap.cursor_row;
+            self.last_cursor_col = snap.cursor_col;
+            self.row_hashes = snap.rows_data.iter().map(hash_terminal_row).collect();
+            self.row_revisions = vec![self.revision; snap.rows_data.len()];
+            return;
+        }
+
+        let mut dirty_rows: Vec<(usize, u64)> = Vec::new();
+        for (idx, row) in snap.rows_data.iter().enumerate() {
+            let new_hash = hash_terminal_row(row);
+            if self.row_hashes.get(idx).copied() != Some(new_hash) {
+                dirty_rows.push((idx, new_hash));
+            }
+        }
+        let cursor_changed =
+            snap.cursor_row != self.last_cursor_row || snap.cursor_col != self.last_cursor_col;
+        if !dirty_rows.is_empty() || cursor_changed {
+            self.revision = self.revision.saturating_add(1);
+            self.last_cursor_row = snap.cursor_row;
+            self.last_cursor_col = snap.cursor_col;
+            for (idx, new_hash) in dirty_rows {
+                if let Some(slot_hash) = self.row_hashes.get_mut(idx) {
+                    *slot_hash = new_hash;
+                }
+                if let Some(slot_rev) = self.row_revisions.get_mut(idx) {
+                    *slot_rev = self.revision;
+                }
+            }
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
+        let saw_clear = self.clear_scanner.feed(bytes);
         self.parser.process(bytes);
         self.refresh_scrollback_cache();
+        self.sync_delta_state(saw_clear);
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -2075,13 +2722,67 @@ impl TerminalGridEmulator {
         if self.parser.screen().size() != (r, c) {
             self.parser.screen_mut().set_size(r, c);
             self.refresh_scrollback_cache();
+            self.sync_delta_state(true);
         }
     }
 
     pub fn clear(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, 2000);
+        self.clear_scanner.reset();
         self.scrollback_lines.clear();
+        self.sync_delta_state(true);
+    }
+
+    pub fn snapshot_with_delta(&mut self, prev_revision: u64) -> TerminalScreenDeltaView {
+        self.snapshot_with_delta_for_slot(1, prev_revision)
+    }
+
+    pub fn snapshot_with_delta_for_slot(
+        &mut self,
+        slot: u8,
+        prev_revision: u64,
+    ) -> TerminalScreenDeltaView {
+        let mut snap = self.snapshot();
+        if snap.cols != self.last_cols
+            || snap.rows != self.last_rows
+            || self.row_hashes.len() != snap.rows_data.len()
+        {
+            self.sync_delta_state(true);
+            snap = self.snapshot();
+        }
+        let normalized_slot = slot.max(1);
+        let reset = prev_revision == 0
+            || prev_revision > self.revision
+            || prev_revision < self.reset_revision;
+        let changed_rows = if reset {
+            snap.rows_data
+        } else if prev_revision == self.revision {
+            Vec::new()
+        } else {
+            snap.rows_data
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    self.row_revisions
+                        .get(*idx)
+                        .copied()
+                        .unwrap_or(self.revision)
+                        > prev_revision
+                })
+                .map(|(_, row)| row)
+                .collect()
+        };
+        TerminalScreenDeltaView {
+            revision: self.revision,
+            slot: normalized_slot,
+            reset,
+            cols: snap.cols,
+            rows: snap.rows,
+            cursor_row: snap.cursor_row,
+            cursor_col: snap.cursor_col,
+            changed_rows,
+        }
     }
 
     pub fn scrollback_lines(&self) -> &[String] {
@@ -2852,5 +3553,267 @@ diff --git a/src/lib.rs b/src/lib.rs
 
         emu.clear();
         assert!(emu.scrollback_lines().is_empty());
+    }
+
+    #[test]
+    fn terminal_delta_tracks_dirty_rows_clear_resize_same_rev_and_stale_rev() {
+        let mut emu = TerminalGridEmulator::new(80, 24);
+        let initial = emu.snapshot_with_delta(0);
+        assert!(initial.reset);
+        assert_eq!(initial.slot, 1);
+        assert_eq!(initial.cols, 80);
+        assert_eq!(initial.rows, 24);
+        assert_eq!(initial.changed_rows.len(), 24);
+
+        // Same revision with no terminal mutations -> empty delta
+        let noop = emu.snapshot_with_delta(initial.revision);
+        assert!(!noop.reset);
+        assert_eq!(noop.revision, initial.revision);
+        assert!(noop.changed_rows.is_empty());
+
+        // Simulate `ls` modifying only 2 rows
+        emu.process(b"Cargo.toml  README.md\r\napps  crates\r\n");
+        let ls_delta = emu.snapshot_with_delta(initial.revision);
+        assert!(!ls_delta.reset);
+        assert!(ls_delta.revision > initial.revision);
+        assert!(
+            (1..=3).contains(&ls_delta.changed_rows.len()),
+            "expected 1..=3 dirty rows for ls output, got {}",
+            ls_delta.changed_rows.len()
+        );
+        let changed_text: Vec<String> = ls_delta
+            .changed_rows
+            .iter()
+            .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        assert!(changed_text.iter().any(|t| t.contains("Cargo.toml")));
+        assert!(changed_text.iter().any(|t| t.contains("crates")));
+
+        // Repeating the same revision returns no changed rows
+        let stable = emu.snapshot_with_delta(ls_delta.revision);
+        assert!(!stable.reset);
+        assert!(stable.changed_rows.is_empty());
+
+        // ANSI `clear` triggers reset + full screen rows
+        emu.process(b"\x1b[2J\x1b[H");
+        let ansi_clear = emu.snapshot_with_delta(ls_delta.revision);
+        assert!(ansi_clear.reset);
+        assert!(ansi_clear.revision > ls_delta.revision);
+        assert_eq!(ansi_clear.changed_rows.len(), 24);
+        assert!(ansi_clear.changed_rows.iter().all(|r| r.spans.is_empty()));
+
+        // Explicit clear() also triggers reset
+        emu.process(b"after-clear\r\n");
+        let after_line = emu.snapshot_with_delta(ansi_clear.revision);
+        assert!(!after_line.reset);
+        assert_eq!(after_line.changed_rows.len(), 1);
+        emu.clear();
+        let explicit_clear = emu.snapshot_with_delta(after_line.revision);
+        assert!(explicit_clear.reset);
+        assert_eq!(explicit_clear.changed_rows.len(), 24);
+
+        // Resize triggers reset=true with new dimensions
+        emu.resize(120, 40);
+        let resized = emu.snapshot_with_delta(explicit_clear.revision);
+        assert!(resized.reset);
+        assert_eq!(resized.cols, 120);
+        assert_eq!(resized.rows, 40);
+        assert_eq!(resized.changed_rows.len(), 40);
+
+        // Future/stale since_revision > current revision triggers reset=true
+        let stale = emu.snapshot_with_delta(resized.revision + 50);
+        assert!(stale.reset);
+        assert_eq!(stale.revision, resized.revision);
+        assert_eq!(stale.changed_rows.len(), 40);
+    }
+
+    #[test]
+    fn highlight_workspace_code_capped_enforces_250_cap_utf8_empty_and_unknown_lang() {
+        let big: String = (1..=400)
+            .map(|i| format!("let v_{i}: usize = {i}; // 第{i}行 🚀\n"))
+            .collect();
+        let capped = highlight_workspace_code_capped("rust", &big, 999);
+        assert_eq!(capped.language, "rust");
+        assert_eq!(capped.total_lines, 400);
+        assert!(capped.truncated);
+        assert_eq!(capped.lines.len(), MAX_WORKSPACE_HIGHLIGHT_LINES);
+        assert_eq!(capped.lines.first().map(|l| l.line_number), Some(1));
+        assert_eq!(capped.lines.last().map(|l| l.line_number), Some(250));
+        let first_text: String = capped.lines[0]
+            .tokens
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect();
+        assert!(first_text.contains("第1行 🚀"));
+
+        let small = highlight_workspace_code_capped("rust", "fn main() {}\nlet x = 1;\n", 250);
+        assert_eq!(small.total_lines, 2);
+        assert!(!small.truncated);
+        assert_eq!(small.lines.len(), 2);
+
+        let empty = highlight_workspace_code_capped("rust", "", 250);
+        assert_eq!(empty.total_lines, 0);
+        assert!(!empty.truncated);
+        assert!(empty.lines.is_empty());
+
+        let unknown =
+            highlight_workspace_code_capped("unknown_lang_pr5", "你好 世界\nline two\n", 10);
+        assert_eq!(unknown.language, "unknown_lang_pr5");
+        assert_eq!(unknown.total_lines, 2);
+        assert!(!unknown.truncated);
+        assert_eq!(unknown.lines.len(), 2);
+        let line1: String = unknown.lines[0]
+            .tokens
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect();
+        assert_eq!(line1, "你好 世界");
+    }
+
+    #[test]
+    fn terminal_delta_detects_split_chunk_screen_clear_at_every_boundary() {
+        let sequences: &[&[u8]] = &[b"\x1b[2J", b"\x1b[3J", b"\x1bc"];
+        for seq in sequences {
+            for split_at in 1..seq.len() {
+                let mut emu = TerminalGridEmulator::new(80, 24);
+                let init = emu.snapshot_with_delta(0);
+                emu.process(b"line-one\r\nline-two\r\n");
+                let after_out = emu.snapshot_with_delta(init.revision);
+                assert!(!after_out.reset);
+
+                emu.process(&seq[..split_at]);
+                emu.process(&seq[split_at..]);
+                let after_clear = emu.snapshot_with_delta(after_out.revision);
+                assert!(
+                    after_clear.reset,
+                    "seq {:?} split at {split_at} must trigger reset=true",
+                    String::from_utf8_lossy(seq)
+                );
+                assert_eq!(
+                    after_clear.changed_rows.len(),
+                    24,
+                    "seq {:?} split at {split_at} must return all 24 rows on reset",
+                    String::from_utf8_lossy(seq)
+                );
+            }
+        }
+
+        // Control: CSI 0 J and CSI 0;2 J (first parameter 0 = erase below cursor) must NOT force
+        // full-screen reset and must preserve lines above cursor in vt100.
+        for partial_seq in [b"\x1b[0J".as_slice(), b"\x1b[0;2J".as_slice()] {
+            for split_at in 1..partial_seq.len() {
+                let mut emu = TerminalGridEmulator::new(80, 24);
+                let init = emu.snapshot_with_delta(0);
+                emu.process(b"keep-top\r\nsecond\r\n");
+                let after_out = emu.snapshot_with_delta(init.revision);
+                emu.process(&partial_seq[..split_at]);
+                emu.process(&partial_seq[split_at..]);
+                let after_partial = emu.snapshot_with_delta(after_out.revision);
+                assert!(
+                    !after_partial.reset,
+                    "partial erase {:?} split at {split_at} must not force full-screen reset",
+                    String::from_utf8_lossy(partial_seq)
+                );
+                let snap = emu.snapshot();
+                let top_line: String = snap.rows_data[0]
+                    .spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert!(
+                    top_line.contains("keep-top"),
+                    "partial erase {:?} must keep visible text above cursor, got {top_line:?}",
+                    String::from_utf8_lossy(partial_seq)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_workspace_code_capped_bounds_minified_single_line_large_file_and_utf8() {
+        // 1. 88 KB single-line minified JS must bypass regex explosion, stay UTF-8 safe, and emit bounded JSON.
+        let minified_js = "const a=1,b=2;function f(x){return x+a+b;}".repeat(2_100);
+        assert!(minified_js.len() > 88_000);
+        let minified_view = highlight_workspace_code_capped("js", &minified_js, 250);
+        assert_eq!(minified_view.total_lines, 1);
+        assert_eq!(minified_view.lines.len(), 1);
+        assert!(minified_view.truncated);
+        let minified_json = serde_json::to_string(&minified_view).expect("serialize minified");
+        assert!(
+            minified_json.len() < 16 * 1024,
+            "minified JS highlight JSON must be tightly bounded, got {} bytes",
+            minified_json.len()
+        );
+
+        // 2. Multi-byte UTF-8 single line exceeding per-line byte budget truncates cleanly on char boundary.
+        let cjk_long = "鸿蒙🚀".repeat(1_000);
+        assert!(cjk_long.len() > MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES);
+        let cjk_view = highlight_workspace_code_capped("rust", &cjk_long, 250);
+        assert_eq!(cjk_view.total_lines, 1);
+        assert!(cjk_view.truncated);
+        let cjk_line_bytes: usize = cjk_view.lines[0].tokens.iter().map(|t| t.text.len()).sum();
+        assert!(cjk_line_bytes <= MAX_WORKSPACE_HIGHLIGHT_LINE_PREVIEW_BYTES);
+        assert!(cjk_line_bytes > 0);
+
+        // 3. 80,000-line multi-line JS reports exact total_lines and caps highlighted output at 250 lines.
+        let giant_js = "export const n = 42;\n".repeat(80_000);
+        let giant_view = highlight_workspace_code_capped("js", &giant_js, 250);
+        assert_eq!(giant_view.total_lines, 80_000);
+        assert!(giant_view.truncated);
+        assert_eq!(giant_view.lines.len(), MAX_WORKSPACE_HIGHLIGHT_LINES);
+
+        // 4. R3-P1-3: Pre-clipped 4,095-byte single JS identifier (from emoji surrogate boundary)
+        //    marked in `plain_line_numbers = &[1]` bypasses syntect regex backtracking in O(1),
+        //    emitting 1 single plain-text span with `truncated == true`.
+        let long_ident = "a".repeat(4_095);
+        let clipped_view =
+            highlight_workspace_code_capped_with_plain_lines("js", &long_ident, 250, &[1]);
+        assert!(clipped_view.truncated);
+        assert_eq!(clipped_view.lines.len(), 1);
+        assert_eq!(clipped_view.lines[0].tokens.len(), 1);
+        assert_eq!(clipped_view.lines[0].tokens[0].text.len(), 4_095);
+        assert_eq!(clipped_view.lines[0].tokens[0].fg_hex, DARK_PLAIN_FG_HEX);
+
+        // 5. R5-Nit-1: Large 16,250-line file with empty line 250 returns full 250 lines on BOTH
+        //    the full async buffer AND the sync pre-clipped buffer ending in `\n\n`!
+        let mut full_empty_250 = "const a = 12345;\n".repeat(249);
+        full_empty_250.push('\n');
+        full_empty_250.push_str(&"const b = 67890;\n".repeat(16_000));
+        let async_empty_250 = highlight_workspace_code_capped("js", &full_empty_250, 250);
+        assert_eq!(async_empty_250.total_lines, 16_250);
+        assert!(async_empty_250.total_lines_exact);
+        assert!(async_empty_250.truncated);
+        assert_eq!(async_empty_250.lines.len(), 250);
+        assert_eq!(async_empty_250.lines[249].line_number, 250);
+        assert!(async_empty_250.lines[249].tokens.is_empty());
+
+        let mut sync_clipped_empty_250 = "const a = 12345;\n".repeat(249);
+        sync_clipped_empty_250.push('\n');
+        let sync_empty_250 = highlight_workspace_code_capped_with_plain_lines(
+            "js",
+            &sync_clipped_empty_250,
+            250,
+            &[],
+        );
+        assert_eq!(sync_empty_250.total_lines, 250);
+        assert_eq!(sync_empty_250.lines.len(), 250);
+        assert_eq!(sync_empty_250.lines[249].line_number, 250);
+        assert!(sync_empty_250.lines[249].tokens.is_empty());
+
+        // 6. R5-P1: Mid-file 65,536-char line 2 clipped to 4,096 B with `plain_line_numbers = &[2]`
+        //    emits 250 lines with syntax tokens on lines 1 and 3 and 1 plain span on line 2.
+        let mut mid_clipped = String::from("const first = 1;\n");
+        mid_clipped.push_str("// ");
+        mid_clipped.push_str(&"c".repeat(4_093));
+        mid_clipped.push('\n');
+        mid_clipped.push_str(&"const val = 42;\n".repeat(248));
+        let mid_view =
+            highlight_workspace_code_capped_with_plain_lines("js", &mid_clipped, 250, &[2]);
+        assert!(mid_view.truncated);
+        assert_eq!(mid_view.lines.len(), 250);
+        assert!(mid_view.lines[0].tokens.len() >= 3);
+        assert_eq!(mid_view.lines[1].tokens.len(), 1);
+        assert_eq!(mid_view.lines[1].tokens[0].fg_hex, DARK_PLAIN_FG_HEX);
+        assert!(mid_view.lines[2].tokens.len() >= 3);
     }
 }

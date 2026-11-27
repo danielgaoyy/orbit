@@ -1,4 +1,59 @@
 use super::OhosCoreFacade;
+use crate::dto::{OhosGitDiscardFilesPayload, OhosGitPushPayload};
+use std::path::{Component, Path};
+
+pub(crate) fn validate_ohos_git_discard_path(raw_path: &str) -> Result<(), String> {
+    if raw_path.is_empty() {
+        return Err("git discard path cannot be empty".into());
+    }
+    if raw_path.len() > 4096 {
+        return Err("git discard path exceeds maximum length".into());
+    }
+    if raw_path.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err("git discard path contains NUL or control characters".into());
+    }
+    if raw_path.contains('\\') {
+        return Err("git discard path must use forward slashes (`/`)".into());
+    }
+    if raw_path.starts_with('-') {
+        return Err("git discard path must not start with `-`".into());
+    }
+    if raw_path.starts_with('/') || raw_path == "~" || raw_path.starts_with("~/") {
+        return Err("git discard path must be repository-relative".into());
+    }
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        return Err("git discard path must not be absolute".into());
+    }
+    let mut normal_count = 0usize;
+    for comp in path.components() {
+        match comp {
+            Component::Normal(os) => {
+                let Some(seg) = os.to_str() else {
+                    return Err("git discard path contains non-UTF-8 characters".into());
+                };
+                if seg.is_empty() || seg == "." || seg == ".." {
+                    return Err("git discard path contains invalid segment".into());
+                }
+                if seg.eq_ignore_ascii_case(".git") {
+                    return Err("modifying `.git` internals is forbidden".into());
+                }
+                normal_count += 1;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("git discard path traversal (`..`) is forbidden".into());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("git discard path must not be absolute".into());
+            }
+        }
+    }
+    if normal_count == 0 {
+        return Err("git discard path must target a file inside the repository".into());
+    }
+    Ok(())
+}
 
 impl OhosCoreFacade {
     pub fn git_review_json(
@@ -22,6 +77,20 @@ impl OhosCoreFacade {
     pub fn terminal_screen_slot_json(&self, host_id: &str, slot: u8) -> Result<String, String> {
         serde_json::to_string(&self.inner.terminal_screen_slot(host_id, slot))
             .map_err(|e| e.to_string())
+    }
+
+    pub fn terminal_screen_delta_slot_json(
+        &self,
+        host_id: &str,
+        slot: u8,
+        since_revision: u64,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.terminal_screen_delta_slot(
+            host_id,
+            slot.max(1),
+            since_revision,
+        ))
+        .map_err(|e| e.to_string())
     }
 
     pub fn fetch_git_status(&self, host_id: &str, cwd: &str) {
@@ -361,5 +430,69 @@ impl OhosCoreFacade {
                 .run_mobile_rpc(self.inner.git_list_conflicts_on_host(&host_id, &cwd))?,
         )
         .map_err(|e| e.to_string())
+    }
+
+    pub fn git_push_json(&self, req_json: &str) -> Result<String, String> {
+        let req: OhosGitPushPayload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid git_push request JSON: {e}"))?;
+        if req.host_id.trim().is_empty() {
+            return Err("git_push requires non-empty host_id".into());
+        }
+        if req.cwd.trim().is_empty() {
+            return Err("git_push requires non-empty cwd".into());
+        }
+        let remote = req
+            .remote
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let branch = req
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        serde_json::to_string(&self.inner.run_mobile_rpc(self.inner.git_push_on_host(
+            &req.host_id,
+            &req.cwd,
+            remote,
+            branch,
+            req.set_upstream,
+        ))?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_discard_files_json(&self, req_json: &str) -> Result<String, String> {
+        let req: OhosGitDiscardFilesPayload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid git_discard_files request JSON: {e}"))?;
+        if req.host_id.trim().is_empty() {
+            return Err("git_discard_files requires non-empty host_id".into());
+        }
+        if req.cwd.trim().is_empty() {
+            return Err("git_discard_files requires non-empty cwd".into());
+        }
+        if req.paths.is_empty() {
+            return Err("git_discard_files requires at least one path".into());
+        }
+        for path in &req.paths {
+            validate_ohos_git_discard_path(path)?;
+        }
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_discard_files_on_host(
+                    &req.host_id,
+                    &req.cwd,
+                    req.paths,
+                    req.include_untracked,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn start_terminal_slot(&self, host_id: &str, cwd: &str, cols: u16, rows: u16, slot: u8) {
+        self.inner
+            .start_terminal_slot(host_id, cwd, cols, rows, slot.clamp(1, 250));
     }
 }

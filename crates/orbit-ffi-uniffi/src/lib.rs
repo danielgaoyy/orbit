@@ -4876,6 +4876,9 @@ impl From<FfiReadWorkspaceFileRequest> for ReadWorkspaceFileRequest {
             host_id: v.host_id,
             cwd: v.cwd,
             path: v.path,
+            offset_bytes: None,
+            max_bytes: None,
+            expected_etag: None,
         }
     }
 }

@@ -197,7 +197,8 @@ export function buildOrbitSidebarRows(
         pinned_project_id: group.pinned_project_id,
         is_home_workspace: group.is_home_workspace,
         sort_weight_ms: group.sort_weight_ms,
-        conversations: filteredConvs
+        conversations: filteredConvs,
+        workspace_ids: group.workspace_ids
       });
     }
   }

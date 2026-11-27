@@ -11,12 +11,17 @@ export type OrbitModalRouteKind =
   | 'work_picker'
   | 'pa_briefing'
   | 'image_viewer'
-  | 'diagram_viewer';
+  | 'diagram_viewer'
+  | 'worktree_handoff'
+  | 'workspace_scripts'
+  | 'create_workspace_v2'
+  | 'rename_workspace';
 
 export interface OrbitModalRoute {
   kind: OrbitModalRouteKind;
   hostId?: string;
   agentId?: string;
+  workspaceId?: string;
   cwd?: string;
   title?: string;
   initialPath?: string;

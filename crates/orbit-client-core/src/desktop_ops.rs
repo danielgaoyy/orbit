@@ -2241,6 +2241,9 @@ pub struct LocalFileReadPayload {
     pub mtime_unix_ms: Option<i64>,
     pub writable: bool,
     pub line_ending: Option<String>,
+    pub offset_bytes: u64,
+    pub next_offset_bytes: u64,
+    pub etag_mismatch: bool,
 }
 
 fn local_sha256_hex(bytes: &[u8]) -> String {
@@ -2833,6 +2836,41 @@ pub fn read_local_workspace_file(
     read_local_workspace_file_with_writable(cwd, raw_path, max_bytes, false)
 }
 
+fn local_stream_file_sha256_hex(
+    file: &mut fs::File,
+    max_hash_bytes: u64,
+    trimmed: &str,
+) -> Result<Option<String>, String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Failed seeking `{trimmed}`: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("Failed hashing `{trimmed}`: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max_hash_bytes {
+            return Ok(None);
+        }
+        hasher.update(&chunk[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    Ok(Some(out))
+}
+
 /// Local filesystem reader for workspace files; computes `writable` using the same rules as the
 /// daemon when `allow_writable` is true (i.e., an active local daemon session can persist edits).
 pub fn read_local_workspace_file_with_writable(
@@ -2841,9 +2879,32 @@ pub fn read_local_workspace_file_with_writable(
     max_bytes: Option<u64>,
     allow_writable: bool,
 ) -> Result<LocalFileReadPayload, String> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-    use std::io::Read;
+    read_local_workspace_file_chunk_with_writable(
+        cwd,
+        raw_path,
+        None,
+        max_bytes,
+        None,
+        allow_writable,
+    )
+}
 
+/// Local filesystem reader supporting bounded chunked text continuation (`offset_bytes`) and
+/// full-file SHA-256 `expected_etag` verification matching the daemon implementation.
+pub fn read_local_workspace_file_chunk_with_writable(
+    cwd: &str,
+    raw_path: &str,
+    offset_bytes: Option<u64>,
+    max_bytes: Option<u64>,
+    expected_etag: Option<&str>,
+    allow_writable: bool,
+) -> Result<LocalFileReadPayload, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use std::io::{Read, Seek, SeekFrom};
+
+    const LOCAL_DEFAULT_MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+    const LOCAL_HARD_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+    const LOCAL_CHUNKED_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
     const LOCAL_IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
     const LOCAL_MEDIA_MAX_READ_BYTES: u64 = 25 * 1024 * 1024;
 
@@ -2855,6 +2916,136 @@ pub fn read_local_workspace_file_with_writable(
     let mtime_unix_ms = local_metadata_mtime_unix_ms(&meta);
     let writable = allow_writable && compute_local_file_writable(cwd, trimmed, &canonical, &meta);
     let resolved_path = canonical.to_string_lossy().to_string();
+    let start_offset = offset_bytes.unwrap_or(0);
+    let clean_expected_etag = expected_etag.map(str::trim).filter(|s| !s.is_empty());
+
+    if start_offset > 0 {
+        if start_offset > LOCAL_CHUNKED_MAX_FILE_BYTES {
+            return Err(format!(
+                "Chunk offset `{start_offset}` exceeds maximum chunked read limit ({LOCAL_CHUNKED_MAX_FILE_BYTES} bytes)"
+            ));
+        }
+        let live_etag = if size_bytes <= LOCAL_CHUNKED_MAX_FILE_BYTES {
+            local_stream_file_sha256_hex(&mut file, LOCAL_CHUNKED_MAX_FILE_BYTES, trimmed)?
+        } else {
+            None
+        };
+        if let Some(exp) = clean_expected_etag
+            && live_etag.as_deref() != Some(exp)
+        {
+            return Ok(LocalFileReadPayload {
+                resolved_path,
+                content_kind: "text".into(),
+                mime_type: Some("text/plain".into()),
+                content: String::new(),
+                size_bytes,
+                truncated: true,
+                etag: live_etag,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
+                offset_bytes: start_offset,
+                next_offset_bytes: start_offset,
+                etag_mismatch: true,
+            });
+        }
+        if start_offset >= size_bytes {
+            return Ok(LocalFileReadPayload {
+                resolved_path,
+                content_kind: "text".into(),
+                mime_type: Some("text/plain".into()),
+                content: String::new(),
+                size_bytes,
+                truncated: false,
+                etag: live_etag,
+                mtime_unix_ms,
+                writable,
+                line_ending: None,
+                offset_bytes: start_offset,
+                next_offset_bytes: size_bytes,
+                etag_mismatch: false,
+            });
+        }
+        let remaining_allowed = LOCAL_CHUNKED_MAX_FILE_BYTES.saturating_sub(start_offset);
+        let cap = max_bytes
+            .unwrap_or(LOCAL_DEFAULT_MAX_READ_BYTES)
+            .clamp(4096, LOCAL_HARD_MAX_READ_BYTES)
+            .min(remaining_allowed);
+        file.seek(SeekFrom::Start(start_offset))
+            .map_err(|e| format!("Failed seeking `{trimmed}`: {e}"))?;
+        let mut buf = Vec::new();
+        (&mut file)
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("Failed reading chunk of `{trimmed}`: {e}"))?;
+        let has_more_raw =
+            (buf.len() as u64) > cap || start_offset.saturating_add(buf.len() as u64) < size_bytes;
+        if (buf.len() as u64) > cap {
+            buf.truncate(cap as usize);
+        }
+        if buf.contains(&0) {
+            return Ok(LocalFileReadPayload {
+                resolved_path,
+                content_kind: "binary".into(),
+                mime_type: None,
+                content: String::new(),
+                size_bytes,
+                truncated: has_more_raw || start_offset > 0,
+                etag: live_etag,
+                mtime_unix_ms,
+                writable: if start_offset > 0 { false } else { writable },
+                line_ending: None,
+                offset_bytes: start_offset,
+                next_offset_bytes: start_offset,
+                etag_mismatch: false,
+            });
+        }
+        let text = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(err) => {
+                let is_incomplete_tail = err.utf8_error().error_len().is_none();
+                let valid_up_to = err.utf8_error().valid_up_to();
+                let raw = err.into_bytes();
+                if has_more_raw && is_incomplete_tail {
+                    String::from_utf8_lossy(&raw[..valid_up_to]).into_owned()
+                } else {
+                    return Ok(LocalFileReadPayload {
+                        resolved_path,
+                        content_kind: "binary".into(),
+                        mime_type: None,
+                        content: String::new(),
+                        size_bytes,
+                        truncated: has_more_raw || start_offset > 0,
+                        etag: live_etag,
+                        mtime_unix_ms,
+                        writable: if start_offset > 0 { false } else { writable },
+                        line_ending: None,
+                        offset_bytes: start_offset,
+                        next_offset_bytes: start_offset,
+                        etag_mismatch: false,
+                    });
+                }
+            }
+        };
+        let next_offset_bytes = start_offset.saturating_add(text.len() as u64);
+        let truncated = next_offset_bytes < size_bytes;
+        let line_ending = Some(local_detect_line_ending(&text));
+        return Ok(LocalFileReadPayload {
+            resolved_path,
+            content_kind: "text".into(),
+            mime_type: Some("text/plain".into()),
+            content: text,
+            size_bytes,
+            truncated,
+            etag: live_etag,
+            mtime_unix_ms,
+            writable,
+            line_ending,
+            offset_bytes: start_offset,
+            next_offset_bytes,
+            etag_mismatch: false,
+        });
+    }
 
     let mut header = Vec::with_capacity((size_bytes as usize).min(4096));
     (&mut file)
@@ -2889,6 +3080,9 @@ pub fn read_local_workspace_file_with_writable(
                 mtime_unix_ms,
                 writable,
                 line_ending: None,
+                offset_bytes: 0,
+                next_offset_bytes: 0,
+                etag_mismatch: false,
             });
         }
         let mut bytes = header;
@@ -2909,26 +3103,33 @@ pub fn read_local_workspace_file_with_writable(
                 mtime_unix_ms,
                 writable,
                 line_ending: None,
+                offset_bytes: 0,
+                next_offset_bytes: 0,
+                etag_mismatch: false,
             });
         }
         let etag = Some(local_sha256_hex(&bytes));
+        let final_len = bytes.len() as u64;
         return Ok(LocalFileReadPayload {
             resolved_path,
             content_kind: kind_str.into(),
             mime_type: Some(sniffed.mime_type.into()),
             content: B64.encode(&bytes),
-            size_bytes: bytes.len() as u64,
+            size_bytes: final_len,
             truncated: false,
             etag,
             mtime_unix_ms,
             writable,
             line_ending: None,
+            offset_bytes: 0,
+            next_offset_bytes: final_len,
+            etag_mismatch: false,
         });
     }
 
     let cap = max_bytes
-        .unwrap_or(2 * 1024 * 1024)
-        .clamp(4096, 4 * 1024 * 1024);
+        .unwrap_or(LOCAL_DEFAULT_MAX_READ_BYTES)
+        .clamp(4096, LOCAL_HARD_MAX_READ_BYTES);
     let mut buf = header;
     if (buf.len() as u64) <= cap {
         let remaining = cap.saturating_sub(buf.len() as u64).saturating_add(1);
@@ -2938,11 +3139,36 @@ pub fn read_local_workspace_file_with_writable(
             .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
     }
 
-    let truncated = (buf.len() as u64) > cap || size_bytes > cap;
+    let raw_truncated = (buf.len() as u64) > cap || size_bytes > cap;
     if (buf.len() as u64) > cap {
         buf.truncate(cap as usize);
     }
-    let etag = (!truncated).then(|| local_sha256_hex(&buf));
+    let etag = if !raw_truncated {
+        Some(local_sha256_hex(&buf))
+    } else if size_bytes <= LOCAL_CHUNKED_MAX_FILE_BYTES {
+        local_stream_file_sha256_hex(&mut file, LOCAL_CHUNKED_MAX_FILE_BYTES, trimmed)?
+    } else {
+        None
+    };
+    if let Some(exp) = clean_expected_etag
+        && etag.as_deref() != Some(exp)
+    {
+        return Ok(LocalFileReadPayload {
+            resolved_path,
+            content_kind: "text".into(),
+            mime_type: Some("text/plain".into()),
+            content: String::new(),
+            size_bytes,
+            truncated: true,
+            etag,
+            mtime_unix_ms,
+            writable,
+            line_ending: None,
+            offset_bytes: 0,
+            next_offset_bytes: 0,
+            etag_mismatch: true,
+        });
+    }
     let probe_len = buf.len().min(8192);
     if buf[..probe_len].contains(&0) {
         return Ok(LocalFileReadPayload {
@@ -2951,11 +3177,14 @@ pub fn read_local_workspace_file_with_writable(
             mime_type: None,
             content: String::new(),
             size_bytes,
-            truncated,
+            truncated: raw_truncated,
             etag,
             mtime_unix_ms,
             writable,
             line_ending: None,
+            offset_bytes: 0,
+            next_offset_bytes: 0,
+            etag_mismatch: false,
         });
     }
 
@@ -2965,7 +3194,7 @@ pub fn read_local_workspace_file_with_writable(
             let is_incomplete_tail = err.utf8_error().error_len().is_none();
             let valid_up_to = err.utf8_error().valid_up_to();
             let raw = err.into_bytes();
-            if truncated && is_incomplete_tail {
+            if raw_truncated && is_incomplete_tail {
                 String::from_utf8_lossy(&raw[..valid_up_to]).into_owned()
             } else {
                 return Ok(LocalFileReadPayload {
@@ -2974,15 +3203,20 @@ pub fn read_local_workspace_file_with_writable(
                     mime_type: None,
                     content: String::new(),
                     size_bytes,
-                    truncated,
+                    truncated: raw_truncated,
                     etag,
                     mtime_unix_ms,
                     writable,
                     line_ending: None,
+                    offset_bytes: 0,
+                    next_offset_bytes: 0,
+                    etag_mismatch: false,
                 });
             }
         }
     };
+    let next_offset_bytes = text.len() as u64;
+    let truncated = raw_truncated || next_offset_bytes < size_bytes;
     let line_ending = Some(local_detect_line_ending(&text));
 
     Ok(LocalFileReadPayload {
@@ -2996,6 +3230,9 @@ pub fn read_local_workspace_file_with_writable(
         mtime_unix_ms,
         writable,
         line_ending,
+        offset_bytes: 0,
+        next_offset_bytes,
+        etag_mismatch: false,
     })
 }
 

@@ -2086,8 +2086,8 @@ mod tests {
         );
 
         // Win32 silently strips trailing spaces when creating files, so only test a literal
-        // trailing-space file on non-Windows filesystems.
-        #[cfg(not(windows))]
+        // trailing-space file on Unix filesystems.
+        #[cfg(unix)]
         {
             std::fs::write(tmp.path().join("report "), "scratch\n").expect("write report space");
             discard_files(tmp.path(), &["report ".into()], true)

@@ -197,6 +197,20 @@ pub struct ReadWorkspaceFileRequest {
     pub host_id: String,
     pub cwd: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_etag: Option<String>,
+}
+
+/// Authoritative daemon reply for `UpdateWorkspaceBoard` with optimistic CAS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceBoardUpdateOutcome {
+    pub ok: bool,
+    pub conflict: bool,
+    pub board: orbit_protocol::WorkspaceBoardSnapshot,
 }
 
 fn default_symbol_search_limit() -> u32 {

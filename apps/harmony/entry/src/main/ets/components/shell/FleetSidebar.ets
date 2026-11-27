@@ -3,6 +3,7 @@ import {
   HostCardDto,
   SidebarConversationDto,
   SidebarProjectGroupDto,
+  WorkspaceDto,
   basenameOfPath,
   cwdPathsEquivalent,
   formatProviderLabel,
@@ -38,6 +39,23 @@ import {
 @ComponentV2
 export struct FleetSidebar {
   private readonly store: OrbitHarmonyStore = orbitRuntime();
+  private disposed: boolean = false;
+
+  aboutToAppear(): void {
+    this.disposed = false;
+  }
+
+  aboutToDisappear(): void {
+    this.disposed = true;
+  }
+
+  private isOriginHostStillActive(originHostId: string, originHostEpoch: number): boolean {
+    return (
+      !this.disposed &&
+      this.store.selectedHostId === originHostId &&
+      this.store.hostSelectionEpoch === originHostEpoch
+    );
+  }
 
   @Computed
   get normalizedQuery(): string {
@@ -86,6 +104,93 @@ export struct FleetSidebar {
     const detail = this.store.fleetStore.getCachedHostDetail(conv.host_id);
     const catalogs = detail !== null ? detail.provider_catalogs : [];
     return resolveCompactAgentModelLabel(conv.agent, catalogs);
+  }
+
+  private resolveActiveProjectWorkspaces(group: SidebarProjectGroupDto): WorkspaceDto[] {
+    const list = this.store.resolveProjectWorkspaces(group.host_id, group.primary_cwd, group.directories, group.id);
+    const out: WorkspaceDto[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const archived = list[i].archived_at !== undefined &&
+        list[i].archived_at !== null &&
+        (list[i].archived_at as string).length > 0;
+      if (!archived) {
+        out.push(list[i]);
+      }
+    }
+    return out;
+  }
+
+  private resolveArchivedProjectWorkspaces(group: SidebarProjectGroupDto): WorkspaceDto[] {
+    const list = this.store.resolveProjectWorkspaces(group.host_id, group.primary_cwd, group.directories, group.id);
+    const out: WorkspaceDto[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const archived = list[i].archived_at !== undefined &&
+        list[i].archived_at !== null &&
+        (list[i].archived_at as string).length > 0;
+      if (archived) {
+        out.push(list[i]);
+      }
+    }
+    return out;
+  }
+
+  private async handleArchiveWorkspaceAction(
+    targetHostId: string,
+    targetWorkspaceId: string,
+    keepAgentsUnclassified: boolean
+  ): Promise<void> {
+    const originActiveHostId = this.store.selectedHostId;
+    const originHostEpoch = this.store.hostSelectionEpoch;
+    const outcome = await this.store.archiveWorkspaceV2(targetHostId, targetWorkspaceId, keepAgentsUnclassified);
+    if (!this.isOriginHostStillActive(originActiveHostId, originHostEpoch)) {
+      return;
+    }
+    if (outcome.ok) {
+      this.store.showToastResource($r('app.string.workspace_archived_toast'), false);
+      this.store.triggerHaptic(10);
+    } else {
+      this.store.showToastResource(
+        outcome.errorDetail.length > 0
+          ? $r('app.string.workspace_archive_failed_detail', outcome.errorDetail)
+          : $r('app.string.workspace_archive_failed'),
+        true,
+        outcome.errorDetail
+      );
+    }
+  }
+
+  private async handleRestoreWorkspaceAction(
+    targetHostId: string,
+    targetWorkspaceId: string
+  ): Promise<void> {
+    const originActiveHostId = this.store.selectedHostId;
+    const originHostEpoch = this.store.hostSelectionEpoch;
+    const outcome = await this.store.unarchiveWorkspace(targetHostId, targetWorkspaceId);
+    if (!this.isOriginHostStillActive(originActiveHostId, originHostEpoch)) {
+      return;
+    }
+    if (outcome.ok) {
+      this.store.showToastResource($r('app.string.workspace_restored_toast'), false);
+      this.store.triggerHaptic(10);
+    } else {
+      this.store.showToastResource(
+        outcome.errorDetail.length > 0
+          ? $r('app.string.workspace_restore_failed_detail', outcome.errorDetail)
+          : $r('app.string.workspace_restore_failed'),
+        true,
+        outcome.errorDetail
+      );
+    }
+  }
+
+  private formatWorkspaceMenuLabel(ws: WorkspaceDto): string {
+    const cleanTitle = ws.title.trim();
+    const base = cleanTitle.length > 0 ? cleanTitle : basenameOfPath(ws.cwd);
+    const branch = (ws.git_branch ?? '').trim();
+    if (ws.is_worktree && branch.length > 0) {
+      return `${base} (${branch})`;
+    }
+    return base.length > 0 ? base : ws.workspace_id;
   }
 
   @Builder
@@ -280,7 +385,104 @@ export struct FleetSidebar {
             this.store.copyToClipboard(group.primary_cwd, '');
           })
       }
+
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder_badge_plus'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: $r('app.string.workspace_new_v2')
+        })
+          .onClick(() => {
+            this.store.openCreateWorkspaceV2Sheet(group.host_id, group.primary_cwd, group.name);
+          })
+      }
+
+      if (this.resolveActiveProjectWorkspaces(group).length > 0) {
+        MenuItemGroup({ header: $r('app.string.workspace_menu_active_group') }) {
+          ForEach(
+            this.resolveActiveProjectWorkspaces(group),
+            (ws: WorkspaceDto) => {
+              this.renderActiveWorkspaceMenuItems(
+                group.host_id,
+                ws.workspace_id,
+                this.formatWorkspaceMenuLabel(ws),
+                ws.title
+              );
+            },
+            (ws: WorkspaceDto): string => `proj_ws_act_${group.host_id}_${ws.workspace_id}`
+          )
+        }
+      }
+
+      if (this.resolveArchivedProjectWorkspaces(group).length > 0) {
+        MenuItemGroup({ header: $r('app.string.workspace_menu_archived_group') }) {
+          ForEach(
+            this.resolveArchivedProjectWorkspaces(group),
+            (ws: WorkspaceDto) => {
+              this.renderArchivedWorkspaceMenuItem(group.host_id, ws.workspace_id, this.formatWorkspaceMenuLabel(ws));
+            },
+            (ws: WorkspaceDto): string => `proj_ws_arc_${group.host_id}_${ws.workspace_id}`
+          )
+        }
+      }
     }
+  }
+
+  @Builder
+  private renderActiveWorkspaceMenuItems(
+    targetHostId: string,
+    targetWorkspaceId: string,
+    label: string,
+    rawTitle: string
+  ) {
+    MenuItem({
+      symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.play_circle'))
+        .fontColor([this.store.palette.iconPrimary]),
+      content: $r('app.string.workspace_menu_scripts_item', label)
+    })
+      .onClick(() => {
+        this.store.openWorkspaceScriptsSheet(targetHostId, targetWorkspaceId, label);
+      })
+
+    MenuItem({
+      symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.pencil_line'))
+        .fontColor([this.store.palette.iconPrimary]),
+      content: $r('app.string.workspace_menu_rename_item', label)
+    })
+      .onClick(() => {
+        this.store.openRenameWorkspaceSheet(targetHostId, targetWorkspaceId, rawTitle);
+      })
+
+    MenuItem({
+      symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
+        .fontColor([this.store.palette.statusDanger]),
+      content: $r('app.string.workspace_menu_archive_item', label)
+    })
+      .contentFontColor(this.store.palette.statusDanger)
+      .onClick(() => {
+        void this.handleArchiveWorkspaceAction(targetHostId, targetWorkspaceId, false);
+      })
+
+    MenuItem({
+      symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
+        .fontColor([this.store.palette.statusWarning]),
+      content: $r('app.string.workspace_menu_archive_keep_item', label)
+    })
+      .onClick(() => {
+        void this.handleArchiveWorkspaceAction(targetHostId, targetWorkspaceId, true);
+      })
+  }
+
+  @Builder
+  private renderArchivedWorkspaceMenuItem(targetHostId: string, targetWorkspaceId: string, label: string) {
+    MenuItem({
+      symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_clockwise'))
+        .fontColor([this.store.palette.accentPrimary]),
+      content: $r('app.string.workspace_menu_restore_item', label)
+    })
+      .onClick(() => {
+        void this.handleRestoreWorkspaceAction(targetHostId, targetWorkspaceId);
+      })
   }
 
   @Builder

@@ -1249,6 +1249,7 @@ pub async fn cmd_terminal(
                     title,
                     cols,
                     rows,
+                    slot: None,
                 },
                 15,
             )

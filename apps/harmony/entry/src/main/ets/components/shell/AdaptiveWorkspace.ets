@@ -6,7 +6,10 @@ import {
   ScrollEffectType
 } from '@kit.UIDesignKit';
 import { HostCardDto } from '../../model/OrbitTypes';
-import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import {
+  OrbitHarmonyStore,
+  OrbitWorktreeHandoffContext
+} from '../../model/OrbitHarmonyStore';
 import { orbitRuntime } from '../../model/OrbitRuntime';
 import { orbitLogWarn } from '../../model/OrbitLogger';
 import {
@@ -83,8 +86,10 @@ export struct AdaptiveWorkspace {
 
   @Monitor('store.toastRevision')
   onToastRevisionChanged(_mon: IMonitor): void {
-    const msg = this.store.toastMessage.trim();
-    if (msg.length === 0) {
+    const msg: ResourceStr | null = this.store.toastResource !== null
+      ? this.store.toastResource
+      : (this.store.toastMessage.trim().length > 0 ? this.store.toastMessage.trim() : null);
+    if (msg === null) {
       return;
     }
     try {
@@ -260,6 +265,34 @@ export struct AdaptiveWorkspace {
 
   private paNeedsYouCount(): number {
     return this.store.briefing !== null ? this.store.briefing.counts.needs_you : 0;
+  }
+
+  private activeWorktreeContext(): OrbitWorktreeHandoffContext | null {
+    return this.store.resolveActiveWorktreeWorkspace();
+  }
+
+  private openActiveWorktreeHandoff(): void {
+    const ctx = this.activeWorktreeContext();
+    if (ctx === null) {
+      return;
+    }
+    dismissHarmonyKeyboard(this.getUIContext());
+    this.store.openWorktreeHandoffSheet(
+      ctx.hostId,
+      ctx.workspaceId,
+      ctx.sourceAgentId,
+      ctx.cwd,
+      ctx.title
+    );
+  }
+
+  private openActiveWorkspaceScripts(): void {
+    const ctx = this.activeWorktreeContext();
+    if (ctx === null) {
+      return;
+    }
+    dismissHarmonyKeyboard(this.getUIContext());
+    this.store.openWorkspaceScriptsSheet(ctx.hostId, ctx.workspaceId, ctx.title);
   }
 
   private openFolderFromHeader(): void {
@@ -596,6 +629,26 @@ export struct AdaptiveWorkspace {
             this.store.openWorkspaceBoard();
           })
 
+        if (this.activeWorktreeContext() !== null) {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_triangle_divide'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: $r('app.string.handoff_title')
+          })
+            .onClick(() => {
+              this.openActiveWorktreeHandoff();
+            })
+
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.play_circle'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: $r('app.string.scripts_title')
+          })
+            .onClick(() => {
+              this.openActiveWorkspaceScripts();
+            })
+        }
+
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.message'))
             .fontColor([this.store.palette.iconPrimary]),
@@ -881,6 +934,28 @@ export struct AdaptiveWorkspace {
           }
 
           if (this.hasActiveConversation()) {
+            if (this.activeWorktreeContext() !== null && this.activeWorktreeContext()!.isWorktree) {
+              Button({ type: ButtonType.Capsule, stateEffect: true }) {
+                Row({ space: 4 }) {
+                  SymbolGlyph($r('sys.symbol.arrow_triangle_divide'))
+                    .fontSize(13)
+                    .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                    .fontColor([this.store.palette.accentPrimary])
+                  Text($r('app.string.handoff_capsule'))
+                    .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
+                    .maxLines(1)
+                }
+                .alignItems(VerticalAlign.Center)
+              }
+              .height(30)
+              .padding({ left: 9, right: 9 })
+              .backgroundColor(this.store.palette.accentPrimarySoft)
+              .accessibilityText($r('app.string.handoff_title'))
+              .onClick(() => {
+                this.openActiveWorktreeHandoff();
+              })
+            }
+
             SubagentCrewMiniDock({
               hostId: this.store.selectedHostId,
               rootAgentId: this.store.selectedAgentId

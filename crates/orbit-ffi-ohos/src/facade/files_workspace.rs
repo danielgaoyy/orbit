@@ -1,9 +1,17 @@
 use super::OhosCoreFacade;
+use crate::dto::{
+    OhosCreateWorkspaceV2Payload, OhosHighlightWorkspaceCodePayload,
+    OhosUpdateWorkspaceBoardCasPayload,
+};
 use orbit_client_core::contract::{
     CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
     PreviewWorktreeHandoffRequest, RenameWorkspaceEntryRequest, SpawnWorkspacePeerRequest,
     UpsertArtifactRequest, WriteWorkspaceFileRequest,
 };
+use orbit_client_core::render::{
+    MAX_WORKSPACE_HIGHLIGHT_LINES, highlight_workspace_code_capped_with_plain_lines,
+};
+use orbit_protocol::{WorkspaceIsolation, WorktreeCreateMode};
 
 impl OhosCoreFacade {
     pub fn list_directory(&self, host_id: &str, path: Option<String>) {
@@ -54,7 +62,7 @@ impl OhosCoreFacade {
     ) -> Result<String, String> {
         let file = self
             .inner
-            .read_workspace_file_blocking(host_id, cwd, path)?;
+            .read_workspace_file_prefix_blocking(host_id, cwd, path)?;
         serde_json::to_string(&file).map_err(|e| e.to_string())
     }
 
@@ -271,6 +279,217 @@ impl OhosCoreFacade {
     pub fn read_workspace_file_request_json(&self, req_json: String) -> Result<String, String> {
         let r: orbit_client_core::contract::ReadWorkspaceFileRequest =
             serde_json::from_str(&req_json).map_err(|e| e.to_string())?;
-        self.read_workspace_file_json(&r.host_id, &r.cwd, &r.path)
+        let file = self.inner.read_workspace_file_request_blocking(r)?;
+        serde_json::to_string(&file).map_err(|e| e.to_string())
+    }
+
+    pub fn highlight_workspace_code_json(&self, req_json: &str) -> Result<String, String> {
+        let req: OhosHighlightWorkspaceCodePayload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid highlight_workspace_code request JSON: {e}"))?;
+        let requested = req
+            .max_lines
+            .map(|n| n as usize)
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_WORKSPACE_HIGHLIGHT_LINES);
+        let capped = requested.min(MAX_WORKSPACE_HIGHLIGHT_LINES);
+        let view = highlight_workspace_code_capped_with_plain_lines(
+            &req.language,
+            &req.code,
+            capped,
+            &req.plain_line_numbers,
+        );
+        serde_json::to_string(&view).map_err(|e| e.to_string())
+    }
+
+    pub fn create_workspace_v2_json(&self, req_json: &str) -> Result<(), String> {
+        let req: OhosCreateWorkspaceV2Payload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid create_workspace_v2 request JSON: {e}"))?;
+        if req.host_id.trim().is_empty() {
+            return Err("create_workspace_v2 requires non-empty host_id".into());
+        }
+        if req.source_cwd.trim().is_empty() {
+            return Err("create_workspace_v2 requires non-empty source_cwd".into());
+        }
+        let isolation = match req.isolation.as_deref().map(str::trim) {
+            None | Some("") | Some("local") => WorkspaceIsolation::Local,
+            Some("worktree") => WorkspaceIsolation::Worktree,
+            Some(other) => return Err(format!("unsupported workspace isolation `{other}`")),
+        };
+        let worktree_mode = match req.worktree_mode.as_deref().map(str::trim) {
+            None | Some("") | Some("branch_off") => WorktreeCreateMode::BranchOff,
+            Some("checkout_branch") => WorktreeCreateMode::CheckoutBranch,
+            Some("checkout_pr") => WorktreeCreateMode::CheckoutPr,
+            Some(other) => return Err(format!("unsupported worktree_mode `{other}`")),
+        };
+        let title = req
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let worktree_branch = req
+            .worktree_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let base_ref = req
+            .base_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        self.inner.create_workspace_v2(
+            &req.host_id,
+            &req.source_cwd,
+            title,
+            isolation,
+            worktree_mode,
+            worktree_branch,
+            base_ref,
+            req.pr_number,
+        );
+        Ok(())
+    }
+
+    pub fn archive_workspace_v2_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        keep_agents_unclassified: bool,
+    ) -> Result<String, String> {
+        if host_id.trim().is_empty() {
+            return Err("archive_workspace_v2 requires non-empty host_id".into());
+        }
+        if workspace_id.trim().is_empty() {
+            return Err("archive_workspace_v2 requires non-empty workspace_id".into());
+        }
+        self.inner
+            .run_mobile_rpc(self.inner.archive_workspace_confirmed(
+                host_id,
+                workspace_id,
+                keep_agents_unclassified,
+            ))?;
+        Ok(r#"{"ok":true}"#.to_string())
+    }
+
+    pub fn unarchive_workspace_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> Result<String, String> {
+        if host_id.trim().is_empty() {
+            return Err("unarchive_workspace requires non-empty host_id".into());
+        }
+        if workspace_id.trim().is_empty() {
+            return Err("unarchive_workspace requires non-empty workspace_id".into());
+        }
+        self.inner.run_mobile_rpc(
+            self.inner
+                .unarchive_workspace_confirmed(host_id, workspace_id),
+        )?;
+        Ok(r#"{"ok":true}"#.to_string())
+    }
+
+    pub fn rename_workspace_confirmed_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        title: &str,
+    ) -> Result<String, String> {
+        if host_id.trim().is_empty() {
+            return Err("rename_workspace_confirmed requires non-empty host_id".into());
+        }
+        if workspace_id.trim().is_empty() {
+            return Err("rename_workspace_confirmed requires non-empty workspace_id".into());
+        }
+        let trimmed_title = title.trim();
+        if trimmed_title.is_empty() {
+            return Err("rename_workspace_confirmed requires non-empty title".into());
+        }
+        self.inner
+            .run_mobile_rpc(self.inner.rename_workspace_confirmed(
+                host_id,
+                workspace_id,
+                trimmed_title,
+            ))?;
+        Ok(r#"{"ok":true}"#.to_string())
+    }
+
+    pub fn request_workspace_scripts(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        if host_id.trim().is_empty() {
+            return Err("request_workspace_scripts requires non-empty host_id".into());
+        }
+        if workspace_id.trim().is_empty() {
+            return Err("request_workspace_scripts requires non-empty workspace_id".into());
+        }
+        self.inner.list_workspace_scripts(host_id, workspace_id);
+        Ok(())
+    }
+
+    pub fn start_workspace_script_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        script_name: &str,
+    ) -> Result<(), String> {
+        if host_id.trim().is_empty() {
+            return Err("start_workspace_script requires non-empty host_id".into());
+        }
+        if workspace_id.trim().is_empty() {
+            return Err("start_workspace_script requires non-empty workspace_id".into());
+        }
+        if script_name.trim().is_empty() {
+            return Err("start_workspace_script requires non-empty script_name".into());
+        }
+        self.inner
+            .start_workspace_script(host_id, workspace_id, script_name);
+        Ok(())
+    }
+
+    pub fn stop_workspace_script_json(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        script_name: &str,
+    ) -> Result<(), String> {
+        if host_id.trim().is_empty() {
+            return Err("stop_workspace_script requires non-empty host_id".into());
+        }
+        if workspace_id.trim().is_empty() {
+            return Err("stop_workspace_script requires non-empty workspace_id".into());
+        }
+        if script_name.trim().is_empty() {
+            return Err("stop_workspace_script requires non-empty script_name".into());
+        }
+        self.inner
+            .stop_workspace_script(host_id, workspace_id, script_name);
+        Ok(())
+    }
+
+    pub fn update_workspace_board_cas_json(&self, req_json: &str) -> Result<String, String> {
+        let req: OhosUpdateWorkspaceBoardCasPayload = serde_json::from_str(req_json)
+            .map_err(|e| format!("invalid update_workspace_board_cas request JSON: {e}"))?;
+        if req.host_id.trim().is_empty() {
+            return Err("update_workspace_board_cas requires non-empty host_id".into());
+        }
+        if req.workspace_id.trim().is_empty() {
+            return Err("update_workspace_board_cas requires non-empty workspace_id".into());
+        }
+        let outcome = self
+            .inner
+            .run_mobile_rpc(self.inner.update_workspace_board_cas_on_host(
+                &req.host_id,
+                &req.workspace_id,
+                req.content,
+                req.section,
+                req.expected_revision,
+                req.updated_by,
+            ))?;
+        serde_json::to_string(&outcome).map_err(|e| e.to_string())
     }
 }

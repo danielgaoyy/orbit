@@ -1350,4 +1350,110 @@ export class OrbitCoreBridge
       return await this.core.upgradeHostDaemonOverWire(hostId, targetVersion);
     });
   }
+
+  // PR-5 Tools, Terminal Delta, Highlight, Workspace v2, Dev Scripts & Worktree Handoff
+
+  public async gitPushJson(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('gitPushJson', async (): Promise<string> => {
+      return await this.core.gitPushJson(reqJson);
+    });
+  }
+
+  public async gitDiscardFilesJson(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('gitDiscardFilesJson', async (): Promise<string> => {
+      return await this.core.gitDiscardFilesJson(reqJson);
+    });
+  }
+
+  public highlightWorkspaceCodeJson(reqJson: string): string {
+    return this.traceJsonSync('highlightWorkspaceCodeJson', (): string => {
+      return this.core.highlightWorkspaceCodeJson(reqJson);
+    });
+  }
+
+  public terminalScreenDeltaSlotJson(hostId: string, slot: number, sinceRevision: number): string {
+    return this.traceJsonSync('terminalScreenDeltaSlotJson', (): string => {
+      return this.core.terminalScreenDeltaSlotJson(hostId, slot, sinceRevision);
+    });
+  }
+
+  public createWorkspaceV2Json(reqJson: string): void {
+    this.traceVoidSync('createWorkspaceV2Json', reqJson.length, (): void => {
+      this.core.createWorkspaceV2Json(reqJson);
+    });
+  }
+
+  public async archiveWorkspaceV2Json(
+    hostId: string,
+    workspaceId: string,
+    keepAgentsUnclassified: boolean
+  ): Promise<string> {
+    return await this.traceJsonAsync('archiveWorkspaceV2Json', async (): Promise<string> => {
+      return await this.core.archiveWorkspaceV2Json(hostId, workspaceId, keepAgentsUnclassified);
+    });
+  }
+
+  public async unarchiveWorkspaceJson(hostId: string, workspaceId: string): Promise<string> {
+    return await this.traceJsonAsync('unarchiveWorkspaceJson', async (): Promise<string> => {
+      return await this.core.unarchiveWorkspaceJson(hostId, workspaceId);
+    });
+  }
+
+  public async renameWorkspaceConfirmedJson(
+    hostId: string,
+    workspaceId: string,
+    title: string
+  ): Promise<string> {
+    return await this.traceJsonAsync('renameWorkspaceConfirmedJson', async (): Promise<string> => {
+      return await this.core.renameWorkspaceConfirmedJson(hostId, workspaceId, title);
+    });
+  }
+
+  public requestWorkspaceScripts(hostId: string, workspaceId: string): void {
+    this.traceVoidSync('requestWorkspaceScripts', workspaceId.length, (): void => {
+      this.core.requestWorkspaceScripts(hostId, workspaceId);
+    });
+  }
+
+  public startWorkspaceScriptJson(hostId: string, workspaceId: string, scriptName: string): void {
+    this.traceVoidSync('startWorkspaceScriptJson', scriptName.length, (): void => {
+      this.core.startWorkspaceScriptJson(hostId, workspaceId, scriptName);
+    });
+  }
+
+  public stopWorkspaceScriptJson(hostId: string, workspaceId: string, scriptName: string): void {
+    this.traceVoidSync('stopWorkspaceScriptJson', scriptName.length, (): void => {
+      this.core.stopWorkspaceScriptJson(hostId, workspaceId, scriptName);
+    });
+  }
+
+  public async previewWorktreeHandoffJson(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('previewWorktreeHandoffJson', async (): Promise<string> => {
+      return await this.core.previewWorktreeHandoffJson(reqJson);
+    });
+  }
+
+  public async executeWorktreeHandoffJson(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('executeWorktreeHandoffJson', async (): Promise<string> => {
+      return await this.core.executeWorktreeHandoffJson(reqJson);
+    });
+  }
+
+  public async readWorkspaceFileRequestJson(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('readWorkspaceFileRequestJson', async (): Promise<string> => {
+      return await this.core.readWorkspaceFileRequestJson(reqJson);
+    });
+  }
+
+  public async updateWorkspaceBoardCasJson(reqJson: string): Promise<string> {
+    return await this.traceJsonAsync('updateWorkspaceBoardCasJson', async (): Promise<string> => {
+      return await this.core.updateWorkspaceBoardCasJson(reqJson);
+    });
+  }
+
+  public startTerminalSlot(hostId: string, cwd: string, cols: number, rows: number, slot: number): void {
+    this.traceVoidSync('startTerminalSlot', cwd.length, (): void => {
+      this.core.startTerminalSlot(hostId, cwd, cols, rows, slot);
+    });
+  }
 }

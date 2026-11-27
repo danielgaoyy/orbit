@@ -1,0 +1,24 @@
+{
+  "changed_rows": [
+    {
+      "row_index": 0,
+      "spans": [
+        {
+          "bg_hex": null,
+          "bold": false,
+          "fg_hex": "#E2E8F0",
+          "inverse": false,
+          "text": "ready",
+          "underline": false
+        }
+      ]
+    }
+  ],
+  "cols": 80,
+  "cursor_col": 0,
+  "cursor_row": 1,
+  "reset": false,
+  "revision": 2,
+  "rows": 24,
+  "slot": 1
+}

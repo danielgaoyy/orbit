@@ -1885,6 +1885,7 @@ mod tests {
                 available_providers: vec![],
                 relay_url: None,
                 direct_endpoints: vec![],
+                board_cas_supported: true,
             };
             let listen_port = Arc::new(RwLock::new(6868));
             let orch_cfg = Arc::new(RwLock::new(orbit_protocol::OrchestrationConfig::default()));

@@ -1,0 +1,18 @@
+{
+  "cwd": "/repo",
+  "cwd_identity_epoch": 0,
+  "diff_files": [],
+  "diff_in_flight": false,
+  "diff_revision": 0,
+  "host_id": "replay-host",
+  "last_diff_error_revision": 0,
+  "last_diff_error_status_revision": 0,
+  "raw_diff": "",
+  "revision": 1,
+  "selected_path": null,
+  "staged": false,
+  "status": null,
+  "status_identity_epoch": 0,
+  "status_reverify_pending": false,
+  "status_revision": 0
+}

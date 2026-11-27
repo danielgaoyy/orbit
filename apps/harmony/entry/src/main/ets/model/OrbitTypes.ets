@@ -1028,6 +1028,12 @@ export interface SessionOutlinePromptDto {
   preview: string;
 }
 
+export interface SubagentLineageStepDto {
+  host_id: string;
+  agent_id: string;
+  role: string;
+}
+
 export interface SessionSubagentEntryDto {
   id: string;
   role: string;
@@ -1041,7 +1047,65 @@ export interface SessionSubagentEntryDto {
   parent_agent_id?: string | null;
   parent_host_id?: string | null;
   depth?: number;
-  lineage?: string[];
+  lineage?: SubagentLineageStepDto[];
+}
+
+export function isSubagentSettledStatus(status: string): boolean {
+  const s = status.trim().toLowerCase();
+  return (
+    s === 'completed' ||
+    s === 'done' ||
+    s === 'succeeded' ||
+    s === 'failed' ||
+    s === 'error' ||
+    s === 'denied' ||
+    s === 'canceled' ||
+    s === 'cancelled' ||
+    s === 'closed' ||
+    s === 'idle'
+  );
+}
+
+export function isSubagentActiveStatus(status: string): boolean {
+  return !isSubagentSettledStatus(status);
+}
+
+export function resolveSubagentActualHostId(
+  sub: SessionSubagentEntryDto,
+  fallbackRootHostId: string
+): string {
+  if (sub.host_id !== undefined && sub.host_id !== null && sub.host_id.trim().length > 0) {
+    return sub.host_id.trim();
+  }
+  return fallbackRootHostId.trim();
+}
+
+export function resolveSubagentDirectParentHostId(
+  sub: SessionSubagentEntryDto,
+  fallbackRootHostId: string
+): string {
+  if (
+    sub.parent_host_id !== undefined &&
+    sub.parent_host_id !== null &&
+    sub.parent_host_id.trim().length > 0
+  ) {
+    return sub.parent_host_id.trim();
+  }
+  return fallbackRootHostId.trim();
+}
+
+export function resolveSubagentDirectParentAgentId(
+  sub: SessionSubagentEntryDto,
+  fallbackRootAgentId: string
+): string {
+  if (
+    sub.parent_agent_id !== undefined &&
+    sub.parent_agent_id !== null &&
+    sub.parent_agent_id.trim().length > 0
+  ) {
+    return sub.parent_agent_id.trim();
+  }
+  return fallbackRootAgentId.trim();
 }
 
 export interface SessionInsightsDto {
@@ -1256,8 +1320,45 @@ export interface WorkspaceFileViewDto {
   content: string;
   size_bytes: number;
   truncated: boolean;
+  etag?: string | null;
+  mtime_unix_ms?: number | null;
+  writable?: boolean;
+  line_ending?: string | null;
   highlighted_lines: HighlightedLineDto[];
   markdown_blocks: RichBlockDto[];
+}
+
+export interface WorkspaceFileConflictDto {
+  current_etag: string;
+  current_content?: string | null;
+  current_size_bytes: number;
+  current_mtime_unix_ms?: number | null;
+}
+
+export interface WorkspaceFileWriteResultDto {
+  host_id: string;
+  cwd: string;
+  path: string;
+  etag: string;
+  size_bytes: number;
+  mtime_unix_ms?: number | null;
+  conflict?: WorkspaceFileConflictDto | null;
+}
+
+export function isWorkspaceFileEditable(view: WorkspaceFileViewDto | null): boolean {
+  if (view === null) {
+    return false;
+  }
+  return view.content_kind === 'text' && !view.truncated && view.writable === true;
+}
+
+export function orbitTextHashSig(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${text.length}:${hash.toString(16)}`;
 }
 
 export interface AskSideQuestionRequestDto {
@@ -1308,6 +1409,8 @@ export interface GitStatusSnapshotDto {
   ahead: number;
   behind: number;
   files: GitFileEntryDto[];
+  repo_prefix?: string | null;
+  repo_root?: string | null;
 }
 
 export interface GitReviewDto {
@@ -1316,6 +1419,15 @@ export interface GitReviewDto {
   cwd: string;
   status: GitStatusSnapshotDto | null;
   selected_path: string | null;
+  staged: boolean;
+  diff_revision: number;
+  diff_in_flight?: boolean;
+  status_revision?: number;
+  status_identity_epoch?: number;
+  status_reverify_pending?: boolean;
+  cwd_identity_epoch?: number;
+  last_diff_error_revision?: number;
+  last_diff_error_status_revision?: number;
   raw_diff: string;
   diff_files: DiffFileDto[];
 }
@@ -1671,62 +1783,203 @@ export function compactPath(rawPath: string): string {
   return clean;
 }
 
-function stripHomePrefixToRel(normPath: string): string | null {
-  if (normPath === '~') {
+/**
+ * Returns `rawPath` verbatim when it contains at least one non-whitespace character, or `''`
+ * when blank/nullish. Preserves legal trailing/leading spaces in POSIX directory & file names
+ * (`repo `, `report.txt `) while still rejecting whitespace-only inputs (R14-P1-3).
+ */
+export function nonBlankPath(rawPath: string | null | undefined): string {
+  if (rawPath === undefined || rawPath === null || rawPath.trim().length === 0) {
     return '';
   }
-  if (normPath.startsWith('~/')) {
-    return normPath.substring(2);
-  }
-  const prefixes: string[] = ['/Users/', '/home/'];
-  for (let i = 0; i < prefixes.length; i++) {
-    const p = prefixes[i];
-    if (normPath.startsWith(p)) {
-      const rest = normPath.substring(p.length);
-      const slashIdx = rest.indexOf('/');
-      if (slashIdx < 0) {
-        return rest.length > 0 ? '' : null;
-      }
-      return rest.substring(slashIdx + 1);
-    }
-  }
-  if (normPath === '/root') {
-    return '';
-  }
-  if (normPath.startsWith('/root/')) {
-    return normPath.substring('/root/'.length);
-  }
-  return null;
+  return rawPath;
 }
 
-export function cwdPathsEquivalent(pathA: string, pathB: string): boolean {
-  if (pathA.trim().length === 0 || pathB.trim().length === 0) {
-    return pathA.trim() === pathB.trim();
+/**
+ * Resolves the exact file path for a Git diff row action (Stage / Unstage / line quote).
+ * Always uses the parsed literal `rowPath` when non-empty — NEVER substitutes `selectedPath`
+ * based on filtered row count, because `selectedPath` may be a directory pathspec (e.g. `d`
+ * containing `d/one` and `d/two`). Falls back to `selectedPath` only when `rowPath` is empty
+ * (R14-P1-2).
+ */
+export function resolveGitDiffRowActionPath(rowPath: string, selectedPath: string | null): string {
+  if (rowPath.length > 0) {
+    return rowPath;
   }
-  let a = pathA;
-  let b = pathB;
-  while (a.length > 1 && a.endsWith('/')) {
-    a = a.substring(0, a.length - 1);
+  if (selectedPath !== null && selectedPath.length > 0) {
+    return selectedPath;
   }
-  while (b.length > 1 && b.endsWith('/')) {
-    b = b.substring(0, b.length - 1);
+  return rowPath;
+}
+
+function normalizeGitRelPathSegments(rawPath: string): string {
+  if (rawPath.length === 0) {
+    return '';
   }
-  if (a === b) {
+  const parts = rawPath.split('/');
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const seg = parts[i];
+    if (seg.length === 0 || seg === '.') {
+      continue;
+    }
+    out.push(seg);
+  }
+  return out.join('/');
+}
+
+/**
+ * Pure mirror of Rust `orbit-client-core`'s post-mutation slot matching (`R17-P1-3` / `R17-P1-4` /
+ * `R17-P1-5`): determines whether a visible Review slot `(focusPath, staged)` that was just
+ * invalidated (`diff_revision === 0`) may still have a real diff in `status` and should trigger a
+ * single targeted re-fetch.
+ * - Returns `false` when `status` is absent, clean (`files.length === 0`), or has zero entries in
+ *   the requested `staged` mode (0 unnecessary re-fetches on clean repos or `AM -> A ` U slots).
+ * - Returns `true` for whole-repo view (`focusPath === null`) whenever the target mode has entries.
+ * - Returns `true` conservatively when `status.repo_prefix` is absent (`undefined`/`null`, legacy
+ *   daemon) and the target `staged` mode still has entries (`R17-P1-5`).
+ * - Otherwise converts `focusPath` via `status.repo_prefix` to the exact repo-root-relative path
+ *   and matches ONLY exact files, untracked directory summaries (`bucket/`), or directory-scope
+ *   queries (`d` -> `d/g`) in the matching `staged` mode, preserving legal trailing spaces.
+ */
+export function gitStatusMayHaveDiffForSlot(
+  status: GitStatusSnapshotDto | null | undefined,
+  focusPath: string | null,
+  staged: boolean
+): boolean {
+  if (status === undefined || status === null || status.files.length === 0) {
+    return false;
+  }
+  let hasAnyInMode = false;
+  for (let i = 0; i < status.files.length; i++) {
+    if (status.files[i].staged === staged) {
+      hasAnyInMode = true;
+      break;
+    }
+  }
+  if (!hasAnyInMode) {
+    return false;
+  }
+  if (focusPath === null) {
     return true;
   }
-  // Only fall back to home-relative comparison when exactly one path uses `~` shorthand;
-  // two distinct absolute user directories (e.g. `/home/worker/project` vs `/home/pa/project`)
-  // are NEVER equivalent.
-  const aIsTilde = a === '~' || a.startsWith('~/');
-  const bIsTilde = b === '~' || b.startsWith('~/');
-  if (aIsTilde !== bIsTilde) {
-    const relA = stripHomePrefixToRel(a);
-    const relB = stripHomePrefixToRel(b);
-    if (relA !== null && relB !== null) {
-      return relA === relB;
+  const normReq = normalizeGitRelPathSegments(focusPath);
+  if (normReq.length === 0) {
+    return true;
+  }
+  if (status.repo_prefix === undefined || status.repo_prefix === null) {
+    return true;
+  }
+  const normPrefix = normalizeGitRelPathSegments(status.repo_prefix);
+  const repoRel = normPrefix.length === 0 ? normReq : `${normPrefix}/${normReq}`;
+  for (let i = 0; i < status.files.length; i++) {
+    const entry = status.files[i];
+    if (entry.staged !== staged) {
+      continue;
+    }
+    const isDirSummary = entry.path.endsWith('/');
+    const rem = normalizeGitRelPathSegments(entry.path);
+    if (rem.length === 0) {
+      continue;
+    }
+    if (rem === repoRel) {
+      return true;
+    }
+    if (isDirSummary && repoRel.length > rem.length && repoRel.startsWith(`${rem}/`)) {
+      return true;
+    }
+    if (rem.length > repoRel.length && rem.startsWith(`${repoRel}/`)) {
+      return true;
     }
   }
   return false;
+}
+
+/**
+ * Normalizes a POSIX workspace path for exact per-host comparison without ever stripping
+ * `/home/<user>`, `/Users/<user>`, `/root` prefixes, or legal trailing spaces (R3-P0-1 /
+ * R3-P1-6 / R14-P1-3).
+ * Expands leading `~` or `~/...` ONLY when an explicit absolute `hostHomeDir` is supplied.
+ */
+export function normalizeAbsoluteCwd(rawPath: string, hostHomeDir?: string | null): string {
+  let clean = nonBlankPath(rawPath);
+  if (clean.length === 0) {
+    return '';
+  }
+  const cleanHome = nonBlankPath(hostHomeDir);
+  if (cleanHome.length > 0 && cleanHome.startsWith('/')) {
+    let normHome = cleanHome.replace(/\/+/g, '/');
+    while (normHome.length > 1 && normHome.endsWith('/')) {
+      normHome = normHome.substring(0, normHome.length - 1);
+    }
+    if (clean === '~') {
+      clean = normHome;
+    } else if (clean.startsWith('~/')) {
+      clean = `${normHome}/${clean.substring(2)}`;
+    }
+  }
+  clean = clean.replace(/\/+/g, '/');
+  const isAbs = clean.startsWith('/');
+  const rawParts = clean.split('/');
+  const normParts: string[] = [];
+  for (let i = 0; i < rawParts.length; i++) {
+    const part = rawParts[i];
+    if (part.length === 0 || part === '.') {
+      continue;
+    }
+    normParts.push(part);
+  }
+  if (isAbs) {
+    return normParts.length === 0 ? '/' : `/${normParts.join('/')}`;
+  }
+  return normParts.join('/');
+}
+
+export function cwdPathsEquivalent(
+  pathA: string,
+  pathB: string,
+  hostHomeDir?: string | null
+): boolean {
+  const a = normalizeAbsoluteCwd(pathA, hostHomeDir);
+  const b = normalizeAbsoluteCwd(pathB, hostHomeDir);
+  if (a.length === 0 || b.length === 0) {
+    return false;
+  }
+  return a === b;
+}
+
+/**
+ * Normalizes a workspace-relative file path for exact receipt/target matching (R3-P1-1 / R14-P1-3).
+ * Strips a matching `cwd/` prefix if present; preserves leading `/` for paths outside `cwd` and
+ * preserves trailing spaces in filenames/cwds.
+ */
+export function normalizeWorkspaceRelPath(rawPath: string, cwd?: string | null): string {
+  let clean = nonBlankPath(rawPath).replace(/\/+/g, '/');
+  if (clean.length === 0) {
+    return '';
+  }
+  if (cwd !== undefined && cwd !== null && cwd.trim().length > 0) {
+    const normCwd = normalizeAbsoluteCwd(cwd);
+    if (normCwd.length > 1 && clean.startsWith(`${normCwd}/`)) {
+      clean = clean.substring(normCwd.length + 1);
+    } else if (normCwd === '/' && clean.startsWith('/')) {
+      clean = clean.substring(1);
+    }
+  }
+  const isAbs = clean.startsWith('/');
+  const rawParts = clean.split('/');
+  const normParts: string[] = [];
+  for (let i = 0; i < rawParts.length; i++) {
+    const part = rawParts[i];
+    if (part.length === 0 || part === '.') {
+      continue;
+    }
+    normParts.push(part);
+  }
+  if (isAbs) {
+    return normParts.length === 0 ? '/' : `/${normParts.join('/')}`;
+  }
+  return normParts.join('/');
 }
 
 export function formatCompactDuration(ms: number | null | undefined): string {
@@ -1865,8 +2118,8 @@ export function formatRelativeTimeLabel(unixSecs: number): string {
 }
 
 export function stripWorkspacePrefix(path: string, cwd: string): string {
-  const cleanPath = path.trim();
-  let cleanCwd = cwd.trim();
+  const cleanPath = nonBlankPath(path);
+  let cleanCwd = nonBlankPath(cwd);
   while (cleanCwd.length > 1 && cleanCwd.endsWith('/')) {
     cleanCwd = cleanCwd.substring(0, cleanCwd.length - 1);
   }
@@ -2195,6 +2448,116 @@ export interface StartDagWorkflowRequestDto {
 export interface ProviderSubagentTimelineDto {
   subagent_id: string;
   items: TimelineItemDto[];
+}
+
+export interface ProviderSubagentEventDto {
+  seq: number;
+  parent_agent_id?: string;
+  subagent_id?: string;
+  timestamp?: string;
+  payload?: Record<string, Object | null | undefined>;
+}
+
+function readOptionalStringField(
+  obj: Record<string, Object | null | undefined>,
+  key: string
+): string {
+  const val = obj[key];
+  return typeof val === 'string' ? val : '';
+}
+
+/**
+ * Parses `providerSubagentTimelineJson` payloads returned by `orbit-ffi-ohos`.
+ * Rust serializes `Vec<ProviderSubagentEvent>` (JSON array where each element holds
+ * `{ seq, parent_agent_id, subagent_id, timestamp, payload: { type, ... } }`).
+ * Also tolerates legacy `{ items: TimelineItemDto[] }` objects if supplied by mocks.
+ */
+export function parseProviderSubagentTimelineJson(rawJson: string): TimelineItemDto[] {
+  if (rawJson.trim().length === 0) {
+    return [];
+  }
+  let parsed: Object;
+  try {
+    parsed = JSON.parse(rawJson) as Object;
+  } catch (_parseErr) {
+    return [];
+  }
+  if (parsed === null || parsed === undefined || typeof parsed !== 'object') {
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    const legacy = parsed as ProviderSubagentTimelineDto;
+    return Array.isArray(legacy.items) ? legacy.items : [];
+  }
+  const events = parsed as ProviderSubagentEventDto[];
+  const out: TimelineItemDto[] = [];
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (ev === null || ev === undefined || typeof ev !== 'object') {
+      continue;
+    }
+    const seq = typeof ev.seq === 'number' && Number.isFinite(ev.seq) ? ev.seq : i + 1;
+    const payload = ev.payload;
+    if (payload === undefined || payload === null || typeof payload !== 'object') {
+      continue;
+    }
+    const rawType = readOptionalStringField(payload, 'type');
+    if (rawType.length === 0) {
+      continue;
+    }
+    const text = readOptionalStringField(payload, 'text');
+    const message = readOptionalStringField(payload, 'message');
+    const title = readOptionalStringField(payload, 'title');
+    const status = readOptionalStringField(payload, 'status');
+    const rawDetail = payload['detail'];
+    let detailObj: ToolCallDetailDto | undefined = undefined;
+    let summaryTitle: string = title;
+
+    if (rawDetail !== undefined && rawDetail !== null && typeof rawDetail === 'object' && !Array.isArray(rawDetail)) {
+      const dRec = rawDetail as Record<string, Object | null | undefined>;
+      const kind = readOptionalStringField(dRec, 'kind');
+      const command = readOptionalStringField(dRec, 'command');
+      const path = readOptionalStringField(dRec, 'path');
+      const toolName = readOptionalStringField(dRec, 'tool_name');
+      const query = readOptionalStringField(dRec, 'query');
+      const role = readOptionalStringField(dRec, 'role');
+      const output = readOptionalStringField(dRec, 'output_preview');
+      detailObj = {
+        kind: kind.length > 0 ? kind : 'generic',
+        command: command.length > 0 ? command : undefined,
+        path: path.length > 0 ? path : undefined,
+        tool_name: toolName.length > 0 ? toolName : undefined,
+        query: query.length > 0 ? query : undefined,
+        role: role.length > 0 ? role : undefined,
+        output_preview: output.length > 0 ? output : undefined
+      };
+      if (summaryTitle.length === 0) {
+        if (command.length > 0) {
+          summaryTitle = `$ ${command}`;
+        } else if (path.length > 0) {
+          summaryTitle = path;
+        } else if (toolName.length > 0) {
+          summaryTitle = toolName;
+        } else if (query.length > 0) {
+          summaryTitle = query;
+        } else if (role.length > 0) {
+          summaryTitle = role;
+        }
+      }
+    }
+
+    const effectiveText = text.length > 0 ? text : message;
+    out.push({
+      item_type: rawType,
+      seq: seq,
+      text: effectiveText.length > 0 ? effectiveText : undefined,
+      title: title.length > 0 ? title : undefined,
+      summary_title: summaryTitle.length > 0 ? summaryTitle : undefined,
+      status: status.length > 0 ? status : undefined,
+      detail: detailObj
+    });
+  }
+  return out;
 }
 
 export interface BriefingAgentRefDto {

@@ -3,6 +3,11 @@ import { preferences } from '@kit.ArkData';
 import { fileIo } from '@kit.CoreFileKit';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { orbitLogWarn } from './OrbitLogger';
+import {
+  ORBIT_SIDE_PANEL_STORAGE_KEY,
+  OrbitSidePanelStorage
+} from './stores/OrbitSidePanelStore';
+import { OrbitShellWidthStorage } from './stores/OrbitShellStore';
 import { PushPreferencesDto } from './OrbitTypes';
 
 const PREFS_NAME: string = 'orbit_harmony_prefs';
@@ -12,6 +17,8 @@ const KEY_MIGRATED_THREAD_PREFS_V1: string = 'orbit.harmony.v2.migrated_thread_p
 const KEY_DRAFT_PREFS: string = 'orbit.harmony.v2.draft_prefs';
 const KEY_DEVICE_ID: string = 'orbit.harmony.v2.device_id';
 const KEY_PRIMARY_ROUTER_HOST: string = 'orbit.harmony.v2.primary_router_host_id';
+const KEY_SIDEBAR_WIDTH_VP: string = 'orbit.harmony.v2.sidebar_width_vp';
+const KEY_SIDE_PANEL_WIDTH_VP: string = 'orbit.harmony.v2.panel_width_vp';
 const KEY_PUSH_PREFS_BY_HOST: string = 'orbit.harmony.v2.push_prefs_by_host_json';
 const KEY_PA_LAST_VISIT_MAP: string = 'orbit.harmony.v2.pa_last_visit_map_json';
 
@@ -52,7 +59,7 @@ function generateAnonymousDeviceId(): string {
   return `ohos-${hex}`;
 }
 
-export class OrbitPreferencesStore {
+export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellWidthStorage {
   private prefs: preferences.Preferences | null = null;
 
   public init(context: common.Context): void {
@@ -352,6 +359,92 @@ export class OrbitPreferencesStore {
       });
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to save draft prefs', err as Object);
+    }
+  }
+
+  public getSidePanelStateJson(): string {
+    if (this.prefs === null) {
+      return '';
+    }
+    try {
+      const stored = this.prefs.getSync(ORBIT_SIDE_PANEL_STORAGE_KEY, '');
+      return typeof stored === 'string' ? stored : '';
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read sidePanel state', err as Object);
+      return '';
+    }
+  }
+
+  public setSidePanelStateJson(payloadJson: string, onAsyncFailure?: () => void): boolean {
+    if (this.prefs === null) {
+      return false;
+    }
+    try {
+      this.prefs.putSync(ORBIT_SIDE_PANEL_STORAGE_KEY, payloadJson);
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush sidePanel state', err);
+        if (onAsyncFailure !== undefined) {
+          onAsyncFailure();
+        }
+      });
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save sidePanel state', err as Object);
+      return false;
+    }
+  }
+
+  public getSidebarWidthVp(): number {
+    if (this.prefs === null) {
+      return 0;
+    }
+    try {
+      const stored = this.prefs.getSync(KEY_SIDEBAR_WIDTH_VP, 0);
+      return typeof stored === 'number' && Number.isFinite(stored) ? stored : 0;
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read sidebar width', err as Object);
+      return 0;
+    }
+  }
+
+  public setSidebarWidthVp(widthVp: number): void {
+    if (this.prefs === null || !Number.isFinite(widthVp) || widthVp <= 0) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_SIDEBAR_WIDTH_VP, Math.round(widthVp));
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush sidebar width', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save sidebar width', err as Object);
+    }
+  }
+
+  public getSidePanelWidthVp(): number {
+    if (this.prefs === null) {
+      return 0;
+    }
+    try {
+      const stored = this.prefs.getSync(KEY_SIDE_PANEL_WIDTH_VP, 0);
+      return typeof stored === 'number' && Number.isFinite(stored) ? stored : 0;
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read side panel width', err as Object);
+      return 0;
+    }
+  }
+
+  public setSidePanelWidthVp(widthVp: number): void {
+    if (this.prefs === null || !Number.isFinite(widthVp) || widthVp <= 0) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_SIDE_PANEL_WIDTH_VP, Math.round(widthVp));
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush side panel width', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save side panel width', err as Object);
     }
   }
 

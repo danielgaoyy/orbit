@@ -451,7 +451,7 @@ pub(crate) fn cwd_paths_equivalent(stored_cwd: &str, query_cwd: &str) -> bool {
 }
 
 /// Collapses consecutive `/` characters into a single `/` without trimming spaces or touching `\`.
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", test))]
 fn collapse_slashes(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut prev_slash = false;
@@ -476,7 +476,7 @@ fn collapse_slashes(raw: &str) -> String {
 /// - Normalizes Windows UNC paths (`\\server\share\p` and `//server/share/p` -> `//server/share/p`)
 ///   idempotently.
 /// - Preserves Windows drive roots (`C:\` and `C:/` -> `C:/`) distinct from drive-relative `C:`.
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", test))]
 fn normalize_git_cache_path(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -530,7 +530,7 @@ fn normalize_git_cache_path(raw: &str) -> String {
 /// `/home/worker/project`) and NEVER trims significant filesystem spaces (such as `/tmp/project `).
 /// Leading `~` is expanded ONLY when `authoritative_home_dir` for that host is explicitly known.
 /// POSIX literal backslashes (`team\project`) are preserved verbatim.
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", test))]
 pub(crate) fn git_cache_paths_equivalent(
     stored_cwd: &str,
     query_cwd: &str,
@@ -1552,6 +1552,232 @@ pub fn project_fleet_overview(
     }
 }
 
+/// Target host path semantics for canonical Git `cwd` cache key normalization (R14-P1-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitPathFlavor {
+    /// Confirmed POSIX host (macOS / Linux): `\` is always a literal filename character and
+    /// leading `//` collapses to `/` (matching the single-slash spelling of the same inode).
+    Posix,
+    /// Confirmed Windows host: `\` is a path separator and `\\server\share` / `//server/share`
+    /// normalize identically to `//server/share`.
+    Windows,
+    /// No authoritative platform evidence: convert `\` to `/` ONLY on explicit Windows drive
+    /// (`C:\...`) or backslash UNC (`\\server\share`) paths; NEVER convert `\` on `/` or `//`
+    /// paths, and conservatively preserve leading `//` distinct from single `/`.
+    Unknown,
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+fn is_windows_backslash_unc(path: &str) -> bool {
+    path.starts_with(r"\\")
+}
+
+fn is_double_slash_prefix(path: &str) -> bool {
+    path.starts_with("//") && !path.starts_with("///")
+}
+
+fn normalize_slash_segments(raw: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        parts.push(seg);
+    }
+    parts.join("/")
+}
+
+/// Strictly normalize a host-local Git `cwd` cache key, inferring platform flavor only when
+/// `authoritative_home_dir` provides explicit platform evidence (R13-P1-3 / R14-P1-4).
+pub fn canonical_git_cwd_key(raw_cwd: &str, authoritative_home_dir: Option<&str>) -> String {
+    let flavor = match authoritative_home_dir {
+        Some(h) if is_windows_drive_path(h) || is_windows_backslash_unc(h) => {
+            GitPathFlavor::Windows
+        }
+        Some(h) if h.starts_with('/') && !is_double_slash_prefix(h) => GitPathFlavor::Posix,
+        _ => GitPathFlavor::Unknown,
+    };
+    canonical_git_cwd_key_for_flavor(raw_cwd, authoritative_home_dir, flavor)
+}
+
+/// Strictly normalize a host-local Git `cwd` cache key using explicit host path semantics:
+/// - Collapses redundant `/` and `.` segments (e.g. `/repo/.` -> `/repo`, `/a/./b/` -> `/a/b`).
+/// - Preserves trailing spaces and POSIX literal backslashes (never converting `\` on POSIX or
+///   unknown-platform `/` / `//` paths; `\\server\share` & `C:\...` stay idempotent with
+///   `//server/share` & `C:/...`).
+/// - Expands `~` / `~/rel` **ONLY** when an explicit `authoritative_home_dir` is provided for the
+///   host; otherwise keeps `~` / `~/rel` as its own isolated key and NEVER suffix-matches other
+///   users' absolute directories.
+pub fn canonical_git_cwd_key_for_flavor(
+    raw_cwd: &str,
+    authoritative_home_dir: Option<&str>,
+    flavor: GitPathFlavor,
+) -> String {
+    if raw_cwd.is_empty() {
+        return String::new();
+    }
+
+    let clean_home = authoritative_home_dir.and_then(|h| {
+        if h.is_empty() {
+            return None;
+        }
+        if h.starts_with('/') || is_windows_drive_path(h) || is_windows_backslash_unc(h) {
+            Some(canonical_git_cwd_key_for_flavor(h, None, flavor))
+        } else {
+            None
+        }
+    });
+
+    if raw_cwd == "~" {
+        return clean_home.unwrap_or_else(|| "~".to_string());
+    }
+    if let Some(rest) = raw_cwd.strip_prefix("~/") {
+        let is_win_home = flavor == GitPathFlavor::Windows
+            || clean_home
+                .as_deref()
+                .is_some_and(|h| is_windows_drive_path(h) || is_double_slash_prefix(h));
+        let norm_rest = if is_win_home {
+            normalize_slash_segments(&rest.replace('\\', "/"))
+        } else {
+            normalize_slash_segments(rest)
+        };
+        if let Some(home) = clean_home {
+            if norm_rest.is_empty() {
+                return home;
+            }
+            if home == "/" || home.ends_with('/') {
+                return format!("{home}{norm_rest}");
+            }
+            return format!("{home}/{norm_rest}");
+        }
+        return if norm_rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{norm_rest}")
+        };
+    }
+    if let Some(rest) = raw_cwd.strip_prefix(r"~\")
+        && let Some(home) = clean_home
+        && (flavor == GitPathFlavor::Windows
+            || is_windows_drive_path(&home)
+            || is_double_slash_prefix(&home))
+    {
+        let norm_rest = normalize_slash_segments(&rest.replace('\\', "/"));
+        if norm_rest.is_empty() {
+            return home;
+        }
+        if home.ends_with('/') {
+            return format!("{home}{norm_rest}");
+        }
+        return format!("{home}/{norm_rest}");
+    }
+
+    if flavor != GitPathFlavor::Posix && is_windows_drive_path(raw_cwd) {
+        let converted = raw_cwd.replace('\\', "/");
+        let drive = &converted[..2];
+        let tail = normalize_slash_segments(&converted[2..]);
+        return if tail.is_empty() {
+            format!("{drive}/")
+        } else {
+            format!("{drive}/{tail}")
+        };
+    }
+
+    if flavor != GitPathFlavor::Posix && is_windows_backslash_unc(raw_cwd) {
+        let converted = raw_cwd.replace('\\', "/");
+        let tail = normalize_slash_segments(converted.trim_start_matches('/'));
+        return if tail.is_empty() {
+            "//".to_string()
+        } else {
+            format!("//{tail}")
+        };
+    }
+
+    if is_double_slash_prefix(raw_cwd) {
+        return match flavor {
+            GitPathFlavor::Posix => {
+                // On confirmed POSIX hosts (Linux/macOS), `//tmp/aa\bb` addresses the same inode
+                // as `/tmp/aa\bb` and `\` is ALWAYS a literal directory character.
+                let tail = normalize_slash_segments(&raw_cwd[2..]);
+                if tail.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{tail}")
+                }
+            }
+            GitPathFlavor::Windows => {
+                let converted = raw_cwd.replace('\\', "/");
+                let tail = normalize_slash_segments(converted.trim_start_matches('/'));
+                if tail.is_empty() {
+                    "//".to_string()
+                } else {
+                    format!("//{tail}")
+                }
+            }
+            GitPathFlavor::Unknown => {
+                // Without platform evidence, NEVER convert `\` to `/` (keeps POSIX `//tmp/aa\bb`
+                // strictly distinct from `//tmp/aa/bb`) while preserving leading `//` so
+                // previously normalized Windows UNC strings (`//server/share/dir`) stay idempotent.
+                let tail = normalize_slash_segments(&raw_cwd[2..]);
+                if tail.is_empty() {
+                    "//".to_string()
+                } else {
+                    format!("//{tail}")
+                }
+            }
+        };
+    }
+
+    if let Some(stripped) = raw_cwd.strip_prefix('/') {
+        let tail = if flavor == GitPathFlavor::Windows {
+            normalize_slash_segments(&stripped.replace('\\', "/"))
+        } else {
+            normalize_slash_segments(stripped)
+        };
+        return if tail.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{tail}")
+        };
+    }
+
+    let rel = if flavor == GitPathFlavor::Windows {
+        normalize_slash_segments(&raw_cwd.replace('\\', "/"))
+    } else {
+        normalize_slash_segments(raw_cwd)
+    };
+    if rel.is_empty() { ".".to_string() } else { rel }
+}
+
+/// Normalize a cwd-relative Git path by stripping redundant `./` and empty path segments while
+/// preserving every literal character (including leading/trailing spaces, `[...]`, and UTF-8).
+pub fn normalize_git_rel_path(raw: &str) -> String {
+    if raw.starts_with('/') {
+        return raw.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        parts.push(seg);
+    }
+    parts.join("/")
+}
+
+pub fn canonical_git_rel_path(path: Option<&str>) -> Option<String> {
+    let raw = path?;
+    let norm = normalize_git_rel_path(raw);
+    (!norm.is_empty()).then_some(norm)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitReviewView {
     pub revision: u64,
@@ -1559,6 +1785,24 @@ pub struct GitReviewView {
     pub cwd: String,
     pub status: Option<GitStatusSnapshot>,
     pub selected_path: Option<String>,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub diff_revision: u64,
+    #[serde(default)]
+    pub diff_in_flight: bool,
+    #[serde(default)]
+    pub status_revision: u64,
+    #[serde(default)]
+    pub status_identity_epoch: u64,
+    #[serde(default)]
+    pub status_reverify_pending: bool,
+    #[serde(default)]
+    pub cwd_identity_epoch: u64,
+    #[serde(default)]
+    pub last_diff_error_revision: u64,
+    #[serde(default)]
+    pub last_diff_error_status_revision: u64,
     pub raw_diff: String,
     pub diff_files: Vec<DiffFileView>,
 }
@@ -1571,6 +1815,90 @@ pub fn project_git_review(
     raw_diff: &str,
     status: Option<GitStatusSnapshot>,
 ) -> GitReviewView {
+    project_git_review_for_mode_with_meta(
+        rev, host_id, cwd, path, raw_diff, status, false, 0, false, 0, 0, false, 0, 0, 0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn project_git_review_for_mode(
+    rev: u64,
+    host_id: &str,
+    cwd: &str,
+    path: Option<&str>,
+    raw_diff: &str,
+    status: Option<GitStatusSnapshot>,
+    staged: bool,
+    diff_revision: u64,
+) -> GitReviewView {
+    project_git_review_for_mode_with_meta(
+        rev,
+        host_id,
+        cwd,
+        path,
+        raw_diff,
+        status,
+        staged,
+        diff_revision,
+        false,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn project_git_review_for_mode_with_in_flight(
+    rev: u64,
+    host_id: &str,
+    cwd: &str,
+    path: Option<&str>,
+    raw_diff: &str,
+    status: Option<GitStatusSnapshot>,
+    staged: bool,
+    diff_revision: u64,
+    diff_in_flight: bool,
+) -> GitReviewView {
+    project_git_review_for_mode_with_meta(
+        rev,
+        host_id,
+        cwd,
+        path,
+        raw_diff,
+        status,
+        staged,
+        diff_revision,
+        diff_in_flight,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn project_git_review_for_mode_with_meta(
+    rev: u64,
+    host_id: &str,
+    cwd: &str,
+    path: Option<&str>,
+    raw_diff: &str,
+    status: Option<GitStatusSnapshot>,
+    staged: bool,
+    diff_revision: u64,
+    diff_in_flight: bool,
+    status_revision: u64,
+    status_identity_epoch: u64,
+    status_reverify_pending: bool,
+    cwd_identity_epoch: u64,
+    last_diff_error_revision: u64,
+    last_diff_error_status_revision: u64,
+) -> GitReviewView {
     let diff_files = crate::render::parse_unified_diff(raw_diff);
     let capped_raw_diff = truncate_utf8_prefix(raw_diff, 32_768);
     GitReviewView {
@@ -1579,6 +1907,15 @@ pub fn project_git_review(
         cwd: cwd.to_string(),
         status,
         selected_path: path.map(ToOwned::to_owned),
+        staged,
+        diff_revision,
+        diff_in_flight,
+        status_revision,
+        status_identity_epoch,
+        status_reverify_pending,
+        cwd_identity_epoch,
+        last_diff_error_revision,
+        last_diff_error_status_revision,
         raw_diff: capped_raw_diff,
         diff_files,
     }

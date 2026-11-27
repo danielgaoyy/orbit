@@ -11171,6 +11171,8 @@ data class FfiGitReview (
     , 
     var `selectedPath`: kotlin.String?
     , 
+    var `statusReverifyPending`: kotlin.Boolean
+    , 
     var `rawDiff`: kotlin.String
     , 
     var `changedFiles`: List<FfiGitFileEntry>
@@ -11201,6 +11203,7 @@ public object FfiConverterTypeFfiGitReview: FfiConverterRustBuffer<FfiGitReview>
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterSequenceTypeFfiGitFileEntry.read(buf),
             FfiConverterSequenceTypeFfiDiffFile.read(buf),
@@ -11217,6 +11220,7 @@ public object FfiConverterTypeFfiGitReview: FfiConverterRustBuffer<FfiGitReview>
             FfiConverterUInt.allocationSize(value.`ahead`) +
             FfiConverterUInt.allocationSize(value.`behind`) +
             FfiConverterOptionalString.allocationSize(value.`selectedPath`) +
+            FfiConverterBoolean.allocationSize(value.`statusReverifyPending`) +
             FfiConverterString.allocationSize(value.`rawDiff`) +
             FfiConverterSequenceTypeFfiGitFileEntry.allocationSize(value.`changedFiles`) +
             FfiConverterSequenceTypeFfiDiffFile.allocationSize(value.`diffFiles`)
@@ -11232,6 +11236,7 @@ public object FfiConverterTypeFfiGitReview: FfiConverterRustBuffer<FfiGitReview>
             FfiConverterUInt.write(value.`ahead`, buf)
             FfiConverterUInt.write(value.`behind`, buf)
             FfiConverterOptionalString.write(value.`selectedPath`, buf)
+            FfiConverterBoolean.write(value.`statusReverifyPending`, buf)
             FfiConverterString.write(value.`rawDiff`, buf)
             FfiConverterSequenceTypeFfiGitFileEntry.write(value.`changedFiles`, buf)
             FfiConverterSequenceTypeFfiDiffFile.write(value.`diffFiles`, buf)

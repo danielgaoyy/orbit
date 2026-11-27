@@ -1,5 +1,6 @@
 import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { OrbitShellStore } from '../../model/stores/OrbitShellStore';
 import {
   OrbitSubagentAvatarAsset,
   resolveOrbitSubagentAvatar
@@ -29,6 +30,7 @@ export struct OrbitSubagentAvatar {
 
   @Local private breathOn: boolean = false;
   @Local private store: OrbitHarmonyStore = orbitRuntime();
+  @Local private shellStore: OrbitShellStore = orbitRuntime().shellStore;
   private breathTimerId: number = -1;
 
   aboutToAppear(): void {
@@ -39,7 +41,7 @@ export struct OrbitSubagentAvatar {
     this.stopBreathTimer();
   }
 
-  @Monitor('status', 'store.reducedMotion')
+  @Monitor('status', 'shellStore.reducedMotion')
   onMotionStateChanged(_mon: IMonitor): void {
     this.syncBreathTimer();
   }
@@ -49,7 +51,7 @@ export struct OrbitSubagentAvatar {
   }
 
   private shouldAnimate(): boolean {
-    return this.isActiveStatus() && !this.store.reducedMotion;
+    return this.isActiveStatus() && !this.shellStore.reducedMotion;
   }
 
   private syncBreathTimer(): void {

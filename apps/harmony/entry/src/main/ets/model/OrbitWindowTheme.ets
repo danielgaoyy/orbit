@@ -1,5 +1,6 @@
 import { ConfigurationConstant, common } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { DARK_PALETTE, LIGHT_PALETTE } from '../theme/OrbitTokens';
 import { orbitLogWarn } from './OrbitLogger';
 
@@ -54,6 +55,14 @@ export function orbitApplySystemBarTheme(isDark: boolean): void {
   }
 
   if (boundMainWindow === null) {
+    return;
+  }
+
+  // `setWindowSystemBarProperties` is unavailable on 2in1 free-window devices; guard explicitly.
+  if (
+    deviceInfo.deviceType === '2in1' ||
+    !canIUse('SystemCapability.WindowManager.WindowManager.Core')
+  ) {
     return;
   }
 

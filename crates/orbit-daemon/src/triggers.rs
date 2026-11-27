@@ -830,11 +830,10 @@ pub(crate) async fn authorize_trigger_cwd(
     store: &Arc<OrbitStore>,
     raw_cwd: &str,
 ) -> Result<String, String> {
-    let trimmed = raw_cwd.trim();
-    if trimmed.is_empty() || trimmed == "~" {
+    if raw_cwd.trim().is_empty() || raw_cwd == "~" {
         return Err("SpawnWorkspaceAgent requires a registered project workspace path".to_string());
     }
-    let expanded = crate::expand_host_path(trimmed);
+    let expanded = crate::expand_host_path(raw_cwd);
     if expanded
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))

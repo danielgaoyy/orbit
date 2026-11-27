@@ -5040,6 +5040,7 @@ pub struct FfiGitReview {
     pub ahead: u32,
     pub behind: u32,
     pub selected_path: Option<String>,
+    pub status_reverify_pending: bool,
     pub raw_diff: String,
     pub changed_files: Vec<FfiGitFileEntry>,
     pub diff_files: Vec<FfiDiffFile>,
@@ -5076,6 +5077,7 @@ impl From<GitReviewView> for FfiGitReview {
             ahead,
             behind,
             selected_path: v.selected_path,
+            status_reverify_pending: v.status_reverify_pending,
             raw_diff: v.raw_diff,
             changed_files,
             diff_files: v.diff_files.into_iter().map(Into::into).collect(),
@@ -7574,5 +7576,60 @@ mod tests {
         core.unregister_push_token("android_fcm".into())
             .expect("unregister push token");
         assert!(!core.push_registration_status().token_registered);
+    }
+
+    #[test]
+    fn ffi_git_review_projects_status_reverify_pending_true_and_false() {
+        let make_view = |status_reverify_pending: bool| GitReviewView {
+            revision: 7,
+            host_id: "host_1".into(),
+            cwd: "/tmp/repo".into(),
+            status: Some(orbit_protocol::GitStatusSnapshot {
+                cwd: "/tmp/repo".into(),
+                is_git_repo: true,
+                branch: Some("main".into()),
+                upstream: Some("origin/main".into()),
+                ahead: 1,
+                behind: 0,
+                files: vec![orbit_protocol::GitFileEntry {
+                    path: "f".into(),
+                    status: "M".into(),
+                    staged: false,
+                    untracked: false,
+                }],
+                nested_git_repos: Vec::new(),
+                repo_prefix: Some(String::new()),
+                repo_root: Some("/private/tmp/repo".into()),
+            }),
+            selected_path: Some("f".into()),
+            staged: false,
+            diff_revision: 2,
+            diff_in_flight: true,
+            status_revision: 3,
+            status_identity_epoch: 0,
+            status_reverify_pending,
+            cwd_identity_epoch: 0,
+            last_diff_error_revision: 0,
+            last_diff_error_status_revision: 0,
+            raw_diff: "diff --git a/f b/f\n+edited-after-stage\n".into(),
+            diff_files: Vec::new(),
+        };
+
+        let pending = FfiGitReview::from(make_view(true));
+        assert!(pending.status_reverify_pending);
+        assert_eq!(pending.selected_path.as_deref(), Some("f"));
+        assert!(pending.raw_diff.contains("+edited-after-stage"));
+        assert_eq!(pending.changed_files.len(), 1);
+        assert!(pending.is_git_repo);
+
+        let settled = FfiGitReview::from(make_view(false));
+        assert!(!settled.status_reverify_pending);
+        assert_eq!(settled.selected_path.as_deref(), Some("f"));
+        assert!(settled.raw_diff.contains("+edited-after-stage"));
+
+        // Default cold `OrbitMobileCore::git_review` path reports `status_reverify_pending = false`.
+        let core = OrbitMobileCore::open_in_memory().expect("open in-memory");
+        let cold = core.git_review("host_1".into(), "/tmp/repo".into(), Some("f".into()));
+        assert!(!cold.status_reverify_pending);
     }
 }

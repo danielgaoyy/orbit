@@ -4239,12 +4239,24 @@ async fn handle_wire_rpc(
             tokio::spawn(async move {
                 let resolved = expand_host_path(&cwd);
                 let reply = match compute_git_diff(&resolved, path.as_deref(), staged).await {
-                    Ok(unified_diff) => WireMessage::GitDiffResponse {
-                        request_id,
-                        cwd,
-                        path,
-                        unified_diff,
-                    },
+                    Ok(unified_diff) => {
+                        let (repo_root, repo_prefix) =
+                            match crate::git::resolve_git_scope(&resolved).await {
+                                Some((canon_root, subdir_scope)) => (
+                                    Some(canon_root.to_string_lossy().into_owned()),
+                                    Some(subdir_scope.unwrap_or_default()),
+                                ),
+                                None => (None, None),
+                            };
+                        WireMessage::GitDiffResponse {
+                            request_id,
+                            cwd,
+                            path,
+                            unified_diff,
+                            repo_root,
+                            repo_prefix,
+                        }
+                    }
                     Err(e) => rpc_err(request_id, "git_diff_error", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
@@ -4413,8 +4425,9 @@ async fn handle_wire_rpc(
                     Ok(repo_root) => {
                         match crate::git_write::commit_changes(&repo_root, &message, amend).await {
                             Ok(commit_res) => {
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4456,8 +4469,9 @@ async fn handle_wire_rpc(
                         .await
                         {
                             Ok(push_res) => {
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4499,8 +4513,9 @@ async fn handle_wire_rpc(
                         .await
                         {
                             Ok(pr_res) => {
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4561,8 +4576,9 @@ async fn handle_wire_rpc(
                         {
                             Ok(res) => {
                                 symbol_index.invalidate(&repo_root);
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4602,8 +4618,9 @@ async fn handle_wire_rpc(
                         {
                             Ok(res) => {
                                 symbol_index.invalidate(&repo_root);
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4643,8 +4660,9 @@ async fn handle_wire_rpc(
                         {
                             Ok(res) => {
                                 symbol_index.invalidate(&repo_root);
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4682,8 +4700,9 @@ async fn handle_wire_rpc(
                         .await
                         {
                             Ok(res) => {
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4737,8 +4756,9 @@ async fn handle_wire_rpc(
                         match crate::git_collab::git_rebase_start(&repo_root, &onto_ref).await {
                             Ok(res) => {
                                 symbol_index.invalidate(&repo_root);
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -4767,8 +4787,9 @@ async fn handle_wire_rpc(
                     {
                         Ok(res) => {
                             symbol_index.invalidate(&repo_root);
-                            let mut status = inspect_git_status(&repo_root).await;
-                            status.cwd = cwd.clone();
+                            let status =
+                                inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                    .await;
                             WireMessage::GitMutationResult {
                                 request_id,
                                 cwd,
@@ -4795,8 +4816,9 @@ async fn handle_wire_rpc(
                     Ok(repo_root) => match crate::git_collab::git_rebase_abort(&repo_root).await {
                         Ok(res) => {
                             symbol_index.invalidate(&repo_root);
-                            let mut status = inspect_git_status(&repo_root).await;
-                            status.cwd = cwd.clone();
+                            let status =
+                                inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                    .await;
                             WireMessage::GitMutationResult {
                                 request_id,
                                 cwd,
@@ -4828,8 +4850,9 @@ async fn handle_wire_rpc(
                         match crate::git_collab::git_rebase_skip(&repo_root, expected_step).await {
                             Ok(res) => {
                                 symbol_index.invalidate(&repo_root);
-                                let mut status = inspect_git_status(&repo_root).await;
-                                status.cwd = cwd.clone();
+                                let status =
+                                    inspect_git_status_for_request_cwd(&resolved, &repo_root, &cwd)
+                                        .await;
                                 WireMessage::GitMutationResult {
                                     request_id,
                                     cwd,
@@ -11003,8 +11026,7 @@ async fn authorize_optional_skills_cwd(
     let Some(raw) = cwd else {
         return Ok(None);
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "~" {
+    if raw.trim().is_empty() || raw == "~" {
         return Ok(None);
     }
     let expanded = expand_host_path(&raw);
@@ -11022,8 +11044,7 @@ async fn authorize_path_rules_cwd(
     store: &Arc<OrbitStore>,
     raw_cwd: &str,
 ) -> Result<Option<PathBuf>, String> {
-    let trimmed = raw_cwd.trim();
-    if trimmed.is_empty() || trimmed == "~" {
+    if raw_cwd.trim().is_empty() || raw_cwd == "~" {
         return Ok(None);
     }
     let resolved = expand_host_path(raw_cwd);
@@ -11144,10 +11165,7 @@ async fn authorize_optional_hooks_cwd(
     store: &Arc<OrbitStore>,
     cwd: Option<String>,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(raw) = cwd.as_deref().filter(|s| {
-        let t = s.trim();
-        !t.is_empty() && t != "~"
-    }) else {
+    let Some(raw) = cwd.as_deref().filter(|s| !s.trim().is_empty() && *s != "~") else {
         return Ok(None);
     };
     let expanded = expand_host_path(raw);
@@ -11240,6 +11258,75 @@ async fn authorize_git_repo_root_mutation(
     Ok(repo_root)
 }
 
+/// Derive a normalized repo-root-relative subdirectory prefix for a requested `cwd` that may have
+/// been removed by a repository-level mutation (e.g. stash/rebase removing a branch-only subdir),
+/// canonicalizing the nearest existing ancestor so symlinked roots (e.g. `/var` -> `/private/var`)
+/// resolve accurately. Returns `None` if a clean non-escaping relative prefix cannot be proved.
+async fn derive_relative_subdir_prefix(
+    requested_resolved: &Path,
+    repo_root: &Path,
+) -> Option<String> {
+    let canon_root = crate::platform::canonicalize_clean_async(repo_root)
+        .await
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = requested_resolved.to_path_buf();
+    loop {
+        if tokio::fs::metadata(&cursor).await.is_ok() {
+            let mut rebuilt = crate::platform::canonicalize_clean_async(&cursor)
+                .await
+                .unwrap_or(cursor);
+            for part in missing_tail.into_iter().rev() {
+                rebuilt.push(part);
+            }
+            let rel = rebuilt.strip_prefix(&canon_root).ok()?;
+            let mut parts: Vec<String> = Vec::new();
+            for comp in rel.components() {
+                match comp {
+                    std::path::Component::Normal(os) => {
+                        parts.push(os.to_string_lossy().into_owned());
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => return None,
+                }
+            }
+            return Some(parts.join("/"));
+        }
+        let name = cursor.file_name()?.to_os_string();
+        missing_tail.push(name);
+        if !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+/// Inspect Git status consistently with the caller's requested `cwd` (`requested_resolved` /
+/// `raw_cwd`) after repository-level mutations (Commit, Push, Create PR, Stash, Rebase) so
+/// `status.cwd` and `status.repo_prefix` always align (`R17-P1-1`).
+///
+/// Inspects `requested_resolved` directly when it still exists as a directory; falls back to
+/// `fallback_repo_root` only if the mutation removed `requested_resolved`, while deriving the exact
+/// relative `repo_prefix` (or `None` if unmappable — never misreporting `Some("")` for a subdir).
+async fn inspect_git_status_for_request_cwd(
+    requested_resolved: &Path,
+    fallback_repo_root: &Path,
+    raw_cwd: &str,
+) -> orbit_protocol::GitStatusSnapshot {
+    let mut status = if tokio::fs::metadata(requested_resolved)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        inspect_git_status(requested_resolved).await
+    } else {
+        let mut fallback = inspect_git_status(fallback_repo_root).await;
+        fallback.repo_prefix =
+            derive_relative_subdir_prefix(requested_resolved, fallback_repo_root).await;
+        fallback
+    };
+    status.cwd = raw_cwd.to_string();
+    status
+}
+
 #[cfg(test)]
 mod self_upgrade_tests {
     use super::*;
@@ -11299,6 +11386,116 @@ mod self_upgrade_tests {
             .expect("repo root authorization should pass once repo root is registered");
         let canon_repo = crate::platform::canonicalize_clean(&repo).expect("canon repo");
         assert_eq!(auth_root, canon_repo);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trailing_space_repo_cwd_expands_authorizes_diffs_and_stages_in_isolation() {
+        let root = std::env::temp_dir().join(format!("orbit_spaced_repo_{}", Uuid::new_v4()));
+        let plain_repo = root.join("repo");
+        let spaced_repo = root.join("repo ");
+        std::fs::create_dir_all(&plain_repo).expect("mkdir plain_repo");
+        std::fs::create_dir_all(&spaced_repo).expect("mkdir spaced_repo");
+
+        let init_repo = |dir: &Path, worktree_body: &str| {
+            let run = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .expect("run git");
+                assert!(
+                    out.status.success(),
+                    "git {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            run(&["init", "-b", "main"]);
+            run(&["config", "user.email", "test@orbit.local"]);
+            run(&["config", "user.name", "Orbit Test"]);
+            std::fs::write(dir.join("f"), "base\n").expect("write base");
+            run(&["add", "--", "f"]);
+            run(&["commit", "-m", "init"]);
+            std::fs::write(dir.join("f"), "index-only\n").expect("write index-only");
+            run(&["add", "--", "f"]);
+            std::fs::write(dir.join("f"), worktree_body).expect("write worktree");
+        };
+
+        init_repo(&plain_repo, "worktree-only\n");
+        init_repo(&spaced_repo, "SPACED-PROJECT\n");
+
+        let plain_str = plain_repo.to_string_lossy().to_string();
+        let spaced_str = spaced_repo.to_string_lossy().to_string();
+        assert_eq!(expand_host_path(&spaced_str), spaced_repo);
+        assert_ne!(expand_host_path(&spaced_str), plain_repo);
+
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "plain_repo".into(),
+                name: "Plain Repo".into(),
+                directories: vec![plain_str.clone()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert plain_repo");
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "spaced_repo".into(),
+                name: "Spaced Repo".into(),
+                directories: vec![spaced_str.clone()],
+                sort_order: 1,
+                hidden: false,
+                updated_at_ms: 2,
+            })
+            .expect("upsert spaced_repo");
+
+        let resolved_spaced = expand_host_path(&spaced_str);
+        let auth_spaced = authorize_workspace_mutation_cwd(&store, &resolved_spaced)
+            .await
+            .expect("spaced repo must authorize cleanly");
+        let canon_plain = crate::platform::canonicalize_clean(&plain_repo).expect("canon plain");
+        let canon_spaced = crate::platform::canonicalize_clean(&spaced_repo).expect("canon spaced");
+        assert_eq!(auth_spaced, canon_spaced);
+        assert_ne!(auth_spaced, canon_plain);
+
+        // Diff on `repo ` must return `+SPACED-PROJECT`, NOT `+worktree-only`!
+        let spaced_diff = crate::git::compute_git_diff(&auth_spaced, Some("f"), false)
+            .await
+            .expect("diff on spaced repo");
+        assert!(
+            spaced_diff.contains("+SPACED-PROJECT"),
+            "expected +SPACED-PROJECT from repo , got: {spaced_diff}"
+        );
+        assert!(!spaced_diff.contains("+worktree-only"));
+
+        // Staging `f` inside `repo ` must update ONLY `repo ` index (`:f == SPACED-PROJECT`) and
+        // leave sibling `repo` index untouched (`:f == index-only`)!
+        crate::git_write::stage_files(&auth_spaced, &["f".to_string()], false)
+            .await
+            .expect("stage f inside repo ");
+
+        let show_index = |dir: &Path| -> String {
+            let out = std::process::Command::new("git")
+                .args(["show", ":f"])
+                .current_dir(dir)
+                .output()
+                .expect("git show :f");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(show_index(&spaced_repo), "SPACED-PROJECT\n");
+        assert_eq!(show_index(&plain_repo), "index-only\n");
+
+        // Also verify repo-root authorization (`commit`/`push`/`PR`) works on `repo `.
+        let auth_root_spaced = authorize_git_repo_root_mutation(&store, &resolved_spaced)
+            .await
+            .expect("repo-root auth must preserve trailing space from --show-toplevel");
+        assert_eq!(auth_root_spaced, canon_spaced);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -13112,6 +13309,119 @@ mod self_upgrade_tests {
             )
             .is_none()
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn repo_level_commit_from_subdir_preserves_matching_status_cwd_and_repo_prefix() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit-daemon-subdir-commit-{}",
+            Uuid::new_v4().simple()
+        ));
+        let repo_dir = tmp.join("repo");
+        let pkg_dir = repo_dir.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg");
+
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        std::fs::write(repo_dir.join("f"), "base-f\n").expect("write f");
+        std::fs::write(pkg_dir.join("g"), "base-g\n").expect("write pkg/g");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
+
+        // Stage change to root `f`, leave unstaged working-tree edit in `pkg/g`.
+        std::fs::write(repo_dir.join("f"), "base-f\n+staged-f\n").expect("update f");
+        run_git(&["add", "f"]);
+        std::fs::write(pkg_dir.join("g"), "base-g\n+g-working\n").expect("update pkg/g");
+
+        // Register repo in an isolated OrbitStore and run the exact repo-level Commit path
+        // (`authorize_git_repo_root_mutation` -> `commit_changes` -> `inspect_git_status_for_request_cwd`).
+        let db_path = tmp.join("orbit.db");
+        let store = Arc::new(OrbitStore::open(&db_path).expect("open store"));
+        let now = chrono::Utc::now();
+        store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_subdir_commit".into(),
+                title: "Subdir Commit Test".into(),
+                cwd: repo_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                is_curated: false,
+                auto_clustered: false,
+            })
+            .expect("register workspace");
+
+        let pkg_raw_cwd = pkg_dir.to_string_lossy().to_string();
+        let resolved_pkg = expand_host_path(&pkg_raw_cwd);
+        let repo_root = authorize_git_repo_root_mutation(&store, &resolved_pkg)
+            .await
+            .expect("authorize subdir commit");
+        let commit_res = crate::git_write::commit_changes(&repo_root, "commit f from pkg", false)
+            .await
+            .expect("commit changes");
+        assert!(!commit_res.commit_sha.is_empty());
+
+        let status =
+            inspect_git_status_for_request_cwd(&resolved_pkg, &repo_root, &pkg_raw_cwd).await;
+        assert_eq!(status.cwd, pkg_raw_cwd);
+        assert_eq!(
+            status.repo_prefix.as_deref(),
+            Some("pkg"),
+            "R17-P1-1: subdir repo-level Commit receipt MUST carry repo_prefix=Some(\"pkg\"), not Some(\"\")"
+        );
+        assert!(
+            status.files.iter().any(|e| e.path == "pkg/g" && !e.staged),
+            "pkg/g unstaged modification must remain in post-commit status: {:?}",
+            status.files
+        );
+        assert!(
+            !status.files.iter().any(|e| e.path == "f"),
+            "committed file f must no longer appear in post-commit status: {:?}",
+            status.files
+        );
+
+        // Root request yields repo_prefix == Some("").
+        let root_raw_cwd = repo_dir.to_string_lossy().to_string();
+        let root_status =
+            inspect_git_status_for_request_cwd(&repo_dir, &repo_root, &root_raw_cwd).await;
+        assert_eq!(root_status.cwd, root_raw_cwd);
+        assert_eq!(root_status.repo_prefix.as_deref(), Some(""));
+
+        // Fallback when requested subdirectory was deleted by a repo-level mutation (e.g. stash/rebase)
+        // MUST derive its exact subdir prefix rather than falsely reporting `Some("")`.
+        let deleted_sub = repo_dir.join("removed_sub");
+        let deleted_raw_cwd = deleted_sub.to_string_lossy().to_string();
+        let fallback_status =
+            inspect_git_status_for_request_cwd(&deleted_sub, &repo_root, &deleted_raw_cwd).await;
+        assert_eq!(fallback_status.cwd, deleted_raw_cwd);
+        assert_eq!(fallback_status.repo_prefix.as_deref(), Some("removed_sub"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -284,9 +284,8 @@ pub(crate) async fn resolve_git_repo_context(cwd: &Path) -> Result<GitRepoContex
             canon_cwd.display()
         )));
     }
-    let raw_root = String::from_utf8_lossy(&top_out.stdout)
-        .trim_end_matches(['\r', '\n'])
-        .to_string();
+    let top_stdout = String::from_utf8_lossy(&top_out.stdout);
+    let raw_root = crate::git::strip_single_line_ending(&top_stdout).to_string();
     if raw_root.is_empty() {
         return Err(GitWriteError::NotAGitRepo(
             "unable to determine git repository root".to_string(),
@@ -955,7 +954,8 @@ pub async fn stage_files(
     }
 
     let validated = validate_path_list(&ctx, paths)?;
-    let mut args: Vec<&str> = Vec::with_capacity(validated.len() + 3);
+    let mut args: Vec<&str> = Vec::with_capacity(validated.len() + 4);
+    args.push("--literal-pathspecs");
     args.push("add");
     args.push("-A");
     args.push("--");
@@ -977,8 +977,69 @@ pub async fn stage_files(
     })
 }
 
+/// Query currently staged renames (`R*` ONLY — never copies `C*` or ordinary entries) in the
+/// repository index via `git --literal-pathspecs diff --cached --name-status -z`, respecting the
+/// repository's actual `diff.renames` configuration (never forcing `-M`, R16-P1-3) and returning
+/// a map from destination path (`new_path`) to source path (`orig_path`) relative to `repo_root`.
+/// Propagates command failure instead of silently assuming no renames exist (R16-P1-4).
+async fn collect_staged_rename_sources(
+    repo_root: &Path,
+) -> Result<std::collections::HashMap<String, String>, GitWriteError> {
+    let out = run_git_output(
+        repo_root,
+        &[
+            "--literal-pathspecs",
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+        ],
+        LOCAL_GIT_TIMEOUT,
+        "diff --cached --name-status -z",
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(GitWriteError::GitFailed {
+            command: "diff --cached --name-status -z".to_string(),
+            stderr: format_process_failure(&out),
+        });
+    }
+
+    let mut renames = std::collections::HashMap::new();
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let mut idx = 0usize;
+    while idx < fields.len() {
+        let status_bytes = fields[idx];
+        idx += 1;
+        if status_bytes.is_empty() {
+            continue;
+        }
+        let status = String::from_utf8_lossy(status_bytes);
+        if status.starts_with('R') {
+            if let (Some(orig_bytes), Some(new_bytes)) = (fields.get(idx), fields.get(idx + 1)) {
+                let orig_path = String::from_utf8_lossy(orig_bytes).into_owned();
+                let new_path = String::from_utf8_lossy(new_bytes).into_owned();
+                if !orig_path.is_empty() && !new_path.is_empty() {
+                    renames.insert(new_path, orig_path);
+                }
+            }
+            idx = idx.saturating_add(2);
+        } else if status.starts_with('C') {
+            // Copies (`C*`) carry 2 path fields (`orig_path\0new_path\0`), and unstaging a copy
+            // MUST NOT reset or touch its source file!
+            idx = idx.saturating_add(2);
+        } else {
+            // Ordinary entries (`A`, `M`, `D`, `T`, `U`, ...) carry 1 path field.
+            idx = idx.saturating_add(1);
+        }
+    }
+    Ok(renames)
+}
+
 /// Unstage specific files or all staged files (`all = true`), supporting both normal repos and
 /// freshly initialized repositories with an unborn `HEAD`, always with `GIT_LITERAL_PATHSPECS=1`.
+/// When unstaging a staged rename (`R*`), automatically resets both the destination and source
+/// paths in one atomic `git reset HEAD` call so no orphan staged deletion (`D <orig>`) remains.
 pub async fn unstage_files(
     cwd: &Path,
     paths: &[String],
@@ -991,7 +1052,7 @@ pub async fn unstage_files(
         let out = if has_head {
             run_git_output(
                 &ctx.cwd,
-                &["reset", "-q", "HEAD", "--", "."],
+                &["--literal-pathspecs", "reset", "-q", "HEAD", "--", "."],
                 LOCAL_GIT_TIMEOUT,
                 "reset HEAD",
             )
@@ -999,7 +1060,16 @@ pub async fn unstage_files(
         } else {
             run_git_output(
                 &ctx.cwd,
-                &["rm", "--cached", "-q", "-r", "--ignore-unmatch", "--", "."],
+                &[
+                    "--literal-pathspecs",
+                    "rm",
+                    "--cached",
+                    "-q",
+                    "-r",
+                    "--ignore-unmatch",
+                    "--",
+                    ".",
+                ],
                 LOCAL_GIT_TIMEOUT,
                 "rm --cached",
             )
@@ -1029,17 +1099,49 @@ pub async fn unstage_files(
     }
 
     let validated = validate_path_list(&ctx, paths)?;
+    let mut reset_paths = validated.clone();
+    if has_head {
+        let staged_renames = collect_staged_rename_sources(&ctx.repo_root).await?;
+        if !staged_renames.is_empty() {
+            let mut seen: HashSet<String> = reset_paths.iter().cloned().collect();
+            for p in &validated {
+                if let Some(orig) = staged_renames.get(p) {
+                    // R16-P1-4: Atomically validate the full rename pair BEFORE mutating the
+                    // index. If the rename source lies outside the authorized `cwd` subdirectory,
+                    // abort with an explicit error so the index retains the intact `R*` entry
+                    // rather than leaving an orphan staged `D <orig>`.
+                    let valid_orig = validate_git_rel_path(&ctx, orig).map_err(|reason| {
+                        GitWriteError::InvalidInput(format!(
+                            "cannot atomically unstage rename `{orig}` -> `{p}` because source path is outside current workspace directory: {reason}"
+                        ))
+                    })?;
+                    if seen.insert(valid_orig.clone()) {
+                        reset_paths.push(valid_orig);
+                    }
+                }
+            }
+        }
+    }
+
     let (label, args): (&str, Vec<&str>) = if has_head {
-        let mut a = Vec::with_capacity(validated.len() + 4);
-        a.extend(["reset", "-q", "HEAD", "--"]);
-        for p in &validated {
+        let mut a = Vec::with_capacity(reset_paths.len() + 5);
+        a.extend(["--literal-pathspecs", "reset", "-q", "HEAD", "--"]);
+        for p in &reset_paths {
             a.push(p.as_str());
         }
         ("reset HEAD", a)
     } else {
-        let mut a = Vec::with_capacity(validated.len() + 6);
-        a.extend(["rm", "--cached", "-q", "-r", "--ignore-unmatch", "--"]);
-        for p in &validated {
+        let mut a = Vec::with_capacity(reset_paths.len() + 7);
+        a.extend([
+            "--literal-pathspecs",
+            "rm",
+            "--cached",
+            "-q",
+            "-r",
+            "--ignore-unmatch",
+            "--",
+        ]);
+        for p in &reset_paths {
             a.push(p.as_str());
         }
         ("rm --cached", a)
@@ -1054,7 +1156,7 @@ pub async fn unstage_files(
     }
 
     Ok(GitMutationOutcome::FilesUnstaged {
-        paths: validated,
+        paths: reset_paths,
         all: false,
     })
 }

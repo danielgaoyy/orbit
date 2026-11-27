@@ -100,12 +100,23 @@ import {
   WorkspaceDto,
   WorkspaceEventRecordDto,
   WorkspaceFileViewDto,
+  WorkspaceFileWriteResultDto,
   WriteWorkspaceFileRequestDto,
   basenameOfPath,
   cwdPathsEquivalent,
   formatEffortLabel,
   formatModeLabel,
-  normalizeModeSlug
+  gitStatusMayHaveDiffForSlot,
+  isSubagentSettledStatus,
+  isWorkspaceFileEditable,
+  nonBlankPath,
+  normalizeAbsoluteCwd,
+  normalizeModeSlug,
+  normalizeWorkspaceRelPath,
+  parseProviderSubagentTimelineJson,
+  resolveSubagentActualHostId,
+  resolveSubagentDirectParentAgentId,
+  resolveSubagentDirectParentHostId
 } from './OrbitTypes';
 import {
   LIGHT_PALETTE,
@@ -149,6 +160,27 @@ import {
   OrbitComposerStore,
   OrbitComposerToastSink
 } from './stores/OrbitComposerStore';
+import {
+  OrbitAgentParentEdge,
+  OrbitAgentParentLookup,
+  OrbitOpenSidePanelTabOptions,
+  OrbitSidePanelKind,
+  OrbitSidePanelStore,
+  OrbitSidePanelTab,
+  OrbitSidePanelVisibilityListener,
+  canonicalCwdToolTabId,
+  canonicalFileTabId,
+  canonicalManagedSubagentTabId,
+  canonicalPeerTabId,
+  canonicalProviderSubagentTabId,
+  canonicalSideQuestionTabId,
+  encodeSidePanelKeyTuple
+} from './stores/OrbitSidePanelStore';
+import {
+  OrbitBreakpoint,
+  OrbitModalRoute,
+  OrbitShellStore
+} from './stores/OrbitShellStore';
 import {
   DeepLinkAgentValidation,
   parseOrbitOpenDeepLink,
@@ -228,6 +260,175 @@ interface SideQuestionEnvelopeDto {
   error?: string | null;
 }
 
+export interface OrbitScopedBoardData {
+  workspace: WorkspaceDto | null;
+  workspaceId: string;
+  workspaceVerified: boolean;
+  snapshotLoaded: boolean;
+  content: string;
+  revision: number;
+  updatedBy: string;
+  boardPath: string;
+  peers: AgentCardDto[];
+  events: WorkspaceEventRecordDto[];
+}
+
+export interface OrbitScopedAutomationsData {
+  schedules: ScheduleSpecDto[];
+  timers: ConditionalTimerRecordDto[];
+  goals: GoalRunRecordDto[];
+  monitors: MonitorWatchRecordDto[];
+  workflows: WorkflowRunRecordDto[];
+}
+
+export interface OrbitWorkspaceFileWriteOutcome {
+  ok: boolean;
+  conflict: boolean;
+  etag: string;
+  currentContent: string | null;
+  errorMessage: string;
+}
+
+export interface OrbitScopedGitCollabData {
+  prStatus: GitPrStatusDto | null;
+  stashes: GitStashEntryDto[];
+  conflicts: GitConflictEntryDto[];
+  rebaseStatus: GitRebaseStatusDto | null;
+}
+
+export interface OrbitScopedSideQuestionState {
+  scopeKey: string;
+  hostId: string;
+  agentId: string | null;
+  cwd: string;
+  provider: string;
+  model: string | null;
+  draft: string;
+  prompt: string;
+  answer: string;
+  error: string;
+  streaming: boolean;
+  requestId: string;
+  requestToken: number;
+  generation: number;
+}
+
+export interface OrbitSubagentBatchArchiveOutcome {
+  archivedCount: number;
+  queuedCount: number;
+  dismissedCount: number;
+  failedCount: number;
+}
+
+export interface OrbitHydratedRootResult {
+  status: 'resolved' | 'failed';
+  hostId: string;
+  rootAgentId: string;
+  unresolvedHostId: string | null;
+}
+
+export type OrbitGitDiffModeState = 'idle' | 'loading' | 'confirmed' | 'unverified';
+
+const ORBIT_MAX_GIT_DIFF_TRACKERS: number = 16;
+
+interface OrbitGitDiffModeTracker {
+  hostId: string;
+  normCwd: string;
+  rawCwd: string;
+  focusPath: string | null;
+  staged: boolean;
+  requestSeq: number;
+  modeState: OrbitGitDiffModeState;
+  baselineDiffRevision: number;
+  confirmedDiffRevision: number;
+  dirtyWhileHidden: boolean;
+  lastStatus: GitStatusSnapshotDto | null;
+  cachedSnapshot: GitReviewDto | null;
+  settleTimerId: number;
+  lastTouchedAt: number;
+  nonErrorLoadingRecoveryBudget: number;
+  lastObservedIdentityEpoch: number;
+  lastObservedStatusRevision: number;
+  lastHandledErrorRevision: number;
+  pendingErrorRecovery: boolean;
+  errorObservedStatusRevision: number;
+}
+
+class OrbitStoreParentLookupAdapter implements OrbitAgentParentLookup {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  hasCachedHostDetail(hostId: string): boolean {
+    const clean = hostId.trim();
+    return clean.length > 0 && this.owner.fleetStore.getCachedHostDetail(clean) !== null;
+  }
+
+  hasAgentCard(hostId: string, agentId: string): boolean {
+    const detail = this.owner.fleetStore.getCachedHostDetail(hostId);
+    if (detail === null) {
+      return false;
+    }
+    for (let i = 0; i < detail.agents.length; i++) {
+      if (detail.agents[i].agent_id === agentId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  getParentEdge(hostId: string, agentId: string): OrbitAgentParentEdge | null {
+    // Pure cache read (no sync N-API in lookup path); preserves cross-host `parent_host_id`.
+    const detail = this.owner.fleetStore.getCachedHostDetail(hostId);
+    if (detail === null) {
+      return null;
+    }
+    for (let i = 0; i < detail.agents.length; i++) {
+      const ag = detail.agents[i];
+      if (ag.agent_id === agentId) {
+        const archived = (
+          ag.archived_at_rfc3339 !== undefined &&
+          ag.archived_at_rfc3339 !== null &&
+          ag.archived_at_rfc3339.length > 0
+        ) || ag.status.state === 'closed';
+        const resolvedParentHost = (
+          ag.parent_host_id !== undefined &&
+          ag.parent_host_id !== null &&
+          ag.parent_host_id.trim().length > 0
+        )
+          ? ag.parent_host_id.trim()
+          : hostId;
+        return {
+          parentHostId: resolvedParentHost,
+          parentAgentId: ag.parent_agent_id,
+          archived: archived
+        };
+      }
+    }
+    return null;
+  }
+}
+
+class OrbitStoreSidePanelVisibilityAdapter implements OrbitSidePanelVisibilityListener {
+  private readonly owner: OrbitHarmonyStore;
+
+  constructor(owner: OrbitHarmonyStore) {
+    this.owner = owner;
+  }
+
+  onSidePanelVisibilityChanged(isOpen: boolean): void {
+    this.owner.shellStore.onSidePanelOpenChanged(isOpen);
+  }
+
+  onSidePanelTabClosed(_scopeKey: string, closedTab: OrbitSidePanelTab): void {
+    if (closedTab.kind === 'review') {
+      this.owner.releaseGitDiffTrackerIfUnused(closedTab.hostId, closedTab.cwd, closedTab.path);
+    }
+  }
+}
+
 class OrbitStoreEventFlushAdapter implements OrbitEventFlushHandler {
   private readonly owner: OrbitHarmonyStore;
 
@@ -240,36 +441,76 @@ class OrbitStoreEventFlushAdapter implements OrbitEventFlushHandler {
   }
 
   isStageScopeVisible(hostId: string, agentId: string): boolean {
-    return isStageScopeVisibleForEvent(
-      this.owner.isInBackgroundMode(),
-      this.owner.isNewSessionDraft,
-      this.owner.fleetStore.selectedHostId,
-      this.owner.selectedAgentId,
-      hostId,
-      agentId
-    );
+    if (hostId.length === 0 || agentId.length === 0) {
+      return false;
+    }
+    if (
+      isStageScopeVisibleForEvent(
+        this.owner.isInBackgroundMode(),
+        this.owner.isNewSessionDraft,
+        this.owner.fleetStore.selectedHostId,
+        this.owner.selectedAgentId,
+        hostId,
+        agentId
+      )
+    ) {
+      return true;
+    }
+    if (!this.owner.isInBackgroundMode() && this.owner.isSidePanelActuallyVisible()) {
+      const tab = this.owner.sidePanelStore.activeTab;
+      if (tab !== null && (tab.kind === 'subagent' || tab.kind === 'peer')) {
+        if (tab.hostId === hostId && (tab.agentId === agentId || tab.childAgentId === agentId)) {
+          return true;
+        }
+        // Provider-native subagent timelines refresh when their direct parent receives timeline updates.
+        const hasProviderId = (
+          tab.providerSubagentId !== undefined &&
+          tab.providerSubagentId !== null &&
+          tab.providerSubagentId.length > 0
+        );
+        if (hasProviderId) {
+          const directParentHost = (
+            tab.directParentHostId !== undefined &&
+            tab.directParentHostId !== null &&
+            tab.directParentHostId.length > 0
+          )
+            ? tab.directParentHostId
+            : (tab.parentHostId ?? tab.hostId);
+          const directParentAgent = (
+            tab.directParentAgentId !== undefined &&
+            tab.directParentAgentId !== null &&
+            tab.directParentAgentId.length > 0
+          )
+            ? tab.directParentAgentId
+            : (tab.parentAgentId ?? '');
+          if (directParentHost === hostId && directParentAgent === agentId) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   isGitScopeVisible(hostId: string, cwd: string): boolean {
-    if (!this.owner.showGitDiffSheet && !this.owner.showInlineDiffInspector) {
-      return false;
-    }
-    const targetHost = this.owner.resolvedDiffHostId();
-    if (targetHost !== hostId || hostId.length === 0) {
-      return false;
-    }
-    return cwd.length === 0 || cwdPathsEquivalent(cwd, this.owner.resolvedDiffCwd());
+    return (
+      this.owner.isReviewScopeVisible(hostId, cwd) ||
+      this.owner.isFilesScopeVisible(hostId, cwd)
+    );
   }
 
   isTerminalScopeVisible(hostId: string, slot: number): boolean {
-    if (!this.owner.showPtySheet || this.owner.fleetStore.selectedHostId !== hostId || hostId.length === 0) {
+    if (!this.owner.isSidePanelActuallyVisible() || hostId.length === 0) {
       return false;
     }
-    const detail = this.owner.fleetStore.currentHostDetail;
-    const activeSlot = detail !== null && detail.active_terminal_slot > 0
-      ? detail.active_terminal_slot
+    const tab = this.owner.sidePanelStore.activeTab;
+    if (tab === null || tab.kind !== 'terminal' || tab.hostId !== hostId) {
+      return false;
+    }
+    const tabSlot = (tab.terminalSlot !== undefined && tab.terminalSlot !== null && tab.terminalSlot > 0)
+      ? tab.terminalSlot
       : 1;
-    return slot === activeSlot;
+    return slot === tabSlot;
   }
 
   onFleetDirty(): void {
@@ -277,7 +518,7 @@ class OrbitStoreEventFlushAdapter implements OrbitEventFlushHandler {
   }
 
   onBriefingDirty(): void {
-    this.owner.personalAgentStore.refreshBriefing(false);
+    this.owner.handleSchedulerBriefingDirty();
   }
 
   onSelectedHostDirty(hostId: string): void {
@@ -380,11 +621,13 @@ export class OrbitHarmonyStore {
   private voiceTimerId: number = -1;
   private pendingDeepLink: string = '';
   private pendingDeepLinkEventKind: string = '';
+  private pendingDeepLinkNavSeq: number = 0;
   private pendingDeepLinkRequestId: string = '';
   private pendingDeepLinkSeq: number = 0;
   private pendingOpenHostId: string = '';
   private pendingOpenAgentId: string = '';
   private pendingOpenEventKind: string = '';
+  private pendingOpenNavSeq: number = 0;
   private pendingOpenRequestId: string = '';
   private pendingOpenSeq: number = 0;
   private pendingAgentValidationHostId: string = '';
@@ -392,6 +635,7 @@ export class OrbitHarmonyStore {
   private pendingAgentValidationEventKind: string = '';
   private pendingAgentValidationRequestId: string = '';
   private pendingAgentValidationSeq: number = 0;
+  private pendingAgentValidationNavSeq: number = 0;
   private pendingReplayHostId: string = '';
   private pendingReplayAgentId: string = '';
   private pendingReplayFramesJson: string = '';
@@ -402,19 +646,18 @@ export class OrbitHarmonyStore {
   private automationsRefreshSeq: number = 0;
   private sideQuestionGen: number = 0;
 
-  // Domain Stores (PR-1 composition root)
+  // Domain Stores (composition root)
   public readonly stageStore: OrbitStageStore = new OrbitStageStore();
   public readonly fleetStore: OrbitFleetStore = new OrbitFleetStore();
   public readonly personalAgentStore: OrbitPersonalAgentStore = new OrbitPersonalAgentStore();
   public readonly composerStore: OrbitComposerStore = new OrbitComposerStore();
+  public readonly sidePanelStore: OrbitSidePanelStore = new OrbitSidePanelStore();
+  public readonly shellStore: OrbitShellStore = new OrbitShellStore();
   public readonly eventScheduler: OrbitEventFrameScheduler;
 
   @Trace public isNewSessionDraft: boolean = false;
   @Trace public keyProtectionMode: string = 'huks_hardware';
-  @Trace public isFoldableDevice: boolean = false;
-  @Trace public foldPosture: string = 'unknown';
   @Trace public showGlobalOverview: boolean = false;
-  @Trace public reducedMotion: boolean = false;
   @Trace public showPersonalAgentSetup: boolean = false;
   @Trace public briefingViewingOpen: boolean = false;
   @Trace public showBriefingPanel: boolean = true;
@@ -425,6 +668,28 @@ export class OrbitHarmonyStore {
   @Trace public pendingFocusDecisionEventKind: string = '';
   @Trace public pendingFocusDecisionRequestId: string = '';
   @Trace public pendingFocusDecisionSeq: number = 0;
+  @Trace public panelDataRevision: number = 0;
+  @Trace public gitPanelRevision: number = 0;
+  @Trace public terminalPanelRevision: number = 0;
+  @Trace public providerSubagentRevision: number = 0;
+  @Trace public sideQuestionRevision: number = 0;
+  @Trace public automationSubmitRevision: number = 0;
+  @Trace public archivedSubagentKeys: string[] = [];
+  private readonly archivedSubagentIndex: Set<string> = new Set<string>();
+  private readonly archivedManagedMarkRevByKey: Map<string, number> = new Map<string, number>();
+  private readonly sideQuestionByScope: Map<string, OrbitScopedSideQuestionState> =
+    new Map<string, OrbitScopedSideQuestionState>();
+  private readonly activeSideQuestionScopeByToken: Map<number, string> = new Map<number, string>();
+  private sideQuestionTokenSeq: number = 0;
+  private navigationSeq: number = 0;
+  private inFlightAgentHydrationNavSeq: number = 0;
+  private readonly createdOptimisticAgentKeys: Set<string> = new Set<string>();
+  private readonly automationSubmitTokenByKey: Map<string, number> = new Map<string, number>();
+  private automationSubmitSeq: number = 0;
+  private readonly gitDiffModeTrackers: Map<string, OrbitGitDiffModeTracker> =
+    new Map<string, OrbitGitDiffModeTracker>();
+  private gitDiffTrackerClock: number = 0;
+  private readonly scopedTerminalGridByKey: Map<string, string> = new Map<string, string>();
   private draftSelectionByProvider: Map<string, DraftModelSelection> = new Map<string, DraftModelSelection>();
   private hasUserCustomizedDraftModel: boolean = false;
 
@@ -437,29 +702,10 @@ export class OrbitHarmonyStore {
   @Trace public safeLeftVp: number = 0;
   @Trace public safeRightVp: number = 0;
   @Trace public keyboardHeightVp: number = 0;
-  @Trace public windowWidthVp: number = 390;
-  @Trace public windowHeightVp: number = 844;
 
-  // Shell & Contextual Sheet Visibility
-  @Trace public sidebarOpen: boolean = false;
-  @Trace public isSidebarCollapsed: boolean = false;
-  @Trace public showInlineDiffInspector: boolean = false;
-  @Trace public showGitDiffSheet: boolean = false;
+  // Composer model popover visibility (non-sheet popup anchored to OmniComposer)
   private diffInspectorOpenedByUser: boolean = false;
-  @Trace public showPtySheet: boolean = false;
   @Trace public showModelPickerSheet: boolean = false;
-  @Trace public showContextPickerSheet: boolean = false;
-  @Trace public showHostSettingsSheet: boolean = false;
-  @Trace public showDirBrowser: boolean = false;
-  @Trace public showAutomationsSheet: boolean = false;
-  @Trace public showWorkspaceBoardSheet: boolean = false;
-  @Trace public showSideQuestionSheet: boolean = false;
-  @Trace public showArchivedSessionsSheet: boolean = false;
-  @Trace public showFileExplorerSheet: boolean = false;
-  @Trace public showGlobalSearchSheet: boolean = false;
-  @Trace public showRouterMeshSheet: boolean = false;
-  @Trace public showExportTranscriptSheet: boolean = false;
-  @Trace public showSubagentSheet: boolean = false;
   @Trace public activeSessionUsage: SessionUsageDto | null = null;
   @Trace public inspectedSubagentId: string = '';
   @Trace public inspectedSubagentTitle: string = '';
@@ -578,8 +824,29 @@ export class OrbitHarmonyStore {
     this.eventScheduler = new OrbitEventFrameScheduler(new OrbitStoreEventFlushAdapter(this));
     this.stageStore.setDeltaAppliedCallback(new OrbitStoreStageDeltaAdapter(this));
     this.composerStore.setToastSink(new OrbitStoreComposerToastAdapter(this));
+    this.sidePanelStore.bindParentLookup(new OrbitStoreParentLookupAdapter(this));
+    this.sidePanelStore.setVisibilityListener(new OrbitStoreSidePanelVisibilityAdapter(this));
     this.personalAgentStore.setBriefingAppliedCallback(new OrbitStoreBriefingAppliedAdapter(this));
     this.personalAgentStore.bindVisitStorage(new OrbitStorePaVisitStorageAdapter(this));
+  }
+
+  public isSidePanelActuallyVisible(): boolean {
+    if (!this.sidePanelStore.isOpen) {
+      return false;
+    }
+    const layout = this.shellStore.resolveLayout(true);
+    if (!layout.sidePanelInline && this.shellStore.isModalSheetPresented) {
+      return false;
+    }
+    return true;
+  }
+
+  public isHostVisibleInSidePanel(hostId: string): boolean {
+    if (!this.isSidePanelActuallyVisible() || hostId.length === 0) {
+      return false;
+    }
+    const tab = this.sidePanelStore.activeTab;
+    return tab !== null && tab.hostId === hostId;
   }
 
   public readPersistedPersonalAgentVisitMs(hostId: string, agentId: string): number {
@@ -728,19 +995,38 @@ export class OrbitHarmonyStore {
   public handleSchedulerFleetDirty(): void {
     this.reloadFleetAsync();
     this.personalAgentStore.refreshBriefing(false);
+    if (this.isSidePanelActuallyVisible()) {
+      const kind = this.sidePanelStore.activeTab?.kind;
+      if (kind === 'briefing' || kind === 'board') {
+        this.panelDataRevision += 1;
+      }
+    }
+  }
+
+  public handleSchedulerBriefingDirty(): void {
+    this.personalAgentStore.refreshBriefing(false);
+    if (this.isSidePanelActuallyVisible() && this.sidePanelStore.activeTab?.kind === 'briefing') {
+      this.panelDataRevision += 1;
+    }
   }
 
   public handleSchedulerSelectedHostDirty(hostId: string): void {
     this.reloadHostAsync(hostId);
+    if (this.isHostVisibleInSidePanel(hostId)) {
+      this.panelDataRevision += 1;
+    }
     this.reloadWorkspaceFiles();
     this.personalAgentStore.refreshBriefing(false);
   }
 
-  public handleSchedulerBackgroundHostDirty(_hostId: string): void {
-    // Strictly avoid polling full HostDetail for unselected background hosts (§3.3):
-    // refresh only zero-IO in-memory sidebar & briefing projections to drive background badges/notifications.
+  public handleSchedulerBackgroundHostDirty(hostId: string): void {
+    // Strictly avoid polling full HostDetail for unselected background hosts (§3.3),
+    // except when that host is actively visible inside the right side panel.
     this.refreshSidebarAsync();
     this.personalAgentStore.refreshBriefing(false);
+    if (hostId.length > 0 && this.isHostVisibleInSidePanel(hostId)) {
+      this.reloadHostAsync(hostId);
+    }
   }
 
   public handleSchedulerBackgroundTimelineDirty(hostId: string, agentId: string): void {
@@ -855,22 +1141,351 @@ export class OrbitHarmonyStore {
     this.stageStore.fetchIncremental(session, this.stageTailLimit()).catch((err: Object) => {
       orbitLogWarn('OrbitStore', 'Incremental stage fetch failed', err);
     });
+    if (this.isSidePanelActuallyVisible()) {
+      const tab = this.sidePanelStore.activeTab;
+      if (
+        tab !== null &&
+        tab.kind === 'subagent' &&
+        tab.providerSubagentId !== undefined &&
+        tab.providerSubagentId !== null &&
+        tab.providerSubagentId.length > 0
+      ) {
+        const directParentHost = (tab.directParentHostId !== undefined && tab.directParentHostId !== null && tab.directParentHostId.length > 0)
+          ? tab.directParentHostId
+          : (tab.parentHostId ?? tab.hostId);
+        const directParentAgent = (tab.directParentAgentId !== undefined && tab.directParentAgentId !== null && tab.directParentAgentId.length > 0)
+          ? tab.directParentAgentId
+          : (tab.parentAgentId ?? '');
+        if (directParentHost === hostId && directParentAgent === agentId) {
+          this.providerSubagentRevision += 1;
+        }
+      }
+    }
   }
 
-  public handleSchedulerVisibleGitDirty(_hostId: string, _cwd: string): void {
-    this.gitDirty = false;
-    this.reloadGitDiff(this.resolvedDiffCwd(), this.resolvedDiffHostId());
-    if (!this.isDiffTargetPinned) {
+  public isReviewScopeVisible(hostId: string, cwd: string): boolean {
+    if (!this.isSidePanelActuallyVisible() || hostId.length === 0) {
+      return false;
+    }
+    const tab = this.sidePanelStore.activeTab;
+    if (tab === null || tab.kind !== 'review' || tab.hostId !== hostId) {
+      return false;
+    }
+    const tabCwd = tab.cwd !== null ? tab.cwd : '';
+    return cwd.length === 0 || tabCwd.length === 0 || cwdPathsEquivalent(cwd, tabCwd);
+  }
+
+  public isFilesScopeVisible(hostId: string, cwd: string): boolean {
+    if (!this.isSidePanelActuallyVisible() || hostId.length === 0) {
+      return false;
+    }
+    const tab = this.sidePanelStore.activeTab;
+    if (tab === null || tab.kind !== 'files' || tab.hostId !== hostId) {
+      return false;
+    }
+    const tabCwd = tab.cwd !== null ? tab.cwd : '';
+    return cwd.length === 0 || tabCwd.length === 0 || cwdPathsEquivalent(cwd, tabCwd);
+  }
+
+  public handleSchedulerVisibleGitDirty(hostId: string, cwd: string): void {
+    const reviewVisible = this.isReviewScopeVisible(hostId, cwd);
+    const filesVisible = this.isFilesScopeVisible(hostId, cwd);
+    if (!reviewVisible && !filesVisible) {
+      this.handleSchedulerBackgroundGitDirty(hostId, cwd);
+      return;
+    }
+    if (reviewVisible) {
+      this.gitDirty = false;
+      this.onScopedGitDirtyArrived(hostId, cwd);
+      this.gitPanelRevision += 1;
+      this.panelDataRevision += 1;
+      return;
+    }
+    // R5-P1-1: Only `Files` is visible while `Review` is hidden — mark hidden Review trackers dirty
+    // with ZERO synchronous `gitReviewJson` calls, and refresh only the directory listing.
+    this.gitDirty = true;
+    this.markHiddenGitTrackersDirty(hostId, cwd);
+    this.panelDataRevision += 1;
+    if (hostId === this.selectedHostId && cwd.length > 0 && cwdPathsEquivalent(cwd, this.activeCwd)) {
       this.reloadWorkspaceFiles();
     }
   }
 
-  public handleSchedulerBackgroundGitDirty(_hostId: string, _cwd: string): void {
+  public handleSchedulerBackgroundGitDirty(hostId: string, cwd: string): void {
+    // §3.3 (R5-P1-1): Invisible Git scope marks dirty with ZERO synchronous `gitReviewJson` calls.
     this.gitDirty = true;
+    this.markHiddenGitTrackersDirty(hostId, cwd);
   }
 
-  public handleSchedulerVisibleTerminalDirty(_hostId: string, _slot: number): void {
-    this.reloadTerminal();
+  public handleSchedulerVisibleTerminalDirty(hostId: string, slot: number): void {
+    this.terminalPanelRevision += 1;
+    this.panelDataRevision += 1;
+    if (hostId === this.selectedHostId && slot === 1) {
+      this.reloadTerminal();
+    }
+  }
+
+  // Shell & Single-Modal Route Facade Accessors (delegating cleanly to OrbitShellStore & OrbitSidePanelStore)
+
+  public get windowWidthVp(): number {
+    return this.shellStore.windowWidthVp;
+  }
+
+  public set windowWidthVp(val: number) {
+    this.shellStore.windowWidthVp = val;
+  }
+
+  public get windowHeightVp(): number {
+    return this.shellStore.windowHeightVp;
+  }
+
+  public set windowHeightVp(val: number) {
+    this.shellStore.windowHeightVp = val;
+  }
+
+  public get isFoldableDevice(): boolean {
+    return this.shellStore.isFoldableDevice;
+  }
+
+  public set isFoldableDevice(val: boolean) {
+    this.shellStore.isFoldableDevice = val;
+  }
+
+  public get reducedMotion(): boolean {
+    return this.shellStore.reducedMotion;
+  }
+
+  public get foldPosture(): string {
+    return this.shellStore.foldPosture;
+  }
+
+  public set foldPosture(val: string) {
+    this.shellStore.foldPosture = val;
+  }
+
+  public get breakpoint(): OrbitBreakpoint {
+    return this.shellStore.breakpoint;
+  }
+
+  public get sidebarOpen(): boolean {
+    return this.shellStore.sidebarOpen;
+  }
+
+  public set sidebarOpen(val: boolean) {
+    this.shellStore.sidebarOpen = val;
+  }
+
+  public get isSidebarCollapsed(): boolean {
+    return this.shellStore.isSidebarCollapsed;
+  }
+
+  public set isSidebarCollapsed(val: boolean) {
+    this.shellStore.isSidebarCollapsed = val;
+  }
+
+  public get modalRoute(): OrbitModalRoute | null {
+    return this.shellStore.modalRoute;
+  }
+
+  public get showHostSettingsSheet(): boolean {
+    return this.shellStore.isModalKindOpen('host_settings');
+  }
+
+  public set showHostSettingsSheet(val: boolean) {
+    if (val) {
+      this.openHostSettings();
+    } else if (this.shellStore.isModalKindOpen('host_settings')) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showGlobalSearchSheet(): boolean {
+    return this.shellStore.isModalKindOpen('global_search');
+  }
+
+  public set showGlobalSearchSheet(val: boolean) {
+    if (val) {
+      this.openGlobalSearch();
+    } else if (this.shellStore.isModalKindOpen('global_search')) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showArchivedSessionsSheet(): boolean {
+    return this.shellStore.isModalKindOpen('archived');
+  }
+
+  public set showArchivedSessionsSheet(val: boolean) {
+    if (val) {
+      this.openArchivedSessions();
+    } else if (this.shellStore.isModalKindOpen('archived')) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showExportTranscriptSheet(): boolean {
+    return this.shellStore.isModalKindOpen('export_transcript');
+  }
+
+  public set showExportTranscriptSheet(val: boolean) {
+    if (val) {
+      this.openExportTranscriptSheet();
+    } else if (this.shellStore.isModalKindOpen('export_transcript')) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showDirBrowser(): boolean {
+    return this.shellStore.isModalKindOpen('directory_browser');
+  }
+
+  public set showDirBrowser(val: boolean) {
+    if (val) {
+      this.shellStore.openModal({
+        kind: 'directory_browser',
+        hostId: this.selectedHostId,
+        cwd: this.activeCwd
+      });
+    } else if (this.shellStore.isModalKindOpen('directory_browser')) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showContextPickerSheet(): boolean {
+    return this.shellStore.isModalKindOpen('work_picker');
+  }
+
+  public set showContextPickerSheet(val: boolean) {
+    if (val) {
+      this.shellStore.openModal({
+        kind: 'work_picker',
+        hostId: this.selectedHostId,
+        cwd: this.activeCwd
+      });
+    } else if (this.shellStore.isModalKindOpen('work_picker')) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showRouterMeshSheet(): boolean {
+    return (
+      this.shellStore.isModalKindOpen('host_settings') &&
+      this.shellStore.modalRoute?.initialPath === 'router_mesh'
+    );
+  }
+
+  public set showRouterMeshSheet(val: boolean) {
+    if (val) {
+      this.openRouterMeshSheet();
+    } else if (this.showRouterMeshSheet) {
+      this.shellStore.closeModal();
+    }
+  }
+
+  public get showInlineDiffInspector(): boolean {
+    return (
+      this.sidePanelStore.isOpen &&
+      this.sidePanelStore.activeTab?.kind === 'review' &&
+      this.shellStore.breakpoint !== 'sm'
+    );
+  }
+
+  public set showInlineDiffInspector(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('review', null, 'user');
+    } else if (this.sidePanelStore.activeTab?.kind === 'review') {
+      this.sidePanelStore.dismissPanel();
+    }
+  }
+
+  public get showGitDiffSheet(): boolean {
+    return (
+      this.sidePanelStore.isOpen &&
+      this.sidePanelStore.activeTab?.kind === 'review' &&
+      this.shellStore.breakpoint === 'sm'
+    );
+  }
+
+  public set showGitDiffSheet(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('review', null, 'user');
+    } else if (this.sidePanelStore.activeTab?.kind === 'review') {
+      this.sidePanelStore.dismissPanel();
+    }
+  }
+
+  public get showPtySheet(): boolean {
+    return this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'terminal';
+  }
+
+  public set showPtySheet(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('terminal', null, 'user');
+    } else if (this.sidePanelStore.activeTab?.kind === 'terminal') {
+      this.sidePanelStore.dismissPanel();
+    }
+  }
+
+  public get showFileExplorerSheet(): boolean {
+    const kind = this.sidePanelStore.activeTab?.kind;
+    return this.sidePanelStore.isOpen && (kind === 'files' || kind === 'file');
+  }
+
+  public set showFileExplorerSheet(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('files', null, 'user');
+    } else {
+      const kind = this.sidePanelStore.activeTab?.kind;
+      if (kind === 'files' || kind === 'file') {
+        this.sidePanelStore.dismissPanel();
+      }
+    }
+  }
+
+  public get showWorkspaceBoardSheet(): boolean {
+    return this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'board';
+  }
+
+  public set showWorkspaceBoardSheet(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('board', null, 'user');
+    } else if (this.sidePanelStore.activeTab?.kind === 'board') {
+      this.sidePanelStore.dismissPanel();
+    }
+  }
+
+  public get showSideQuestionSheet(): boolean {
+    return this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'side_question';
+  }
+
+  public set showSideQuestionSheet(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('side_question', null, 'user');
+    } else if (this.sidePanelStore.activeTab?.kind === 'side_question') {
+      this.sidePanelStore.dismissPanel();
+    }
+  }
+
+  public get showAutomationsSheet(): boolean {
+    return this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'automations';
+  }
+
+  public set showAutomationsSheet(val: boolean) {
+    if (val) {
+      this.openSidePanelToolTab('automations', null, 'user');
+    } else if (this.sidePanelStore.activeTab?.kind === 'automations') {
+      this.sidePanelStore.dismissPanel();
+    }
+  }
+
+  public get showSubagentSheet(): boolean {
+    return this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'subagent';
+  }
+
+  public set showSubagentSheet(val: boolean) {
+    if (!val && this.sidePanelStore.activeTab?.kind === 'subagent') {
+      this.sidePanelStore.dismissPanel();
+    }
   }
 
   public handleSchedulerResync(): void {
@@ -1077,6 +1692,24 @@ export class OrbitHarmonyStore {
     return OrbitHarmonyStore.instance;
   }
 
+  public initializeWithTestBridge(bridge: OrbitCoreBridge): void {
+    if (this.bridge !== null) {
+      if (this.pendingDeepLink.length > 0) {
+        const uri = this.pendingDeepLink;
+        const evKind = this.pendingDeepLinkEventKind;
+        const linkNavSeq = this.pendingDeepLinkNavSeq;
+        this.pendingDeepLink = '';
+        this.pendingDeepLinkEventKind = '';
+        this.pendingDeepLinkNavSeq = 0;
+        if (linkNavSeq === this.navigationSeq) {
+          this.handleDeepLinkUri(uri, evKind);
+        }
+      }
+      return;
+    }
+    this.initializeWithBridgeInternal(bridge, false);
+  }
+
   public initialize(dbPath: string, masterKeyB64: string = ''): void {
     if (this.pinnedThreadsFilePath.length === 0 && dbPath.length > 0) {
       this.pinnedThreadsFilePath = `${dbPath}.pinned_threads.json`;
@@ -1089,101 +1722,23 @@ export class OrbitHarmonyStore {
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
         const evKind = this.pendingDeepLinkEventKind;
+        const linkNavSeq = this.pendingDeepLinkNavSeq;
         const reqId = this.pendingDeepLinkRequestId;
         const seq = this.pendingDeepLinkSeq;
         this.pendingDeepLink = '';
         this.pendingDeepLinkEventKind = '';
+        this.pendingDeepLinkNavSeq = 0;
         this.pendingDeepLinkRequestId = '';
         this.pendingDeepLinkSeq = 0;
-        this.handleDeepLinkUri(uri, evKind, reqId, seq);
+        if (linkNavSeq === this.navigationSeq) {
+          this.handleDeepLinkUri(uri, evKind, reqId, seq);
+        }
       }
       return;
     }
     try {
-      this.bridge = OrbitCoreBridge.openWithMasterKeyOrFallback(dbPath, masterKeyB64);
-      this.nativeAvailable = true;
-      this.stageStore.bindBridge(this.bridge);
-      this.stageStore.setTailLimit(this.stageTailLimit());
-      this.fleetStore.bindBridge(this.bridge);
-      this.personalAgentStore.bindBridge(this.bridge);
-      this.composerStore.bindBridge(this.bridge);
-      this.composerStore.hydrate();
-
-      if (!this.prefsStore.hasMigratedThreadPrefsV1()) {
-        const legacyPinned = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
-        if (legacyPinned.length > 0) {
-          const nowMs = Date.now();
-          const seeds: ThreadPrefSeedDto[] = [];
-          for (let i = 0; i < legacyPinned.length; i++) {
-            const composite = legacyPinned[i];
-            const sep = composite.indexOf('::');
-            if (sep > 0 && sep + 2 < composite.length) {
-              seeds.push({
-                host_id: composite.substring(0, sep),
-                agent_id: composite.substring(sep + 2),
-                seen_seq: 0,
-                is_pinned: true,
-                pinned_order: i,
-                updated_at_ms: nowMs
-              });
-            }
-          }
-          if (seeds.length > 0) {
-            this.bridge.seedThreadPrefsJson(JSON.stringify(seeds));
-          }
-        }
-        this.prefsStore.markMigratedThreadPrefsV1();
-      }
-
-      try {
-        this.cachedFallbackCatalogs = JSON.parse(
-          this.bridge.fallbackProviderCatalogsJson()
-        ) as ProviderModelCatalogDto[];
-      } catch (err) {
-        orbitLogWarn('OrbitStore', 'Failed to parse fallback catalogs', err as Object);
-      }
-      try {
-        this.slashCommands = JSON.parse(
-          this.bridge.slashCommandsJson('harmony', null)
-        ) as SlashCommandDto[];
-      } catch (err) {
-        orbitLogWarn('OrbitStore', 'Failed to parse slash commands', err as Object);
-      }
-
-      this.bridge.subscribeEvents((err: Error | null, payloadJson: string) => {
-        if (err !== null || payloadJson.length === 0) {
-          return;
-        }
-        this.eventScheduler.enqueue(payloadJson);
-      });
-      this.reloadFleet();
-      this.refreshSidebar();
-      this.personalAgentStore.refreshBriefing(true);
-      this.refreshCloudSyncStatus();
-      this.bridge.connectAllHosts();
-      if (this.pushToken.length > 0) {
-        this.syncPushTokenToAllHosts(false);
-      }
-      if (this.pendingDeepLink.length > 0) {
-        const uri = this.pendingDeepLink;
-        const evKind = this.pendingDeepLinkEventKind;
-        const reqId = this.pendingDeepLinkRequestId;
-        const seq = this.pendingDeepLinkSeq;
-        this.pendingDeepLink = '';
-        this.pendingDeepLinkEventKind = '';
-        this.pendingDeepLinkRequestId = '';
-        this.pendingDeepLinkSeq = 0;
-        this.handleDeepLinkUri(uri, evKind, reqId, seq);
-      }
-      if (this.pendingReplayFramesJson.length > 0) {
-        const rHost = this.pendingReplayHostId;
-        const rAgent = this.pendingReplayAgentId;
-        const rFrames = this.pendingReplayFramesJson;
-        this.pendingReplayHostId = '';
-        this.pendingReplayAgentId = '';
-        this.pendingReplayFramesJson = '';
-        this.startDebugStageReplay(rHost, rAgent, rFrames);
-      }
+      const opened = OrbitCoreBridge.openWithMasterKeyOrFallback(dbPath, masterKeyB64);
+      this.initializeWithBridgeInternal(opened, true);
     } catch (e) {
       this.nativeAvailable = false;
       const msg = (e as Error).message;
@@ -1193,11 +1748,106 @@ export class OrbitHarmonyStore {
     }
   }
 
+  private initializeWithBridgeInternal(bridge: OrbitCoreBridge, migrateLegacyPrefs: boolean): void {
+    this.bridge = bridge;
+    this.nativeAvailable = true;
+    this.stageStore.bindBridge(this.bridge);
+    this.stageStore.setTailLimit(this.stageTailLimit());
+    this.fleetStore.bindBridge(this.bridge);
+    this.personalAgentStore.bindBridge(this.bridge);
+    this.composerStore.bindBridge(this.bridge);
+    this.composerStore.hydrate();
+
+    if (migrateLegacyPrefs && !this.prefsStore.hasMigratedThreadPrefsV1()) {
+      const legacyPinned = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
+      if (legacyPinned.length > 0) {
+        const nowMs = Date.now();
+        const seeds: ThreadPrefSeedDto[] = [];
+        for (let i = 0; i < legacyPinned.length; i++) {
+          const composite = legacyPinned[i];
+          const sep = composite.indexOf('::');
+          if (sep > 0 && sep + 2 < composite.length) {
+            seeds.push({
+              host_id: composite.substring(0, sep),
+              agent_id: composite.substring(sep + 2),
+              seen_seq: 0,
+              is_pinned: true,
+              pinned_order: i,
+              updated_at_ms: nowMs
+            });
+          }
+        }
+        if (seeds.length > 0) {
+          this.bridge.seedThreadPrefsJson(JSON.stringify(seeds));
+        }
+      }
+      this.prefsStore.markMigratedThreadPrefsV1();
+    }
+
+    try {
+      this.cachedFallbackCatalogs = JSON.parse(
+        this.bridge.fallbackProviderCatalogsJson()
+      ) as ProviderModelCatalogDto[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'Failed to parse fallback catalogs', err as Object);
+    }
+    try {
+      this.slashCommands = JSON.parse(
+        this.bridge.slashCommandsJson('harmony', null)
+      ) as SlashCommandDto[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'Failed to parse slash commands', err as Object);
+    }
+
+    this.bridge.subscribeEvents((err: Error | null, payloadJson: string) => {
+      if (err !== null || payloadJson.length === 0) {
+        return;
+      }
+      this.eventScheduler.enqueue(payloadJson);
+    });
+    this.reloadFleet();
+    this.refreshSidebar();
+    this.personalAgentStore.refreshBriefing(true);
+    this.refreshCloudSyncStatus();
+    this.bridge.connectAllHosts();
+    if (this.pushToken.length > 0) {
+      this.syncPushTokenToAllHosts(false);
+    }
+    if (this.pendingDeepLink.length > 0) {
+      const uri = this.pendingDeepLink;
+      const evKind = this.pendingDeepLinkEventKind;
+      const linkNavSeq = this.pendingDeepLinkNavSeq;
+      const reqId = this.pendingDeepLinkRequestId;
+      const seq = this.pendingDeepLinkSeq;
+      this.pendingDeepLink = '';
+      this.pendingDeepLinkEventKind = '';
+      this.pendingDeepLinkNavSeq = 0;
+      this.pendingDeepLinkRequestId = '';
+      this.pendingDeepLinkSeq = 0;
+      if (linkNavSeq === this.navigationSeq) {
+        this.handleDeepLinkUri(uri, evKind, reqId, seq);
+      }
+    }
+    if (this.pendingReplayFramesJson.length > 0) {
+      const rHost = this.pendingReplayHostId;
+      const rAgent = this.pendingReplayAgentId;
+      const rFrames = this.pendingReplayFramesJson;
+      this.pendingReplayHostId = '';
+      this.pendingReplayAgentId = '';
+      this.pendingReplayFramesJson = '';
+      this.startDebugStageReplay(rHost, rAgent, rFrames);
+    }
+  }
+
   // Theme & Layout Management
 
   public bindContext(ctx: common.Context): void {
     this.abilityContext = ctx;
     this.prefsStore.init(ctx);
+    this.shellStore.bindWidthStorage(this.prefsStore);
+    this.sidePanelStore.bindStorage(this.prefsStore);
+    this.sidePanelStore.hydrate();
+    this.sidePanelStore.setDefaultWidthVp(this.shellStore.sidePanelWidthVp);
     this.hydratePushPreferencesFromStorage();
   }
 
@@ -1274,56 +1924,41 @@ export class OrbitHarmonyStore {
       clearTimeout(this.replayFinishTimerId);
       this.replayFinishTimerId = -1;
     }
+    this.gitDiffModeTrackers.forEach((tracker: OrbitGitDiffModeTracker): void => {
+      if (tracker.settleTimerId !== -1) {
+        clearTimeout(tracker.settleTimerId);
+        tracker.settleTimerId = -1;
+      }
+    });
     this.voiceController.cancel();
+    this.sidePanelStore.dispose();
     this.composerStore.dispose();
     this.personalAgentStore.dispose();
     this.eventScheduler.dispose();
   }
 
   public updateFoldPosture(isFoldable: boolean, posture: string): void {
-    this.isFoldableDevice = isFoldable;
-    this.foldPosture = posture;
-    if (posture === 'expanded' && !this.isSidebarCollapsed) {
-      this.sidebarOpen = true;
-    } else if (posture === 'folded') {
-      this.sidebarOpen = false;
-    }
+    this.shellStore.updateFoldPosture(isFoldable, posture, this.sidePanelStore.isOpen);
+    this.sidePanelStore.setCompactViewport(this.shellStore.breakpoint === 'sm');
+  }
+
+  public updateTitleButtonAvoidWidth(rightAvoidVp: number, decorHidden: boolean): void {
+    this.shellStore.updateTitleButtonAvoidWidth(rightAvoidVp, decorHidden);
   }
 
   public effectiveSidebarWidth(): number {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN || this.isSidebarCollapsed) {
-      return 0;
-    }
-    return OrbitTokens.SIDEBAR_FOLD_WIDTH;
+    const layout = this.shellStore.resolveLayout(this.sidePanelStore.isOpen);
+    return layout.sidebarVisible ? layout.sidebarWidthVp : 0;
   }
 
   public canShowInlineDiffInspector(): boolean {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
-      return false;
-    }
-    if (this.windowWidthVp >= OrbitTokens.BP_EXPANDED_MIN) {
-      return true;
-    }
-    return (this.windowWidthVp - this.effectiveSidebarWidth()) >= 780;
+    return this.shellStore.breakpoint !== 'sm';
   }
 
   public toggleSidebar(): void {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
-      this.sidebarOpen = !this.sidebarOpen;
-      this.triggerHaptic(8);
-      return;
-    }
-    this.isSidebarCollapsed = !this.isSidebarCollapsed;
-    this.sidebarOpen = !this.isSidebarCollapsed;
-    if (this.canShowInlineDiffInspector() && this.showGitDiffSheet) {
-      this.showGitDiffSheet = false;
-      this.briefingViewingOpen = false;
-      this.showBriefingPanel = false;
-      this.showBriefingSheet = false;
-      this.showInlineDiffInspector = true;
-    } else if (!this.canShowInlineDiffInspector() && this.showInlineDiffInspector) {
-      this.showInlineDiffInspector = false;
-    }
+    this.shellStore.toggleSidebar(this.sidePanelStore.isOpen, (): void => {
+      this.sidePanelStore.dismissPanel();
+    });
     this.triggerHaptic(8);
   }
 
@@ -1523,26 +2158,11 @@ export class OrbitHarmonyStore {
   }
 
   public updateWindowSize(widthVp: number, heightVp: number): void {
-    if (heightVp > 0) {
-      this.windowHeightVp = heightVp;
-    }
-    if (widthVp > 0) {
-      this.updateWindowWidth(widthVp);
-    }
-  }
-
-  public updateWindowWidth(widthVp: number): void {
     const prevWidthVp = this.windowWidthVp;
-    const prevWasPhone = prevWidthVp < OrbitTokens.BP_FOLDABLE_MIN;
-    const nextIsPhone = widthVp < OrbitTokens.BP_FOLDABLE_MIN;
-    const prevWasExpanded = prevWidthVp >= OrbitTokens.BP_EXPANDED_MIN;
-    const nextIsExpanded = widthVp >= OrbitTokens.BP_EXPANDED_MIN;
-    this.windowWidthVp = widthVp;
-    this.stageStore.setTailLimit(resolveStageTailLimit(widthVp));
-    if (prevWasPhone && !nextIsPhone) {
-      this.sidebarOpen = !this.isSidebarCollapsed;
-    } else if (!prevWasPhone && nextIsPhone) {
-      this.sidebarOpen = false;
+    this.shellStore.updateWindowSize(widthVp, heightVp, this.sidePanelStore.isOpen);
+    this.sidePanelStore.setCompactViewport(this.shellStore.breakpoint === 'sm');
+    if (widthVp > 0) {
+      this.stageStore.setTailLimit(resolveStageTailLimit(widthVp));
     }
     const reconciledBriefing = reconcileBriefingPresentationOnResize(
       prevWidthVp,
@@ -1556,24 +2176,17 @@ export class OrbitHarmonyStore {
     this.briefingViewingOpen = reconciledBriefing.briefingViewingOpen;
     this.showBriefingSheet = reconciledBriefing.showBriefingSheet;
     this.showBriefingPanel = reconciledBriefing.showBriefingPanel;
-
-    if (!prevWasExpanded && nextIsExpanded) {
-      const promotedFromUserSheet = this.showGitDiffSheet;
-      this.showGitDiffSheet = false;
-      this.showInlineDiffInspector = !(this.isCurrentSessionPersonalAgent() && this.showBriefingPanel);
-      this.diffInspectorOpenedByUser =
-        this.showInlineDiffInspector &&
-        (promotedFromUserSheet || this.diffInspectorOpenedByUser || this.isDiffTargetPinned);
-      if (this.selectedHostId.length > 0 && this.showInlineDiffInspector) {
-        this.refreshGitReview(
-          this.gitStagedMode,
-          this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
-        );
+    if (reconciledBriefing.showBriefingSheet) {
+      if (this.shellStore.modalRoute?.kind !== 'pa_briefing') {
+        this.shellStore.openModal({ kind: 'pa_briefing' });
       }
-    } else if (!this.canShowInlineDiffInspector() && this.showInlineDiffInspector) {
-      this.showInlineDiffInspector = false;
-      this.diffInspectorOpenedByUser = false;
+    } else if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
     }
+  }
+
+  public updateWindowWidth(widthVp: number): void {
+    this.updateWindowSize(widthVp, this.shellStore.windowHeightVp);
   }
 
   public updateSafeArea(
@@ -1588,6 +2201,11 @@ export class OrbitHarmonyStore {
     this.keyboardHeightVp = Math.max(0, Math.round(keyboardVp));
     this.safeLeftVp = Math.max(0, Math.round(leftVp));
     this.safeRightVp = Math.max(0, Math.round(rightVp));
+    this.shellStore.updateHorizontalInsets(this.safeLeftVp, this.safeRightVp);
+  }
+
+  public setReducedMotion(enabled: boolean): void {
+    this.shellStore.setReducedMotion(enabled);
   }
 
   // Lifecycle & Network Hooks
@@ -1619,6 +2237,7 @@ export class OrbitHarmonyStore {
       this.markPersonalAgentVisitedNow(this.selectedHostId, this.selectedAgentId);
     }
     this.composerStore.flushNow();
+    this.sidePanelStore.flushNow();
     if (this.bridge !== null) {
       try {
         this.bridge.onAppBackground();
@@ -1652,8 +2271,10 @@ export class OrbitHarmonyStore {
       return;
     }
     if (this.bridge === null) {
+      this.navigationSeq += 1;
       this.pendingDeepLink = clean;
       this.pendingDeepLinkEventKind = eventKind;
+      this.pendingDeepLinkNavSeq = this.navigationSeq;
       this.pendingDeepLinkRequestId = requestId;
       this.pendingDeepLinkSeq = targetSeq;
       return;
@@ -1727,10 +2348,13 @@ export class OrbitHarmonyStore {
     if (cleanHost.length === 0) {
       return;
     }
+    this.navigationSeq += 1;
+    const navSeq = this.navigationSeq;
     if (this.bridge === null) {
       this.pendingOpenHostId = cleanHost;
       this.pendingOpenAgentId = cleanAgent;
       this.pendingOpenEventKind = cleanEvent;
+      this.pendingOpenNavSeq = navSeq;
       this.pendingOpenRequestId = cleanReqId;
       this.pendingOpenSeq = cleanSeq;
       return;
@@ -1740,6 +2364,7 @@ export class OrbitHarmonyStore {
       this.pendingOpenHostId = cleanHost;
       this.pendingOpenAgentId = cleanAgent;
       this.pendingOpenEventKind = cleanEvent;
+      this.pendingOpenNavSeq = navSeq;
       this.pendingOpenRequestId = cleanReqId;
       this.pendingOpenSeq = cleanSeq;
       this.reloadFleet();
@@ -1748,6 +2373,7 @@ export class OrbitHarmonyStore {
     this.pendingOpenHostId = '';
     this.pendingOpenAgentId = '';
     this.pendingOpenEventKind = '';
+    this.pendingOpenNavSeq = 0;
     this.pendingOpenRequestId = '';
     this.pendingOpenSeq = 0;
 
@@ -1765,10 +2391,11 @@ export class OrbitHarmonyStore {
         this.pendingAgentValidationEventKind = cleanEvent;
         this.pendingAgentValidationRequestId = cleanReqId;
         this.pendingAgentValidationSeq = cleanSeq;
+        this.pendingAgentValidationNavSeq = navSeq;
         if (this.selectedHostId !== cleanHost) {
-          this.selectHost(cleanHost);
+          this.selectHostInternal(cleanHost, false, false);
         } else {
-          this.reloadHostAsync(cleanHost);
+          this.reloadHostAsync(cleanHost, false);
         }
         return;
       }
@@ -1779,11 +2406,14 @@ export class OrbitHarmonyStore {
     this.pendingAgentValidationEventKind = '';
     this.pendingAgentValidationRequestId = '';
     this.pendingAgentValidationSeq = 0;
+    this.pendingAgentValidationNavSeq = 0;
     this.showGlobalOverview = false;
     this.showPersonalAgentSetup = false;
     this.showBriefingSheet = false;
     if (this.selectedHostId !== cleanHost) {
-      this.selectHost(cleanHost);
+      // `openSessionFromDeepLink` already incremented `navigationSeq` above; suppress
+      // automatic `agents[0]` selection when an explicit target `cleanAgent` follows.
+      this.selectHostInternal(cleanHost, false, cleanAgent.length === 0);
     }
     if (cleanAgent.length > 0) {
       this.selectAgent(cleanAgent);
@@ -1870,8 +2500,42 @@ export class OrbitHarmonyStore {
   }
 
   public openHostSettings(): void {
-    this.showHostSettingsSheet = true;
+    this.shellStore.openModal({
+      kind: 'host_settings',
+      hostId: this.selectedHostId
+    });
     this.triggerHaptic(8);
+  }
+
+  public openImageViewerModal(imageUri: string, imageLabel: string = ''): void {
+    const cleanUri = imageUri.trim();
+    if (cleanUri.length === 0) {
+      return;
+    }
+    this.shellStore.openModal({
+      kind: 'image_viewer',
+      imageUri: cleanUri,
+      imageLabel: imageLabel
+    });
+    this.triggerHaptic(6);
+  }
+
+  public openDiagramViewerModal(
+    kind: string,
+    language: string,
+    source: string,
+    svg: string,
+    title: string = ''
+  ): void {
+    this.shellStore.openModal({
+      kind: 'diagram_viewer',
+      title: title,
+      diagramKind: kind,
+      diagramLanguage: language,
+      diagramSource: source,
+      diagramSvg: svg
+    });
+    this.triggerHaptic(6);
   }
 
   public scanQrAndPair(context: common.Context | undefined): void {
@@ -1905,11 +2569,58 @@ export class OrbitHarmonyStore {
         orbitLogWarn('OrbitStore', 'Resync stage reload failed', err);
       });
     }
-    if (this.showGitDiffSheet || this.showInlineDiffInspector) {
-      this.reloadGitDiff(this.resolvedDiffCwd(), this.resolvedDiffHostId());
-    }
-    if (this.showPtySheet) {
-      this.reloadTerminal();
+    // Resync strictly against the currently visible side-panel tab's own target (host/agent/cwd/slot).
+    if (this.isSidePanelActuallyVisible()) {
+      const tab = this.sidePanelStore.activeTab;
+      if (tab !== null && tab.hostId.length > 0) {
+        if (tab.hostId !== this.selectedHostId) {
+          this.reloadHostAsync(tab.hostId);
+        }
+        const tabCwd = tab.cwd !== null ? tab.cwd : '';
+        if (tab.kind === 'review' && tabCwd.length > 0 && this.bridge !== null) {
+          const staged = tab.gitStaged === true;
+          this.requestScopedGitReviewFetch(tab.hostId, tabCwd, staged, tab.path);
+          this.gitPanelRevision += 1;
+        } else if (tab.kind === 'files' && tabCwd.length > 0 && this.bridge !== null) {
+          try {
+            this.bridge.fetchWorkspaceFiles(tab.hostId, tabCwd);
+          } catch (_err) {
+            // Best-effort resync trigger
+          }
+          this.gitPanelRevision += 1;
+        } else if (tab.kind === 'terminal') {
+          this.terminalPanelRevision += 1;
+        } else if (tab.kind === 'board') {
+          const hostDetail = this.getScopedHostDetail(tab.hostId);
+          const verifiedWs = hostDetail !== null
+            ? this.verifyScopedWorkspace(hostDetail, tabCwd, tab.workspaceId ?? '', tab.agentId)
+            : null;
+          const wsId = verifiedWs !== null ? verifiedWs.workspace_id : '';
+          if (wsId.length > 0 && this.bridge !== null) {
+            try {
+              this.bridge.fetchWorkspaceBoard(tab.hostId, wsId);
+              this.bridge.fetchWorkspaceEvents(tab.hostId, wsId, 30);
+            } catch (_err) {
+              // Best-effort resync trigger
+            }
+          }
+          this.panelDataRevision += 1;
+        } else if (tab.kind === 'subagent' || tab.kind === 'peer') {
+          const managedId = (tab.childAgentId !== undefined && tab.childAgentId !== null && tab.childAgentId.length > 0)
+            ? tab.childAgentId
+            : (tab.kind === 'peer' ? (tab.agentId ?? '') : '');
+          if (managedId.length > 0) {
+            const subSess = this.stageStore.getOrCreateSession(tab.hostId, managedId);
+            this.stageStore.reloadFull(subSess, { limit: 24 }, 'resync').catch((err: Object) => {
+              orbitLogWarn('OrbitStore', 'Resync panel agent reload failed', err);
+            });
+          } else if (tab.providerSubagentId !== undefined && tab.providerSubagentId !== null && tab.providerSubagentId.length > 0) {
+            this.providerSubagentRevision += 1;
+          }
+        } else {
+          this.panelDataRevision += 1;
+        }
+      }
     }
   }
 
@@ -1982,29 +2693,45 @@ export class OrbitHarmonyStore {
   }
 
   private onFleetOverviewLoaded(snap: FleetOverviewDto): void {
+    const hasValidPendingDeepLink =
+      this.pendingDeepLink.length > 0 && this.pendingDeepLinkNavSeq === this.navigationSeq;
     if (this.pendingOpenHostId.length > 0) {
       const targetHost = this.pendingOpenHostId;
       const targetAgent = this.pendingOpenAgentId;
       const targetEvent = this.pendingOpenEventKind;
+      const targetNavSeq = this.pendingOpenNavSeq;
       const targetReq = this.pendingOpenRequestId;
       const targetSeq = this.pendingOpenSeq;
       this.pendingOpenHostId = '';
       this.pendingOpenAgentId = '';
       this.pendingOpenEventKind = '';
+      this.pendingOpenNavSeq = 0;
       this.pendingOpenRequestId = '';
       this.pendingOpenSeq = 0;
-      if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
-        this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent, targetReq, targetSeq);
-      } else {
-        this.showToast('Host not found', true);
-        if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
-          this.selectHost(snap.hosts[0].host_id);
+      // Only replay a queued deep-link if NO newer user navigation superseded it (R3-P1-2).
+      if (targetNavSeq === this.navigationSeq) {
+        if (snap.hosts.some((h: HostCardDto): boolean => h.host_id === targetHost)) {
+          this.openSessionFromDeepLink(targetHost, targetAgent, targetEvent, targetReq, targetSeq);
         } else {
-          this.refreshSidebarAsync();
+          this.showToast('Host not found', true);
+          if (this.selectedHostId.length === 0 && snap.hosts.length > 0 && !hasValidPendingDeepLink) {
+            // Default first-host selection is initialization, NOT user navigation (never bumps navigationSeq).
+            this.selectHostInternal(snap.hosts[0].host_id, false);
+          } else {
+            this.refreshSidebarAsync();
+          }
         }
+      } else {
+        this.refreshSidebarAsync();
       }
     } else if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
-      this.selectHost(snap.hosts[0].host_id);
+      if (!hasValidPendingDeepLink) {
+        // Default first-host selection during cold start MUST NOT bump `navigationSeq` or cancel
+        // a valid queued launch URI (R3-P1-2).
+        this.selectHostInternal(snap.hosts[0].host_id, false);
+      } else {
+        this.refreshSidebarAsync();
+      }
     } else {
       this.refreshSidebarAsync();
     }
@@ -2206,8 +2933,19 @@ export class OrbitHarmonyStore {
   }
 
   public selectHost(hostId: string): void {
+    this.selectHostInternal(hostId, true, true);
+  }
+
+  private selectHostInternal(
+    hostId: string,
+    bumpNavigation: boolean,
+    autoSelectFirstAgent: boolean = true
+  ): void {
     if (hostId.length === 0) {
       return;
+    }
+    if (bumpNavigation) {
+      this.navigationSeq += 1;
     }
     const prevWasPa = this.isCurrentSessionPersonalAgent();
     const prevHostId = this.selectedHostId;
@@ -2235,6 +2973,7 @@ export class OrbitHarmonyStore {
       this.currentAgent = null;
       this.stageStore.clearActiveSession();
       this.composerStore.setActiveScope(hostId, '');
+      this.sidePanelStore.switchScope(hostId, null);
       this.schedules = [];
       this.conditionalTimers = [];
       this.goalRuns = [];
@@ -2244,7 +2983,7 @@ export class OrbitHarmonyStore {
       this.resetWorkspaceBoardState();
       this.syncActiveQueuedPrompts();
     }
-    this.reloadHostAsync(hostId);
+    this.reloadHostAsync(hostId, autoSelectFirstAgent);
     this.refreshSidebarAsync();
     if (this.bridge !== null) {
       this.bridge.connectHost(hostId);
@@ -2260,24 +2999,86 @@ export class OrbitHarmonyStore {
     }
     const detail = this.fleetStore.reloadHostSync(hostId);
     if (detail !== null) {
-      this.onHostDetailLoaded(hostId, detail);
+      this.onHostDetailLoaded(hostId, detail, true);
     }
   }
 
-  public reloadHostAsync(hostId: string): void {
+  public reloadHostAsync(hostId: string, autoSelectFirstAgent: boolean = true): void {
     if (this.bridge === null || hostId.length === 0) {
       return;
     }
     this.fleetStore.reloadHostAsync(hostId).then((detail: HostDetailDto | null): void => {
-      if (detail !== null && hostId === this.selectedHostId) {
-        this.onHostDetailLoaded(hostId, detail);
+      if (detail === null) {
+        return;
+      }
+      this.applyReplacedOptimisticMappings(hostId, detail);
+      if (hostId === this.selectedHostId) {
+        this.onHostDetailLoaded(hostId, detail, autoSelectFirstAgent);
+      }
+      if (this.isHostVisibleInSidePanel(hostId)) {
+        this.panelDataRevision += 1;
       }
     }).catch((err: Object) => {
       orbitLogWarn('OrbitStore', 'reloadHostAsync failed', err);
     });
   }
 
-  private onHostDetailLoaded(hostId: string, detail: HostDetailDto): void {
+  private applyReplacedOptimisticMappings(hostId: string, detail: HostDetailDto): void {
+    const replacedMap = detail.replaced_optimistic_agents;
+    if (replacedMap === undefined || replacedMap === null) {
+      return;
+    }
+    const optIds = Object.keys(replacedMap);
+    for (let i = 0; i < optIds.length; i++) {
+      const oldOptId = optIds[i];
+      const newAgentId = replacedMap[oldOptId];
+      if (
+        typeof newAgentId !== 'string' ||
+        newAgentId.trim().length === 0 ||
+        oldOptId === newAgentId
+      ) {
+        continue;
+      }
+      const stillHasOpt = detail.agents.some((a: AgentCardDto) => a.agent_id === oldOptId);
+      if (stillHasOpt) {
+        continue;
+      }
+      const oldKey = this.agentQueueKey(hostId, oldOptId);
+      const newKey = this.agentQueueKey(hostId, newAgentId);
+      this.createdOptimisticAgentKeys.delete(this.optimisticAgentKey(hostId, oldOptId));
+      const pendingQueue = this.queuedPromptsByAgent.get(oldKey);
+      if (pendingQueue !== undefined && pendingQueue.length > 0) {
+        const existing = this.queuedPromptsByAgent.get(newKey) ?? [];
+        this.queuedPromptsByAgent.delete(oldKey);
+        this.queuedPromptsByAgent.set(newKey, existing.concat(pendingQueue));
+      }
+      this.composerStore.remapScope(hostId, oldOptId, hostId, newAgentId);
+      this.sidePanelStore.remapOptimisticScopes(hostId, oldOptId, newAgentId);
+      this.remapScopedSideQuestion(
+        this.sidePanelStore.scopeKeyFor(hostId, oldOptId),
+        this.sidePanelStore.scopeKeyFor(hostId, newAgentId),
+        newAgentId
+      );
+      this.stageStore.dropSession(hostId, oldOptId);
+
+      if (hostId === this.selectedHostId && this.selectedAgentId === oldOptId) {
+        this.selectedAgentId = newAgentId;
+        this.isNewSessionDraft = false;
+        this.stageStore.activateSession(hostId, newAgentId);
+        this.syncActiveQueuedPrompts();
+        if (this.bridge !== null) {
+          this.bridge.openAgentTimeline(hostId, this.selectedAgentId);
+        }
+        this.reloadStage();
+      }
+    }
+  }
+
+  private onHostDetailLoaded(
+    hostId: string,
+    detail: HostDetailDto,
+    autoSelectFirstAgent: boolean = true
+  ): void {
     if (this.bridge === null) {
       return;
     }
@@ -2289,33 +3090,9 @@ export class OrbitHarmonyStore {
       this.workflowRuns = detail.workflow_runs ?? [];
       this.syncActiveWorkspaceBoardFromDetail(detail);
 
-      // Seamlessly upgrade optimistic session ID when daemon confirms AgentCreated
-      const replacedId = this.selectedAgentId.startsWith('opt_')
-        ? (detail.replaced_optimistic_agents?.[this.selectedAgentId] ?? detail.last_created_agent_id)
-        : null;
-      if (this.selectedAgentId.startsWith('opt_') && replacedId !== null && replacedId.length > 0) {
-        const stillHasOpt = detail.agents.some((a: AgentCardDto) => a.agent_id === this.selectedAgentId);
-        if (!stillHasOpt) {
-          const oldOptId = this.selectedAgentId;
-          const oldKey = this.agentQueueKey(hostId, oldOptId);
-          const newAgentId = replacedId;
-          const newKey = this.agentQueueKey(hostId, newAgentId);
-          const pendingQueue = this.queuedPromptsByAgent.get(oldKey);
-          if (pendingQueue !== undefined && pendingQueue.length > 0) {
-            const existing = this.queuedPromptsByAgent.get(newKey) ?? [];
-            this.queuedPromptsByAgent.delete(oldKey);
-            this.queuedPromptsByAgent.set(newKey, existing.concat(pendingQueue));
-          }
-          this.composerStore.remapScope(hostId, oldOptId, hostId, newAgentId);
-          this.stageStore.dropSession(hostId, oldOptId);
-          this.selectedAgentId = newAgentId;
-          this.isNewSessionDraft = false;
-          this.stageStore.activateSession(hostId, newAgentId);
-          this.syncActiveQueuedPrompts();
-          this.bridge.openAgentTimeline(hostId, this.selectedAgentId);
-          this.reloadStage();
-        }
-      }
+      // Consume every explicit optimistic -> real replacement map entry for this host
+      // (even when the user already switched away from the optimistic scope).
+      this.applyReplacedOptimisticMappings(hostId, detail);
 
       if (this.activeCwd === '~' || this.activeCwd.length === 0) {
         if (detail.workspaces.length > 0) {
@@ -2326,6 +3103,16 @@ export class OrbitHarmonyStore {
           this.setActiveCwd(detail.agents[0].cwd);
         }
       }
+
+      const hasPendingDeepLinkOrOpen =
+        (this.pendingDeepLink.length > 0 && this.pendingDeepLinkNavSeq === this.navigationSeq) ||
+        (this.pendingOpenHostId.length > 0 && this.pendingOpenNavSeq === this.navigationSeq) ||
+        (this.pendingAgentValidationHostId.length > 0 &&
+          this.pendingAgentValidationAgentId.length > 0 &&
+          this.pendingAgentValidationNavSeq === this.navigationSeq);
+      const hasInFlightAgentHydration =
+        this.inFlightAgentHydrationNavSeq > 0 &&
+        this.inFlightAgentHydrationNavSeq === this.navigationSeq;
 
       if (this.selectedAgentId.length > 0) {
         let matchedAgent: AgentCardDto | null = null;
@@ -2338,12 +3125,16 @@ export class OrbitHarmonyStore {
         this.currentAgent = matchedAgent;
         this.syncActiveQueuedPrompts();
       } else if (
+        autoSelectFirstAgent &&
+        !hasPendingDeepLinkOrOpen &&
+        !hasInFlightAgentHydration &&
         !this.isNewSessionDraft &&
         detail.agents.length > 0 &&
         this.stageTurns.length === 0 &&
         this.composerText.length === 0
       ) {
-        this.selectAgent(detail.agents[0].agent_id);
+        // Automatic default first-agent selection MUST NOT bump `navigationSeq` (R3-P1-2).
+        this.selectAgentInternal(detail.agents[0].agent_id, false);
       }
 
       if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
@@ -2379,15 +3170,19 @@ export class OrbitHarmonyStore {
           const pEvent = this.pendingAgentValidationEventKind;
           const pReq = this.pendingAgentValidationRequestId;
           const pSeq = this.pendingAgentValidationSeq;
+          const pNavSeq = this.pendingAgentValidationNavSeq;
           this.pendingAgentValidationHostId = '';
           this.pendingAgentValidationAgentId = '';
           this.pendingAgentValidationEventKind = '';
           this.pendingAgentValidationRequestId = '';
           this.pendingAgentValidationSeq = 0;
-          if (valResult === 'selected') {
-            this.openSessionFromDeepLink(pHost, pAgent, pEvent, pReq, pSeq);
-          } else {
-            this.showLocalizedToast($r('app.string.briefing_sessionNotFound'), 'Session not found', true);
+          this.pendingAgentValidationNavSeq = 0;
+          if (pNavSeq === this.navigationSeq) {
+            if (valResult === 'selected') {
+              this.openSessionFromDeepLink(pHost, pAgent, pEvent, pReq, pSeq);
+            } else {
+              this.showLocalizedToast($r('app.string.briefing_sessionNotFound'), 'Session not found', true);
+            }
           }
         }
       }
@@ -2406,6 +3201,10 @@ export class OrbitHarmonyStore {
     }
     const changed = this.activeCwd !== cwd;
     this.activeCwd = cwd;
+    if (changed && (this.isNewSessionDraft || this.selectedAgentId.length === 0) && this.selectedHostId.length > 0) {
+      const nextWsId = this.resolveScopedWorkspaceId(this.selectedHostId, cwd, null);
+      this.sidePanelStore.rebindDraftCwd(this.selectedHostId, cwd, nextWsId);
+    }
     if (changed) {
       this.refreshSidebar();
       if (this.currentHostDetail !== null) {
@@ -2426,26 +3225,29 @@ export class OrbitHarmonyStore {
       try {
         if (canUpdateGitDiff) {
           this.bridge.fetchGitStatus(this.selectedHostId, cwd);
-          this.bridge.fetchGitDiff(this.selectedHostId, cwd, null, this.gitStagedMode);
         }
         this.bridge.fetchWorkspaceFiles(this.selectedHostId, cwd);
       } catch (err) {
         orbitLogWarn('OrbitStore', 'setActiveCwd fetch failed', err as Object);
       }
       if (canUpdateGitDiff) {
-        this.reloadGitDiff(cwd, this.selectedHostId);
+        this.gitDirty = true;
       }
       this.reloadWorkspaceFiles();
     }
   }
 
   public startNewSessionDraft(cwd?: string): void {
+    this.navigationSeq += 1;
     if (this.isCurrentSessionPersonalAgent() && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0) {
       this.markPersonalAgentVisitedNow(this.selectedHostId, this.selectedAgentId);
       this.personalAgentStore.clearActiveVisitKey();
     }
     this.briefingViewingOpen = false;
     this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
     this.briefingDismissedByUserForPaKey = '';
     if (this.isDiffTargetPinned) {
       this.closeGitInspector();
@@ -2458,6 +3260,9 @@ export class OrbitHarmonyStore {
     this.currentAgent = null;
     this.stageStore.clearActiveSession();
     this.composerStore.setActiveScope(this.selectedHostId, '');
+    if (this.selectedHostId.length > 0) {
+      this.sidePanelStore.switchScope(this.selectedHostId, null);
+    }
     this.activeSessionUsage = null;
     this.syncDefaultModelAndEffort(this.composerProvider);
     this.syncActiveQueuedPrompts();
@@ -2475,12 +3280,351 @@ export class OrbitHarmonyStore {
     this.triggerHaptic(10);
   }
 
+  public buildManagedSubagentTab(
+    childHostId: string,
+    childAgentId: string,
+    rootHostId: string,
+    rootAgentId: string,
+    directParentHostId: string,
+    directParentAgentId: string,
+    titleOverride: string = '',
+    cwdOverride: string | null = null
+  ): OrbitSidePanelTab {
+    const cleanChildHost = childHostId.trim();
+    const cleanChildAgent = childAgentId.trim();
+    const cleanRootHost = rootHostId.trim();
+    const cleanRootAgent = rootAgentId.trim();
+    const cleanDirectHost = directParentHostId.trim().length > 0 ? directParentHostId.trim() : cleanRootHost;
+    const cleanDirectAgent = directParentAgentId.trim().length > 0 ? directParentAgentId.trim() : cleanRootAgent;
+    const childCard = this.findAgentCardOnHost(cleanChildHost, cleanChildAgent);
+    const title = titleOverride.trim().length > 0
+      ? titleOverride.trim()
+      : (childCard !== null && childCard.title.trim().length > 0 ? childCard.title.trim() : 'Subagent');
+    const cwd = (cwdOverride !== null && cwdOverride.trim().length > 0)
+      ? cwdOverride.trim()
+      : (childCard !== null && childCard.cwd.length > 0 ? childCard.cwd : null);
+    return {
+      tabId: canonicalManagedSubagentTabId(cleanChildHost, cleanChildAgent),
+      kind: 'subagent',
+      hostId: cleanChildHost,
+      agentId: cleanChildAgent,
+      cwd: cwd,
+      path: null,
+      parentHostId: cleanRootHost,
+      title: title,
+      closable: true,
+      parentAgentId: cleanRootAgent,
+      directParentHostId: cleanDirectHost,
+      directParentAgentId: cleanDirectAgent,
+      childAgentId: cleanChildAgent
+    };
+  }
+
+  public async resolveRootScopeHydratingChainAsync(
+    startHostId: string,
+    startAgentId: string,
+    requireStartCardExists: boolean = false,
+    isStillCurrent?: () => boolean
+  ): Promise<OrbitHydratedRootResult> {
+    const cleanStartHost = startHostId.trim();
+    const cleanStartAgent = startAgentId.trim();
+    if (cleanStartHost.length === 0 || cleanStartAgent.length === 0) {
+      return {
+        status: 'failed',
+        hostId: '',
+        rootAgentId: '',
+        unresolvedHostId: null
+      };
+    }
+    let resolved = this.sidePanelStore.resolveRootScope(cleanStartHost, cleanStartAgent, requireStartCardExists);
+    const attemptedHosts: Set<string> = new Set<string>();
+    for (let hops = 0; hops < 8; hops++) {
+      if (isStillCurrent !== undefined && !isStillCurrent()) {
+        return {
+          status: 'failed',
+          hostId: '',
+          rootAgentId: '',
+          unresolvedHostId: null
+        };
+      }
+      const missingHost = resolved.unresolvedHostId !== undefined && resolved.unresolvedHostId !== null
+        ? resolved.unresolvedHostId.trim()
+        : '';
+      const isMissingCard = resolved.missingAgentCard === true;
+      if (missingHost.length === 0 && !isMissingCard) {
+        break;
+      }
+      const targetHostToFetch = missingHost.length > 0 ? missingHost : resolved.hostId.trim();
+      if (targetHostToFetch.length === 0 || attemptedHosts.has(targetHostToFetch)) {
+        return {
+          status: 'failed',
+          hostId: '',
+          rootAgentId: '',
+          unresolvedHostId: targetHostToFetch.length > 0 ? targetHostToFetch : null
+        };
+      }
+      attemptedHosts.add(targetHostToFetch);
+      // Follow superseding same-host detail refreshes (e.g. concurrent `host_changed(TARGET)`)
+      // instead of treating a superseded `null` as a terminal host failure (R3-P1-2).
+      const loaded = await this.fleetStore.awaitLatestHostDetailAsync(
+        targetHostToFetch,
+        isMissingCard
+      );
+      if (isStillCurrent !== undefined && !isStillCurrent()) {
+        return {
+          status: 'failed',
+          hostId: '',
+          rootAgentId: '',
+          unresolvedHostId: null
+        };
+      }
+      if (loaded === null) {
+        return {
+          status: 'failed',
+          hostId: '',
+          rootAgentId: '',
+          unresolvedHostId: targetHostToFetch
+        };
+      }
+      resolved = this.sidePanelStore.resolveRootScope(cleanStartHost, cleanStartAgent, requireStartCardExists);
+    }
+    const remainingUnresolved = resolved.unresolvedHostId !== undefined && resolved.unresolvedHostId !== null
+      ? resolved.unresolvedHostId.trim()
+      : '';
+    if (remainingUnresolved.length > 0 || resolved.missingAgentCard === true) {
+      return {
+        status: 'failed',
+        hostId: '',
+        rootAgentId: '',
+        unresolvedHostId: remainingUnresolved.length > 0 ? remainingUnresolved : resolved.hostId.trim()
+      };
+    }
+    const finalHost = resolved.hostId.trim();
+    const finalAgent = resolved.rootAgentId !== null ? resolved.rootAgentId.trim() : '';
+    if (finalHost.length === 0 || finalAgent.length === 0) {
+      return {
+        status: 'failed',
+        hostId: '',
+        rootAgentId: '',
+        unresolvedHostId: null
+      };
+    }
+    return {
+      status: 'resolved',
+      hostId: finalHost,
+      rootAgentId: finalAgent,
+      unresolvedHostId: null
+    };
+  }
+
+  private commitManagedChildSelection(
+    childHostId: string,
+    childAgentId: string,
+    rootHostId: string,
+    rootAgentId: string,
+    directParentHostId: string,
+    directParentAgentId: string,
+    switchPrimaryStageToRoot: boolean,
+    titleOverride: string = '',
+    cwdOverride: string | null = null
+  ): void {
+    if (switchPrimaryStageToRoot) {
+      if (this.selectedHostId !== rootHostId) {
+        this.selectHostInternal(rootHostId, false, false);
+      }
+      if (this.selectedAgentId !== rootAgentId || this.isNewSessionDraft || this.showGlobalOverview) {
+        this.selectRootAgentDirectly(rootHostId, rootAgentId);
+      }
+    }
+    const subTab = this.buildManagedSubagentTab(
+      childHostId,
+      childAgentId,
+      rootHostId,
+      rootAgentId,
+      directParentHostId,
+      directParentAgentId,
+      titleOverride,
+      cwdOverride
+    );
+    this.sidePanelStore.openSubagentTab(
+      rootHostId,
+      rootAgentId,
+      subTab,
+      { source: 'user', activate: true }
+    );
+    if (this.bridge !== null) {
+      try {
+        this.bridge.openAgentTimeline(childHostId, childAgentId);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'openAgentTimeline for subagent failed', err as Object);
+      }
+    }
+    this.triggerHaptic(8);
+  }
+
+  private optimisticAgentKey(hostId: string, agentId: string): string {
+    return encodeSidePanelKeyTuple(['opt_agent', hostId.trim(), agentId.trim()]);
+  }
+
+  private clearOptimisticAgentKeysForHost(hostId: string): void {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0 || this.createdOptimisticAgentKeys.size === 0) {
+      return;
+    }
+    const prefix = encodeSidePanelKeyTuple(['opt_agent', cleanHost, '']).slice(0, -3);
+    const toRemove: string[] = [];
+    this.createdOptimisticAgentKeys.forEach((k: string): void => {
+      if (k.startsWith(prefix)) {
+        toRemove.push(k);
+      }
+    });
+    for (let i = 0; i < toRemove.length; i++) {
+      this.createdOptimisticAgentKeys.delete(toRemove[i]);
+    }
+  }
+
   public selectAgent(agentId: string): void {
+    this.selectAgentInternal(agentId, true);
+  }
+
+  private selectAgentInternal(agentId: string, bumpNavigation: boolean): void {
     if (agentId.length === 0) {
       return;
     }
+    if (bumpNavigation) {
+      this.navigationSeq += 1;
+    }
+    const navSeq = this.navigationSeq;
+
+    // Subagent Force-Routing & Start-Card Invariant (P0-4 + R3-P1-2):
+    // Require authoritative start-card verification whenever selecting an agent unless this store
+    // holds explicit local creation credentials for that optimistic session (`createdOptimisticAgentKeys`).
+    // If cached host detail omits the card, refresh once asynchronously under `navigationSeq` before
+    // deciding whether it is a verified root, a managed child, or missing (fail closed).
+    if (this.selectedHostId.length > 0) {
+      const childHostId = this.selectedHostId;
+      const isLocalOptimistic = this.createdOptimisticAgentKeys.has(
+        this.optimisticAgentKey(childHostId, agentId)
+      );
+      const requireStartCard = !isLocalOptimistic;
+      const childCard = this.findAgentCardOnHost(childHostId, agentId);
+      const hasDirectParent = childCard !== null &&
+        childCard.parent_agent_id !== null &&
+        childCard.parent_agent_id.trim().length > 0;
+      const directParentHostId = hasDirectParent && childCard !== null
+        ? ((childCard.parent_host_id !== undefined && childCard.parent_host_id !== null && childCard.parent_host_id.trim().length > 0)
+          ? childCard.parent_host_id.trim()
+          : childHostId)
+        : childHostId;
+      const directParentAgentId = hasDirectParent && childCard !== null && childCard.parent_agent_id !== null
+        ? childCard.parent_agent_id.trim()
+        : '';
+
+      const root = this.sidePanelStore.resolveRootScope(childHostId, agentId, requireStartCard);
+      const hasUnresolvedHost = root.unresolvedHostId !== undefined &&
+        root.unresolvedHostId !== null &&
+        root.unresolvedHostId.trim().length > 0;
+      const needsHydration = hasUnresolvedHost || root.missingAgentCard === true;
+
+      if (needsHydration) {
+        this.inFlightAgentHydrationNavSeq = navSeq;
+        this.resolveRootScopeHydratingChainAsync(
+          childHostId,
+          agentId,
+          requireStartCard,
+          (): boolean => navSeq === this.navigationSeq
+        ).then((hydrated: OrbitHydratedRootResult): void => {
+          if (navSeq !== this.navigationSeq) {
+            if (this.inFlightAgentHydrationNavSeq === navSeq) {
+              this.inFlightAgentHydrationNavSeq = 0;
+            }
+            return;
+          }
+          if (hydrated.status !== 'resolved') {
+            if (this.inFlightAgentHydrationNavSeq === navSeq) {
+              this.inFlightAgentHydrationNavSeq = 0;
+            }
+            this.showToast('Unable to load parent session host — tap to retry', true);
+            return;
+          }
+          const finalRootHost = hydrated.hostId;
+          const finalRootAgent = hydrated.rootAgentId;
+          if (finalRootHost === childHostId && finalRootAgent === agentId) {
+            this.selectRootAgentDirectly(childHostId, agentId);
+            if (this.inFlightAgentHydrationNavSeq === navSeq) {
+              this.inFlightAgentHydrationNavSeq = 0;
+            }
+            return;
+          }
+          const hydratedCard = this.findAgentCardOnHost(childHostId, agentId);
+          const hydratedDirectHost = (
+            hydratedCard !== null &&
+            hydratedCard.parent_host_id !== undefined &&
+            hydratedCard.parent_host_id !== null &&
+            hydratedCard.parent_host_id.trim().length > 0
+          )
+            ? hydratedCard.parent_host_id.trim()
+            : directParentHostId;
+          const hydratedDirectAgent = (
+            hydratedCard !== null &&
+            hydratedCard.parent_agent_id !== null &&
+            hydratedCard.parent_agent_id.trim().length > 0
+          )
+            ? hydratedCard.parent_agent_id.trim()
+            : (directParentAgentId.length > 0 ? directParentAgentId : finalRootAgent);
+          const hydratedTitle = hydratedCard !== null ? hydratedCard.title : '';
+          const hydratedCwd = hydratedCard !== null && hydratedCard.cwd.length > 0
+            ? hydratedCard.cwd
+            : this.activeCwd;
+          this.commitManagedChildSelection(
+            childHostId,
+            agentId,
+            finalRootHost,
+            finalRootAgent,
+            hydratedDirectHost,
+            hydratedDirectAgent,
+            true,
+            hydratedTitle,
+            hydratedCwd
+          );
+          if (this.inFlightAgentHydrationNavSeq === navSeq) {
+            this.inFlightAgentHydrationNavSeq = 0;
+          }
+        }).catch((err: Object) => {
+          if (this.inFlightAgentHydrationNavSeq === navSeq) {
+            this.inFlightAgentHydrationNavSeq = 0;
+          }
+          orbitLogWarn('OrbitStore', 'Async parent chain resolution failed', err);
+        });
+        return;
+      }
+
+      if (
+        root.rootAgentId !== null &&
+        root.rootAgentId.length > 0 &&
+        (root.rootAgentId !== agentId || root.hostId !== childHostId)
+      ) {
+        this.commitManagedChildSelection(
+          childHostId,
+          agentId,
+          root.hostId,
+          root.rootAgentId,
+          directParentHostId,
+          directParentAgentId.length > 0 ? directParentAgentId : root.rootAgentId,
+          true,
+          childCard !== null ? childCard.title : '',
+          childCard !== null && childCard.cwd.length > 0 ? childCard.cwd : this.activeCwd
+        );
+        return;
+      }
+    }
+
+    this.selectRootAgentDirectly(this.selectedHostId, agentId);
+  }
+
+  private selectRootAgentDirectly(hostId: string, agentId: string): void {
     const prevWasPa = this.isCurrentSessionPersonalAgent();
-    const prevHostId = this.selectedHostId;
+    const prevHostId = hostId;
     const prevAgentId = this.selectedAgentId;
     const sameSession = !this.isNewSessionDraft && prevAgentId === agentId;
     if (prevWasPa && !sameSession && prevHostId.length > 0 && prevAgentId.length > 0) {
@@ -2491,7 +3635,7 @@ export class OrbitHarmonyStore {
       this.closeGitInspector();
     }
     if (
-      this.pendingFocusDecisionHostId !== this.selectedHostId ||
+      this.pendingFocusDecisionHostId !== hostId ||
       this.pendingFocusDecisionAgentId !== agentId
     ) {
       this.clearPendingDecisionFocus();
@@ -2501,24 +3645,25 @@ export class OrbitHarmonyStore {
     this.isNewSessionDraft = false;
     this.selectedAgentId = agentId;
     this.activeSessionUsage = null;
-    if (this.selectedHostId.length > 0) {
-      this.fleetStore.clearConversationDirty(this.selectedHostId, agentId);
-      this.composerStore.setActiveScope(this.selectedHostId, agentId);
-      this.stageStore.activateSession(this.selectedHostId, agentId);
+    if (hostId.length > 0) {
+      this.fleetStore.clearConversationDirty(hostId, agentId);
+      this.composerStore.setActiveScope(hostId, agentId);
+      this.stageStore.activateSession(hostId, agentId);
+      this.sidePanelStore.switchScope(hostId, agentId);
     }
     // Unified PA visit & Briefing presentation lifecycle across ALL session navigation entries
     // (including cold-start deep links, sidebar taps, and cross-host switches).
     if (this.isCurrentSessionPersonalAgent()) {
-      const paKey = `${this.selectedHostId}::${agentId}`;
+      const paKey = `${hostId}::${agentId}`;
       const userDismissedCurrentPa = this.briefingDismissedByUserForPaKey === paKey;
       const userOpenedDiff = this.showInlineDiffInspector &&
         (this.diffInspectorOpenedByUser || this.isDiffTargetPinned);
       if (
         !prevWasPa ||
         !sameSession ||
-        !this.personalAgentStore.activeVisitKeyMatches(this.selectedHostId, agentId)
+        !this.personalAgentStore.activeVisitKeyMatches(hostId, agentId)
       ) {
-        this.personalAgentStore.enterPersonalAgentVisit(this.selectedHostId, agentId);
+        this.personalAgentStore.enterPersonalAgentVisit(hostId, agentId);
       }
       if (!sameSession) {
         this.briefingDismissedByUserForPaKey = '';
@@ -2542,9 +3687,12 @@ export class OrbitHarmonyStore {
     } else {
       this.briefingViewingOpen = false;
       this.showBriefingSheet = false;
+      if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+        this.shellStore.closeModal();
+      }
       this.briefingDismissedByUserForPaKey = '';
     }
-    if (this.bridge !== null && this.selectedHostId.length > 0) {
+    if (this.bridge !== null && hostId.length > 0) {
       const agents = this.currentHostDetail?.agents ?? [];
       let matchedSeq = 0;
       for (let i = 0; i < agents.length; i++) {
@@ -2553,15 +3701,15 @@ export class OrbitHarmonyStore {
           break;
         }
       }
-      this.bridge.markAgentSeen(this.selectedHostId, agentId, matchedSeq);
+      this.bridge.markAgentSeen(hostId, agentId, matchedSeq);
     }
     this.syncActiveQueuedPrompts();
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
-    if (this.bridge !== null && this.selectedHostId.length > 0) {
-      this.bridge.openAgentTimeline(this.selectedHostId, agentId);
-      this.bridge.listProviderSubagents(this.selectedHostId, agentId);
+    if (this.bridge !== null && hostId.length > 0) {
+      this.bridge.openAgentTimeline(hostId, agentId);
+      this.bridge.listProviderSubagents(hostId, agentId);
       this.reloadStage();
       this.refreshSessionUsage();
       if (this.currentHostDetail !== null) {
@@ -2803,6 +3951,9 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.removeHost(hostId);
+      this.revokeSideQuestionsForHost(hostId);
+      this.releaseGitDiffTrackersForHost(hostId);
+      this.clearOptimisticAgentKeysForHost(hostId);
       this.fleetStore.removeCachedHost(hostId);
       if (this.selectedHostId === hostId) {
         this.fleetStore.setSelectedHostId('');
@@ -3742,6 +4893,13 @@ export class OrbitHarmonyStore {
           label: snip.lineLabel,
           content: snip.content
         });
+      } else if (snip.kind === 'file_quote') {
+        // Explicit cross-project/cross-host file excerpt carrying its own source path & read body (P1-6).
+        quotes.push({
+          path: snip.path.length > 0 ? snip.path : snip.lineLabel,
+          line_number: null,
+          code: snip.content
+        });
       } else {
         const prefix = snip.kind === 'added' ? '+' : snip.kind === 'removed' ? '-' : ' ';
         quotes.push({
@@ -4137,11 +5295,7 @@ export class OrbitHarmonyStore {
       const q = (composed.btw_question ?? '').trim();
       this.composerText = '';
       this.activeSlashDirective = '';
-      if (q.length > 0) {
-        this.askSideQuestion(q);
-      } else {
-        this.openSideQuestionSheet();
-      }
+      this.submitBtwFromComposer(q);
       return;
     }
     if (overridePrompt === undefined && composed.is_compact) {
@@ -4209,7 +5363,15 @@ export class OrbitHarmonyStore {
           auto_cluster: null
         };
         const optId = this.bridge.createSessionJson(JSON.stringify(createReq));
+        if (optId.trim().length > 0) {
+          this.createdOptimisticAgentKeys.add(this.optimisticAgentKey(this.selectedHostId, optId));
+        }
+        const promotedWsId = this.resolveScopedWorkspaceId(this.selectedHostId, this.activeCwd, optId);
         this.composerStore.clearActiveDraft(true);
+        const draftScopeKey = this.sidePanelStore.scopeKeyFor(this.selectedHostId, null);
+        const targetScopeKey = this.sidePanelStore.scopeKeyFor(this.selectedHostId, optId);
+        this.sidePanelStore.promoteDraftScope(this.selectedHostId, optId, this.activeCwd, promotedWsId);
+        this.remapScopedSideQuestion(draftScopeKey, targetScopeKey, optId, this.activeCwd);
         this.selectedAgentId = optId;
         this.isNewSessionDraft = false;
         this.composerStore.setActiveScope(this.selectedHostId, optId);
@@ -4314,6 +5476,9 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.archiveAgent(this.selectedHostId, agentId);
+      const scopeKey = this.sidePanelStore.scopeKeyFor(this.selectedHostId, agentId);
+      this.dropScopeAndRevokeSideQuestion(scopeKey);
+      this.sidePanelStore.removeSubagentTabs(this.selectedHostId, agentId);
       if (this.selectedAgentId === agentId) {
         this.startNewSessionDraft();
       }
@@ -4399,8 +5564,8 @@ export class OrbitHarmonyStore {
   }
 
   public toggleTopBarGitDiff(): void {
-    if (this.canShowInlineDiffInspector() && this.showInlineDiffInspector) {
-      this.closeGitInspector();
+    if (this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'review') {
+      this.sidePanelStore.dismissPanel();
       this.triggerHaptic(8);
       return;
     }
@@ -4409,28 +5574,53 @@ export class OrbitHarmonyStore {
     this.openGitInspector();
   }
 
-  public openGitInspector(focusPath?: string): void {
-    this.isDiffTargetPinned = false;
-    this.diffTargetHostId = this.selectedHostId;
-    this.diffTargetCwd = this.activeCwd;
+  public openGitInspector(focusPath?: string, cwdOverride?: string, hostIdOverride?: string): void {
     this.diffInspectorOpenedByUser = true;
-    this.resetGitCollabState();
+    if (this.isCurrentSessionPersonalAgent()) {
+      this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
+    }
+    this.briefingViewingOpen = false;
+    this.showBriefingPanel = false;
+    this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
     if (focusPath !== undefined) {
       this.gitSelectedPath = focusPath;
     }
-    this.refreshGitReview(this.gitStagedMode, this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null);
-    if (this.canShowInlineDiffInspector()) {
-      // Right rail is mutually exclusive: yield docked Briefing rail so Diff is immediately visible.
-      if (this.isCurrentSessionPersonalAgent()) {
-        this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
-      }
-      this.briefingViewingOpen = false;
-      this.showBriefingPanel = false;
-      this.showBriefingSheet = false;
-      this.showInlineDiffInspector = true;
-      this.showGitDiffSheet = false;
-    } else {
-      this.showGitDiffSheet = true;
+    const cleanCwd = cwdOverride !== undefined && cwdOverride.trim().length > 0 ? cwdOverride : undefined;
+    const cleanHost = hostIdOverride !== undefined && hostIdOverride.trim().length > 0 ? hostIdOverride.trim() : undefined;
+    const normPath = focusPath !== undefined ? this.normalizeGitFocusPath(focusPath) : null;
+    const prevTab = this.sidePanelStore.activeTab;
+    const wasOpen = this.sidePanelStore.isOpen;
+    this.openSidePanelToolTab(
+      'review',
+      normPath,
+      'user',
+      cleanCwd,
+      cleanHost
+    );
+    // Avoid issuing a duplicate global `refreshGitReview` when mounting/switching to a Review tab
+    // (which triggers `OrbitScopedGitTabView`'s own tracked fetch). Only refresh directly if the
+    // exact same Review tab was already mounted & active.
+    const nextTab = this.sidePanelStore.activeTab;
+    if (
+      wasOpen &&
+      prevTab !== null &&
+      nextTab !== null &&
+      prevTab.kind === 'review' &&
+      nextTab.kind === 'review' &&
+      prevTab.tabId === nextTab.tabId &&
+      nextTab.cwd !== null &&
+      nextTab.cwd.trim().length > 0
+    ) {
+      this.requestScopedGitReviewFetch(
+        nextTab.hostId,
+        nextTab.cwd,
+        nextTab.gitStaged === true,
+        nextTab.path,
+        true
+      );
     }
     this.triggerHaptic(8);
   }
@@ -4455,11 +5645,18 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.fetchGitStatus(targetHost, targetCwd);
-      this.bridge.fetchGitDiff(targetHost, targetCwd, path, staged);
+      this.bridge.fetchGitDiff(
+        targetHost,
+        targetCwd,
+        this.normalizeGitFocusPath(path),
+        staged
+      );
     } catch (err) {
       orbitLogWarn('OrbitStore', 'refreshGitReview failed', err as Object);
     }
-    this.reloadGitDiff(targetCwd, targetHost);
+    if (this.isReviewScopeVisible(targetHost, targetCwd)) {
+      this.reloadGitDiff(targetCwd, targetHost);
+    }
   }
 
   public reloadGitDiff(cwd: string, hostId?: string): void {
@@ -4482,8 +5679,10 @@ export class OrbitHarmonyStore {
       return;
     }
     try {
-      const pathOpt = this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null;
-      const gr = JSON.parse(this.bridge.gitReviewJson(targetHost, cwd, pathOpt)) as GitReviewDto;
+      const pathOpt = this.gitSelectedPath.length > 0 ? this.normalizeGitFocusPath(this.gitSelectedPath) : null;
+      const gr = JSON.parse(
+        this.bridge.gitReviewJson(targetHost, cwd, pathOpt, this.gitStagedMode)
+      ) as GitReviewDto;
       if (this.isDiffTargetPinned) {
         const hostHomeDir = this.resolveHostHomeDir(targetHost);
         const respHost = (gr.host_id ?? '').trim();
@@ -4524,32 +5723,25 @@ export class OrbitHarmonyStore {
   }
 
   public openFullGitDiffSheet(): void {
-    this.diffInspectorOpenedByUser = true;
-    this.refreshGitReview(
-      this.gitStagedMode,
-      this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
-    );
-    this.showGitDiffSheet = true;
-    this.triggerHaptic(8);
+    this.openGitInspector();
   }
 
   // Detached PTY Multi-Terminal Operations
 
-  public inspectGitDiffForCwd(cwd: string): void {
-    if (cwd.trim().length > 0) {
-      this.setActiveCwd(cwd);
-    }
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+  public inspectGitDiffForCwd(cwd: string, hostIdOverride?: string): void {
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanHost = hostIdOverride !== undefined && hostIdOverride.trim().length > 0
+      ? hostIdOverride.trim()
+      : undefined;
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
-    this.openGitInspector('');
+    this.openGitInspector('', cleanCwd.length > 0 ? cleanCwd : undefined, cleanHost);
   }
 
   /**
    * Opens Git Diff for a specific `(hostId, cwd)` targeted from a Briefing decision card.
-   * Pins the Diff inspector's independent `(diffTargetHostId, diffTargetCwd)` so incoming PA
-   * Stage deltas NEVER overwrite the inspected worker's directory across staged/unstaged switches,
-   * refreshes, or Git actions. On wide screens (`>= 1024 vp`) yields the docked Briefing rail.
+   * Routes into PR-4's scoped Review tab for `(hostId, cwd)` while yielding the docked Briefing rail.
    */
   public openDecisionDiffForHostCwd(hostId: string, cwd: string): void {
     const cleanHost = hostId.trim();
@@ -4565,59 +5757,41 @@ export class OrbitHarmonyStore {
     this.diffTargetHostId = cleanHost;
     this.diffTargetCwd = cwd;
     this.isDiffTargetPinned = true;
-    this.diffInspectorOpenedByUser = true;
-    this.gitSelectedPath = '';
-    this.gitStatus = null;
-    this.gitDiffFiles = [];
-    this.resetGitCollabState();
-    this.refreshGitReview(this.gitStagedMode, null);
-    this.refreshGitCollabStatus();
-    if (this.isCurrentSessionPersonalAgent()) {
-      this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
-    }
-    this.briefingViewingOpen = false;
-    this.showBriefingPanel = false;
-    this.showBriefingSheet = false;
-    if (this.canShowInlineDiffInspector()) {
-      this.showInlineDiffInspector = true;
-      this.showGitDiffSheet = false;
-    } else {
-      this.showGitDiffSheet = true;
-    }
-    this.triggerHaptic(8);
+    this.openGitInspector('', cwd, cleanHost);
   }
 
-  public openPtyTerminalInCwd(cwd: string): void {
-    const hasCwd = cwd.trim().length > 0;
-    if (hasCwd) {
-      this.setActiveCwd(cwd);
-    }
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+  public openPtyTerminalInCwd(cwd: string, hostIdOverride?: string): void {
+    const clean = nonBlankPath(cwd);
+    const cleanHost = hostIdOverride !== undefined && hostIdOverride.trim().length > 0
+      ? hostIdOverride.trim()
+      : undefined;
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
-    this.showPtySheet = true;
-    if (this.bridge !== null && this.selectedHostId.length > 0) {
-      const detail = this.currentHostDetail;
+    this.openSidePanelToolTab('terminal', null, 'user', clean.length > 0 ? clean : undefined, cleanHost);
+    const targetHost = cleanHost ?? this.selectedHostId;
+    if (this.bridge !== null && targetHost.length > 0) {
+      const detail = this.getScopedHostDetail(targetHost);
       let matchedTermId = '';
-      if (detail !== null && hasCwd) {
+      if (detail !== null && clean.length > 0) {
         for (let i = 0; i < detail.terminals.length; i++) {
-          if (cwdPathsEquivalent(detail.terminals[i].cwd, cwd)) {
+          if (cwdPathsEquivalent(detail.terminals[i].cwd, clean)) {
             matchedTermId = detail.terminals[i].terminal_id;
             break;
           }
         }
       }
       if (matchedTermId.length > 0) {
-        this.attachTerminal(matchedTermId, 1);
+        this.attachScopedTerminal(targetHost, matchedTermId, 1);
       } else {
-        this.startNewTerminal();
+        this.startScopedTerminal(targetHost, clean.length > 0 ? clean : this.activeCwd);
       }
     }
     this.triggerHaptic(10);
   }
 
   public openPtyTerminal(): void {
-    this.showPtySheet = true;
+    this.openSidePanelToolTab('terminal', null, 'user');
     if (this.bridge !== null && this.selectedHostId.length > 0) {
       const detail = this.currentHostDetail;
       if (detail === null || detail.terminals.length === 0) {
@@ -4874,87 +6048,8 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public askSideQuestion(question: string, contextSummary?: string): string {
-    const cleanQ = question.trim();
-    if (this.bridge === null || this.selectedHostId.length === 0 || cleanQ.length === 0) {
-      return '';
-    }
-    this.sideQuestionGen += 1;
-    const gen = this.sideQuestionGen;
-    this.showSideQuestionSheet = true;
-    this.sideQuestionActive = true;
-    this.sideQuestionStreaming = true;
-    this.sideQuestionPrompt = cleanQ;
-    this.sideQuestionAnswer = '';
-    this.sideQuestionError = '';
-
-    const resolvedContext = contextSummary !== undefined
-      ? contextSummary
-      : (this.selectedAgentId.length > 0 ? this.buildSideQuestionContext(4000) : '');
-    const req: AskSideQuestionRequestDto = {
-      host_id: this.selectedHostId,
-      agent_id: this.selectedAgentId.length > 0 ? this.selectedAgentId : null,
-      cwd: this.activeCwd,
-      provider: this.composerProvider,
-      model: this.composerModel.trim().length > 0 ? this.composerModel.trim() : null,
-      question: cleanQ,
-      context_summary: resolvedContext.length > 0 ? resolvedContext : null
-    };
-    try {
-      return this.bridge.askSideQuestion(JSON.stringify(req), (err: Error | null, eventJson: string) => {
-        if (gen !== this.sideQuestionGen) {
-          return;
-        }
-        if (err !== null && err !== undefined) {
-          this.sideQuestionError = err.message;
-          this.sideQuestionStreaming = false;
-          return;
-        }
-        if (eventJson === undefined || eventJson === null || eventJson.length === 0) {
-          return;
-        }
-        try {
-          const ev = JSON.parse(eventJson) as SideQuestionEnvelopeDto;
-          if (ev.Delta !== undefined) {
-            this.sideQuestionAnswer += ev.Delta.text_delta ?? '';
-          } else if (ev.Done !== undefined) {
-            const full = ev.Done.full_text ?? '';
-            if (full.length > 0) {
-              this.sideQuestionAnswer = full;
-            }
-            const errMsg = ev.Done.error ?? '';
-            if (errMsg.length > 0) {
-              this.sideQuestionError = errMsg;
-            }
-            this.sideQuestionStreaming = false;
-          } else {
-            if (ev.text_delta !== undefined && ev.text_delta.length > 0) {
-              this.sideQuestionAnswer += ev.text_delta;
-            }
-            if (ev.full_text !== undefined && ev.full_text.length > 0) {
-              this.sideQuestionAnswer = ev.full_text;
-              this.sideQuestionStreaming = false;
-            }
-            if (ev.error !== undefined && ev.error !== null && ev.error.length > 0) {
-              this.sideQuestionError = ev.error;
-              this.sideQuestionStreaming = false;
-            }
-            if (ev.kind === 'done') {
-              this.sideQuestionStreaming = false;
-            }
-          }
-        } catch (parseErr) {
-          orbitLogWarn('OrbitStore', 'askSideQuestion event parse failed', parseErr as Object);
-        }
-      });
-    } catch (err) {
-      orbitLogWarn('OrbitStore', 'askSideQuestion failed', err as Object);
-      if (gen === this.sideQuestionGen) {
-        this.sideQuestionError = (err as Error).message;
-        this.sideQuestionStreaming = false;
-      }
-      return '';
-    }
+  public askSideQuestion(question: string, _contextSummary?: string): string {
+    return this.submitBtwFromComposer(question);
   }
 
   public detectDiagramKind(language: string, source: string): string | null {
@@ -5113,10 +6208,10 @@ export class OrbitHarmonyStore {
   // 2. Side Question (`/btw`) Sheet
 
   public openSideQuestionSheet(): void {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
-    this.showSideQuestionSheet = true;
+    this.openSidePanelToolTab('side_question', null, 'user');
     this.triggerHaptic(8);
   }
 
@@ -5132,13 +6227,16 @@ export class OrbitHarmonyStore {
   // 3. Archived Sessions
 
   public openArchivedSessions(): void {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
     if (this.bridge !== null && this.selectedHostId.length > 0) {
       this.reloadHost(this.selectedHostId);
     }
-    this.showArchivedSessionsSheet = true;
+    this.shellStore.openModal({
+      kind: 'archived',
+      hostId: this.selectedHostId
+    });
     this.triggerHaptic(8);
   }
 
@@ -5160,13 +6258,17 @@ export class OrbitHarmonyStore {
     return result;
   }
 
-  public unarchiveSession(agentId: string): void {
-    if (this.bridge === null || this.selectedHostId.length === 0 || agentId.length === 0) {
+  public unarchiveSession(agentId: string, hostIdOverride?: string): void {
+    const targetHost = (hostIdOverride !== undefined && hostIdOverride.trim().length > 0)
+      ? hostIdOverride.trim()
+      : this.selectedHostId;
+    if (this.bridge === null || targetHost.length === 0 || agentId.length === 0) {
       return;
     }
     try {
-      this.bridge.unarchiveAgent(this.selectedHostId, agentId);
-      this.reloadHost(this.selectedHostId);
+      this.bridge.unarchiveAgent(targetHost, agentId);
+      this.clearArchivedSubagentLocalMark(targetHost, agentId);
+      this.reloadHost(targetHost);
       this.showToast('Session restored', false);
       this.triggerHaptic(10);
     } catch (err) {
@@ -5181,6 +6283,9 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.deleteAgent(this.selectedHostId, agentId);
+      const scopeKey = this.sidePanelStore.scopeKeyFor(this.selectedHostId, agentId);
+      this.dropScopeAndRevokeSideQuestion(scopeKey);
+      this.sidePanelStore.removeSubagentTabs(this.selectedHostId, agentId);
       if (this.selectedAgentId === agentId) {
         this.startNewSessionDraft();
       }
@@ -5280,10 +6385,10 @@ export class OrbitHarmonyStore {
   }
 
   public openWorkspaceBoard(): void {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
-    this.showWorkspaceBoardSheet = true;
+    this.openSidePanelToolTab('board', null, 'user');
     this.triggerHaptic(8);
   }
 
@@ -5385,10 +6490,10 @@ export class OrbitHarmonyStore {
   // 5. Automations: Schedules, Conditional Timers, Goals, Monitors & Workflows
 
   public openAutomationsSheet(): void {
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+    if (this.shellStore.breakpoint === 'sm') {
       this.sidebarOpen = false;
     }
-    this.showAutomationsSheet = true;
+    this.openSidePanelToolTab('automations', null, 'user');
     this.triggerHaptic(8);
   }
 
@@ -6026,6 +7131,7 @@ export class OrbitHarmonyStore {
   // 8. Global Personal Agent Briefing & Safe Batch Approval
 
   public openGlobalOverview(): void {
+    this.navigationSeq += 1;
     this.openPersonalAgentHome();
   }
 
@@ -6061,7 +7167,7 @@ export class OrbitHarmonyStore {
     this.showPersonalAgentSetup = false;
     this.showGlobalOverview = false;
     if (this.selectedHostId !== cleanHost) {
-      this.selectHost(cleanHost);
+      this.selectHostInternal(cleanHost, true, false);
     }
     this.selectAgent(cleanAgent);
     if (markRead) {
@@ -6075,6 +7181,7 @@ export class OrbitHarmonyStore {
   }
 
   public openPersonalAgentHome(): void {
+    this.navigationSeq += 1;
     // Reuse fresh briefing when available; fetch once only when missing/stale/invalidated.
     this.personalAgentStore.ensureFreshBriefing();
     const pa = this.personalAgentStore.briefing?.personal_agent ?? null;
@@ -6082,7 +7189,7 @@ export class OrbitHarmonyStore {
       this.showPersonalAgentSetup = false;
       this.showGlobalOverview = false;
       this.selectAgentOnHost(pa.host_id, pa.agent_id, true);
-      if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+      if (this.shellStore.breakpoint === 'sm') {
         this.sidebarOpen = false;
       }
       this.triggerHaptic(8);
@@ -6092,6 +7199,9 @@ export class OrbitHarmonyStore {
     this.showGlobalOverview = false;
     this.briefingViewingOpen = false;
     this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
     // Discovery is owned by PersonalAgentSetupCard.aboutToAppear() via coalesced refreshRouterAndMesh().
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
@@ -6106,7 +7216,13 @@ export class OrbitHarmonyStore {
     if (nextOpen) {
       this.briefingDismissedByUserForPaKey = '';
       this.closeGitInspector();
+      if (this.sidePanelStore.isOpen) {
+        this.sidePanelStore.dismissPanel();
+      }
       this.showBriefingSheet = false;
+      if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+        this.shellStore.closeModal();
+      }
       this.personalAgentStore.ensureFreshBriefing();
     } else if (this.isCurrentSessionPersonalAgent()) {
       this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
@@ -6137,6 +7253,7 @@ export class OrbitHarmonyStore {
     }
     this.showBriefingPanel = false;
     this.showBriefingSheet = true;
+    this.shellStore.openModal({ kind: 'pa_briefing' });
     this.personalAgentStore.ensureFreshBriefing();
     const pa = this.personalAgentStore.briefing?.personal_agent ?? null;
     if (pa !== null && pa.host_id.length > 0) {
@@ -6147,6 +7264,9 @@ export class OrbitHarmonyStore {
 
   public closeBriefingSheet(): void {
     this.showBriefingSheet = false;
+    if (this.shellStore.modalRoute?.kind === 'pa_briefing') {
+      this.shellStore.closeModal();
+    }
     // Only mark user-dismissed when closing on compact width; programmatic Sheet close during
     // a 1023 -> 1024 vp promotion MUST preserve `briefingViewingOpen = true` for the docked rail.
     if (this.windowWidthVp < OrbitTokens.BP_EXPANDED_MIN) {
@@ -6345,7 +7465,7 @@ export class OrbitHarmonyStore {
       );
       if (targetRouter !== undefined && targetRouter.active_router_agent_id !== undefined &&
         targetRouter.active_router_agent_id !== null && targetRouter.active_router_agent_id.length > 0) {
-        this.selectHost(targetRouter.host_id);
+        this.selectHostInternal(targetRouter.host_id, true, false);
         this.selectAgent(targetRouter.active_router_agent_id);
         this.composerText = clean;
         this.submitComposerPrompt(clean);
@@ -6526,47 +7646,144 @@ export class OrbitHarmonyStore {
   }
 
   public inspectSubagent(sub: SessionSubagentEntryDto): void {
-    if (sub.child_agent_id !== null && sub.child_agent_id.length > 0) {
-      const targetHostId = (
-        sub.host_id !== undefined &&
-        sub.host_id !== null &&
-        sub.host_id.trim().length > 0
-      ) ? sub.host_id.trim() : this.selectedHostId;
-      if (targetHostId.length > 0) {
-        this.selectAgentOnHost(targetHostId, sub.child_agent_id, true);
-      } else {
-        this.selectAgent(sub.child_agent_id);
-      }
+    if (this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
-    const subId = (sub.provider_subagent_id !== undefined && sub.provider_subagent_id !== null && sub.provider_subagent_id.length > 0)
-      ? sub.provider_subagent_id
-      : sub.id;
-    if (this.bridge === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+    const root = this.sidePanelStore.resolveRootScope(this.selectedHostId, this.selectedAgentId);
+    const rootHost = root.hostId.length > 0 ? root.hostId : this.selectedHostId;
+    const rootAgent = root.rootAgentId !== null ? root.rootAgentId : this.selectedAgentId;
+    this.openSubagentEntryInRootScope(rootHost, rootAgent, sub, this.activeCwd);
+  }
+
+  public openSubagentEntryInRootScope(
+    rootHostId: string,
+    rootAgentId: string,
+    sub: SessionSubagentEntryDto,
+    fallbackCwd: string | null = null
+  ): void {
+    const cleanRootHost = rootHostId.trim();
+    const cleanRootAgent = rootAgentId.trim();
+    if (cleanRootHost.length === 0 || cleanRootAgent.length === 0) {
       return;
     }
-    this.inspectedSubagentId = subId;
-    this.inspectedSubagentTitle = sub.role.length > 0 ? sub.role : 'Subagent';
-    this.inspectedSubagentItems = [];
-    this.showSubagentSheet = true;
-    try {
-      this.bridge.openProviderSubagentTimeline(this.selectedHostId, this.selectedAgentId, subId);
-      const raw = this.bridge.providerSubagentTimelineJson(this.selectedHostId, this.selectedAgentId, subId);
-      const parsed = JSON.parse(raw) as ProviderSubagentTimelineDto;
-      this.inspectedSubagentItems = parsed.items ?? [];
-    } catch (err) {
-      orbitLogWarn('OrbitStore', 'providerSubagentTimelineJson failed', err as Object);
+    this.navigationSeq += 1;
+    const navSeq = this.navigationSeq;
+    const root = this.sidePanelStore.resolveRootScope(cleanRootHost, cleanRootAgent, true);
+    const resolvedRootHost = root.hostId.length > 0 ? root.hostId : cleanRootHost;
+    const resolvedRootAgent = root.rootAgentId !== null ? root.rootAgentId : cleanRootAgent;
+
+    const managedChildId = (sub.child_agent_id !== null && sub.child_agent_id.trim().length > 0)
+      ? sub.child_agent_id.trim()
+      : null;
+    const providerSubId = (
+      sub.provider_subagent_id !== undefined &&
+      sub.provider_subagent_id !== null &&
+      sub.provider_subagent_id.trim().length > 0
+    )
+      ? sub.provider_subagent_id.trim()
+      : (managedChildId === null ? sub.id : null);
+
+    // Preserve actual child host and direct parent separately from root scope (P0-4).
+    const directParentHost = resolveSubagentDirectParentHostId(sub, resolvedRootHost);
+    const directParentAgent = resolveSubagentDirectParentAgentId(sub, resolvedRootAgent);
+    const actualChildHost = managedChildId !== null
+      ? resolveSubagentActualHostId(sub, resolvedRootHost)
+      : directParentHost;
+    const childCard = managedChildId !== null
+      ? this.findAgentCardOnHost(actualChildHost, managedChildId)
+      : null;
+    const effectiveCwd = (childCard !== null && childCard.cwd.length > 0)
+      ? childCard.cwd
+      : fallbackCwd;
+
+    const title = sub.role.trim().length > 0 ? sub.role.trim() : 'Subagent';
+    const hasUnresolvedHost = root.unresolvedHostId !== undefined &&
+      root.unresolvedHostId !== null &&
+      root.unresolvedHostId.trim().length > 0;
+    if (hasUnresolvedHost || root.missingAgentCard === true) {
+      this.resolveRootScopeHydratingChainAsync(cleanRootHost, cleanRootAgent, true).then((hydrated: OrbitHydratedRootResult): void => {
+        if (navSeq !== this.navigationSeq) {
+          return;
+        }
+        if (hydrated.status !== 'resolved') {
+          this.showToast('Unable to load parent session host — tap to retry', true);
+          return;
+        }
+        const finalRootHost = hydrated.hostId;
+        const finalRootAgent = hydrated.rootAgentId;
+        const tabId = managedChildId !== null
+          ? canonicalManagedSubagentTabId(actualChildHost, managedChildId)
+          : canonicalProviderSubagentTabId(directParentHost, directParentAgent, providerSubId ?? sub.id);
+        const asyncTab: OrbitSidePanelTab = {
+          tabId: tabId,
+          kind: 'subagent',
+          hostId: actualChildHost,
+          agentId: managedChildId !== null ? managedChildId : (providerSubId ?? sub.id),
+          cwd: effectiveCwd,
+          path: null,
+          parentHostId: finalRootHost,
+          title: title,
+          closable: true,
+          parentAgentId: finalRootAgent,
+          directParentHostId: directParentHost,
+          directParentAgentId: directParentAgent,
+          childAgentId: managedChildId,
+          providerSubagentId: providerSubId,
+          subagentCallId: sub.id
+        };
+        this.sidePanelStore.openSubagentTab(finalRootHost, finalRootAgent, asyncTab, { source: 'user', activate: true });
+        this.triggerHaptic(8);
+      }).catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'openSubagentEntryInRootScope chain resolution failed', err);
+      });
+      return;
     }
+
+    const tabId = managedChildId !== null
+      ? canonicalManagedSubagentTabId(actualChildHost, managedChildId)
+      : canonicalProviderSubagentTabId(directParentHost, directParentAgent, providerSubId ?? sub.id);
+
+    const subTab: OrbitSidePanelTab = {
+      tabId: tabId,
+      kind: 'subagent',
+      hostId: actualChildHost,
+      agentId: managedChildId !== null ? managedChildId : (providerSubId ?? sub.id),
+      cwd: effectiveCwd,
+      path: null,
+      parentHostId: resolvedRootHost,
+      title: title,
+      closable: true,
+      parentAgentId: resolvedRootAgent,
+      directParentHostId: directParentHost,
+      directParentAgentId: directParentAgent,
+      childAgentId: managedChildId,
+      providerSubagentId: providerSubId,
+      subagentCallId: sub.id
+    };
+
+    // Subagent Force-Routing Invariant: NEVER switch main Stage away from root agent.
+    this.sidePanelStore.openSubagentTab(
+      resolvedRootHost,
+      resolvedRootAgent,
+      subTab,
+      { source: 'user', activate: true }
+    );
     this.triggerHaptic(8);
   }
 
   // 11. File Explorer & Code Viewer (Read / Edit / Create / Rename / Delete)
 
-  public openFileExplorer(initialPath?: string): void {
-    this.ensureWorkspaceFilesLoaded();
-    this.showFileExplorerSheet = true;
+  public openFileExplorer(initialPath?: string, cwdOverride?: string, hostIdOverride?: string): void {
+    const cleanCwd = cwdOverride !== undefined && cwdOverride.trim().length > 0 ? cwdOverride.trim() : undefined;
+    const cleanHost = hostIdOverride !== undefined && hostIdOverride.trim().length > 0 ? hostIdOverride.trim() : undefined;
+    if (this.shellStore.breakpoint === 'sm') {
+      this.sidebarOpen = false;
+    }
     if (initialPath !== undefined && initialPath.trim().length > 0) {
-      this.openWorkspaceFileInViewer(initialPath.trim());
+      const cleanPath = initialPath.trim();
+      this.openSidePanelFileTab(cleanHost ?? this.selectedHostId, cleanCwd ?? this.activeCwd, cleanPath);
+    } else {
+      this.openSidePanelToolTab('files', null, 'user', cleanCwd, cleanHost);
     }
     this.triggerHaptic(8);
   }
@@ -6586,24 +7803,25 @@ export class OrbitHarmonyStore {
     if (this.bridge === null || this.selectedHostId.length === 0) {
       return false;
     }
+    if (this.inspectedFileView !== null && !isWorkspaceFileEditable(this.inspectedFileView)) {
+      this.showToast('This file is read-only, binary, or truncated', true);
+      return false;
+    }
     this.fileExplorerBusy = true;
     try {
-      const req: WriteWorkspaceFileRequestDto = {
-        host_id: this.selectedHostId,
-        cwd: this.activeCwd,
-        path: path,
-        content: content,
-        expected_etag: null,
-        force: true
-      };
-      await this.bridge.writeWorkspaceFileJson(JSON.stringify(req));
-      await this.openWorkspaceFileInViewer(path);
-      this.showToast(`Saved ${basenameOfPath(path)}`, false);
-      this.triggerHaptic(10);
-      return true;
-    } catch (err) {
-      orbitLogWarn('OrbitStore', 'writeWorkspaceFileJson failed', err as Object);
-      this.showToast((err as Error).message || 'Save failed', true);
+      const expectedEtag = this.inspectedFileView?.etag ?? null;
+      const outcome = await this.saveScopedWorkspaceFile(
+        this.selectedHostId,
+        this.activeCwd,
+        path,
+        content,
+        expectedEtag,
+        false
+      );
+      if (outcome.ok) {
+        await this.openWorkspaceFileInViewer(path);
+        return true;
+      }
       return false;
     } finally {
       this.fileExplorerBusy = false;
@@ -6712,7 +7930,9 @@ export class OrbitHarmonyStore {
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitStagePathsJson(targetHost, targetCwd, paths, all);
-      this.pullRefreshGitReview();
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
+        this.pullRefreshGitReview();
+      }
       this.showToast(all ? 'Staged all changes' : 'Staged file', false);
       this.triggerHaptic(8);
       return true;
@@ -6734,7 +7954,9 @@ export class OrbitHarmonyStore {
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitUnstagePathsJson(targetHost, targetCwd, paths, all);
-      this.pullRefreshGitReview();
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
+        this.pullRefreshGitReview();
+      }
       this.showToast(all ? 'Unstaged all changes' : 'Unstaged file', false);
       this.triggerHaptic(8);
       return true;
@@ -6785,8 +8007,10 @@ export class OrbitHarmonyStore {
     try {
       const json = await this.bridge.gitCommitJson(targetHost, targetCwd, clean, amend);
       const res = JSON.parse(json) as GitCommitResultDto;
-      this.pullRefreshGitReview();
-      this.refreshGitCollabStatus();
+      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+        this.pullRefreshGitReview();
+        this.refreshGitCollabStatus();
+      }
       this.showToast(`Committed ${res.short_sha}`, false);
       this.triggerHaptic(12);
       return true;
@@ -6888,7 +8112,9 @@ export class OrbitHarmonyStore {
         draft
       );
       const res = JSON.parse(json) as GitCreatePrResultDto;
-      this.refreshGitCollabStatus();
+      if (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd)) {
+        this.refreshGitCollabStatus();
+      }
       this.showToast(`Created PR: ${res.title}`, false);
       this.triggerHaptic(12);
       return res;
@@ -6910,8 +8136,10 @@ export class OrbitHarmonyStore {
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitStashSaveJson(targetHost, targetCwd, message, includeUntracked);
-      this.pullRefreshGitReview();
-      this.refreshGitCollabStatus();
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
+        this.pullRefreshGitReview();
+        this.refreshGitCollabStatus();
+      }
       this.showToast('Saved working tree stash', false);
       return true;
     } catch (err) {
@@ -6931,8 +8159,10 @@ export class OrbitHarmonyStore {
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitStashPopJson(targetHost, targetCwd, stashRef, expectedOid);
-      this.pullRefreshGitReview();
-      this.refreshGitCollabStatus();
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
+        this.pullRefreshGitReview();
+        this.refreshGitCollabStatus();
+      }
       this.showToast(`Popped ${stashRef}`, false);
       return true;
     } catch (err) {
@@ -6952,8 +8182,10 @@ export class OrbitHarmonyStore {
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitRebaseContinueJson(targetHost, targetCwd);
-      this.pullRefreshGitReview();
-      this.refreshGitCollabStatus();
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
+        this.pullRefreshGitReview();
+        this.refreshGitCollabStatus();
+      }
       this.showToast('Continued rebase', false);
       return true;
     } catch (err) {
@@ -6973,8 +8205,10 @@ export class OrbitHarmonyStore {
     this.gitWriteBusy = true;
     try {
       await this.bridge.gitRebaseAbortJson(targetHost, targetCwd);
-      this.pullRefreshGitReview();
-      this.refreshGitCollabStatus();
+      if (this.isDiffTargetPinned || (this.selectedHostId === targetHost && cwdPathsEquivalent(this.activeCwd, targetCwd))) {
+        this.pullRefreshGitReview();
+        this.refreshGitCollabStatus();
+      }
       this.showToast('Aborted rebase', false);
       return true;
     } catch (err) {
@@ -6988,10 +8222,10 @@ export class OrbitHarmonyStore {
   // 13. Global Cross-Host Search
 
   public openGlobalSearch(): void {
-    this.showGlobalSearchSheet = true;
-    if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
-      this.sidebarOpen = false;
-    }
+    this.shellStore.openModal({
+      kind: 'global_search',
+      hostId: this.selectedHostId
+    });
     this.triggerHaptic(8);
   }
 
@@ -7050,7 +8284,11 @@ export class OrbitHarmonyStore {
   // 14. Personal Router & Fleet Mesh
 
   public openRouterMeshSheet(): void {
-    this.showRouterMeshSheet = true;
+    this.shellStore.openModal({
+      kind: 'host_settings',
+      hostId: this.selectedHostId,
+      initialPath: 'router_mesh'
+    });
     this.refreshRouterAndMesh();
     this.triggerHaptic(8);
   }
@@ -7522,8 +8760,3885 @@ export class OrbitHarmonyStore {
   // 17. Transcript Export (Markdown / JSON / HTML)
 
   public openExportTranscriptSheet(): void {
-    this.showExportTranscriptSheet = true;
+    this.shellStore.openModal({
+      kind: 'export_transcript',
+      hostId: this.selectedHostId,
+      agentId: this.selectedAgentId
+    });
     this.triggerHaptic(8);
+  }
+
+  // 18. Side Panel Tab Openers & Strictly Scoped Data-Isolation Helpers (PR-4)
+  // Every scoped helper below reads ONLY its explicit `hostId`/`agentId`/`cwd`/`path` arguments
+  // and NEVER falls back to global `this.selectedHostId` or `this.activeCwd`.
+
+  /**
+   * Pure observable cache read (ZERO synchronous N-API calls, safe inside `@Computed` and `build()`).
+   * Call `ensureScopedHostDetailAsync(hostId)` from lifecycle hooks to populate cache misses.
+   */
+  public getScopedHostDetail(hostId: string): HostDetailDto | null {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return null;
+    }
+    const _rev = this.fleetStore.hostDetailRevision;
+    if (_rev < 0) {
+      return null;
+    }
+    return this.fleetStore.getCachedHostDetail(cleanHost);
+  }
+
+  public ensureScopedHostDetailAsync(hostId: string): void {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return;
+    }
+    this.fleetStore.ensureHostDetailAsync(cleanHost);
+  }
+
+  public findAgentCardOnHost(hostId: string, agentId: string): AgentCardDto | null {
+    const detail = this.getScopedHostDetail(hostId);
+    if (detail === null || agentId.trim().length === 0) {
+      return null;
+    }
+    for (let i = 0; i < detail.agents.length; i++) {
+      if (detail.agents[i].agent_id === agentId) {
+        return detail.agents[i];
+      }
+    }
+    return null;
+  }
+
+  private resolveCurrentScopeTuple(): [string, string | null, string] {
+    const hostId = this.selectedHostId.trim();
+    if (hostId.length === 0) {
+      return ['', null, ''];
+    }
+    if (this.isNewSessionDraft || this.selectedAgentId.trim().length === 0) {
+      return [hostId, null, this.activeCwd];
+    }
+    const root = this.sidePanelStore.resolveRootScope(hostId, this.selectedAgentId);
+    const resolvedHost = root.hostId.length > 0 ? root.hostId : hostId;
+    const resolvedAgent = root.rootAgentId;
+    const card = resolvedAgent !== null ? this.findAgentCardOnHost(resolvedHost, resolvedAgent) : null;
+    const cwd = card !== null && card.cwd.length > 0 ? card.cwd : this.activeCwd;
+    return [resolvedHost, resolvedAgent, cwd];
+  }
+
+  public openSidePanelToolTab(
+    kind: OrbitSidePanelKind,
+    path: string | null = null,
+    source: 'user' | 'auto' = 'user',
+    cwdOverride?: string,
+    hostIdOverride?: string
+  ): void {
+    const tuple = this.resolveCurrentScopeTuple();
+    const scopeHostId = tuple[0];
+    const rootAgentId = tuple[1];
+    const hasExplicitHost = hostIdOverride !== undefined && hostIdOverride.trim().length > 0;
+    const tabHostId = hasExplicitHost ? hostIdOverride!.trim() : scopeHostId;
+    const hasExplicitCwd = cwdOverride !== undefined && cwdOverride.trim().length > 0;
+    const resolvedCwd = hasExplicitCwd ? cwdOverride! : tuple[2];
+    if (tabHostId.length === 0) {
+      return;
+    }
+    const effectiveScopeHost = scopeHostId.length > 0 ? scopeHostId : tabHostId;
+    const scopeKey = this.sidePanelStore.scopeKeyFor(effectiveScopeHost, rootAgentId);
+    if (this.sidePanelStore.activeScopeKey !== scopeKey) {
+      this.sidePanelStore.switchScopeByKey(scopeKey);
+    }
+
+    const explicitTargetDifferent =
+      (hasExplicitCwd && !cwdPathsEquivalent(resolvedCwd, tuple[2])) ||
+      (hasExplicitHost && tabHostId !== scopeHostId);
+
+    let title = 'Panel';
+    let tabId = `${kind}:${scopeKey}`;
+    if (kind === 'review') {
+      title = explicitTargetDifferent && resolvedCwd.length > 0
+        ? `Git · ${basenameOfPath(resolvedCwd)}`
+        : 'Git Review';
+      if (explicitTargetDifferent && resolvedCwd.length > 0) {
+        tabId = canonicalCwdToolTabId('review', tabHostId, resolvedCwd);
+      }
+    } else if (kind === 'files') {
+      title = explicitTargetDifferent && resolvedCwd.length > 0
+        ? `Files · ${basenameOfPath(resolvedCwd)}`
+        : 'Files';
+      if (explicitTargetDifferent && resolvedCwd.length > 0) {
+        tabId = canonicalCwdToolTabId('files', tabHostId, resolvedCwd);
+      }
+    } else if (kind === 'file') {
+      const cleanPath = nonBlankPath(path);
+      title = cleanPath.length > 0 ? basenameOfPath(cleanPath) : 'File';
+      tabId = canonicalFileTabId(tabHostId, resolvedCwd, cleanPath);
+    } else if (kind === 'terminal') {
+      title = explicitTargetDifferent && resolvedCwd.length > 0
+        ? `Terminal · ${basenameOfPath(resolvedCwd)}`
+        : 'Terminal';
+      if (explicitTargetDifferent && resolvedCwd.length > 0) {
+        tabId = canonicalCwdToolTabId('terminal', tabHostId, resolvedCwd);
+      }
+    } else if (kind === 'board') {
+      title = 'Board';
+    } else if (kind === 'side_question') {
+      title = 'Side Q&A';
+      tabId = canonicalSideQuestionTabId(scopeKey);
+    } else if (kind === 'briefing') {
+      title = 'Briefing';
+    } else if (kind === 'automations') {
+      title = 'Automations';
+    } else if (kind === 'subagent') {
+      title = 'Subagent Crew';
+      tabId = `crew:${scopeKey}`;
+    }
+
+    const boardAgentForResolve = explicitTargetDifferent ? null : rootAgentId;
+    const wsId = kind === 'board'
+      ? this.resolveScopedWorkspaceId(tabHostId, resolvedCwd, boardAgentForResolve)
+      : null;
+
+    const tab: OrbitSidePanelTab = {
+      tabId: tabId,
+      kind: kind,
+      hostId: tabHostId,
+      agentId: explicitTargetDifferent ? null : rootAgentId,
+      cwd: resolvedCwd.length > 0 ? resolvedCwd : null,
+      path: path,
+      parentHostId: effectiveScopeHost,
+      title: title,
+      closable: true,
+      parentAgentId: rootAgentId,
+      workspaceId: wsId !== null && wsId.length > 0 ? wsId : null,
+      terminalSlot: kind === 'terminal' ? 1 : null
+    };
+
+    const opts: OrbitOpenSidePanelTabOptions = {
+      source: source,
+      activate: true
+    };
+    this.sidePanelStore.openTab(tab, opts);
+  }
+
+  public openSidePanelFileTab(hostId: string, cwd: string, filePath: string): void {
+    const cleanHost = hostId.trim();
+    const cleanPath = nonBlankPath(filePath);
+    if (cleanHost.length === 0 || cleanPath.length === 0) {
+      return;
+    }
+    const cleanCwd = nonBlankPath(cwd);
+    const tab: OrbitSidePanelTab = {
+      tabId: canonicalFileTabId(cleanHost, cleanCwd, cleanPath),
+      kind: 'file',
+      hostId: cleanHost,
+      agentId: this.isNewSessionDraft ? null : (this.selectedAgentId.length > 0 ? this.selectedAgentId : null),
+      cwd: cleanCwd.length > 0 ? cleanCwd : null,
+      path: cleanPath,
+      parentHostId: cleanHost,
+      title: basenameOfPath(cleanPath),
+      closable: true
+    };
+    this.sidePanelStore.openTab(tab, { source: 'user', activate: true });
+    this.triggerHaptic(6);
+  }
+
+  public openSubagentCrewPanel(hostId?: string, rootAgentId?: string): void {
+    const targetHost = hostId !== undefined && hostId.trim().length > 0
+      ? hostId.trim()
+      : this.selectedHostId.trim();
+    const targetAgent = rootAgentId !== undefined && rootAgentId.trim().length > 0
+      ? rootAgentId.trim()
+      : this.selectedAgentId.trim();
+    if (targetHost.length === 0 || targetAgent.length === 0) {
+      return;
+    }
+    this.navigationSeq += 1;
+    const navSeq = this.navigationSeq;
+    const root = this.sidePanelStore.resolveRootScope(targetHost, targetAgent, true);
+    const hasUnresolvedHost = root.unresolvedHostId !== undefined &&
+      root.unresolvedHostId !== null &&
+      root.unresolvedHostId.trim().length > 0;
+    if (hasUnresolvedHost || root.missingAgentCard === true) {
+      this.resolveRootScopeHydratingChainAsync(targetHost, targetAgent, true).then((hydrated: OrbitHydratedRootResult): void => {
+        if (navSeq !== this.navigationSeq) {
+          return;
+        }
+        if (hydrated.status !== 'resolved') {
+          this.showToast('Unable to load parent session host — tap to retry', true);
+          return;
+        }
+        const resolvedHost = hydrated.hostId;
+        const resolvedAgent = hydrated.rootAgentId;
+        const card = this.findAgentCardOnHost(resolvedHost, resolvedAgent);
+        const scopeKey = this.sidePanelStore.scopeKeyFor(resolvedHost, resolvedAgent);
+        const crewTab: OrbitSidePanelTab = {
+          tabId: `crew:${scopeKey}`,
+          kind: 'subagent',
+          hostId: resolvedHost,
+          agentId: resolvedAgent,
+          cwd: card !== null && card.cwd.length > 0 ? card.cwd : null,
+          path: null,
+          parentHostId: resolvedHost,
+          title: 'Subagent Crew',
+          closable: true,
+          parentAgentId: resolvedAgent
+        };
+        this.sidePanelStore.openSubagentTab(
+          resolvedHost,
+          resolvedAgent,
+          crewTab,
+          { source: 'user', activate: true }
+        );
+        this.triggerHaptic(8);
+      }).catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'openSubagentCrewPanel async parent resolution failed', err);
+      });
+      return;
+    }
+    const resolvedHost = root.hostId.length > 0 ? root.hostId : targetHost;
+    const resolvedAgent = root.rootAgentId !== null ? root.rootAgentId : targetAgent;
+    const card = this.findAgentCardOnHost(resolvedHost, resolvedAgent);
+    const scopeKey = this.sidePanelStore.scopeKeyFor(resolvedHost, resolvedAgent);
+    const crewTab: OrbitSidePanelTab = {
+      tabId: `crew:${scopeKey}`,
+      kind: 'subagent',
+      hostId: resolvedHost,
+      agentId: resolvedAgent,
+      cwd: card !== null && card.cwd.length > 0 ? card.cwd : null,
+      path: null,
+      parentHostId: resolvedHost,
+      title: 'Subagent Crew',
+      closable: true,
+      parentAgentId: resolvedAgent
+    };
+    this.sidePanelStore.openSubagentTab(
+      resolvedHost,
+      resolvedAgent,
+      crewTab,
+      { source: 'user', activate: true }
+    );
+    this.triggerHaptic(8);
+  }
+
+  /**
+   * Opens a peer card in the side panel. If the card is itself a child subagent, enforces the
+   * mandatory "child click -> root agent scope + subagent tab" invariant (P1-6 / P0-4 / R3-P1-2).
+   * Always bumps unified `navigationSeq` even for synchronous peer opens so any older in-flight
+   * cross-host hydration cannot commit afterward and steal the Stage.
+   */
+  public openPeerPanelTab(hostId: string, peer: AgentCardDto, originParentHostId?: string): void {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0 || peer.agent_id.trim().length === 0) {
+      return;
+    }
+    this.navigationSeq += 1;
+    const navSeq = this.navigationSeq;
+    const label = (peer.handle !== undefined && peer.handle !== null && peer.handle.trim().length > 0)
+      ? `@${peer.handle.trim()}`
+      : (peer.title.trim().length > 0 ? peer.title.trim() : peer.provider_label);
+
+    if (peer.parent_agent_id !== null && peer.parent_agent_id.trim().length > 0) {
+      const directParentHost = (
+        peer.parent_host_id !== undefined &&
+        peer.parent_host_id !== null &&
+        peer.parent_host_id.trim().length > 0
+      )
+        ? peer.parent_host_id.trim()
+        : cleanHost;
+      const directParentAgent = peer.parent_agent_id.trim();
+      const root = this.sidePanelStore.resolveRootScope(directParentHost, directParentAgent, true);
+      const hasUnresolvedHost = root.unresolvedHostId !== undefined &&
+        root.unresolvedHostId !== null &&
+        root.unresolvedHostId.trim().length > 0;
+      if (hasUnresolvedHost || root.missingAgentCard === true) {
+        this.resolveRootScopeHydratingChainAsync(directParentHost, directParentAgent, true).then((hydrated: OrbitHydratedRootResult): void => {
+          if (navSeq !== this.navigationSeq) {
+            return;
+          }
+          if (hydrated.status !== 'resolved') {
+            this.showToast('Unable to load parent session host — tap to retry', true);
+            return;
+          }
+          this.commitManagedChildSelection(
+            cleanHost,
+            peer.agent_id,
+            hydrated.hostId,
+            hydrated.rootAgentId,
+            directParentHost,
+            directParentAgent,
+            false,
+            label,
+            peer.cwd.length > 0 ? peer.cwd : null
+          );
+        }).catch((err: Object) => {
+          orbitLogWarn('OrbitStore', 'openPeerPanelTab async parent resolution failed', err);
+        });
+        return;
+      }
+      const resolvedRootHost = root.hostId.length > 0 ? root.hostId : directParentHost;
+      const resolvedRootAgent = root.rootAgentId !== null ? root.rootAgentId : directParentAgent;
+      this.commitManagedChildSelection(
+        cleanHost,
+        peer.agent_id,
+        resolvedRootHost,
+        resolvedRootAgent,
+        directParentHost,
+        directParentAgent,
+        false,
+        label,
+        peer.cwd.length > 0 ? peer.cwd : null
+      );
+      return;
+    }
+
+    const parentHost = (originParentHostId !== undefined && originParentHostId.trim().length > 0)
+      ? originParentHostId.trim()
+      : (this.selectedHostId.length > 0 ? this.selectedHostId : cleanHost);
+    const tab: OrbitSidePanelTab = {
+      tabId: canonicalPeerTabId(cleanHost, peer.agent_id),
+      kind: 'peer',
+      hostId: cleanHost,
+      agentId: peer.agent_id,
+      cwd: peer.cwd.length > 0 ? peer.cwd : null,
+      path: null,
+      parentHostId: parentHost,
+      title: label,
+      closable: true
+    };
+    this.sidePanelStore.openTab(tab, { source: 'user', activate: true });
+    this.triggerHaptic(8);
+  }
+
+  public openBriefingPanelTab(): void {
+    this.openSidePanelToolTab('briefing', null, 'user');
+    this.triggerHaptic(8);
+  }
+
+  public getScopedBriefing(hostId: string, agentId: string | null = null): PersonalAgentBriefingDto | null {
+    return this.personalAgentStore.fetchScopedBriefing(hostId, agentId);
+  }
+
+  /**
+   * Resolves the EXACT, UNAMBIGUOUS workspace ID matching `(hostId, cwd, agentId)`.
+   * Returns `''` on mismatch, ambiguity, or missing host detail — NEVER falls back to
+   * `detail.workspaces[0]` and NEVER strips `/home/<user>` prefixes (P0-3 + R3-P0-1).
+   */
+  public resolveScopedWorkspaceId(hostId: string, cwd: string, agentId: string | null): string {
+    const detail = this.getScopedHostDetail(hostId);
+    if (detail === null) {
+      return '';
+    }
+    const verified = this.verifyScopedWorkspace(detail, cwd, '', agentId);
+    return verified !== null ? verified.workspace_id : '';
+  }
+
+  // --- Scoped Git Review, Collab & Write Helpers ---
+
+  /**
+   * Normalizes a cwd-relative Git path by stripping redundant `./` and empty segments while
+   * preserving every literal character including leading/trailing spaces (e.g. `report.txt `).
+   */
+  private normalizeGitRelPath(raw: string): string {
+    if (raw.length === 0) {
+      return '';
+    }
+    if (raw.startsWith('/')) {
+      return raw;
+    }
+    const segs = raw.split('/');
+    const out: string[] = [];
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
+      if (s.length === 0 || s === '.') {
+        continue;
+      }
+      out.push(s);
+    }
+    return out.join('/');
+  }
+
+  private normalizeGitFocusPath(focusPath: string | null): string | null {
+    if (focusPath === null) {
+      return null;
+    }
+    const norm = this.normalizeGitRelPath(focusPath);
+    return norm.length > 0 ? norm : null;
+  }
+
+  private safeReadGitReviewSnapshot(
+    hostId: string,
+    cwd: string,
+    focusPath: string | null,
+    staged: boolean
+  ): GitReviewDto | null {
+    if (this.bridge === null) {
+      return null;
+    }
+    try {
+      const normPath = this.normalizeGitFocusPath(focusPath);
+      const raw = this.bridge.gitReviewJson(hostId, cwd, normPath, staged);
+      if (raw === undefined || raw === null || raw.trim().length === 0) {
+        return null;
+      }
+      return JSON.parse(raw) as GitReviewDto | null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  private clearGitDiffSettleTimer(tracker: OrbitGitDiffModeTracker): void {
+    if (tracker.settleTimerId !== -1) {
+      clearTimeout(tracker.settleTimerId);
+      tracker.settleTimerId = -1;
+    }
+  }
+
+  private gitDiffTrackerKey(
+    hostId: string,
+    cwd: string,
+    focusPath: string | null,
+    staged: boolean
+  ): string {
+    const normPath = this.normalizeGitFocusPath(focusPath);
+    return encodeSidePanelKeyTuple([
+      'git_diff_mode',
+      hostId.trim(),
+      normalizeAbsoluteCwd(cwd),
+      normPath === null ? 'all:' : `file:${normPath}`,
+      staged ? 'S' : 'U'
+    ]);
+  }
+
+  private isTrackerCurrentlyVisibleReviewTab(tracker: OrbitGitDiffModeTracker): boolean {
+    if (!this.isSidePanelActuallyVisible()) {
+      return false;
+    }
+    const activeTab = this.sidePanelStore.activeTab;
+    if (activeTab === null || activeTab.kind !== 'review') {
+      return false;
+    }
+    if (activeTab.hostId.trim() !== tracker.hostId) {
+      return false;
+    }
+    const tabCwd = nonBlankPath(activeTab.cwd);
+    if (tabCwd.length === 0 || normalizeAbsoluteCwd(tabCwd) !== tracker.normCwd) {
+      return false;
+    }
+    if ((activeTab.gitStaged === true) !== tracker.staged) {
+      return false;
+    }
+    return this.normalizeGitFocusPath(activeTab.path) === tracker.focusPath;
+  }
+
+  private evictInactiveGitDiffTrackersIfNeeded(keepKey: string): void {
+    if (this.gitDiffModeTrackers.size <= ORBIT_MAX_GIT_DIFF_TRACKERS) {
+      return;
+    }
+    while (this.gitDiffModeTrackers.size > ORBIT_MAX_GIT_DIFF_TRACKERS) {
+      let oldestIdleKey = '';
+      let oldestIdleClock = Number.MAX_SAFE_INTEGER;
+      let oldestAnyInactiveKey = '';
+      let oldestAnyInactiveClock = Number.MAX_SAFE_INTEGER;
+      this.gitDiffModeTrackers.forEach((tr: OrbitGitDiffModeTracker, key: string): void => {
+        if (key === keepKey || this.isTrackerCurrentlyVisibleReviewTab(tr)) {
+          return;
+        }
+        if (tr.modeState !== 'loading' && tr.lastTouchedAt < oldestIdleClock) {
+          oldestIdleClock = tr.lastTouchedAt;
+          oldestIdleKey = key;
+        }
+        if (tr.lastTouchedAt < oldestAnyInactiveClock) {
+          oldestAnyInactiveClock = tr.lastTouchedAt;
+          oldestAnyInactiveKey = key;
+        }
+      });
+      const victimKey = oldestIdleKey.length > 0 ? oldestIdleKey : oldestAnyInactiveKey;
+      if (victimKey.length === 0) {
+        break;
+      }
+      const victim = this.gitDiffModeTrackers.get(victimKey);
+      if (victim !== undefined) {
+        this.clearGitDiffSettleTimer(victim);
+        victim.cachedSnapshot = null;
+        victim.lastStatus = null;
+      }
+      this.gitDiffModeTrackers.delete(victimKey);
+    }
+  }
+
+  public releaseGitDiffTrackerIfUnused(
+    hostId: string,
+    cwd: string | null,
+    focusPath: string | null
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (cleanHost.length === 0 || cleanCwd.length === 0) {
+      return;
+    }
+    const modes: boolean[] = [false, true];
+    for (let i = 0; i < modes.length; i++) {
+      const key = this.gitDiffTrackerKey(cleanHost, cleanCwd, focusPath, modes[i]);
+      const tracker = this.gitDiffModeTrackers.get(key);
+      if (tracker === undefined || this.isTrackerCurrentlyVisibleReviewTab(tracker)) {
+        continue;
+      }
+      // R5-P1-1: Immediately drop large diff body cache & remove inactive tracker on close,
+      // unmount, or same-kind Review tab takeover.
+      this.clearGitDiffSettleTimer(tracker);
+      tracker.cachedSnapshot = null;
+      tracker.lastStatus = null;
+      this.gitDiffModeTrackers.delete(key);
+    }
+  }
+
+  private releaseGitDiffTrackersForHost(hostId: string): void {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return;
+    }
+    const toDelete: string[] = [];
+    this.gitDiffModeTrackers.forEach((tracker: OrbitGitDiffModeTracker, key: string): void => {
+      if (tracker.hostId === cleanHost) {
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.cachedSnapshot = null;
+        tracker.lastStatus = null;
+        toDelete.push(key);
+      }
+    });
+    for (let i = 0; i < toDelete.length; i++) {
+      this.gitDiffModeTrackers.delete(toDelete[i]);
+    }
+  }
+
+  public get gitDiffTrackerCount(): number {
+    return this.gitDiffModeTrackers.size;
+  }
+
+  public hasCachedGitDiffPayload(
+    hostId: string,
+    cwd: string,
+    focusPath: string | null,
+    staged?: boolean
+  ): boolean {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    if (staged !== undefined) {
+      const tracker = this.gitDiffModeTrackers.get(
+        this.gitDiffTrackerKey(cleanHost, cleanCwd, focusPath, staged)
+      );
+      return tracker !== undefined && tracker.cachedSnapshot !== null;
+    }
+    const uTracker = this.gitDiffModeTrackers.get(
+      this.gitDiffTrackerKey(cleanHost, cleanCwd, focusPath, false)
+    );
+    const sTracker = this.gitDiffModeTrackers.get(
+      this.gitDiffTrackerKey(cleanHost, cleanCwd, focusPath, true)
+    );
+    return (
+      (uTracker !== undefined && uTracker.cachedSnapshot !== null) ||
+      (sTracker !== undefined && sTracker.cachedSnapshot !== null)
+    );
+  }
+
+  private markHiddenGitTrackersDirty(hostId: string, cwd: string): void {
+    const cleanHost = hostId.trim();
+    const normCwd = normalizeAbsoluteCwd(cwd);
+    if (cleanHost.length === 0 || normCwd.length === 0) {
+      return;
+    }
+    this.gitDiffModeTrackers.forEach((tracker: OrbitGitDiffModeTracker): void => {
+      if (tracker.hostId !== cleanHost || tracker.normCwd !== normCwd) {
+        return;
+      }
+      tracker.dirtyWhileHidden = true;
+      tracker.cachedSnapshot = null;
+    });
+  }
+
+  private getOrCreateGitDiffTracker(
+    hostId: string,
+    cwd: string,
+    focusPath: string | null,
+    staged: boolean
+  ): OrbitGitDiffModeTracker {
+    const key = this.gitDiffTrackerKey(hostId, cwd, focusPath, staged);
+    this.gitDiffTrackerClock += 1;
+    const existing = this.gitDiffModeTrackers.get(key);
+    if (existing !== undefined) {
+      existing.rawCwd = nonBlankPath(cwd);
+      existing.lastTouchedAt = this.gitDiffTrackerClock;
+      return existing;
+    }
+    const created: OrbitGitDiffModeTracker = {
+      hostId: hostId.trim(),
+      normCwd: normalizeAbsoluteCwd(cwd),
+      rawCwd: nonBlankPath(cwd),
+      focusPath: this.normalizeGitFocusPath(focusPath),
+      staged: staged,
+      requestSeq: 0,
+      modeState: 'idle',
+      baselineDiffRevision: 0,
+      confirmedDiffRevision: 0,
+      dirtyWhileHidden: false,
+      lastStatus: null,
+      cachedSnapshot: null,
+      settleTimerId: -1,
+      lastTouchedAt: this.gitDiffTrackerClock,
+      nonErrorLoadingRecoveryBudget: 1,
+      lastObservedIdentityEpoch: 0,
+      lastObservedStatusRevision: 0,
+      lastHandledErrorRevision: 0,
+      pendingErrorRecovery: false,
+      errorObservedStatusRevision: 0
+    };
+    this.gitDiffModeTrackers.set(key, created);
+    this.evictInactiveGitDiffTrackersIfNeeded(key);
+    return created;
+  }
+
+  private readSnapStatusRevision(snap: GitReviewDto | null): number {
+    return snap !== null && typeof snap.status_revision === 'number' && snap.status_revision > 0
+      ? snap.status_revision
+      : 0;
+  }
+
+  private readSnapIdentityEpoch(snap: GitReviewDto | null): number {
+    return snap !== null && typeof snap.cwd_identity_epoch === 'number' && snap.cwd_identity_epoch > 0
+      ? snap.cwd_identity_epoch
+      : 0;
+  }
+
+  private readSnapStatusIdentityEpoch(snap: GitReviewDto | null): number {
+    if (snap === null || snap.status === null || snap.status === undefined) {
+      return -1;
+    }
+    if (typeof snap.status_identity_epoch === 'number') {
+      return snap.status_identity_epoch;
+    }
+    return this.readSnapIdentityEpoch(snap);
+  }
+
+  private readSnapDiffErrorRevision(snap: GitReviewDto | null): number {
+    return snap !== null &&
+      typeof snap.last_diff_error_revision === 'number' &&
+      snap.last_diff_error_revision > 0
+      ? snap.last_diff_error_revision
+      : 0;
+  }
+
+  private readSnapDiffErrorStatusRevision(snap: GitReviewDto | null, fallbackStatusRev: number): number {
+    if (snap !== null && typeof snap.last_diff_error_status_revision === 'number') {
+      return snap.last_diff_error_status_revision;
+    }
+    return fallbackStatusRev;
+  }
+
+  private requestScopedGitReviewFetch(
+    hostId: string,
+    cwd: string,
+    staged: boolean,
+    focusPath: string | null,
+    includeStatus: boolean = true,
+    preloadedSnap: GitReviewDto | null = null,
+    resetRetryBudget: boolean = true
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return;
+    }
+    const tracker = this.getOrCreateGitDiffTracker(cleanHost, cleanCwd, focusPath, staged);
+    this.clearGitDiffSettleTimer(tracker);
+
+    const preSnap =
+      preloadedSnap !== null
+        ? preloadedSnap
+        : this.safeReadGitReviewSnapshot(cleanHost, cleanCwd, tracker.focusPath, staged);
+    const preDiffRev =
+      preSnap !== null && typeof preSnap.diff_revision === 'number' && preSnap.diff_revision > 0
+        ? preSnap.diff_revision
+        : 0;
+    if (preSnap !== null) {
+      if (preSnap.status !== undefined) {
+        tracker.lastStatus = preSnap.status;
+      }
+      const preEpoch = this.readSnapIdentityEpoch(preSnap);
+      const preStatusEpoch = this.readSnapStatusIdentityEpoch(preSnap);
+      if (preEpoch > tracker.lastObservedIdentityEpoch && preStatusEpoch === preEpoch) {
+        tracker.lastObservedIdentityEpoch = preEpoch;
+      }
+      const preStatusRev = this.readSnapStatusRevision(preSnap);
+      if (preStatusEpoch === preEpoch && preStatusRev > tracker.lastObservedStatusRevision) {
+        tracker.lastObservedStatusRevision = preStatusRev;
+      }
+      const preErrRev = this.readSnapDiffErrorRevision(preSnap);
+      if (preErrRev > tracker.lastHandledErrorRevision) {
+        tracker.lastHandledErrorRevision = preErrRev;
+      }
+    }
+
+    tracker.dirtyWhileHidden = false;
+    tracker.cachedSnapshot = null;
+    tracker.pendingErrorRecovery = false;
+    if (resetRetryBudget) {
+      tracker.nonErrorLoadingRecoveryBudget = 1;
+    }
+    tracker.requestSeq += 1;
+    const reqSeq = tracker.requestSeq;
+    tracker.modeState = 'loading';
+    tracker.baselineDiffRevision = preDiffRev;
+
+    tracker.settleTimerId = setTimeout((): void => {
+      if (tracker.requestSeq === reqSeq && tracker.modeState === 'loading') {
+        tracker.settleTimerId = -1;
+        tracker.modeState = 'unverified';
+        tracker.cachedSnapshot = null;
+        this.gitPanelRevision += 1;
+        this.panelDataRevision += 1;
+      }
+    }, 1500);
+
+    try {
+      if (includeStatus) {
+        this.bridge.fetchGitStatus(cleanHost, cleanCwd);
+      }
+      this.bridge.fetchGitDiff(cleanHost, cleanCwd, tracker.focusPath, staged);
+    } catch (err) {
+      this.clearGitDiffSettleTimer(tracker);
+      tracker.modeState = 'unverified';
+      tracker.cachedSnapshot = null;
+      orbitLogWarn('OrbitStore', 'fetchScopedGitReview failed', err as Object);
+    }
+  }
+
+  private adoptInFlightGitReviewFetch(
+    tracker: OrbitGitDiffModeTracker,
+    snap: GitReviewDto
+  ): void {
+    this.clearGitDiffSettleTimer(tracker);
+    if (snap.status !== undefined) {
+      tracker.lastStatus = snap.status;
+    }
+    const snapEpoch = this.readSnapIdentityEpoch(snap);
+    const snapStatusEpoch = this.readSnapStatusIdentityEpoch(snap);
+    if (snapEpoch > tracker.lastObservedIdentityEpoch && snapStatusEpoch === snapEpoch) {
+      tracker.lastObservedIdentityEpoch = snapEpoch;
+    }
+    const snapStatusRev = this.readSnapStatusRevision(snap);
+    if (snapStatusEpoch === snapEpoch && snapStatusRev > tracker.lastObservedStatusRevision) {
+      tracker.lastObservedStatusRevision = snapStatusRev;
+    }
+    const snapErrRev = this.readSnapDiffErrorRevision(snap);
+    if (snapErrRev > tracker.lastHandledErrorRevision) {
+      tracker.lastHandledErrorRevision = snapErrRev;
+    }
+    tracker.dirtyWhileHidden = false;
+    tracker.cachedSnapshot = null;
+    tracker.confirmedDiffRevision = 0;
+    tracker.baselineDiffRevision = 0;
+    tracker.pendingErrorRecovery = false;
+    tracker.requestSeq += 1;
+    const reqSeq = tracker.requestSeq;
+    tracker.modeState = 'loading';
+    tracker.settleTimerId = setTimeout((): void => {
+      if (tracker.requestSeq === reqSeq && tracker.modeState === 'loading') {
+        tracker.settleTimerId = -1;
+        tracker.modeState = 'unverified';
+        tracker.cachedSnapshot = null;
+        this.gitPanelRevision += 1;
+        this.panelDataRevision += 1;
+      }
+    }, 1500);
+  }
+
+  /**
+   * Reconciles a post-mutation scoped Git Review refresh (`R19-N2`, `R24-P1-1`):
+   * - Prioritizes returning an already-confirmed positive-revision snapshot (`diff_revision > 0`)
+   *   whose `(identity, path, staged)` matches the slot — even when a concurrent same-slot
+   *   `diff_in_flight === true` coexists with `status_reverify_pending === true` — so confirmed
+   *   diff lines and revision stay stably rendered without clearing cache or arming a wipe timer
+   *   while reusing the in-flight request.
+   * - Otherwise reuses the single live native in-flight request when `preSnap.diff_in_flight === true`
+   *   (zero duplicate UUIDs across core routine refresh, Store callback, and component callback).
+   * - Stays silent during `status_reverify_pending === true` when no positive diff is cached yet.
+   * - Settles to `unverified` with 0 fetches if status already proves the slot clean.
+   * - Otherwise dispatches a single targeted fetch.
+   */
+  private syncPostMutationGitReview(
+    hostId: string,
+    cwd: string,
+    staged: boolean,
+    focusPath: string | null,
+    includeStatusIfFetching: boolean = false
+  ): GitReviewDto | null {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return null;
+    }
+    const tracker = this.getOrCreateGitDiffTracker(cleanHost, cleanCwd, focusPath, staged);
+    const preSnap = this.safeReadGitReviewSnapshot(cleanHost, cleanCwd, tracker.focusPath, staged);
+    if (preSnap !== null) {
+      if (preSnap.status !== undefined) {
+        tracker.lastStatus = preSnap.status;
+      }
+      const preEpoch = this.readSnapIdentityEpoch(preSnap);
+      const preStatusEpoch = this.readSnapStatusIdentityEpoch(preSnap);
+      if (preEpoch > tracker.lastObservedIdentityEpoch && preStatusEpoch === preEpoch) {
+        tracker.lastObservedIdentityEpoch = preEpoch;
+      }
+      const preStatusRev = this.readSnapStatusRevision(preSnap);
+      if (preStatusEpoch === preEpoch && preStatusRev > tracker.lastObservedStatusRevision) {
+        tracker.lastObservedStatusRevision = preStatusRev;
+      }
+      const preErrRev = this.readSnapDiffErrorRevision(preSnap);
+      if (preErrRev > tracker.lastHandledErrorRevision) {
+        tracker.lastHandledErrorRevision = preErrRev;
+      }
+      const preDiffRev =
+        typeof preSnap.diff_revision === 'number' && preSnap.diff_revision > 0
+          ? preSnap.diff_revision
+          : 0;
+      const preFocusPath = this.normalizeGitFocusPath(preSnap.selected_path ?? null);
+      const slotMatched =
+        preSnap.staged === staged &&
+        preFocusPath === tracker.focusPath &&
+        preEpoch >= tracker.lastObservedIdentityEpoch;
+      if (slotMatched && preDiffRev > 0) {
+        if (preEpoch > tracker.lastObservedIdentityEpoch) {
+          tracker.lastObservedIdentityEpoch = preEpoch;
+        }
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.dirtyWhileHidden = false;
+        tracker.modeState = 'confirmed';
+        tracker.baselineDiffRevision = preDiffRev;
+        tracker.confirmedDiffRevision = preDiffRev;
+        tracker.cachedSnapshot = preSnap;
+        tracker.nonErrorLoadingRecoveryBudget = 1;
+        tracker.pendingErrorRecovery = false;
+        return preSnap;
+      }
+      if (preSnap.diff_in_flight === true) {
+        if (tracker.modeState !== 'loading' || tracker.baselineDiffRevision !== 0) {
+          this.adoptInFlightGitReviewFetch(tracker, preSnap);
+        }
+        return null;
+      }
+      if (preSnap.status_reverify_pending === true) {
+        return null;
+      }
+      if (
+        preSnap.status !== null &&
+        preSnap.status !== undefined &&
+        !gitStatusMayHaveDiffForSlot(preSnap.status, tracker.focusPath, staged)
+      ) {
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.dirtyWhileHidden = false;
+        tracker.modeState = 'unverified';
+        tracker.confirmedDiffRevision = 0;
+        tracker.baselineDiffRevision = 0;
+        tracker.cachedSnapshot = null;
+        tracker.pendingErrorRecovery = false;
+        return null;
+      }
+    }
+    this.requestScopedGitReviewFetch(
+      cleanHost,
+      cleanCwd,
+      staged,
+      focusPath,
+      includeStatusIfFetching,
+      preSnap
+    );
+    return null;
+  }
+
+  private onScopedGitDirtyArrived(hostId: string, cwd: string): void {
+    const cleanHost = hostId.trim();
+    const normCwd = normalizeAbsoluteCwd(cwd);
+    if (cleanHost.length === 0 || normCwd.length === 0) {
+      return;
+    }
+    // Visibility-scoped evaluation (R5-P1-1): ONLY read `gitReviewJson` for the currently active,
+    // visible Review tab's exact `(hostId, normCwd, focusPath, staged)` slot; mark all other
+    // trackers dirty with zero synchronous FFI calls.
+    this.gitDiffModeTrackers.forEach((tracker: OrbitGitDiffModeTracker): void => {
+      if (tracker.hostId !== cleanHost || tracker.normCwd !== normCwd) {
+        return;
+      }
+      if (!this.isTrackerCurrentlyVisibleReviewTab(tracker)) {
+        tracker.dirtyWhileHidden = true;
+        tracker.cachedSnapshot = null;
+        return;
+      }
+      tracker.dirtyWhileHidden = false;
+      const snap = this.safeReadGitReviewSnapshot(
+        cleanHost,
+        tracker.rawCwd,
+        tracker.focusPath,
+        tracker.staged
+      );
+      if (snap === null) {
+        return;
+      }
+      if (snap.status !== undefined) {
+        tracker.lastStatus = snap.status;
+        if (cleanHost === this.selectedHostId && cwdPathsEquivalent(tracker.rawCwd, this.activeCwd)) {
+          this.gitStatus = snap.status;
+        }
+      }
+      const snapDiffRev =
+        typeof snap.diff_revision === 'number' && snap.diff_revision > 0 ? snap.diff_revision : 0;
+      const snapStatusRev = this.readSnapStatusRevision(snap);
+      const snapIdentityEpoch = this.readSnapIdentityEpoch(snap);
+      const snapStatusIdentityEpoch = this.readSnapStatusIdentityEpoch(snap);
+      const snapErrorRev = this.readSnapDiffErrorRevision(snap);
+      const prevObservedStatusRev = tracker.lastObservedStatusRevision;
+      if (
+        snapStatusIdentityEpoch === snapIdentityEpoch &&
+        snapStatusRev > tracker.lastObservedStatusRevision
+      ) {
+        tracker.lastObservedStatusRevision = snapStatusRev;
+      }
+
+      // Rule A (R20-P1-1 / R20-P1-2 / R21-P1-1): Directory identity `(repo_root, repo_prefix)`
+      // switched! Immediately drop stale cached payload. Only advance `lastObservedIdentityEpoch`
+      // and judge clean-vs-dirty once a matching `GitStatusSnapshot` for `snapIdentityEpoch` has
+      // arrived (`snapStatusIdentityEpoch === snapIdentityEpoch`)—so if a whole-repo diff revealed
+      // the switch before the new directory's status arrived, this visible slot stays pending
+      // until the real new-identity status lands (and still confirms immediately if THIS slot
+      // already received a valid post-switch diff).
+      if (snapIdentityEpoch > tracker.lastObservedIdentityEpoch) {
+        if (snapErrorRev > tracker.lastHandledErrorRevision) {
+          tracker.lastHandledErrorRevision = snapErrorRev;
+        }
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.confirmedDiffRevision = 0;
+        tracker.baselineDiffRevision = 0;
+        tracker.cachedSnapshot = null;
+        tracker.pendingErrorRecovery = false;
+        tracker.nonErrorLoadingRecoveryBudget = 1;
+        if (snap.staged === tracker.staged && snapDiffRev > 0) {
+          tracker.lastObservedIdentityEpoch = snapIdentityEpoch;
+          tracker.modeState = 'confirmed';
+          tracker.baselineDiffRevision = snapDiffRev;
+          tracker.confirmedDiffRevision = snapDiffRev;
+          tracker.cachedSnapshot = snap;
+          return;
+        }
+        if (snap.diff_in_flight === true) {
+          if (snapStatusIdentityEpoch === snapIdentityEpoch) {
+            tracker.lastObservedIdentityEpoch = snapIdentityEpoch;
+          }
+          this.adoptInFlightGitReviewFetch(tracker, snap);
+          return;
+        }
+        if (snapStatusIdentityEpoch !== snapIdentityEpoch) {
+          tracker.modeState = 'unverified';
+          return;
+        }
+        tracker.lastObservedIdentityEpoch = snapIdentityEpoch;
+        if (gitStatusMayHaveDiffForSlot(snap.status, tracker.focusPath, tracker.staged)) {
+          this.requestScopedGitReviewFetch(
+            cleanHost,
+            tracker.rawCwd,
+            tracker.staged,
+            tracker.focusPath,
+            false,
+            snap
+          );
+        } else {
+          tracker.modeState = 'unverified';
+        }
+        return;
+      }
+
+      // Rule B (R20-P1-5 / R21-P1-3): Native recorded a new terminal `RpcError` for this exact
+      // slot. Register pending recovery unconditionally—decoupled from 1.5s UI timeout AND
+      // non-zero prior `diff_revision`—anchoring `errorObservedStatusRevision` to native
+      // `last_diff_error_status_revision` (recorded at the exact moment `RpcError` settled in
+      // Rust). Fall through directly into Rule C in the SAME coalesced frame so an error +
+      // post-error status flushed together immediately trigger the single recovery fetch, while a
+      // pre-error status + error flushed together (`status_revision === errorObservedStatusRevision`)
+      // stay unverified and wait for the next status!
+      let errorJustRegistered = false;
+      if (snapErrorRev > tracker.lastHandledErrorRevision) {
+        tracker.lastHandledErrorRevision = snapErrorRev;
+        tracker.errorObservedStatusRevision = this.readSnapDiffErrorStatusRevision(
+          snap,
+          snapStatusRev
+        );
+        tracker.pendingErrorRecovery = true;
+        errorJustRegistered = true;
+        if (tracker.modeState === 'loading' && snap.diff_in_flight !== true) {
+          this.clearGitDiffSettleTimer(tracker);
+          tracker.modeState = 'unverified';
+          tracker.cachedSnapshot = null;
+        }
+      }
+
+      // Fresh diff confirmation strictly newer than baseline.
+      if (snap.staged === tracker.staged && snapDiffRev > tracker.baselineDiffRevision) {
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.modeState = 'confirmed';
+        tracker.baselineDiffRevision = snapDiffRev;
+        tracker.confirmedDiffRevision = snapDiffRev;
+        tracker.cachedSnapshot = snap;
+        tracker.nonErrorLoadingRecoveryBudget = 1;
+        tracker.pendingErrorRecovery = false;
+        return;
+      }
+
+      // Rule C (R20-P1-5 / R20-P1-6 / R21-P1-3): Consume the single post-error recovery opportunity
+      // IF AND ONLY IF a strictly newer valid `GitStatusSnapshot` arrived AFTER the error settled
+      // (`snap.status_revision > tracker.errorObservedStatusRevision`). Works identically across
+      // separate frames, same-frame coalesced flushes, post-1.5s timeout, and non-zero prior diff.
+      if (tracker.pendingErrorRecovery && snapStatusRev > tracker.errorObservedStatusRevision) {
+        tracker.pendingErrorRecovery = false;
+        if (gitStatusMayHaveDiffForSlot(snap.status, tracker.focusPath, tracker.staged)) {
+          if (snap.diff_in_flight === true) {
+            this.adoptInFlightGitReviewFetch(tracker, snap);
+          } else {
+            this.requestScopedGitReviewFetch(
+              cleanHost,
+              tracker.rawCwd,
+              tracker.staged,
+              tracker.focusPath,
+              false,
+              snap,
+              false
+            );
+          }
+        } else {
+          this.clearGitDiffSettleTimer(tracker);
+          tracker.modeState = 'unverified';
+          tracker.cachedSnapshot = null;
+        }
+        return;
+      }
+
+      if (errorJustRegistered) {
+        return;
+      }
+
+      if (
+        tracker.modeState === 'confirmed' &&
+        snap.staged === tracker.staged &&
+        snapDiffRev > 0 &&
+        snapDiffRev >= tracker.confirmedDiffRevision
+      ) {
+        tracker.cachedSnapshot = snap;
+        return;
+      }
+
+      if (tracker.modeState === 'confirmed' && snapDiffRev === 0) {
+        // R17-P1-3 / R17-P1-4 / R17-P1-5 / R18-N1 / R19-P1-1: Native core invalidated this
+        // visible slot's cached diff. Drop stale body immediately; reuse native re-dispatch when
+        // `diff_in_flight === true`, or dispatch once if status may have a diff; else `unverified`.
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.confirmedDiffRevision = 0;
+        tracker.baselineDiffRevision = 0;
+        tracker.cachedSnapshot = null;
+        tracker.pendingErrorRecovery = false;
+        if (gitStatusMayHaveDiffForSlot(snap.status, tracker.focusPath, tracker.staged)) {
+          if (snap.diff_in_flight === true) {
+            this.adoptInFlightGitReviewFetch(tracker, snap);
+          } else {
+            this.requestScopedGitReviewFetch(
+              cleanHost,
+              tracker.rawCwd,
+              tracker.staged,
+              tracker.focusPath,
+              false,
+              snap
+            );
+          }
+        } else {
+          tracker.modeState = 'unverified';
+        }
+        return;
+      }
+
+      if (tracker.modeState === 'loading' && snapDiffRev === 0 && snap.diff_in_flight === false) {
+        // R18-P1-3: Non-error invalidation of a visible `loading` slot with no live native
+        // re-dispatch: allow at most 1 bounded recovery fetch when status still has changes.
+        this.clearGitDiffSettleTimer(tracker);
+        tracker.confirmedDiffRevision = 0;
+        tracker.baselineDiffRevision = 0;
+        tracker.cachedSnapshot = null;
+        if (
+          gitStatusMayHaveDiffForSlot(snap.status, tracker.focusPath, tracker.staged) &&
+          tracker.nonErrorLoadingRecoveryBudget > 0
+        ) {
+          tracker.nonErrorLoadingRecoveryBudget -= 1;
+          this.requestScopedGitReviewFetch(
+            cleanHost,
+            tracker.rawCwd,
+            tracker.staged,
+            tracker.focusPath,
+            false,
+            snap,
+            false
+          );
+        } else {
+          tracker.modeState = 'unverified';
+        }
+        return;
+      }
+
+      // Rule D (R22-P1-2): A previously cleared/unverified visible slot (`diff_revision === 0`,
+      // no pending error recovery) receives a strictly newer matching-identity `GitStatusSnapshot`
+      // (`snapStatusRev > prevObservedStatusRev`, e.g. post-completion `GetGitStatus` recheck
+      // after a delayed Stage ack temporarily overwrote `[true, false]` with `[true]`): adopt any
+      // live in-flight request or dispatch strictly ONE targeted fetch if this slot now has a diff
+      // (while clean statuses stay `unverified` with 0 fetches and non-advancing `status_revision`
+      // events stay silent).
+      if (
+        (tracker.modeState === 'unverified' || tracker.modeState === 'idle') &&
+        !tracker.pendingErrorRecovery &&
+        snapDiffRev === 0 &&
+        snapStatusIdentityEpoch === snapIdentityEpoch &&
+        snapStatusRev > prevObservedStatusRev &&
+        gitStatusMayHaveDiffForSlot(snap.status, tracker.focusPath, tracker.staged)
+      ) {
+        if (snap.diff_in_flight === true) {
+          this.adoptInFlightGitReviewFetch(tracker, snap);
+        } else {
+          this.requestScopedGitReviewFetch(
+            cleanHost,
+            tracker.rawCwd,
+            tracker.staged,
+            tracker.focusPath,
+            false,
+            snap,
+            false
+          );
+        }
+      }
+    });
+  }
+
+  public getScopedGitDiffModeState(
+    hostId: string,
+    cwd: string,
+    staged: boolean,
+    focusPath: string | null
+  ): OrbitGitDiffModeState {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (cleanHost.length === 0 || cleanCwd.length === 0) {
+      return 'idle';
+    }
+    const tracker = this.gitDiffModeTrackers.get(
+      this.gitDiffTrackerKey(cleanHost, cleanCwd, focusPath, staged)
+    );
+    return tracker !== undefined ? tracker.modeState : 'idle';
+  }
+
+  public isScopedGitDiffConfirmed(
+    hostId: string,
+    cwd: string,
+    staged: boolean,
+    focusPath: string | null
+  ): boolean {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    const tracker = this.gitDiffModeTrackers.get(
+      this.gitDiffTrackerKey(cleanHost, cleanCwd, focusPath, staged)
+    );
+    return tracker !== undefined && !tracker.dirtyWhileHidden && tracker.modeState === 'confirmed';
+  }
+
+  public loadScopedGitReview(
+    hostId: string,
+    cwd: string,
+    staged: boolean,
+    focusPath: string | null,
+    triggerRemoteFetch: boolean = false,
+    includeStatus: boolean = true,
+    reuseInFlight: boolean = false
+  ): GitReviewDto | null {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return null;
+    }
+    const tracker = this.getOrCreateGitDiffTracker(cleanHost, cleanCwd, focusPath, staged);
+    const emptySnapshot: GitReviewDto = {
+      revision: 0,
+      host_id: cleanHost,
+      cwd: cleanCwd,
+      status: tracker.lastStatus,
+      selected_path: tracker.focusPath,
+      staged: staged,
+      diff_revision: 0,
+      raw_diff: '',
+      diff_files: []
+    };
+    if (triggerRemoteFetch || tracker.dirtyWhileHidden) {
+      if (reuseInFlight && !tracker.dirtyWhileHidden) {
+        const adoptedOrConfirmed = this.syncPostMutationGitReview(
+          cleanHost,
+          cleanCwd,
+          staged,
+          focusPath,
+          includeStatus
+        );
+        return adoptedOrConfirmed !== null ? adoptedOrConfirmed : emptySnapshot;
+      }
+      this.requestScopedGitReviewFetch(
+        cleanHost,
+        cleanCwd,
+        staged,
+        focusPath,
+        includeStatus || tracker.dirtyWhileHidden
+      );
+      return emptySnapshot;
+    }
+    if (tracker.modeState !== 'confirmed') {
+      return emptySnapshot;
+    }
+    if (tracker.cachedSnapshot !== null) {
+      return tracker.cachedSnapshot;
+    }
+    const parsed = this.safeReadGitReviewSnapshot(cleanHost, cleanCwd, tracker.focusPath, staged);
+    if (parsed !== null) {
+      tracker.lastStatus = parsed.status;
+      if (parsed.staged === staged && parsed.diff_revision > 0) {
+        tracker.cachedSnapshot = parsed;
+        return parsed;
+      }
+    }
+    return emptySnapshot;
+  }
+
+  public async loadScopedGitCollabStatus(
+    hostId: string,
+    cwd: string
+  ): Promise<OrbitScopedGitCollabData> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const empty: OrbitScopedGitCollabData = {
+      prStatus: null,
+      stashes: [],
+      conflicts: [],
+      rebaseStatus: null
+    };
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return empty;
+    }
+    let prStatus: GitPrStatusDto | null = null;
+    let stashes: GitStashEntryDto[] = [];
+    let conflicts: GitConflictEntryDto[] = [];
+    let rebaseStatus: GitRebaseStatusDto | null = null;
+    try {
+      prStatus = JSON.parse(await this.bridge.gitPrStatusJson(cleanHost, cleanCwd)) as GitPrStatusDto;
+    } catch (_e) {
+      prStatus = null;
+    }
+    try {
+      stashes = JSON.parse(await this.bridge.gitStashListJson(cleanHost, cleanCwd)) as GitStashEntryDto[];
+    } catch (_e) {
+      stashes = [];
+    }
+    try {
+      conflicts = JSON.parse(await this.bridge.gitConflictsJson(cleanHost, cleanCwd)) as GitConflictEntryDto[];
+    } catch (_e) {
+      conflicts = [];
+    }
+    try {
+      rebaseStatus = JSON.parse(await this.bridge.gitRebaseStatusJson(cleanHost, cleanCwd)) as GitRebaseStatusDto;
+    } catch (_e) {
+      rebaseStatus = null;
+    }
+    return {
+      prStatus: prStatus,
+      stashes: stashes,
+      conflicts: conflicts,
+      rebaseStatus: rebaseStatus
+    };
+  }
+
+  private resolveActiveReviewStagedMode(hostId: string, cwd: string, fallback: boolean): boolean {
+    const activeTab = this.sidePanelStore.activeTab;
+    if (
+      activeTab !== null &&
+      activeTab.kind === 'review' &&
+      activeTab.hostId === hostId &&
+      activeTab.cwd !== null &&
+      cwdPathsEquivalent(activeTab.cwd, cwd)
+    ) {
+      return activeTab.gitStaged === true;
+    }
+    return fallback;
+  }
+
+  private resolveActiveReviewFocusPath(hostId: string, cwd: string): string | null {
+    const activeTab = this.sidePanelStore.activeTab;
+    if (
+      activeTab !== null &&
+      activeTab.kind === 'review' &&
+      activeTab.hostId === hostId &&
+      activeTab.cwd !== null &&
+      cwdPathsEquivalent(activeTab.cwd, cwd)
+    ) {
+      return activeTab.path;
+    }
+    return null;
+  }
+
+  public async gitStageScopedPaths(
+    hostId: string,
+    cwd: string,
+    paths: string[],
+    all: boolean
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.gitStagePathsJson(cleanHost, cleanCwd, paths, all);
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast(all ? 'Staged all changes' : 'Staged file', false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitStageScopedPaths failed', err as Object);
+      this.showToast((err as Error).message || 'Stage failed', true);
+      return false;
+    }
+  }
+
+  public async gitUnstageScopedPaths(
+    hostId: string,
+    cwd: string,
+    paths: string[],
+    all: boolean
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.gitUnstagePathsJson(cleanHost, cleanCwd, paths, all);
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, true),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast(all ? 'Unstaged all changes' : 'Unstaged file', false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitUnstageScopedPaths failed', err as Object);
+      this.showToast((err as Error).message || 'Unstage failed', true);
+      return false;
+    }
+  }
+
+  public async gitGenerateScopedCommitMessage(hostId: string, cwd: string): Promise<string> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return '';
+    }
+    try {
+      const json = await this.bridge.gitGenerateCommitMessageJson(cleanHost, cleanCwd);
+      const parsed = JSON.parse(json) as GitGeneratedCommitMessageDto;
+      if (parsed.message !== undefined && parsed.message.trim().length > 0) {
+        return parsed.message.trim();
+      }
+      if (parsed.subject !== undefined && parsed.subject.trim().length > 0) {
+        const body = (parsed.body ?? '').trim();
+        return body.length > 0 ? `${parsed.subject.trim()}\n\n${body}` : parsed.subject.trim();
+      }
+      return '';
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitGenerateScopedCommitMessage failed', err as Object);
+      this.showToast((err as Error).message || 'Unable to generate commit message', true);
+      return '';
+    }
+  }
+
+  public async gitCommitScoped(
+    hostId: string,
+    cwd: string,
+    message: string,
+    amend: boolean
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanMsg = message.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanMsg.length === 0) {
+      return false;
+    }
+    try {
+      const json = await this.bridge.gitCommitJson(cleanHost, cleanCwd, cleanMsg, amend);
+      const res = JSON.parse(json) as GitCommitResultDto;
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast(`Committed ${res.short_sha}`, false);
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitCommitScoped failed', err as Object);
+      this.showToast((err as Error).message || 'Commit failed', true);
+      return false;
+    }
+  }
+
+  public async gitCreateScopedPr(
+    hostId: string,
+    cwd: string,
+    title: string,
+    body: string,
+    base: string | null,
+    draft: boolean
+  ): Promise<GitCreatePrResultDto | null> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanTitle = title.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanTitle.length === 0) {
+      return null;
+    }
+    try {
+      const json = await this.bridge.gitCreatePrJson(
+        cleanHost,
+        cleanCwd,
+        cleanTitle,
+        body.trim(),
+        base !== null && base.trim().length > 0 ? base.trim() : null,
+        draft
+      );
+      const res = JSON.parse(json) as GitCreatePrResultDto;
+      this.gitPanelRevision += 1;
+      this.showToast(`Created PR: ${res.title}`, false);
+      this.triggerHaptic(12);
+      return res;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'gitCreateScopedPr failed', err as Object);
+      this.showToast((err as Error).message || 'Create PR failed', true);
+      return null;
+    }
+  }
+
+  public async gitSaveScopedStash(
+    hostId: string,
+    cwd: string,
+    message: string | null,
+    includeUntracked: boolean
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.gitStashSaveJson(cleanHost, cleanCwd, message, includeUntracked);
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast('Saved working tree stash', false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Stash failed', true);
+      return false;
+    }
+  }
+
+  public async gitPopScopedStash(
+    hostId: string,
+    cwd: string,
+    stashRef: string,
+    expectedOid: string | null
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || stashRef.trim().length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.gitStashPopJson(cleanHost, cleanCwd, stashRef, expectedOid);
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast(`Popped ${stashRef}`, false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Pop stash failed', true);
+      return false;
+    }
+  }
+
+  public async gitRebaseContinueScoped(hostId: string, cwd: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.gitRebaseContinueJson(cleanHost, cleanCwd);
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast('Continued rebase', false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Rebase continue failed', true);
+      return false;
+    }
+  }
+
+  public async gitRebaseAbortScoped(hostId: string, cwd: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.gitRebaseAbortJson(cleanHost, cleanCwd);
+      this.syncPostMutationGitReview(
+        cleanHost,
+        cleanCwd,
+        this.resolveActiveReviewStagedMode(cleanHost, cleanCwd, false),
+        this.resolveActiveReviewFocusPath(cleanHost, cleanCwd),
+        false
+      );
+      this.gitPanelRevision += 1;
+      this.showToast('Aborted rebase', false);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Rebase abort failed', true);
+      return false;
+    }
+  }
+
+  // --- Scoped Workspace Files & Protected File Save Helpers ---
+
+  public loadScopedWorkspaceFiles(
+    hostId: string,
+    cwd: string,
+    triggerRemoteFetch: boolean = false
+  ): string[] {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0) {
+      return [];
+    }
+    if (triggerRemoteFetch) {
+      try {
+        this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'fetchScopedWorkspaceFiles failed', err as Object);
+      }
+    }
+    try {
+      return JSON.parse(this.bridge.workspaceFilesJson(cleanHost, cleanCwd)) as string[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'loadScopedWorkspaceFiles failed', err as Object);
+      return [];
+    }
+  }
+
+  public async readScopedWorkspaceFile(
+    hostId: string,
+    cwd: string,
+    path: string
+  ): Promise<WorkspaceFileViewDto | null> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanPath = nonBlankPath(path);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanPath.length === 0) {
+      return null;
+    }
+    try {
+      const json = await this.bridge.readWorkspaceFileJson(cleanHost, cleanCwd, cleanPath);
+      return JSON.parse(json) as WorkspaceFileViewDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'readScopedWorkspaceFile failed', err as Object);
+      return null;
+    }
+  }
+
+  /**
+   * Concurrency-safe workspace file write (P0-2):
+   * Sends `expected_etag` with `force: false` by default and inspects `WorkspaceFileWriteResultDto.conflict`.
+   * Only passes `force: true` when the user explicitly confirms overwriting a detected conflict.
+   */
+  public async saveScopedWorkspaceFile(
+    hostId: string,
+    cwd: string,
+    path: string,
+    content: string,
+    expectedEtag: string | null = null,
+    force: boolean = false
+  ): Promise<OrbitWorkspaceFileWriteOutcome> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanPath = nonBlankPath(path);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanPath.length === 0) {
+      return {
+        ok: false,
+        conflict: false,
+        etag: '',
+        currentContent: null,
+        errorMessage: 'Target file is unavailable'
+      };
+    }
+    try {
+      const req: WriteWorkspaceFileRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        path: cleanPath,
+        content: content,
+        expected_etag: expectedEtag,
+        force: force
+      };
+      const rawResult = await this.bridge.writeWorkspaceFileJson(JSON.stringify(req));
+      if (rawResult === undefined || rawResult === null || rawResult.trim().length === 0) {
+        this.showToast('Save failed: empty write receipt from host', true);
+        return {
+          ok: false,
+          conflict: false,
+          etag: '',
+          currentContent: null,
+          errorMessage: 'Empty write receipt from host.'
+        };
+      }
+      let parsed: WorkspaceFileWriteResultDto | null = null;
+      try {
+        const candidate: Object | null = JSON.parse(rawResult) as Object | null;
+        if (candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)) {
+          parsed = candidate as WorkspaceFileWriteResultDto;
+        }
+      } catch (_parseErr) {
+        parsed = null;
+      }
+      if (parsed === null) {
+        this.showToast('Save failed: invalid write receipt from host', true);
+        return {
+          ok: false,
+          conflict: false,
+          etag: '',
+          currentContent: null,
+          errorMessage: 'Invalid write receipt from host.'
+        };
+      }
+      // Validate common receipt target `(host_id, cwd, path)` AND u64-safe `size_bytes` FIRST
+      // BEFORE branching on `conflict` vs success so wrong-target or malformed conflict receipts
+      // NEVER surface a conflict banner or unlock force-overwrite (R3-P1-1).
+      const receiptHost = typeof parsed.host_id === 'string' ? parsed.host_id.trim() : '';
+      const receiptCwd = typeof parsed.cwd === 'string' ? nonBlankPath(parsed.cwd) : '';
+      const receiptPath = typeof parsed.path === 'string' ? nonBlankPath(parsed.path) : '';
+      const receiptSizeValid = typeof parsed.size_bytes === 'number' &&
+        Number.isSafeInteger(parsed.size_bytes) &&
+        parsed.size_bytes >= 0;
+      const targetMatches =
+        receiptHost.length > 0 &&
+        receiptCwd.length > 0 &&
+        receiptPath.length > 0 &&
+        receiptHost === cleanHost &&
+        cwdPathsEquivalent(receiptCwd, cleanCwd) &&
+        normalizeWorkspaceRelPath(receiptPath, cleanCwd) === normalizeWorkspaceRelPath(cleanPath, cleanCwd);
+      if (!targetMatches || !receiptSizeValid) {
+        const reason = !targetMatches && receiptHost.length > 0
+          ? 'Write receipt target mismatch.'
+          : 'Invalid write receipt from host.';
+        this.showToast(`Save failed: ${reason}`, true);
+        return {
+          ok: false,
+          conflict: false,
+          etag: '',
+          currentContent: null,
+          errorMessage: reason
+        };
+      }
+      if (parsed.conflict !== undefined && parsed.conflict !== null) {
+        const conflictObj: Object = parsed.conflict as Object;
+        const conflictIsObj = typeof conflictObj === 'object' && !Array.isArray(conflictObj);
+        const conflictEtag = conflictIsObj && typeof parsed.conflict.current_etag === 'string'
+          ? parsed.conflict.current_etag.trim()
+          : '';
+        const conflictSizeValid = conflictIsObj &&
+          typeof parsed.conflict.current_size_bytes === 'number' &&
+          Number.isSafeInteger(parsed.conflict.current_size_bytes) &&
+          parsed.conflict.current_size_bytes >= 0;
+        if (!conflictIsObj || conflictEtag.length === 0 || !conflictSizeValid) {
+          this.showToast('Save failed: malformed conflict receipt from host', true);
+          return {
+            ok: false,
+            conflict: false,
+            etag: '',
+            currentContent: null,
+            errorMessage: 'Malformed conflict receipt from host.'
+          };
+        }
+        this.showToast('Save conflict: file modified on host', true);
+        return {
+          ok: false,
+          conflict: true,
+          etag: conflictEtag,
+          currentContent: parsed.conflict.current_content ?? null,
+          errorMessage: 'File changed on host since it was opened.'
+        };
+      }
+      const receiptEtag = typeof parsed.etag === 'string' ? parsed.etag.trim() : '';
+      if (receiptEtag.length === 0) {
+        const reason = 'Incomplete write receipt from host.';
+        this.showToast(`Save failed: ${reason}`, true);
+        return {
+          ok: false,
+          conflict: false,
+          etag: '',
+          currentContent: null,
+          errorMessage: reason
+        };
+      }
+      this.showToast(`Saved ${basenameOfPath(cleanPath)}`, false);
+      this.triggerHaptic(10);
+      return {
+        ok: true,
+        conflict: false,
+        etag: receiptEtag,
+        currentContent: null,
+        errorMessage: ''
+      };
+    } catch (err) {
+      const msg = (err as Error).message || 'Save failed';
+      orbitLogWarn('OrbitStore', 'saveScopedWorkspaceFile failed', err as Object);
+      this.showToast(msg, true);
+      return {
+        ok: false,
+        conflict: false,
+        etag: '',
+        currentContent: null,
+        errorMessage: msg
+      };
+    }
+  }
+
+  public async createScopedWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    path: string,
+    isDir: boolean,
+    initialContent: string | null
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanPath = nonBlankPath(path);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanPath.length === 0) {
+      return false;
+    }
+    try {
+      const req: CreateWorkspaceEntryRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        path: cleanPath,
+        is_dir: isDir,
+        initial_content: initialContent
+      };
+      await this.bridge.createWorkspaceEntryJson(JSON.stringify(req));
+      this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
+      this.gitPanelRevision += 1;
+      this.showToast(`Created ${basenameOfPath(cleanPath)}`, false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'createScopedWorkspaceEntry failed', err as Object);
+      this.showToast((err as Error).message || 'Create failed', true);
+      return false;
+    }
+  }
+
+  public async renameScopedWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    oldPath: string,
+    newPath: string
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanOld = nonBlankPath(oldPath);
+    const cleanNew = nonBlankPath(newPath);
+    if (
+      this.bridge === null ||
+      cleanHost.length === 0 ||
+      cleanCwd.length === 0 ||
+      cleanOld.length === 0 ||
+      cleanNew.length === 0
+    ) {
+      return false;
+    }
+    try {
+      const req: RenameWorkspaceEntryRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        old_path: cleanOld,
+        new_path: cleanNew
+      };
+      await this.bridge.renameWorkspaceEntryJson(JSON.stringify(req));
+      this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
+      this.gitPanelRevision += 1;
+      this.showToast(`Renamed to ${basenameOfPath(cleanNew)}`, false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'renameScopedWorkspaceEntry failed', err as Object);
+      this.showToast((err as Error).message || 'Rename failed', true);
+      return false;
+    }
+  }
+
+  public async deleteScopedWorkspaceEntry(
+    hostId: string,
+    cwd: string,
+    path: string
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanPath = nonBlankPath(path);
+    if (this.bridge === null || cleanHost.length === 0 || cleanCwd.length === 0 || cleanPath.length === 0) {
+      return false;
+    }
+    try {
+      const req: DeleteWorkspaceEntryRequestDto = {
+        host_id: cleanHost,
+        cwd: cleanCwd,
+        path: cleanPath
+      };
+      await this.bridge.deleteWorkspaceEntryJson(JSON.stringify(req));
+      this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
+      this.gitPanelRevision += 1;
+      this.showToast(`Deleted ${basenameOfPath(cleanPath)}`, false);
+      this.triggerHaptic(8);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'deleteScopedWorkspaceEntry failed', err as Object);
+      this.showToast((err as Error).message || 'Delete failed', true);
+      return false;
+    }
+  }
+
+  /**
+   * Quotes a file viewed inside a scoped side-panel tab into the composer (P1-6):
+   * - When the file belongs to the active session's exact `(selectedHostId, activeCwd)`, attaches it as a
+   *   regular workspace file badge.
+   * - When the file comes from a different host or project directory, inserts an explicit `file_quote`
+   *   carrying the already-loaded file content and `(hostId, cwd, path)` origin so `composePromptViaCore`
+   *   never resolves a same-named file from the current project!
+   */
+  public quoteScopedFileIntoComposer(
+    hostId: string,
+    cwd: string,
+    filePath: string,
+    loadedContent: string
+  ): void {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanPath = nonBlankPath(filePath);
+    if (cleanHost.length === 0 || cleanPath.length === 0) {
+      return;
+    }
+    const relPath = cleanCwd.length > 0 && cleanPath.startsWith(`${cleanCwd}/`)
+      ? cleanPath.slice(cleanCwd.length + 1)
+      : cleanPath;
+    if (
+      cleanHost === this.selectedHostId &&
+      cleanCwd.length > 0 &&
+      this.activeCwd.trim().length > 0 &&
+      cwdPathsEquivalent(cleanCwd, this.activeCwd)
+    ) {
+      this.attachFileBadge(relPath);
+      return;
+    }
+    const originPath = cleanCwd.length > 0
+      ? `${cleanHost}:${cleanCwd.replace(/\/+$/, '')}/${relPath.replace(/^\/+/, '')}`
+      : `${cleanHost}:${relPath}`;
+    const trimmedContent = loadedContent.length > 6000
+      ? `${loadedContent.slice(0, 6000)}\n/* … truncated … */`
+      : loadedContent;
+    const next: QuotedDiffSnippet = {
+      id: `file_quote_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+      path: originPath,
+      lineLabel: basenameOfPath(relPath),
+      content: trimmedContent.length > 0 ? trimmedContent : `(empty file: ${originPath})`,
+      kind: 'file_quote'
+    };
+    this.quotedSnippets = this.quotedSnippets.concat([next]);
+    this.showToast(`Quoted ${basenameOfPath(relPath)} into composer`, false);
+    this.triggerHaptic(8);
+  }
+
+  // --- Scoped PTY Terminal Helpers ---
+
+  public loadScopedTerminalScreen(hostId: string, slot: number): TerminalScreenDto | null {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return null;
+    }
+    try {
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      const raw = this.bridge.terminalScreenSlotJson(cleanHost, normalizedSlot);
+      return JSON.parse(raw) as TerminalScreenDto | null;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'loadScopedTerminalScreen failed', err as Object);
+      return null;
+    }
+  }
+
+  public sendScopedTerminalBytes(hostId: string, slot: number, bytes: Uint8Array): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || bytes.length === 0) {
+      return;
+    }
+    try {
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      this.bridge.sendTerminalBytes(cleanHost, normalizedSlot, bytes);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'sendScopedTerminalBytes failed', err as Object);
+    }
+  }
+
+  public sendScopedTerminalUtf8(hostId: string, slot: number, raw: string): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || raw.length === 0) {
+      return;
+    }
+    try {
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      const encoder = new util.TextEncoder();
+      const bytes = encoder.encodeInto(raw);
+      this.bridge.sendTerminalBytes(cleanHost, normalizedSlot, bytes);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'sendScopedTerminalUtf8 failed', err as Object);
+    }
+  }
+
+  private clearScopedTerminalGridCache(hostId: string, slot?: number): void {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return;
+    }
+    if (slot !== undefined) {
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      this.scopedTerminalGridByKey.delete(encodeSidePanelKeyTuple(['pty_grid', cleanHost, `${normalizedSlot}`]));
+      return;
+    }
+    const prefix = encodeSidePanelKeyTuple(['pty_grid', cleanHost, '']).slice(0, -3);
+    const toDelete: string[] = [];
+    this.scopedTerminalGridByKey.forEach((_v: string, k: string): void => {
+      if (k.startsWith(prefix)) {
+        toDelete.push(k);
+      }
+    });
+    for (let i = 0; i < toDelete.length; i++) {
+      this.scopedTerminalGridByKey.delete(toDelete[i]);
+    }
+  }
+
+  public resizeScopedTerminalIfChanged(
+    hostId: string,
+    slot: number,
+    cols: number,
+    rows: number
+  ): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return;
+    }
+    const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+    const clampedCols = Math.max(24, Math.min(240, Math.floor(cols)));
+    const clampedRows = Math.max(8, Math.min(120, Math.floor(rows)));
+    const key = encodeSidePanelKeyTuple(['pty_grid', cleanHost, `${normalizedSlot}`]);
+    const sig = `${clampedCols}x${clampedRows}`;
+    if (this.scopedTerminalGridByKey.get(key) === sig) {
+      return;
+    }
+    try {
+      this.bridge.resizeTerminalSlot(cleanHost, normalizedSlot, clampedCols, clampedRows);
+      // Cache dimensions ONLY after native resize succeeds so a failed attempt can be retried (P1-8).
+      this.scopedTerminalGridByKey.set(key, sig);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'resizeScopedTerminalIfChanged failed', err as Object);
+    }
+  }
+
+  public startScopedTerminal(hostId: string, cwd: string, cols?: number, rows?: number): void {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    if (this.bridge === null || cleanHost.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.startTerminal(
+        cleanHost,
+        cleanCwd.length > 0 ? cleanCwd : '~',
+        cols !== undefined && cols >= 24 ? Math.floor(cols) : this.terminalCols,
+        rows !== undefined && rows >= 8 ? Math.floor(rows) : this.terminalGridRows
+      );
+      this.clearScopedTerminalGridCache(cleanHost);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'startScopedTerminal failed', err as Object);
+      this.showToast('Failed to start terminal', true);
+    }
+  }
+
+  public attachScopedTerminal(hostId: string, terminalId: string, slot: number): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || terminalId.trim().length === 0) {
+      return;
+    }
+    try {
+      const normalizedSlot = Math.max(1, Math.min(3, Math.floor(slot)));
+      this.bridge.attachTerminal(cleanHost, terminalId, normalizedSlot);
+      this.clearScopedTerminalGridCache(cleanHost, normalizedSlot);
+      this.terminalPanelRevision += 1;
+      this.triggerHaptic(8);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'attachScopedTerminal failed', err as Object);
+    }
+  }
+
+  public killScopedTerminal(hostId: string, terminalId: string): void {
+    const cleanHost = hostId.trim();
+    const cleanTermId = terminalId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanTermId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.killTerminal(cleanHost, cleanTermId);
+      this.clearScopedTerminalGridCache(cleanHost);
+      this.reloadHostAsync(cleanHost);
+      this.terminalPanelRevision += 1;
+      this.showToast('Terminal closed', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'killScopedTerminal failed', err as Object);
+      this.showToast('Failed to close terminal', true);
+    }
+  }
+
+  public extractTerminalScreenPlainText(screen: TerminalScreenDto | null): string {
+    if (screen === null || screen.rows_data.length === 0) {
+      return '';
+    }
+    const lines: string[] = [];
+    for (let i = 0; i < screen.rows_data.length; i++) {
+      let line = '';
+      const spans = screen.rows_data[i].spans;
+      for (let j = 0; j < spans.length; j++) {
+        line += spans[j].text;
+      }
+      lines.push(line.replace(/\s+$/, ''));
+    }
+    while (lines.length > 0 && lines[lines.length - 1].length === 0) {
+      lines.pop();
+    }
+    return lines.join('\n');
+  }
+
+  public quoteScopedTerminalIntoComposer(screen: TerminalScreenDto | null, cwd: string): void {
+    const snapshot = this.extractTerminalScreenPlainText(screen);
+    if (snapshot.length === 0) {
+      this.showToast('Terminal buffer is empty', true);
+      return;
+    }
+    const cleanCwd = nonBlankPath(cwd);
+    const label = cleanCwd.length > 0 ? `terminal:${basenameOfPath(cleanCwd)}` : 'terminal';
+    const next: QuotedDiffSnippet = {
+      id: `term_${Date.now()}`,
+      path: label,
+      lineLabel: label,
+      content: snapshot,
+      kind: 'terminal'
+    };
+    this.quotedSnippets = this.quotedSnippets.concat([next]);
+    this.showToast('Quoted terminal output into composer', false);
+    this.triggerHaptic(8);
+  }
+
+  // --- Scoped Mission Workspace Board & Peers Helpers (P0-3 + R2-P0-2 + P1-8) ---
+
+  private verifyScopedWorkspace(
+    detail: HostDetailDto,
+    cwd: string,
+    explicitWorkspaceId: string,
+    agentId: string | null
+  ): WorkspaceDto | null {
+    const cleanCwd = nonBlankPath(cwd);
+    const cleanAgent = agentId !== null ? agentId.trim() : '';
+    const explicitWs = explicitWorkspaceId.trim();
+
+    let agentFound = false;
+    let agentWorkspaceId = '';
+    let agentWorkspace: WorkspaceDto | null = null;
+    if (cleanAgent.length > 0) {
+      for (let i = 0; i < detail.agents.length; i++) {
+        const ag = detail.agents[i];
+        if (ag.agent_id === cleanAgent) {
+          agentFound = true;
+          if (ag.workspace_id !== null && ag.workspace_id.trim().length > 0) {
+            agentWorkspaceId = ag.workspace_id.trim();
+          }
+          break;
+        }
+      }
+      // If a tab declares an agentId, that agent card MUST be present in authoritative host detail
+      // so ownership can be verified — NEVER let a persisted explicitWorkspaceId bypass missing agent cards (R3-P0-1).
+      if (!agentFound) {
+        return null;
+      }
+      if (agentWorkspaceId.length > 0) {
+        for (let i = 0; i < detail.workspaces.length; i++) {
+          if (detail.workspaces[i].workspace_id === agentWorkspaceId) {
+            agentWorkspace = detail.workspaces[i];
+            break;
+          }
+        }
+        // Fail closed if agent references a workspace ID missing from authoritative host detail.
+        if (agentWorkspace === null) {
+          return null;
+        }
+      }
+    }
+
+    // Collect ALL exact full-normalized-cwd candidates (NEVER stripping /home/<user> prefixes, R3-P0-1).
+    const cwdMatches: WorkspaceDto[] = [];
+    if (cleanCwd.length > 0) {
+      for (let i = 0; i < detail.workspaces.length; i++) {
+        if (cwdPathsEquivalent(detail.workspaces[i].cwd, cleanCwd, null)) {
+          cwdMatches.push(detail.workspaces[i]);
+        }
+      }
+    }
+
+    // Independent agent ownership proof: verify cwd & explicitWorkspaceId agree without conflict.
+    if (agentWorkspace !== null) {
+      if (explicitWs.length > 0 && explicitWs !== agentWorkspace.workspace_id) {
+        return null;
+      }
+      if (cleanCwd.length > 0 && !cwdPathsEquivalent(agentWorkspace.cwd, cleanCwd, null)) {
+        return null;
+      }
+      return agentWorkspace;
+    }
+
+    // Without independent agent ownership proof (draft tab or standalone non-workspace agent):
+    // persisted `explicitWorkspaceId` MUST NOT break ties among multiple same-cwd workspaces (R3-P0-1).
+    if (cleanCwd.length > 0) {
+      if (cwdMatches.length !== 1) {
+        return null;
+      }
+      const uniqueMatch = cwdMatches[0];
+      if (explicitWs.length > 0 && uniqueMatch.workspace_id !== explicitWs) {
+        return null;
+      }
+      return uniqueMatch;
+    }
+
+    // No agent ownership AND no cwd: allow explicitWs ONLY when the host has a single unambiguous workspace
+    // sharing that workspace's cwd.
+    if (explicitWs.length > 0) {
+      let explicitMatch: WorkspaceDto | null = null;
+      for (let i = 0; i < detail.workspaces.length; i++) {
+        if (detail.workspaces[i].workspace_id === explicitWs) {
+          explicitMatch = detail.workspaces[i];
+          break;
+        }
+      }
+      if (explicitMatch === null) {
+        return null;
+      }
+      let sameCwdCount = 0;
+      for (let i = 0; i < detail.workspaces.length; i++) {
+        if (cwdPathsEquivalent(detail.workspaces[i].cwd, explicitMatch.cwd, null)) {
+          sameCwdCount += 1;
+        }
+      }
+      return sameCwdCount === 1 ? explicitMatch : null;
+    }
+
+    return null;
+  }
+
+  public loadScopedWorkspaceBoard(
+    hostId: string,
+    cwd: string,
+    workspaceId: string,
+    agentId: string | null,
+    triggerRemoteFetch: boolean = false
+  ): OrbitScopedBoardData {
+    const cleanHost = hostId.trim();
+    const cleanCwd = nonBlankPath(cwd);
+    const detail = this.getScopedHostDetail(cleanHost);
+
+    // R2-P0-2: Never trust a persisted/stale explicit workspaceId while host detail is missing (cold cache).
+    if (detail === null) {
+      if (triggerRemoteFetch && cleanHost.length > 0) {
+        this.ensureScopedHostDetailAsync(cleanHost);
+      }
+      return {
+        workspace: null,
+        workspaceId: '',
+        workspaceVerified: false,
+        snapshotLoaded: false,
+        content: '',
+        revision: 0,
+        updatedBy: '',
+        boardPath: '',
+        peers: [],
+        events: []
+      };
+    }
+
+    const workspace = this.verifyScopedWorkspace(detail, cleanCwd, workspaceId, agentId);
+    const resolvedWsId = workspace !== null ? workspace.workspace_id : '';
+    const workspaceVerified = workspace !== null && resolvedWsId.length > 0;
+
+    const peers: AgentCardDto[] = [];
+    if (workspaceVerified) {
+      for (let i = 0; i < detail.agents.length; i++) {
+        const ag = detail.agents[i];
+        const archived = ag.archived_at_rfc3339 !== undefined &&
+          ag.archived_at_rfc3339 !== null &&
+          ag.archived_at_rfc3339.length > 0;
+        if (ag.workspace_id === resolvedWsId && !archived && ag.status.state !== 'closed') {
+          peers.push(ag);
+        }
+      }
+    }
+
+    let snapshotLoaded = false;
+    let content = '';
+    let revision = 0;
+    let updatedBy = '';
+    let boardPath = '';
+    let events: WorkspaceEventRecordDto[] = [];
+
+    if (this.bridge !== null && cleanHost.length > 0 && workspaceVerified) {
+      if (triggerRemoteFetch) {
+        try {
+          this.bridge.fetchWorkspaceBoard(cleanHost, resolvedWsId);
+          this.bridge.fetchWorkspaceEvents(cleanHost, resolvedWsId, 30);
+        } catch (err) {
+          orbitLogWarn('OrbitStore', 'fetchScopedWorkspaceBoard failed', err as Object);
+        }
+      }
+      try {
+        const snapJson = this.bridge.workspaceBoardJson(cleanHost, resolvedWsId);
+        if (snapJson !== undefined && snapJson !== null && snapJson.trim().length > 0) {
+          const parsedSnap: Object | null = JSON.parse(snapJson) as Object | null;
+          if (parsedSnap !== null && typeof parsedSnap === 'object') {
+            const snap = parsedSnap as WorkspaceBoardSnapshotDto;
+            if (typeof snap.content === 'string') {
+              snapshotLoaded = true;
+              content = snap.content;
+              revision = typeof snap.revision === 'number' ? snap.revision : 0;
+              updatedBy = snap.updated_by ?? '';
+              boardPath = snap.board_path ?? '';
+            }
+          }
+        }
+      } catch (err) {
+        snapshotLoaded = false;
+        orbitLogWarn('OrbitStore', 'loadScopedWorkspaceBoard snapshot failed', err as Object);
+      }
+      try {
+        const eventsJson = this.bridge.workspaceEventsJson(cleanHost, resolvedWsId);
+        if (eventsJson !== undefined && eventsJson !== null && eventsJson.trim().length > 0) {
+          const parsedEvents: Object | null = JSON.parse(eventsJson) as Object | null;
+          if (Array.isArray(parsedEvents)) {
+            events = parsedEvents as WorkspaceEventRecordDto[];
+          }
+        }
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'loadScopedWorkspaceBoard events failed', err as Object);
+      }
+    }
+
+    return {
+      workspace: workspace,
+      workspaceId: resolvedWsId,
+      workspaceVerified: workspaceVerified,
+      snapshotLoaded: snapshotLoaded,
+      content: content,
+      revision: revision,
+      updatedBy: updatedBy,
+      boardPath: boardPath,
+      peers: peers,
+      events: events
+    };
+  }
+
+  public saveScopedWorkspaceBoard(
+    hostId: string,
+    workspaceId: string,
+    content: string,
+    expectedCwd: string = '',
+    expectedAgentId: string | null = null
+  ): boolean {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0) {
+      this.showToast('No workspace bound to this tab', true);
+      return false;
+    }
+    // Re-verify workspace ownership and loaded snapshot immediately before write (R2-P0-2).
+    const detail = this.getScopedHostDetail(cleanHost);
+    if (detail === null) {
+      this.showToast('Workspace metadata is still loading — please wait', true);
+      return false;
+    }
+    const verified = this.verifyScopedWorkspace(detail, expectedCwd, cleanWs, expectedAgentId);
+    if (verified === null || verified.workspace_id !== cleanWs) {
+      this.showToast('Workspace changed or no longer matches this tab', true);
+      return false;
+    }
+    let hasLoadedSnapshot = false;
+    try {
+      const snapJson = this.bridge.workspaceBoardJson(cleanHost, cleanWs);
+      if (snapJson !== undefined && snapJson !== null && snapJson.trim().length > 0) {
+        const parsedSnap: Object | null = JSON.parse(snapJson) as Object | null;
+        if (parsedSnap !== null && typeof parsedSnap === 'object') {
+          const snap = parsedSnap as WorkspaceBoardSnapshotDto;
+          hasLoadedSnapshot = typeof snap.content === 'string';
+        }
+      }
+    } catch (_err) {
+      hasLoadedSnapshot = false;
+    }
+    if (!hasLoadedSnapshot) {
+      this.showToast('Board snapshot has not finished loading yet', true);
+      return false;
+    }
+    try {
+      this.bridge.updateWorkspaceBoard(cleanHost, cleanWs, content, null, 'harmony-user');
+      this.showToast('Saved BOARD.md', false);
+      this.panelDataRevision += 1;
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'saveScopedWorkspaceBoard failed', err as Object);
+      this.showToast('Failed to save BOARD.md', true);
+      return false;
+    }
+  }
+
+  public spawnScopedWorkspacePeer(
+    hostId: string,
+    workspaceId: string,
+    cwd: string,
+    handle: string,
+    prompt: string,
+    provider: string = ''
+  ): boolean {
+    const cleanHost = hostId.trim();
+    const cleanWs = workspaceId.trim();
+    const cleanPrompt = prompt.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanWs.length === 0 || cleanPrompt.length === 0) {
+      this.showToast(cleanWs.length === 0 ? 'No workspace bound to this tab' : 'Enter instructions for the peer', true);
+      return false;
+    }
+    const cleanHandle = handle.trim();
+    const detail = this.getScopedHostDetail(cleanHost);
+    let resolvedProvider = provider.trim();
+    if (resolvedProvider.length === 0 && detail !== null && detail.host.available_providers.length > 0) {
+      resolvedProvider = detail.host.available_providers[0];
+    }
+    if (resolvedProvider.length === 0) {
+      resolvedProvider = this.composerProvider;
+    }
+    const req: SpawnWorkspacePeerRequestDto = {
+      host_id: cleanHost,
+      workspace_id: cleanWs,
+      cwd: nonBlankPath(cwd).length > 0 ? nonBlankPath(cwd) : '~',
+      provider: resolvedProvider,
+      model: null,
+      effort: null,
+      mode: normalizeModeSlug(this.composerMode),
+      initial_prompt: cleanPrompt,
+      handle: cleanHandle.length > 0 ? cleanHandle : null
+    };
+    try {
+      const optId = this.bridge.spawnWorkspacePeerJson(JSON.stringify(req));
+      this.reloadHostAsync(cleanHost);
+      if (optId.length > 0) {
+        this.showToast(
+          cleanHandle.length > 0 ? `Spawned @${cleanHandle}` : 'Spawned workspace peer',
+          false
+        );
+      }
+      this.panelDataRevision += 1;
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'spawnScopedWorkspacePeer failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to spawn peer', true);
+      return false;
+    }
+  }
+
+  // --- Unified Scoped Side Question (/btw) State Machine (P1-2) ---
+
+  private allocateSideQuestionToken(): number {
+    this.sideQuestionTokenSeq += 1;
+    return this.sideQuestionTokenSeq;
+  }
+
+  private buildSideQuestionTab(
+    scopeKey: string,
+    hostId: string,
+    agentId: string | null,
+    cwd: string
+  ): OrbitSidePanelTab {
+    return {
+      tabId: canonicalSideQuestionTabId(scopeKey),
+      kind: 'side_question',
+      hostId: hostId,
+      agentId: agentId,
+      cwd: nonBlankPath(cwd).length > 0 ? nonBlankPath(cwd) : null,
+      path: null,
+      parentHostId: hostId,
+      title: 'Side Q&A',
+      closable: true,
+      parentAgentId: agentId
+    };
+  }
+
+  private resolveModelSnapshotForScope(hostId: string, agentId: string | null): [string, string | null] {
+    if (agentId !== null && agentId.trim().length > 0) {
+      const card = this.findAgentCardOnHost(hostId, agentId.trim());
+      if (card !== null && card.provider.trim().length > 0) {
+        const modelVal = (card.model !== null && card.model.trim().length > 0) ? card.model.trim() : null;
+        return [card.provider.trim(), modelVal];
+      }
+    }
+    const detail = this.getScopedHostDetail(hostId);
+    const defaultProvider = (
+      detail !== null &&
+      detail.host.available_providers.length > 0 &&
+      hostId !== this.selectedHostId
+    )
+      ? detail.host.available_providers[0]
+      : this.composerProvider;
+    const defaultModel = hostId === this.selectedHostId && this.composerModel.trim().length > 0
+      ? this.composerModel.trim()
+      : null;
+    return [defaultProvider, defaultModel];
+  }
+
+  public getScopedSideQuestionState(
+    scopeKey: string,
+    hostId: string,
+    agentId: string | null,
+    cwd: string
+  ): OrbitScopedSideQuestionState {
+    const _rev = this.sideQuestionRevision;
+    if (_rev < 0) {
+      // keep reactive subscription
+    }
+    const existing = this.sideQuestionByScope.get(scopeKey);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const modelSnap = this.resolveModelSnapshotForScope(hostId, agentId);
+    return {
+      scopeKey: scopeKey,
+      hostId: hostId,
+      agentId: agentId,
+      cwd: cwd,
+      provider: modelSnap[0],
+      model: modelSnap[1],
+      draft: '',
+      prompt: '',
+      answer: '',
+      error: '',
+      streaming: false,
+      requestId: '',
+      requestToken: 0,
+      generation: 0
+    };
+  }
+
+  public setScopedSideQuestionDraft(
+    scopeKey: string,
+    hostId: string,
+    agentId: string | null,
+    cwd: string,
+    draft: string
+  ): void {
+    const cur = this.getScopedSideQuestionState(scopeKey, hostId, agentId, cwd);
+    if (cur.draft === draft && this.sideQuestionByScope.has(scopeKey)) {
+      return;
+    }
+    const next: OrbitScopedSideQuestionState = {
+      scopeKey: scopeKey,
+      hostId: hostId,
+      agentId: agentId,
+      cwd: cwd,
+      provider: cur.provider,
+      model: cur.model,
+      draft: draft,
+      prompt: cur.prompt,
+      answer: cur.answer,
+      error: cur.error,
+      streaming: cur.streaming,
+      requestId: cur.requestId,
+      requestToken: cur.requestToken,
+      generation: cur.generation
+    };
+    this.sideQuestionByScope.set(scopeKey, next);
+    this.sideQuestionRevision += 1;
+  }
+
+  public clearScopedSideQuestion(scopeKey: string): void {
+    const cur = this.sideQuestionByScope.get(scopeKey);
+    if (cur === undefined) {
+      return;
+    }
+    if (cur.requestToken > 0) {
+      this.activeSideQuestionScopeByToken.delete(cur.requestToken);
+    }
+    const cleared: OrbitScopedSideQuestionState = {
+      scopeKey: cur.scopeKey,
+      hostId: cur.hostId,
+      agentId: cur.agentId,
+      cwd: cur.cwd,
+      provider: cur.provider,
+      model: cur.model,
+      draft: '',
+      prompt: '',
+      answer: '',
+      error: '',
+      streaming: false,
+      requestId: '',
+      requestToken: 0,
+      generation: cur.generation + 1
+    };
+    this.sideQuestionByScope.set(scopeKey, cleared);
+    this.sideQuestionRevision += 1;
+  }
+
+  public revokeScopedSideQuestion(scopeKey: string): void {
+    const cleanScope = scopeKey.trim();
+    if (cleanScope.length === 0) {
+      return;
+    }
+    const cur = this.sideQuestionByScope.get(cleanScope);
+    if (cur !== undefined && cur.requestToken > 0) {
+      this.activeSideQuestionScopeByToken.delete(cur.requestToken);
+    }
+    const staleTokens: number[] = [];
+    this.activeSideQuestionScopeByToken.forEach((ownerKey: string, tok: number): void => {
+      if (ownerKey === cleanScope) {
+        staleTokens.push(tok);
+      }
+    });
+    for (let i = 0; i < staleTokens.length; i++) {
+      this.activeSideQuestionScopeByToken.delete(staleTokens[i]);
+    }
+    if (this.sideQuestionByScope.delete(cleanScope)) {
+      this.sideQuestionRevision += 1;
+    }
+  }
+
+  public dropScopeAndRevokeSideQuestion(scopeKey: string): void {
+    this.revokeScopedSideQuestion(scopeKey);
+    this.sidePanelStore.dropScope(scopeKey);
+  }
+
+  private revokeSideQuestionsForHost(hostId: string): void {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return;
+    }
+    const targetScopes: string[] = [];
+    this.sideQuestionByScope.forEach((state: OrbitScopedSideQuestionState, sk: string): void => {
+      if (state.hostId === cleanHost || sk === `draft::${cleanHost}` || sk.startsWith(`${cleanHost}::`)) {
+        targetScopes.push(sk);
+      }
+    });
+    for (let i = 0; i < targetScopes.length; i++) {
+      this.revokeScopedSideQuestion(targetScopes[i]);
+    }
+  }
+
+  private remapScopedSideQuestion(
+    oldScopeKey: string,
+    newScopeKey: string,
+    newAgentId: string,
+    newCwd?: string
+  ): void {
+    if (oldScopeKey === newScopeKey) {
+      return;
+    }
+    const cur = this.sideQuestionByScope.get(oldScopeKey);
+    if (cur === undefined) {
+      return;
+    }
+    this.sideQuestionByScope.delete(oldScopeKey);
+    if (!this.sideQuestionByScope.has(newScopeKey)) {
+      const moved: OrbitScopedSideQuestionState = {
+        scopeKey: newScopeKey,
+        hostId: cur.hostId,
+        agentId: newAgentId,
+        cwd: newCwd !== undefined && newCwd.length > 0 ? newCwd : cur.cwd,
+        provider: cur.provider,
+        model: cur.model,
+        draft: cur.draft,
+        prompt: cur.prompt,
+        answer: cur.answer,
+        error: cur.error,
+        streaming: cur.streaming,
+        requestId: cur.requestId,
+        requestToken: cur.requestToken,
+        generation: cur.generation
+      };
+      this.sideQuestionByScope.set(newScopeKey, moved);
+      // Migrate active request token ownership to the promoted/remapped scope (P1-2).
+      if (cur.requestToken > 0 && this.activeSideQuestionScopeByToken.get(cur.requestToken) === oldScopeKey) {
+        this.activeSideQuestionScopeByToken.set(cur.requestToken, newScopeKey);
+      }
+      this.sideQuestionRevision += 1;
+    } else if (cur.requestToken > 0) {
+      // Target scope already owns its own Q&A state; revoke the superseded request token so it cannot leak back.
+      this.activeSideQuestionScopeByToken.delete(cur.requestToken);
+    }
+  }
+
+  /**
+   * Entry point for Composer `/btw <question>` submission (P1-2):
+   * - Opens `side_question` tab in the originating scope with `source: 'auto'` (desktop parity:
+   *   on `sm` adds tab + unread dot without hijacking screen; on `md`/`lg` opens when not dismissed).
+   * - Routes request & streaming updates into the unified per-scope side-question state.
+   */
+  public submitBtwFromComposer(question: string): string {
+    const tuple = this.resolveCurrentScopeTuple();
+    const hostId = tuple[0];
+    const rootAgentId = tuple[1];
+    const cwd = tuple[2];
+    if (hostId.length === 0) {
+      return '';
+    }
+    const scopeKey = this.sidePanelStore.scopeKeyFor(hostId, rootAgentId);
+    const sideTab = this.buildSideQuestionTab(scopeKey, hostId, rootAgentId, cwd);
+    this.sidePanelStore.openTabInScope(scopeKey, sideTab, { source: 'auto', activate: true });
+    const cleanQ = question.trim();
+    if (cleanQ.length === 0) {
+      return '';
+    }
+    const modelSnap: [string, string | null] = [
+      this.composerProvider,
+      this.composerModel.trim().length > 0 ? this.composerModel.trim() : null
+    ];
+    return this.submitScopedSideQuestion(scopeKey, hostId, rootAgentId, cwd, cleanQ, 'auto', modelSnap);
+  }
+
+  public submitScopedSideQuestion(
+    scopeKey: string,
+    hostId: string,
+    agentId: string | null,
+    cwd: string,
+    question: string,
+    source: 'user' | 'auto' = 'user',
+    modelSnapshot?: [string, string | null]
+  ): string {
+    const cleanHost = hostId.trim();
+    const cleanQ = question.trim();
+    if (cleanHost.length === 0 || cleanQ.length === 0) {
+      return '';
+    }
+    const cleanAgent = agentId !== null && agentId.trim().length > 0 ? agentId.trim() : null;
+    const effectiveScopeKey = scopeKey.trim().length > 0
+      ? scopeKey.trim()
+      : this.sidePanelStore.scopeKeyFor(cleanHost, cleanAgent);
+    const prev = this.getScopedSideQuestionState(effectiveScopeKey, cleanHost, cleanAgent, cwd);
+    if (prev.requestToken > 0) {
+      this.activeSideQuestionScopeByToken.delete(prev.requestToken);
+    }
+    const nextGen = prev.generation + 1;
+    const requestToken = this.allocateSideQuestionToken();
+    const snapModel = modelSnapshot !== undefined
+      ? modelSnapshot
+      : this.resolveModelSnapshotForScope(cleanHost, cleanAgent);
+
+    const sideTab = this.buildSideQuestionTab(effectiveScopeKey, cleanHost, cleanAgent, cwd);
+
+    if (this.bridge === null) {
+      this.sideQuestionByScope.set(effectiveScopeKey, {
+        scopeKey: effectiveScopeKey,
+        hostId: cleanHost,
+        agentId: cleanAgent,
+        cwd: cwd,
+        provider: snapModel[0],
+        model: snapModel[1],
+        draft: '',
+        prompt: cleanQ,
+        answer: '',
+        error: 'Native core unavailable',
+        streaming: false,
+        requestId: '',
+        requestToken: 0,
+        generation: nextGen
+      });
+      this.sideQuestionRevision += 1;
+      return '';
+    }
+
+    const activeState: OrbitScopedSideQuestionState = {
+      scopeKey: effectiveScopeKey,
+      hostId: cleanHost,
+      agentId: cleanAgent,
+      cwd: cwd,
+      provider: snapModel[0],
+      model: snapModel[1],
+      draft: '',
+      prompt: cleanQ,
+      answer: '',
+      error: '',
+      streaming: true,
+      requestId: '',
+      requestToken: requestToken,
+      generation: nextGen
+    };
+    this.sideQuestionByScope.set(effectiveScopeKey, activeState);
+    this.activeSideQuestionScopeByToken.set(requestToken, effectiveScopeKey);
+    this.sideQuestionRevision += 1;
+
+    // Keep legacy mirrors synced for any callers still observing them on the active scope.
+    if (effectiveScopeKey === this.sidePanelStore.activeScopeKey) {
+      this.sideQuestionActive = true;
+      this.sideQuestionStreaming = true;
+      this.sideQuestionPrompt = cleanQ;
+      this.sideQuestionAnswer = '';
+      this.sideQuestionError = '';
+    }
+
+    let ctxSummary = '';
+    if (cleanAgent !== null) {
+      try {
+        ctxSummary = this.bridge.buildSideQuestionContext(cleanHost, cleanAgent, 4000);
+      } catch (_err) {
+        ctxSummary = '';
+      }
+    }
+    const req: AskSideQuestionRequestDto = {
+      host_id: cleanHost,
+      agent_id: cleanAgent,
+      cwd: nonBlankPath(cwd).length > 0 ? nonBlankPath(cwd) : '~',
+      provider: snapModel[0],
+      model: snapModel[1],
+      question: cleanQ,
+      context_summary: ctxSummary.length > 0 ? ctxSummary : null
+    };
+
+    const applyUpdate = (deltaText: string, fullText: string | null, errMsg: string | null, finished: boolean): void => {
+      // Strictly verify immutable requestToken & its current scope owner (migrated on promoteDraftScope,
+      // revoked on clear/dropScope/removeHost) so late callbacks NEVER leak into reused drafts or deleted scopes.
+      const ownerScopeKey = this.activeSideQuestionScopeByToken.get(requestToken);
+      if (ownerScopeKey === undefined) {
+        return;
+      }
+      const current = this.sideQuestionByScope.get(ownerScopeKey);
+      if (current === undefined || current.requestToken !== requestToken) {
+        this.activeSideQuestionScopeByToken.delete(requestToken);
+        return;
+      }
+      if (finished) {
+        this.activeSideQuestionScopeByToken.delete(requestToken);
+      }
+      const nextAnswer = fullText !== null && fullText.length > 0
+        ? fullText
+        : (deltaText.length > 0 ? `${current.answer}${deltaText}` : current.answer);
+      const nextErr = errMsg !== null && errMsg.length > 0 ? errMsg : current.error;
+      const updated: OrbitScopedSideQuestionState = {
+        scopeKey: current.scopeKey,
+        hostId: current.hostId,
+        agentId: current.agentId,
+        cwd: current.cwd,
+        provider: current.provider,
+        model: current.model,
+        draft: current.draft,
+        prompt: current.prompt,
+        answer: nextAnswer,
+        error: nextErr,
+        streaming: finished ? false : current.streaming,
+        requestId: current.requestId,
+        requestToken: finished ? 0 : current.requestToken,
+        generation: current.generation
+      };
+      this.sideQuestionByScope.set(ownerScopeKey, updated);
+      this.sideQuestionRevision += 1;
+
+      if (ownerScopeKey === this.sidePanelStore.activeScopeKey) {
+        this.sideQuestionAnswer = nextAnswer;
+        this.sideQuestionError = nextErr;
+        if (finished) {
+          this.sideQuestionStreaming = false;
+        }
+      }
+      if (finished) {
+        // Surface unread indicator in the CURRENT owning scope without stealing focus or compact screen (P1-2).
+        const ownerTab = this.buildSideQuestionTab(
+          ownerScopeKey,
+          current.hostId,
+          current.agentId,
+          current.cwd
+        );
+        this.sidePanelStore.openTabInScope(ownerScopeKey, ownerTab, { source: 'auto', activate: false });
+      }
+    };
+
+    try {
+      const reqId = this.bridge.askSideQuestion(JSON.stringify(req), (err: Error | null, eventJson: string) => {
+        if (err !== null && err !== undefined) {
+          applyUpdate('', null, err.message || 'Side question failed', true);
+          return;
+        }
+        if (eventJson === undefined || eventJson === null || eventJson.length === 0) {
+          return;
+        }
+        try {
+          const ev = JSON.parse(eventJson) as SideQuestionEnvelopeDto;
+          if (ev.Delta !== undefined) {
+            applyUpdate(ev.Delta.text_delta ?? '', null, null, false);
+          } else if (ev.Done !== undefined) {
+            applyUpdate('', ev.Done.full_text ?? '', ev.Done.error ?? '', true);
+          } else {
+            const delta = ev.text_delta ?? '';
+            const hasFull = ev.full_text !== undefined && ev.full_text !== null;
+            const hasErr = ev.error !== undefined && ev.error !== null && ev.error.length > 0;
+            const isDone = hasFull || hasErr || ev.kind === 'done';
+            applyUpdate(delta, hasFull ? (ev.full_text ?? '') : null, hasErr ? (ev.error ?? '') : null, isDone);
+          }
+        } catch (parseErr) {
+          orbitLogWarn('OrbitStore', 'submitScopedSideQuestion event parse failed', parseErr as Object);
+        }
+      });
+
+      if (reqId === undefined || reqId === null || reqId.trim().length === 0) {
+        applyUpdate('', null, 'Unable to start side question on this host', true);
+        return '';
+      }
+      const ownerScopeKey = this.activeSideQuestionScopeByToken.get(requestToken);
+      if (ownerScopeKey !== undefined) {
+        const latest = this.sideQuestionByScope.get(ownerScopeKey);
+        if (latest !== undefined && latest.requestToken === requestToken) {
+          latest.requestId = reqId;
+          this.sideQuestionRevision += 1;
+        }
+      }
+      if (source === 'user') {
+        const currentOwner = this.activeSideQuestionScopeByToken.get(requestToken) ?? effectiveScopeKey;
+        const currentState = this.sideQuestionByScope.get(currentOwner);
+        const tabToOpen = currentState !== undefined
+          ? this.buildSideQuestionTab(currentOwner, currentState.hostId, currentState.agentId, currentState.cwd)
+          : sideTab;
+        this.sidePanelStore.openTabInScope(currentOwner, tabToOpen, { source: 'user', activate: true });
+      }
+      return reqId;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'submitScopedSideQuestion failed', err as Object);
+      applyUpdate('', null, (err as Error).message || 'Side question failed', true);
+      return '';
+    }
+  }
+
+  // --- Cross-Host Subagent Crew, Timelines, Steer & Fail-Closed Archive (P0-4, P1-4, P1-13) ---
+
+  public clearArchivedSubagentLocalMark(hostId: string, agentId: string): void {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    if (cleanHost.length === 0 || cleanAgent.length === 0) {
+      return;
+    }
+    const managedKey = encodeSidePanelKeyTuple(['managed_archive', cleanHost, cleanAgent]);
+    let changed = this.archivedSubagentIndex.delete(managedKey);
+    if (this.archivedSubagentIndex.delete(`managed::${cleanHost}::${cleanAgent}`)) {
+      changed = true;
+    }
+    this.archivedManagedMarkRevByKey.delete(managedKey);
+    const toRemove: string[] = [];
+    const legacySuffix = `::${cleanHost}::${cleanAgent}`;
+    this.archivedSubagentIndex.forEach((k: string): void => {
+      if (k.endsWith(legacySuffix) && k.indexOf('::provider::') < 0) {
+        toRemove.push(k);
+      }
+    });
+    for (let i = 0; i < toRemove.length; i++) {
+      this.archivedSubagentIndex.delete(toRemove[i]);
+      changed = true;
+    }
+    if (changed) {
+      this.syncArchivedSubagentKeys();
+      this.panelDataRevision += 1;
+    }
+  }
+
+  public isSubagentArchivedLocally(
+    rootHostId: string,
+    rootAgentId: string,
+    sub: SessionSubagentEntryDto
+  ): boolean {
+    const actualHost = resolveSubagentActualHostId(sub, rootHostId);
+    const directParentHost = resolveSubagentDirectParentHostId(sub, rootHostId);
+    const directParentAgent = resolveSubagentDirectParentAgentId(sub, rootAgentId);
+
+    if (sub.child_agent_id !== null && sub.child_agent_id.trim().length > 0) {
+      const cid = sub.child_agent_id.trim();
+      const managedKey = encodeSidePanelKeyTuple(['managed_archive', actualHost, cid]);
+      const card = this.findAgentCardOnHost(actualHost, cid);
+      if (card !== null) {
+        const archived = card.archived_at_rfc3339 !== undefined &&
+          card.archived_at_rfc3339 !== null &&
+          card.archived_at_rfc3339.length > 0;
+        if (archived || card.status.state === 'closed') {
+          return true;
+        }
+        // Authoritative fresher HostDetail for THIS child's actual host shows the session is open & unarchived (R3-P1-9).
+        const markedRev = this.archivedManagedMarkRevByKey.get(managedKey);
+        if (markedRev !== undefined && this.fleetStore.getHostDetailRevision(actualHost) > markedRev) {
+          return false;
+        }
+      }
+      if (
+        this.archivedSubagentIndex.has(managedKey) ||
+        this.archivedSubagentIndex.has(`managed::${actualHost}::${cid}`) ||
+        this.archivedSubagentIndex.has(`${rootHostId}::${rootAgentId}::${actualHost}::${cid}`)
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    const provKey = (
+      sub.provider_subagent_id !== undefined &&
+      sub.provider_subagent_id !== null &&
+      sub.provider_subagent_id.trim().length > 0
+    )
+      ? sub.provider_subagent_id.trim()
+      : sub.id.trim();
+    if (provKey.length > 0) {
+      const providerKey = encodeSidePanelKeyTuple([
+        'provider_archive',
+        rootHostId,
+        rootAgentId,
+        directParentHost,
+        directParentAgent,
+        provKey
+      ]);
+      if (
+        this.archivedSubagentIndex.has(providerKey) ||
+        this.archivedSubagentIndex.has(
+          `${rootHostId}::${rootAgentId}::provider::${directParentHost}::${directParentAgent}::${provKey}`
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Pure projection of Subagent Crew for `(rootHostId, rootAgentId)` across ALL cached hosts (P0-4, P1-12, P1-13):
+   * - Preserves actual `host_id`, `parent_host_id`, `parent_agent_id` for cross-host & nested descendants.
+   * - Propagates live `awaiting_permission` from managed AgentCards even on existing insights entries.
+   * - Applies local archive filtering uniformly across both insights entries and scanned managed cards.
+   */
+  public getScopedSubagentsForSession(hostId: string, agentId: string): SessionSubagentEntryDto[] {
+    const cleanRootHost = hostId.trim();
+    const cleanRootAgent = agentId.trim();
+    if (cleanRootHost.length === 0 || cleanRootAgent.length === 0) {
+      return EMPTY_SUBAGENTS;
+    }
+    const _rev = this.fleetStore.hostDetailRevision + this.archivedSubagentKeys.length;
+    if (_rev < 0) {
+      return EMPTY_SUBAGENTS;
+    }
+
+    const sess = this.stageStore.getSession(cleanRootHost, cleanRootAgent);
+    const rawList: SessionSubagentEntryDto[] = (
+      sess !== null &&
+      sess.insights !== null &&
+      sess.insights.subagents !== undefined
+    )
+      ? sess.insights.subagents
+      : EMPTY_SUBAGENTS;
+
+    const result: SessionSubagentEntryDto[] = [];
+    const seenChildKeys: Set<string> = new Set<string>();
+
+    for (let i = 0; i < rawList.length; i++) {
+      const sub = rawList[i];
+      if (this.isSubagentArchivedLocally(cleanRootHost, cleanRootAgent, sub)) {
+        continue;
+      }
+      if (sub.child_agent_id !== null && sub.child_agent_id.trim().length > 0) {
+        const actualHost = resolveSubagentActualHostId(sub, cleanRootHost);
+        const childId = sub.child_agent_id.trim();
+        const childKey = `${actualHost}::${childId}`;
+        seenChildKeys.add(childKey);
+        const card = this.findAgentCardOnHost(actualHost, childId);
+        if (card !== null) {
+          const derivedStatus = card.is_awaiting_permission
+            ? 'awaiting_permission'
+            : (card.is_running ? 'running' : sub.status);
+          const enriched: SessionSubagentEntryDto = {
+            id: sub.id,
+            role: sub.role,
+            prompt_preview: sub.prompt_preview,
+            status: derivedStatus,
+            child_agent_id: childId,
+            provider_subagent_id: sub.provider_subagent_id ?? null,
+            last_seq: Math.max(sub.last_seq, card.latest_seq),
+            host_id: actualHost,
+            host_name: sub.host_name ?? null,
+            parent_agent_id: resolveSubagentDirectParentAgentId(sub, cleanRootAgent),
+            parent_host_id: resolveSubagentDirectParentHostId(sub, cleanRootHost),
+            depth: sub.depth,
+            lineage: sub.lineage
+          };
+          result.push(enriched);
+          continue;
+        }
+      }
+      result.push(sub);
+    }
+
+    // Scan ALL cached host details so cross-host and nested managed descendants are discovered
+    // without touching synchronous N-API.
+    const hostIds = this.fleetStore.getAllCachedHostIds();
+    for (let hIdx = 0; hIdx < hostIds.length; hIdx++) {
+      const candidateHostId = hostIds[hIdx];
+      const detail = this.fleetStore.getCachedHostDetail(candidateHostId);
+      if (detail === null) {
+        continue;
+      }
+      for (let i = 0; i < detail.agents.length; i++) {
+        const ag = detail.agents[i];
+        if (ag.parent_agent_id === null || ag.parent_agent_id.trim().length === 0) {
+          continue;
+        }
+        const archived = ag.archived_at_rfc3339 !== undefined &&
+          ag.archived_at_rfc3339 !== null &&
+          ag.archived_at_rfc3339.length > 0;
+        if (archived || ag.status.state === 'closed') {
+          continue;
+        }
+        const childKey = `${candidateHostId}::${ag.agent_id}`;
+        if (seenChildKeys.has(childKey)) {
+          continue;
+        }
+        const resolvedRoot = this.sidePanelStore.resolveRootScope(candidateHostId, ag.agent_id);
+        if (resolvedRoot.hostId !== cleanRootHost || resolvedRoot.rootAgentId !== cleanRootAgent) {
+          continue;
+        }
+        const directParentHost = (
+          ag.parent_host_id !== undefined &&
+          ag.parent_host_id !== null &&
+          ag.parent_host_id.trim().length > 0
+        )
+          ? ag.parent_host_id.trim()
+          : candidateHostId;
+        const statusSlug = ag.is_awaiting_permission
+          ? 'awaiting_permission'
+          : (ag.is_running ? 'running' : (ag.status.state || 'idle'));
+        const entry: SessionSubagentEntryDto = {
+          id: ag.agent_id,
+          role: ag.title.trim().length > 0 ? ag.title.trim() : ag.provider_label,
+          prompt_preview: ag.status_label,
+          status: statusSlug,
+          child_agent_id: ag.agent_id,
+          provider_subagent_id: null,
+          last_seq: ag.latest_seq,
+          host_id: candidateHostId,
+          host_name: detail.host.display_name,
+          parent_agent_id: ag.parent_agent_id,
+          parent_host_id: directParentHost
+        };
+        if (this.isSubagentArchivedLocally(cleanRootHost, cleanRootAgent, entry)) {
+          continue;
+        }
+        seenChildKeys.add(childKey);
+        result.push(entry);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Subscribes once to a managed subagent or peer session and triggers an incremental stage fetch.
+   * Returns the `@ObservedV2 OrbitStageSession` so views observe `session.commitRevision` directly
+   * instead of re-opening timelines or copying all turns on every global revision (P1-4).
+   */
+  public bindScopedManagedSession(hostId: string, agentId: string): OrbitStageSession | null {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    if (cleanHost.length === 0 || cleanAgent.length === 0) {
+      return null;
+    }
+    const sess = this.stageStore.getOrCreateSession(cleanHost, cleanAgent);
+    if (this.bridge !== null) {
+      try {
+        this.bridge.openAgentTimeline(cleanHost, cleanAgent);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'openAgentTimeline failed for scoped session', err as Object);
+      }
+      this.stageStore.fetchIncremental(sess, 24).catch((err: Object) => {
+        orbitLogWarn('OrbitStore', 'fetchIncremental failed for scoped session', err);
+      });
+    }
+    return sess;
+  }
+
+  /**
+   * Fetches provider-native subagent events using the direct parent `(directParentHostId, directParentAgentId)`
+   * and parses the real `Vec<ProviderSubagentEvent>` JSON array serialized by Rust N-API (P1-4).
+   */
+  public loadScopedProviderSubagentTimeline(
+    directParentHostId: string,
+    directParentAgentId: string,
+    providerSubagentId: string,
+    subscribe: boolean = false
+  ): TimelineItemDto[] {
+    const cleanHost = directParentHostId.trim();
+    const cleanParent = directParentAgentId.trim();
+    const cleanSub = providerSubagentId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanParent.length === 0 || cleanSub.length === 0) {
+      return [];
+    }
+    try {
+      if (subscribe) {
+        this.bridge.openProviderSubagentTimeline(cleanHost, cleanParent, cleanSub);
+      }
+      const raw = this.bridge.providerSubagentTimelineJson(cleanHost, cleanParent, cleanSub);
+      return parseProviderSubagentTimelineJson(raw);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'loadScopedProviderSubagentTimeline failed', err as Object);
+      return [];
+    }
+  }
+
+  private timelineModelToDto(model: OrbitTimelineItemModel): TimelineItemDto {
+    return {
+      item_type: model.itemType,
+      seq: model.seq,
+      item_id: model.itemKey.length > 0 ? model.itemKey : undefined,
+      text: model.rawText,
+      summary_title: model.title,
+      status: model.status,
+      blocks: model.rawBlocks.length > 0 ? model.rawBlocks : undefined,
+      detail: model.detail ?? undefined
+    };
+  }
+
+  public projectStageSessionTimelineItems(sess: OrbitStageSession | null): TimelineItemDto[] {
+    if (sess === null) {
+      return [];
+    }
+    const items: TimelineItemDto[] = [];
+    for (let i = 0; i < sess.turns.length; i++) {
+      const turn = sess.turns[i];
+      const seenKeys: Set<string> = new Set<string>();
+      const pushUnique = (model: OrbitTimelineItemModel | null): void => {
+        if (model === null) {
+          return;
+        }
+        const key = model.itemKey.length > 0 ? model.itemKey : `${model.itemType}:${model.seq}`;
+        if (seenKeys.has(key)) {
+          return;
+        }
+        seenKeys.add(key);
+        items.push(this.timelineModelToDto(model));
+      };
+
+      pushUnique(turn.userPrompt);
+      pushUnique(turn.agentMessage);
+      for (let f = 0; f < turn.foldedSteps.length; f++) {
+        pushUnique(turn.foldedSteps[f]);
+      }
+      for (let j = 0; j < turn.liveSegments.length; j++) {
+        const seg = turn.liveSegments[j];
+        // Handle BOTH single-item segments (`seg.item`, e.g. active assistant_message / tool_call)
+        // AND array segments (`seg.items`, e.g. step_group) in chronological segment order (P1-4).
+        if (seg.item !== null) {
+          pushUnique(seg.item);
+        }
+        for (let k = 0; k < seg.items.length; k++) {
+          pushUnique(seg.items[k]);
+        }
+      }
+      pushUnique(turn.terminalReply);
+      for (let n = 0; n < turn.notices.length; n++) {
+        pushUnique(turn.notices[n]);
+      }
+    }
+    return items;
+  }
+
+  public steerScopedAgent(hostId: string, agentId: string, prompt: string): boolean {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    const cleanPrompt = prompt.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanAgent.length === 0 || cleanPrompt.length === 0) {
+      return false;
+    }
+    try {
+      this.bridge.sendPromptWithMeta(cleanHost, cleanAgent, cleanPrompt, cleanPrompt, null);
+      this.showToast('Sent steer message', false);
+      const sess = this.stageStore.getSession(cleanHost, cleanAgent);
+      if (sess !== null) {
+        this.stageStore.fetchIncremental(sess, 24).catch((_e: Object) => {
+          // Best-effort refresh
+        });
+      }
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'steerScopedAgent failed', err as Object);
+      this.showToast((err as Error).message || 'Steer failed', true);
+      return false;
+    }
+  }
+
+  /**
+   * Archives a single subagent on its ACTUAL host (`sub.host_id ?? rootHostId`).
+   * Fail-closed (P0-4 + P1-7 + P1-13):
+   * - For managed children, queues `archiveAgent` on the child's actual host and records the current
+   *   `hostDetailRevision` so subsequent authoritative unarchive updates clear the optimistic local hide mark.
+   * - For provider-native subagents, scopes tab removal strictly by `(directParentHost, directParentAgent, provId)`
+   *   across both open and closed tab stacks so sibling parents sharing a provider ID never collide.
+   */
+  public archiveScopedSubagent(
+    rootHostId: string,
+    rootAgentId: string,
+    sub: SessionSubagentEntryDto
+  ): boolean {
+    const cleanRootHost = rootHostId.trim();
+    const cleanRootAgent = rootAgentId.trim();
+    if (cleanRootHost.length === 0 || cleanRootAgent.length === 0) {
+      return false;
+    }
+    const rootScopeKey = this.sidePanelStore.scopeKeyFor(cleanRootHost, cleanRootAgent);
+    const actualChildHost = resolveSubagentActualHostId(sub, cleanRootHost);
+    const directParentHost = resolveSubagentDirectParentHostId(sub, cleanRootHost);
+    const directParentAgent = resolveSubagentDirectParentAgentId(sub, cleanRootAgent);
+
+    if (sub.child_agent_id !== null && sub.child_agent_id.trim().length > 0) {
+      const childId = sub.child_agent_id.trim();
+      if (this.bridge === null) {
+        this.showToast('Native core unavailable; archive request failed', true);
+        return false;
+      }
+      try {
+        this.bridge.archiveAgent(actualChildHost, childId);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'archiveScopedSubagent bridge call failed', err as Object);
+        this.showToast((err as Error).message || 'Failed to queue subagent archive', true);
+        return false;
+      }
+      // Only mutate local state & tabs AFTER native RPC accepts/queues the request.
+      this.sidePanelStore.removeSubagentTabs(actualChildHost, childId, undefined, false);
+      const managedKey = encodeSidePanelKeyTuple(['managed_archive', actualChildHost, childId]);
+      this.archivedSubagentIndex.add(managedKey);
+      this.archivedManagedMarkRevByKey.set(managedKey, this.fleetStore.getHostDetailRevision(actualChildHost));
+      this.syncArchivedSubagentKeys();
+      this.panelDataRevision += 1;
+      this.reloadHostAsync(actualChildHost);
+      this.triggerHaptic(10);
+      return true;
+    }
+
+    // Provider-native subagent (local dismissal scoped strictly to its direct parent).
+    const provId = (
+      sub.provider_subagent_id !== undefined &&
+      sub.provider_subagent_id !== null &&
+      sub.provider_subagent_id.trim().length > 0
+    )
+      ? sub.provider_subagent_id.trim()
+      : sub.id.trim();
+    if (provId.length === 0) {
+      return false;
+    }
+    this.sidePanelStore.removeSubagentTabs(
+      directParentHost,
+      provId,
+      rootScopeKey,
+      true,
+      directParentHost,
+      directParentAgent
+    );
+    this.archivedSubagentIndex.add(
+      encodeSidePanelKeyTuple([
+        'provider_archive',
+        cleanRootHost,
+        cleanRootAgent,
+        directParentHost,
+        directParentAgent,
+        provId
+      ])
+    );
+    this.syncArchivedSubagentKeys();
+    this.panelDataRevision += 1;
+    this.triggerHaptic(10);
+    return true;
+  }
+
+  private syncArchivedSubagentKeys(): void {
+    const nextKeys: string[] = [];
+    this.archivedSubagentIndex.forEach((k: string): void => {
+      nextKeys.push(k);
+    });
+    this.archivedSubagentKeys = nextKeys;
+  }
+
+  public archiveSettledSubagentsForSession(
+    rootHostId: string,
+    rootAgentId: string,
+    subagents: SessionSubagentEntryDto[]
+  ): OrbitSubagentBatchArchiveOutcome {
+    let queuedCount = 0;
+    let dismissedCount = 0;
+    let failedCount = 0;
+    for (let i = 0; i < subagents.length; i++) {
+      const sub = subagents[i];
+      if (!isSubagentSettledStatus(sub.status)) {
+        continue;
+      }
+      const isManaged = sub.child_agent_id !== null && sub.child_agent_id.trim().length > 0;
+      if (this.archiveScopedSubagent(rootHostId, rootAgentId, sub)) {
+        if (isManaged) {
+          queuedCount += 1;
+        } else {
+          dismissedCount += 1;
+        }
+      } else {
+        failedCount += 1;
+      }
+    }
+    const acceptedTotal = queuedCount + dismissedCount;
+    if (failedCount > 0 && acceptedTotal > 0) {
+      this.showToast(`Accepted ${acceptedTotal}, ${failedCount} failed — tap to retry`, true);
+    } else if (failedCount > 0) {
+      this.showToast(`Failed to archive ${failedCount} subagent${failedCount === 1 ? '' : 's'}`, true);
+    } else if (queuedCount > 0 && dismissedCount > 0) {
+      this.showToast(`Archive requested (${queuedCount}) · dismissed (${dismissedCount})`, false);
+    } else if (queuedCount > 0) {
+      this.showToast(`Archive requested for ${queuedCount} subagent${queuedCount === 1 ? '' : 's'}`, false);
+    } else if (dismissedCount > 0) {
+      this.showToast(`Dismissed ${dismissedCount} finished subagent${dismissedCount === 1 ? '' : 's'}`, false);
+    }
+    return {
+      archivedCount: acceptedTotal,
+      queuedCount: queuedCount,
+      dismissedCount: dismissedCount,
+      failedCount: failedCount
+    };
+  }
+
+  // --- Scoped Automations Helpers (Full Parity for All 5 Automation Kinds — P1-8) ---
+
+  public async loadScopedAutomations(hostId: string): Promise<OrbitScopedAutomationsData> {
+    const cleanHost = hostId.trim();
+    const empty: OrbitScopedAutomationsData = {
+      schedules: [],
+      timers: [],
+      goals: [],
+      monitors: [],
+      workflows: []
+    };
+    if (this.bridge === null || cleanHost.length === 0) {
+      return empty;
+    }
+    try {
+      this.ensureScopedHostDetailAsync(cleanHost);
+      const detail = this.getScopedHostDetail(cleanHost);
+      const schedules: ScheduleSpecDto[] = detail !== null && detail.schedules !== undefined
+        ? detail.schedules
+        : [];
+      const timerJson = await this.settleAutomationJson(
+        this.bridge.listConditionalTimersJson(cleanHost, null, true),
+        'scoped.listConditionalTimersJson'
+      );
+      const goalJson = await this.settleAutomationJson(
+        this.bridge.listGoalRunsJson(cleanHost, null),
+        'scoped.listGoalRunsJson'
+      );
+      const monJson = await this.settleAutomationJson(
+        this.bridge.listMonitorWatchesJson(cleanHost, null),
+        'scoped.listMonitorWatchesJson'
+      );
+      const wfJson = await this.settleAutomationJson(
+        this.bridge.listWorkflowRunsJson(cleanHost, true),
+        'scoped.listWorkflowRunsJson'
+      );
+      return {
+        schedules: schedules,
+        timers: timerJson !== null ? (JSON.parse(timerJson) as ConditionalTimerRecordDto[]) : [],
+        goals: goalJson !== null ? (JSON.parse(goalJson) as GoalRunRecordDto[]) : [],
+        monitors: monJson !== null ? (JSON.parse(monJson) as MonitorWatchRecordDto[]) : [],
+        workflows: wfJson !== null ? (JSON.parse(wfJson) as WorkflowRunRecordDto[]) : []
+      };
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'loadScopedAutomations failed', err as Object);
+      return empty;
+    }
+  }
+
+  public createScopedSchedule(
+    hostId: string,
+    cwd: string,
+    name: string,
+    cronExpr: string,
+    prompt: string,
+    useWorktree: boolean
+  ): boolean {
+    const cleanHost = hostId.trim();
+    const cleanName = name.trim();
+    const cleanCron = cronExpr.trim();
+    const cleanPrompt = prompt.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanName.length === 0 || cleanCron.length === 0 || cleanPrompt.length === 0) {
+      this.showToast('Name, cron expression, and prompt are required', true);
+      return false;
+    }
+    const modelSnap = this.resolveModelSnapshotForScope(cleanHost, null);
+    const payload: CreateSchedulePayloadDto = {
+      host_id: cleanHost,
+      name: cleanName,
+      cron_expr: cleanCron,
+      prompt: cleanPrompt,
+      cwd: nonBlankPath(cwd).length > 0 ? nonBlankPath(cwd) : '~',
+      provider: modelSnap[0],
+      model: modelSnap[1],
+      effort: null,
+      mode: normalizeModeSlug(this.composerMode),
+      worktree: useWorktree,
+      archive_on_finish: true,
+      max_runs: null
+    };
+    try {
+      this.bridge.createScheduleJson(JSON.stringify(payload));
+      this.bridge.refreshHost(cleanHost);
+      this.reloadHostAsync(cleanHost);
+      this.showToast(`Created schedule "${cleanName}"`, false);
+      this.triggerHaptic(12);
+      return true;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'createScopedSchedule failed', err as Object);
+      this.showToast((err as Error).message || 'Failed to create schedule', true);
+      return false;
+    }
+  }
+
+  public pauseScopedSchedule(hostId: string, scheduleId: string): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.pauseSchedule(cleanHost, scheduleId);
+      this.reloadHostAsync(cleanHost);
+      this.showToast('Schedule paused', false);
+      this.triggerHaptic(8);
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to pause schedule', true);
+    }
+  }
+
+  public resumeScopedSchedule(hostId: string, scheduleId: string): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.resumeSchedule(cleanHost, scheduleId);
+      this.reloadHostAsync(cleanHost);
+      this.showToast('Schedule resumed', false);
+      this.triggerHaptic(8);
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to resume schedule', true);
+    }
+  }
+
+  public runScopedScheduleOnce(hostId: string, scheduleId: string): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.runScheduleOnce(cleanHost, scheduleId);
+      this.showToast('Triggered schedule run', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to trigger schedule', true);
+    }
+  }
+
+  public deleteScopedSchedule(hostId: string, scheduleId: string): void {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || scheduleId.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.deleteSchedule(cleanHost, scheduleId);
+      this.reloadHostAsync(cleanHost);
+      this.showToast('Schedule deleted', false);
+      this.triggerHaptic(10);
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to delete schedule', true);
+    }
+  }
+
+  public loadScopedScheduleRuns(hostId: string, scheduleId: string): ScheduleRunRecordDto[] {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || scheduleId.length === 0) {
+      return [];
+    }
+    try {
+      this.bridge.fetchScheduleRuns(cleanHost, scheduleId, 10);
+      const raw = this.bridge.scheduleRunsJson(cleanHost, scheduleId);
+      return JSON.parse(raw) as ScheduleRunRecordDto[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'loadScopedScheduleRuns failed', err as Object);
+      return [];
+    }
+  }
+
+  public async createScopedConditionalTimer(
+    hostId: string,
+    agentId: string | null,
+    durationSeconds: number,
+    prompt: string,
+    conditionKind: string
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId !== null ? agentId.trim() : '';
+    const cleanPrompt = prompt.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanAgent.length === 0 || cleanPrompt.length === 0) {
+      this.showToast('Requires an active session and prompt to arm a timer', true);
+      return false;
+    }
+    try {
+      const condObj: TimerConditionDto = { kind: conditionKind };
+      await this.bridge.createTimerJson(
+        cleanHost,
+        cleanAgent,
+        Math.max(10, Math.round(durationSeconds)),
+        cleanPrompt,
+        JSON.stringify(condObj)
+      );
+      this.showToast('Conditional timer armed', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to arm timer', true);
+      return false;
+    }
+  }
+
+  public async cancelScopedConditionalTimer(hostId: string, timerId: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || timerId.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.cancelConditionalTimerJson(cleanHost, timerId);
+      this.showToast('Timer canceled', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to cancel timer', true);
+      return false;
+    }
+  }
+
+  public async fireScopedConditionalTimerNow(hostId: string, timerId: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || timerId.length === 0) {
+      return false;
+    }
+    try {
+      await this.bridge.fireConditionalTimerNowJson(cleanHost, timerId);
+      this.showToast('Timer fired', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to fire timer', true);
+      return false;
+    }
+  }
+
+  public async startScopedGoalRun(
+    hostId: string,
+    agentId: string | null,
+    objective: string,
+    verifyCmd: string | null,
+    maxIterations: number
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId !== null ? agentId.trim() : '';
+    const cleanObj = objective.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanAgent.length === 0 || cleanObj.length === 0) {
+      this.showToast('Requires an active session and objective to start a goal', true);
+      return false;
+    }
+    try {
+      const req: StartGoalRunRequestDto = {
+        host_id: cleanHost,
+        agent_id: cleanAgent,
+        objective: cleanObj,
+        criteria: [],
+        verify_command: verifyCmd !== null && verifyCmd.trim().length > 0 ? verifyCmd.trim() : null,
+        max_iterations: Math.max(1, maxIterations),
+        max_duration_secs: 7200
+      };
+      await this.bridge.startGoalJson(JSON.stringify(req));
+      this.showToast('Goal loop started', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to start goal', true);
+      return false;
+    }
+  }
+
+  public async controlScopedGoalRun(hostId: string, goalId: string, action: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || goalId.length === 0) {
+      return false;
+    }
+    try {
+      const req: ControlGoalRunRequestDto = {
+        host_id: cleanHost,
+        goal_id: goalId,
+        action: action
+      };
+      await this.bridge.controlGoalRunJson(JSON.stringify(req));
+      const label = action === 'pause'
+        ? 'Goal paused'
+        : (action === 'resume' ? 'Goal resumed' : (action === 'cancel' ? 'Goal stopped' : 'Goal verifying'));
+      this.showToast(label, false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to update goal', true);
+      return false;
+    }
+  }
+
+  public async createScopedMonitorWatch(
+    hostId: string,
+    agentId: string | null,
+    name: string,
+    kind: string,
+    target: string,
+    pattern: string | null
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId !== null ? agentId.trim() : '';
+    const cleanName = name.trim();
+    const cleanTarget = target.trim();
+    if (
+      this.bridge === null ||
+      cleanHost.length === 0 ||
+      cleanAgent.length === 0 ||
+      cleanName.length === 0 ||
+      cleanTarget.length === 0
+    ) {
+      this.showToast('Requires an active session, name, and target', true);
+      return false;
+    }
+    try {
+      const req: StartMonitorWatchRequestDto = {
+        host_id: cleanHost,
+        agent_id: cleanAgent,
+        name: cleanName,
+        kind: kind === 'http_health'
+          ? { kind: 'http_health', url: cleanTarget }
+          : (kind === 'log_file_tail'
+            ? { kind: 'log_file_tail', path: cleanTarget, pattern: pattern }
+            : { kind: 'command_stream', command: cleanTarget, pattern: pattern }),
+        expires_in_secs: 3600
+      };
+      await this.bridge.createMonitorJson(JSON.stringify(req));
+      this.showToast('Monitor watch started', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to start monitor', true);
+      return false;
+    }
+  }
+
+  public async stopScopedMonitorWatch(hostId: string, monitorId: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || monitorId.length === 0) {
+      return false;
+    }
+    try {
+      const req: StopMonitorWatchRequestDto = {
+        host_id: cleanHost,
+        monitor_id: monitorId
+      };
+      await this.bridge.stopMonitorWatchJson(JSON.stringify(req));
+      this.showToast('Monitor stopped', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to stop monitor', true);
+      return false;
+    }
+  }
+
+  public async startScopedDagWorkflow(
+    hostId: string,
+    cwd: string,
+    name: string,
+    stepPrompt: string
+  ): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    const cleanName = name.trim();
+    const cleanPrompt = stepPrompt.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanName.length === 0 || cleanPrompt.length === 0) {
+      return false;
+    }
+    try {
+      const modelSnap = this.resolveModelSnapshotForScope(cleanHost, null);
+      const step: DagStepSpecDto = {
+        step_id: 'step_1',
+        name: cleanName,
+        prompt: cleanPrompt,
+        depends_on: []
+      };
+      const req: StartDagWorkflowRequestDto = {
+        host_id: cleanHost,
+        name: cleanName,
+        cwd: nonBlankPath(cwd).length > 0 ? nonBlankPath(cwd) : '~',
+        steps: [step],
+        default_provider: modelSnap[0],
+        default_mode: normalizeModeSlug(this.composerMode),
+        max_concurrency: 2
+      };
+      await this.bridge.startWorkflowJson(JSON.stringify(req));
+      this.showToast('Workflow started', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to start workflow', true);
+      return false;
+    }
+  }
+
+  public async cancelScopedWorkflowRun(hostId: string, runId: string): Promise<boolean> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || runId.length === 0) {
+      return false;
+    }
+    try {
+      const req: CancelWorkflowRunRequestDto = {
+        host_id: cleanHost,
+        run_id: runId
+      };
+      await this.bridge.cancelWorkflowRunJson(JSON.stringify(req));
+      this.showToast('Workflow canceled', false);
+      this.triggerHaptic(10);
+      return true;
+    } catch (err) {
+      this.showToast((err as Error).message || 'Failed to cancel workflow', true);
+      return false;
+    }
+  }
+
+  // --- Store-backed Automations In-Flight Submission Locks (R3-P1-10) ---
+
+  public automationSubmitLockKey(
+    scopeKey: string,
+    tabId: string,
+    hostId: string,
+    agentId: string | null,
+    cwd: string | null,
+    formKind: string
+  ): string {
+    return encodeSidePanelKeyTuple([
+      'auto_submit',
+      scopeKey.trim(),
+      tabId.trim(),
+      hostId.trim(),
+      agentId !== null ? agentId.trim() : '',
+      nonBlankPath(cwd),
+      formKind.trim()
+    ]);
+  }
+
+  public isAutomationFormSubmitting(lockKey: string): boolean {
+    return lockKey.length > 0 && this.automationSubmitTokenByKey.has(lockKey);
+  }
+
+  public acquireAutomationSubmitToken(lockKey: string): number {
+    if (lockKey.length === 0 || this.automationSubmitTokenByKey.has(lockKey)) {
+      return 0;
+    }
+    this.automationSubmitSeq += 1;
+    const token = this.automationSubmitSeq;
+    this.automationSubmitTokenByKey.set(lockKey, token);
+    this.automationSubmitRevision += 1;
+    return token;
+  }
+
+  public releaseAutomationSubmitToken(lockKey: string, token: number): boolean {
+    if (lockKey.length === 0 || token <= 0) {
+      return false;
+    }
+    if (this.automationSubmitTokenByKey.get(lockKey) !== token) {
+      return false;
+    }
+    this.automationSubmitTokenByKey.delete(lockKey);
+    this.automationSubmitRevision += 1;
+    return true;
   }
 
   public exportCurrentSessionTranscript(

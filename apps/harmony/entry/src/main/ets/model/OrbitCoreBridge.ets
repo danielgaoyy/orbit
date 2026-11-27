@@ -51,12 +51,19 @@ export interface OrbitComposerDraftBridge {
  */
 export class OrbitCoreBridge
   implements OrbitStageBridge, OrbitFleetBridge, OrbitPersonalAgentBridge, OrbitComposerDraftBridge {
-  private readonly core: OrbitHarmonyCore;
+  private readonly coreImpl: OrbitHarmonyCore | null;
   public readonly usedMasterKey: boolean;
 
-  constructor(core: OrbitHarmonyCore, usedMasterKey: boolean) {
-    this.core = core;
+  constructor(core: OrbitHarmonyCore | null, usedMasterKey: boolean) {
+    this.coreImpl = core;
     this.usedMasterKey = usedMasterKey;
+  }
+
+  private get core(): OrbitHarmonyCore {
+    if (this.coreImpl === null) {
+      throw new Error('OrbitCoreBridge native core unavailable');
+    }
+    return this.coreImpl;
   }
 
   public static openWithMasterKeyOrFallback(
@@ -723,6 +730,12 @@ export class OrbitCoreBridge
     });
   }
 
+  public resizeTerminalSlot(hostId: string, slot: number, cols: number, rows: number): void {
+    this.traceVoidSync('resizeTerminalSlot', 0, (): void => {
+      this.core.resizeTerminalSlot(hostId, slot, cols, rows);
+    });
+  }
+
   public terminalScreenJson(hostId: string): string {
     return this.traceJsonSync('terminalScreenJson', (): string => {
       return this.core.terminalScreenJson(hostId);
@@ -936,9 +949,14 @@ export class OrbitCoreBridge
     });
   }
 
-  public gitReviewJson(hostId: string, cwd: string, path?: string | null): string {
+  public gitReviewJson(
+    hostId: string,
+    cwd: string,
+    path?: string | null,
+    staged?: boolean | null
+  ): string {
     return this.traceJsonSync('gitReviewJson', (): string => {
-      return this.core.gitReviewJson(hostId, cwd, path);
+      return this.core.gitReviewJson(hostId, cwd, path, staged);
     });
   }
 

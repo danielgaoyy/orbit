@@ -2528,7 +2528,9 @@ export default function orbitPr2Test(): void {
       expect(gitTargetPathsEqual('~/project', '/home/pa/project')).assertFalse();
       expect(shouldApplyGitDiffForTarget(true, 'host-L', '/home/worker/project', 'host-L', '/home/pa/project')).assertFalse();
       expect(cwdPathsEquivalent('/home/worker/project', '/home/pa/project')).assertFalse();
-      expect(cwdPathsEquivalent('~/project', '/home/worker/project')).assertTrue();
+      expect(cwdPathsEquivalent('~/project', '/home/worker/project')).assertFalse();
+      expect(cwdPathsEquivalent('~/project', '/home/worker/project', '/home/worker')).assertTrue();
+      expect(cwdPathsEquivalent('~/project', '/home/pa/project', '/home/worker')).assertFalse();
       // POSIX literal backslash directory names (`team\project` vs `team/project`) MUST stay distinct;
       // only explicit Windows drive/UNC paths normalize `\` -> `/`.
       expect(gitTargetPathsEqual('/tmp/team\\project', '/tmp/team/project')).assertFalse();

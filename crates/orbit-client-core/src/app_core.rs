@@ -110,6 +110,168 @@ const CLOUD_AUTO_SYNC_URGENT_DEBOUNCE_MS: u64 = 1_500;
 const CLOUD_AUTO_SYNC_URGENT_MIN_INTERVAL_MS: u64 = 5_000;
 const CLOUD_AUTO_SYNC_THROTTLED_MIN_INTERVAL_MS: u64 = 30_000;
 const CLOUD_SYNC_ETAG_POLL_INTERVAL_SECS: u64 = 30;
+const MAX_PENDING_GIT_DIFF_REQUESTS: usize = 512;
+const MAX_PENDING_GIT_STATUS_REQUESTS: usize = 256;
+
+#[derive(Debug, Clone)]
+struct StoredGitDiff {
+    raw_cwd: String,
+    unified_diff: String,
+    diff_revision: u64,
+    source_req_seq: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingGitDiffRequest {
+    norm_cwd: String,
+    raw_cwd: String,
+    path: Option<String>,
+    staged: bool,
+    req_seq: u64,
+    status_seq_at_dispatch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RemainingGitStatusPath {
+    norm_path: String,
+    staged: bool,
+    is_dir_summary: bool,
+}
+
+/// Convert a normalized cwd-relative request path into an exact repository-root-relative path
+/// using `GitStatusSnapshot.repo_prefix` (`Some("pkg")` inside `<repo>/pkg`, `Some("")` at repo
+/// root, `None` for legacy daemons). Never performs arbitrary suffix/substring matching (R16-P1-1).
+fn resolve_repo_rel_request_path(req_path: &str, repo_prefix: Option<&str>) -> String {
+    let norm_req = normalize_git_rel_path(req_path);
+    if norm_req.is_empty() {
+        return String::new();
+    }
+    let Some(raw_prefix) = repo_prefix else {
+        return norm_req;
+    };
+    let norm_prefix = normalize_git_rel_path(raw_prefix);
+    if norm_prefix.is_empty() {
+        norm_req
+    } else {
+        format!("{norm_prefix}/{norm_req}")
+    }
+}
+
+/// Match a requested Git diff `(req_path, slot_staged)` against post-mutation porcelain status
+/// entries using exact repository-root-relative path conversion (`repo_prefix`) and strict
+/// `staged` mode isolation (R16-P1-1 / R16-P1-2):
+/// 1. Exact file match (`entry.norm_path == repo_rel`).
+/// 2. Untracked directory summary (`entry.is_dir_summary` from trailing `/`, e.g. `bucket/` or
+///    `pkg/bucket/` matching `bucket/new.txt` or `pkg/bucket/new.txt`).
+/// 3. Directory-scope query (`d` -> `d/g` or `pkg/d` -> `pkg/d/g`).
+///
+/// Returns `false` when `remaining` is empty or no entry matches BOTH exact path and `slot_staged`.
+fn git_status_paths_match_request(
+    req_path: &str,
+    repo_prefix: Option<&str>,
+    slot_staged: bool,
+    remaining: &[RemainingGitStatusPath],
+) -> bool {
+    let repo_rel = resolve_repo_rel_request_path(req_path, repo_prefix);
+    if repo_rel.is_empty() || remaining.is_empty() {
+        return false;
+    }
+    let rel_bytes = repo_rel.as_bytes();
+    for entry in remaining {
+        if entry.staged != slot_staged || entry.norm_path.is_empty() {
+            continue;
+        }
+        let rem = entry.norm_path.as_str();
+        // 1. Exact file / path match
+        if rem == repo_rel {
+            return true;
+        }
+        // 2. Untracked directory summary (`bucket/` or `pkg/bucket/`)
+        if entry.is_dir_summary
+            && repo_rel.len() > rem.len()
+            && repo_rel.starts_with(rem)
+            && rel_bytes[rem.len()] == b'/'
+        {
+            return true;
+        }
+        // 3. Directory-scope query (`d` matching `d/g`, or `pkg/d` matching `pkg/d/g`)
+        if rem.len() > repo_rel.len()
+            && rem.starts_with(&repo_rel)
+            && rem.as_bytes()[repo_rel.len()] == b'/'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Derive the exact canonical Git worktree root for `norm_cwd` from `GitStatusSnapshot.repo_prefix`
+/// (`Some("")` -> `norm_cwd`, `Some("pkg")` -> strip exact `"/pkg"` suffix while preserving legal
+/// trailing spaces such as `"/tmp/repo "`, `None` -> `None` for legacy daemons).
+fn derive_git_repo_root(norm_cwd: &str, repo_prefix: Option<&str>) -> Option<String> {
+    if norm_cwd.is_empty() {
+        return None;
+    }
+    let raw_prefix = repo_prefix?;
+    let norm_prefix = normalize_git_rel_path(raw_prefix);
+    if norm_prefix.is_empty() {
+        return Some(norm_cwd.to_string());
+    }
+    let suffix = format!("/{norm_prefix}");
+    let stripped = norm_cwd.strip_suffix(&suffix)?;
+    if stripped.is_empty() {
+        Some("/".to_string())
+    } else if stripped.len() == 2
+        && stripped.as_bytes()[0].is_ascii_alphabetic()
+        && stripped.as_bytes()[1] == b':'
+    {
+        Some(format!("{stripped}/"))
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+/// Derive the exact repository-root-relative subdirectory prefix for `norm_cwd` within `repo_root`
+/// (`""` at root, `"pkg"` inside `<root>/pkg`, `None` outside `repo_root`). Preserves trailing
+/// spaces and enforces a strict `/` directory boundary so `"/tmp/repo "` never matches `"/tmp/repo"`.
+fn derive_repo_prefix_from_root(norm_cwd: &str, repo_root: &str) -> Option<String> {
+    if norm_cwd.is_empty() || repo_root.is_empty() {
+        return None;
+    }
+    if norm_cwd == repo_root {
+        return Some(String::new());
+    }
+    if repo_root.ends_with('/') {
+        norm_cwd.strip_prefix(repo_root).map(|s| s.to_string())
+    } else {
+        norm_cwd
+            .strip_prefix(repo_root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(|s| s.to_string())
+    }
+}
+
+/// Determine whether two canonical host-local `cwd` keys belong to the same physical Git worktree
+/// (`R17-P1-2` / `R18-P1-1` / `R18-P1-2`):
+/// - Same canonical `cwd` always matches (covers both modern and legacy daemons).
+/// - Different `cwd` spellings (subdirectories OR POSIX directory symlinks) match **ONLY** when
+///   both sides carry a verified physical `repo_root` and `root_a == root_b`.
+/// - Never guesses cross-directory membership via string prefix containment, so an independent
+///   nested repository (`vendor`) whose first status has not arrived yet is NEVER overwritten or
+///   evicted by its parent repository.
+fn cwds_share_git_worktree(
+    a_cwd: &str,
+    b_cwd: &str,
+    repo_root_by_cwd: &HashMap<String, String>,
+    known_a_root: Option<&str>,
+) -> bool {
+    if a_cwd == b_cwd {
+        return true;
+    }
+    let root_a = known_a_root.or_else(|| repo_root_by_cwd.get(a_cwd).map(String::as_str));
+    let root_b = repo_root_by_cwd.get(b_cwd).map(String::as_str);
+    matches!((root_a, root_b), (Some(ra), Some(rb)) if ra == rb)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscribeOptions {
@@ -830,8 +992,21 @@ impl Drop for ActivePreviewListener {
     }
 }
 
-type PendingGitMutationTx =
-    tokio::sync::oneshot::Sender<Result<(GitMutationOutcome, bool), String>>;
+struct GitMutationAck {
+    outcome: GitMutationOutcome,
+    status_refreshed: bool,
+    origin_cwd_rebound: bool,
+    reverify_pending: bool,
+}
+
+struct PendingGitMutation {
+    tx: tokio::sync::oneshot::Sender<Result<GitMutationAck, String>>,
+    origin_norm_cwd: String,
+    origin_repo_root: Option<String>,
+    origin_identity_epoch: u64,
+    dispatch_seq: u64,
+    accepted_overlapping_status_cwds: HashMap<String, String>,
+}
 
 type PendingGitCollabQueryTx = tokio::sync::oneshot::Sender<Result<GitCollabQueryResult, String>>;
 
@@ -894,7 +1069,7 @@ struct HostMemoryState {
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
-    pending_git_mutations: HashMap<Uuid, PendingGitMutationTx>,
+    pending_git_mutations: HashMap<Uuid, PendingGitMutation>,
     pending_git_collab_queries: HashMap<Uuid, PendingGitCollabQueryTx>,
     pending_acp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AcpProbeResult, String>>>,
     pending_acp_snapshots: HashMap<
@@ -1061,9 +1236,31 @@ struct HostMemoryState {
     terminal_emulators: HashMap<u8, TerminalGridEmulator>,
     terminal_raw_history: HashMap<String, Vec<u8>>,
     pending_slot_raw_history: HashMap<u8, Vec<u8>>,
-    git_statuses: HashMap<String, GitStatusSnapshot>,
-    git_diffs: HashMap<(String, Option<String>), String>,
     authoritative_home_dir: Option<String>,
+    git_statuses: HashMap<String, GitStatusSnapshot>,
+    git_status_seq_by_cwd: HashMap<String, u64>,
+    next_git_status_req_seq: u64,
+    pending_git_status_requests: HashMap<Uuid, (String, String, u64, u64)>,
+    git_status_revision_counter: u64,
+    git_status_revision_by_cwd: HashMap<String, u64>,
+    git_status_identity_epoch_by_cwd: HashMap<String, u64>,
+    git_cwd_identity_epoch: HashMap<String, u64>,
+    git_cwd_identity_status_watermark: HashMap<String, u64>,
+    git_cwd_identity_established_status_seq: HashMap<String, u64>,
+    git_pending_mutation_reverify_by_cwd: HashMap<String, u64>,
+    git_diff_error_revision_counter: u64,
+    last_git_diff_error_revision: HashMap<(String, Option<String>, bool), (u64, u64)>,
+    git_repo_root_by_cwd: HashMap<String, String>,
+    git_repo_prefix_by_cwd: HashMap<String, String>,
+    git_cwd_identity_watermark: HashMap<String, u64>,
+    git_cwd_root_set_seq: HashMap<String, u64>,
+    latest_mutation_watermark_by_repo_root: HashMap<String, u64>,
+    latest_git_status_by_repo_root: HashMap<String, (u64, GitStatusSnapshot)>,
+    git_diffs: HashMap<(String, Option<String>, bool), StoredGitDiff>,
+    pending_git_diff_requests: HashMap<Uuid, PendingGitDiffRequest>,
+    latest_dispatched_git_diff_req_seq: HashMap<(String, Option<String>, bool), u64>,
+    next_git_diff_req_seq: u64,
+    git_diff_revision_counter: u64,
     last_git_diff_staged: HashMap<String, bool>,
     git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
     workspace_files: HashMap<String, Vec<String>>,
@@ -1250,9 +1447,31 @@ impl HostMemoryState {
             terminal_emulators,
             terminal_raw_history: HashMap::new(),
             pending_slot_raw_history: HashMap::new(),
-            git_statuses: HashMap::new(),
-            git_diffs: HashMap::new(),
             authoritative_home_dir: None,
+            git_statuses: HashMap::new(),
+            git_status_seq_by_cwd: HashMap::new(),
+            next_git_status_req_seq: 0,
+            pending_git_status_requests: HashMap::new(),
+            git_status_revision_counter: 0,
+            git_status_revision_by_cwd: HashMap::new(),
+            git_status_identity_epoch_by_cwd: HashMap::new(),
+            git_cwd_identity_epoch: HashMap::new(),
+            git_cwd_identity_status_watermark: HashMap::new(),
+            git_cwd_identity_established_status_seq: HashMap::new(),
+            git_pending_mutation_reverify_by_cwd: HashMap::new(),
+            git_diff_error_revision_counter: 0,
+            last_git_diff_error_revision: HashMap::new(),
+            git_repo_root_by_cwd: HashMap::new(),
+            git_repo_prefix_by_cwd: HashMap::new(),
+            git_cwd_identity_watermark: HashMap::new(),
+            git_cwd_root_set_seq: HashMap::new(),
+            latest_mutation_watermark_by_repo_root: HashMap::new(),
+            latest_git_status_by_repo_root: HashMap::new(),
+            git_diffs: HashMap::new(),
+            pending_git_diff_requests: HashMap::new(),
+            latest_dispatched_git_diff_req_seq: HashMap::new(),
+            next_git_diff_req_seq: 0,
+            git_diff_revision_counter: 0,
             last_git_diff_staged: HashMap::new(),
             git_repos_by_cwd: HashMap::new(),
             workspace_files: HashMap::new(),
@@ -1281,6 +1500,92 @@ impl HostMemoryState {
             monitor_watches: Vec::new(),
             workflow_runs: Vec::new(),
         }
+    }
+
+    fn authoritative_home_dir(&self) -> Option<String> {
+        if let Some(ref home) = self.authoritative_home_dir {
+            return Some(home.clone());
+        }
+        if self.is_local {
+            return crate::desktop_ops::resolve_user_home()
+                .map(|p| p.to_string_lossy().into_owned());
+        }
+        None
+    }
+
+    fn git_path_flavor(&self, home: Option<&str>) -> crate::viewmodel::GitPathFlavor {
+        if let Some(h) = home {
+            let bytes = h.as_bytes();
+            let is_win_drive = bytes.len() >= 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
+            if h.starts_with(r"\\") || is_win_drive {
+                return crate::viewmodel::GitPathFlavor::Windows;
+            }
+            if h.starts_with('/') && !(h.starts_with("//") && !h.starts_with("///")) {
+                return crate::viewmodel::GitPathFlavor::Posix;
+            }
+        }
+        if self.is_local {
+            if cfg!(windows) {
+                return crate::viewmodel::GitPathFlavor::Windows;
+            }
+            return crate::viewmodel::GitPathFlavor::Posix;
+        }
+        crate::viewmodel::GitPathFlavor::Unknown
+    }
+
+    fn canonical_git_cwd(&self, raw_cwd: &str) -> String {
+        let home = self.authoritative_home_dir();
+        let flavor = self.git_path_flavor(home.as_deref());
+        crate::viewmodel::canonical_git_cwd_key_for_flavor(raw_cwd, home.as_deref(), flavor)
+    }
+
+    /// Returns `true` when `pending_git_diff_requests` holds at least one non-stale in-flight
+    /// request matching `slot_key` (`req_seq >= latest_dispatched_git_diff_req_seq[slot_key]`).
+    fn has_live_git_diff_in_flight(&self, slot_key: &(String, Option<String>, bool)) -> bool {
+        let latest_dispatched = self
+            .latest_dispatched_git_diff_req_seq
+            .get(slot_key)
+            .copied()
+            .unwrap_or(0);
+        let cwd_identity_wm = self
+            .git_cwd_identity_watermark
+            .get(&slot_key.0)
+            .copied()
+            .unwrap_or(0);
+        let min_live_seq = latest_dispatched.max(cwd_identity_wm);
+        self.pending_git_diff_requests.values().any(|req| {
+            req.norm_cwd == slot_key.0
+                && req.path == slot_key.1
+                && req.staged == slot_key.2
+                && req.req_seq >= min_live_seq
+        })
+    }
+
+    fn bump_git_status_revision(&mut self, norm_cwd: &str) -> u64 {
+        self.git_status_revision_counter = self.git_status_revision_counter.saturating_add(1);
+        let rev = self.git_status_revision_counter;
+        let cur_epoch = self
+            .git_cwd_identity_epoch
+            .get(norm_cwd)
+            .copied()
+            .unwrap_or(0);
+        self.git_status_revision_by_cwd
+            .insert(norm_cwd.to_string(), rev);
+        self.git_status_identity_epoch_by_cwd
+            .insert(norm_cwd.to_string(), cur_epoch);
+        rev
+    }
+
+    fn bump_git_cwd_identity_epoch(&mut self, norm_cwd: &str) -> u64 {
+        let epoch = self
+            .git_cwd_identity_epoch
+            .entry(norm_cwd.to_string())
+            .or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        *epoch
     }
 
     fn observe_outline_prompt(&mut self, event: &TimelineEvent) -> bool {
@@ -3253,63 +3558,199 @@ impl OrbitAppCore {
     }
 
     pub fn git_review(&self, host_id: &str, cwd: &str, path: Option<&str>) -> GitReviewView {
+        let norm_path = canonical_git_rel_path(path);
+        let staged = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|guard| {
+                let h = guard.get(host_id)?;
+                let norm_cwd = h.canonical_git_cwd(cwd);
+                let unstaged_rev = h
+                    .git_diffs
+                    .get(&(norm_cwd.clone(), norm_path.clone(), false))
+                    .map(|entry| entry.diff_revision)
+                    .or_else(|| {
+                        h.git_diffs
+                            .iter()
+                            .filter(|((sc, sp, ss), _)| {
+                                *sp == norm_path && !*ss && h.canonical_git_cwd(sc) == norm_cwd
+                            })
+                            .map(|(_, entry)| entry.diff_revision)
+                            .max()
+                    })
+                    .unwrap_or(0);
+                let staged_rev = h
+                    .git_diffs
+                    .get(&(norm_cwd.clone(), norm_path.clone(), true))
+                    .map(|entry| entry.diff_revision)
+                    .or_else(|| {
+                        h.git_diffs
+                            .iter()
+                            .filter(|((sc, sp, ss), _)| {
+                                *sp == norm_path && *ss && h.canonical_git_cwd(sc) == norm_cwd
+                            })
+                            .map(|(_, entry)| entry.diff_revision)
+                            .max()
+                    })
+                    .unwrap_or(0);
+                if unstaged_rev > 0 || staged_rev > 0 {
+                    Some(staged_rev > unstaged_rev)
+                } else {
+                    h.last_git_diff_staged.get(&norm_cwd).copied()
+                }
+            })
+            .unwrap_or(false);
+        self.git_review_for_mode(host_id, cwd, path, staged)
+    }
+
+    pub fn git_review_for_mode(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        path: Option<&str>,
+        staged: bool,
+    ) -> GitReviewView {
         let rev = self.revision.load(Ordering::SeqCst);
-        let (raw_diff, status) = {
+        let norm_path = canonical_git_rel_path(path);
+        let (
+            raw_diff,
+            diff_revision,
+            diff_in_flight,
+            status_revision,
+            status_identity_epoch,
+            status_reverify_pending,
+            cwd_identity_epoch,
+            last_diff_error_revision,
+            last_diff_error_status_revision,
+            status,
+        ) = {
             let Ok(guard) = self.hosts.read() else {
-                return GitReviewView {
-                    revision: rev,
-                    host_id: host_id.to_string(),
-                    cwd: cwd.to_string(),
-                    status: None,
-                    selected_path: path.map(ToOwned::to_owned),
-                    raw_diff: String::new(),
-                    diff_files: Vec::new(),
-                };
+                return project_git_review_for_mode_with_meta(
+                    rev,
+                    host_id,
+                    cwd,
+                    norm_path.as_deref(),
+                    "",
+                    None,
+                    staged,
+                    0,
+                    false,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    0,
+                );
             };
             let Some(host_state) = guard.get(host_id) else {
-                return GitReviewView {
-                    revision: rev,
-                    host_id: host_id.to_string(),
-                    cwd: cwd.to_string(),
-                    status: None,
-                    selected_path: path.map(ToOwned::to_owned),
-                    raw_diff: String::new(),
-                    diff_files: Vec::new(),
-                };
+                return project_git_review_for_mode_with_meta(
+                    rev,
+                    host_id,
+                    cwd,
+                    norm_path.as_deref(),
+                    "",
+                    None,
+                    staged,
+                    0,
+                    false,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    0,
+                );
             };
 
-            let exact_key = (cwd.to_string(), path.map(ToOwned::to_owned));
-            let auth_home = host_state.authoritative_home_dir.as_deref();
-            let raw_diff = host_state
-                .git_diffs
-                .get(&exact_key)
-                .or_else(|| {
+            let norm_cwd = host_state.canonical_git_cwd(cwd);
+            let exact_key = (norm_cwd.clone(), norm_path.clone(), staged);
+            let (raw_diff, diff_revision) =
+                match host_state.git_diffs.get(&exact_key).or_else(|| {
                     host_state
                         .git_diffs
                         .iter()
-                        .find_map(|((stored_cwd, stored_path), v)| {
-                            (stored_path.as_deref() == path
-                                && crate::viewmodel::git_cache_paths_equivalent(
-                                    stored_cwd, cwd, auth_home,
-                                ))
-                            .then_some(v)
+                        .filter(|((stored_cwd, stored_path, stored_staged), _)| {
+                            *stored_path == norm_path
+                                && *stored_staged == staged
+                                && host_state.canonical_git_cwd(stored_cwd) == norm_cwd
                         })
-                })
-                .cloned()
-                .unwrap_or_default();
+                        .max_by_key(|(_, entry)| entry.diff_revision)
+                        .map(|(_, entry)| entry)
+                }) {
+                    Some(entry) => (entry.unified_diff.clone(), entry.diff_revision),
+                    None => (String::new(), 0),
+                };
+            let diff_in_flight = host_state.has_live_git_diff_in_flight(&exact_key);
+            let status_revision = host_state
+                .git_status_revision_by_cwd
+                .get(&norm_cwd)
+                .copied()
+                .unwrap_or(0);
+            let cwd_identity_epoch = host_state
+                .git_cwd_identity_epoch
+                .get(&norm_cwd)
+                .copied()
+                .unwrap_or(0);
+            let status_reverify_pending = host_state
+                .git_pending_mutation_reverify_by_cwd
+                .contains_key(&norm_cwd);
+            let (last_diff_error_revision, last_diff_error_status_revision) = host_state
+                .last_git_diff_error_revision
+                .get(&exact_key)
+                .copied()
+                .unwrap_or((0, 0));
             let status = host_state
                 .git_statuses
-                .get(cwd)
+                .get(&norm_cwd)
+                .or_else(|| host_state.git_statuses.get(cwd))
                 .or_else(|| {
                     host_state.git_statuses.iter().find_map(|(k, v)| {
-                        crate::viewmodel::git_cache_paths_equivalent(k, cwd, auth_home).then_some(v)
+                        (host_state.canonical_git_cwd(k) == norm_cwd).then_some(v)
                     })
                 })
                 .cloned();
-            (raw_diff, status)
+            let status_identity_epoch = if status.is_some() {
+                host_state
+                    .git_status_identity_epoch_by_cwd
+                    .get(&norm_cwd)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            (
+                raw_diff,
+                diff_revision,
+                diff_in_flight,
+                status_revision,
+                status_identity_epoch,
+                status_reverify_pending,
+                cwd_identity_epoch,
+                last_diff_error_revision,
+                last_diff_error_status_revision,
+                status,
+            )
         };
         // Parse & syntax-highlight diff outside `self.hosts` read lock so inbound WS/PTY never stalls.
-        project_git_review(rev, host_id, cwd, path, &raw_diff, status)
+        project_git_review_for_mode_with_meta(
+            rev,
+            host_id,
+            cwd,
+            norm_path.as_deref(),
+            &raw_diff,
+            status,
+            staged,
+            diff_revision,
+            diff_in_flight,
+            status_revision,
+            status_identity_epoch,
+            status_reverify_pending,
+            cwd_identity_epoch,
+            last_diff_error_revision,
+            last_diff_error_status_revision,
+        )
     }
 
     pub fn terminal_screen(&self, host_id: &str) -> Option<TerminalScreenView> {
@@ -3429,13 +3870,11 @@ impl OrbitAppCore {
 
                 let active_branch = if active_host_id == Some(hid.as_str()) {
                     active_cwd.and_then(|cwd| {
-                        let gs = state.git_statuses.get(cwd).or_else(|| {
-                            state
-                                .git_statuses
-                                .iter()
-                                .find(|(k, _)| cwd_paths_equivalent(k, cwd))
-                                .map(|(_, v)| v)
-                        });
+                        let norm_cwd = state.canonical_git_cwd(cwd);
+                        let gs = state
+                            .git_statuses
+                            .get(&norm_cwd)
+                            .or_else(|| state.git_statuses.get(cwd));
                         crate::sidebar::active_git_branch_from_state(
                             gs,
                             &state.workspaces,
@@ -4215,15 +4654,11 @@ impl OrbitAppCore {
             .ok()
             .and_then(|g| {
                 let h = g.get(&req.host_id)?;
+                let norm_cwd = h.canonical_git_cwd(&req.cwd);
                 let gfiles = h
                     .git_statuses
-                    .get(&req.cwd)
-                    .or_else(|| {
-                        h.git_statuses
-                            .iter()
-                            .find(|(k, _)| cwd_paths_equivalent(k, &req.cwd))
-                            .map(|(_, v)| v)
-                    })
+                    .get(&norm_cwd)
+                    .or_else(|| h.git_statuses.get(&req.cwd))
                     .map(|st| {
                         st.files
                             .iter()
@@ -4322,13 +4757,11 @@ impl OrbitAppCore {
             let gs = if cwd.is_empty() {
                 None
             } else {
-                state.git_statuses.get(&cwd).or_else(|| {
-                    state
-                        .git_statuses
-                        .iter()
-                        .find(|(k, _)| cwd_paths_equivalent(k, &cwd))
-                        .map(|(_, v)| v)
-                })
+                let norm_cwd = state.canonical_git_cwd(&cwd);
+                state
+                    .git_statuses
+                    .get(&norm_cwd)
+                    .or_else(|| state.git_statuses.get(&cwd))
             };
             let branch = if cwd.is_empty() {
                 None
@@ -5421,6 +5854,7 @@ impl OrbitAppCore {
                     h.slot_attach_dispatched_gen.clear();
                     h.slot_confirmed_gen.clear();
                     h.silent_attach_req_ids.clear();
+                    prune_pending_git_diff_requests_not_queued(h);
 
                     let outbox = std::mem::take(&mut h.transient_requests);
                     let resubs: Vec<(String, u64)> = h
@@ -5766,6 +6200,24 @@ impl OrbitAppCore {
                         h.pending_tail_catchups.clear();
                         h.stage_cache.clear();
                         h.stage_dirty.clear();
+                        h.pending_git_diff_requests.clear();
+                        h.pending_git_status_requests.clear();
+                        h.latest_dispatched_git_diff_req_seq.clear();
+                        h.git_diffs.clear();
+                        h.git_status_seq_by_cwd.clear();
+                        h.git_status_revision_by_cwd.clear();
+                        h.git_status_identity_epoch_by_cwd.clear();
+                        h.git_cwd_identity_epoch.clear();
+                        h.git_cwd_identity_status_watermark.clear();
+                        h.git_cwd_identity_established_status_seq.clear();
+                        h.git_pending_mutation_reverify_by_cwd.clear();
+                        h.last_git_diff_error_revision.clear();
+                        h.git_repo_root_by_cwd.clear();
+                        h.git_repo_prefix_by_cwd.clear();
+                        h.git_cwd_identity_watermark.clear();
+                        h.git_cwd_root_set_seq.clear();
+                        h.latest_mutation_watermark_by_repo_root.clear();
+                        h.latest_git_status_by_repo_root.clear();
                     }
 
                     if cfg!(any(target_os = "macos", target_os = "linux"))
@@ -5937,7 +6389,14 @@ impl OrbitAppCore {
                 notify_timeline_agents.push(ag_id);
             }
         };
-        let mut notify_git_cwd: Option<String> = None;
+        let mut notify_git_cwds: Vec<String> = Vec::new();
+        let mut push_notify_git_cwd = |git_cwd: String| {
+            if !git_cwd.is_empty() && !notify_git_cwds.iter().any(|existing| existing == &git_cwd) {
+                notify_git_cwds.push(git_cwd);
+            }
+        };
+        let mut git_diffs_to_redispatch: Vec<(String, Option<String>, bool)> = Vec::new();
+        let mut git_statuses_to_redispatch: Vec<String> = Vec::new();
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
         let mut continue_subagent_catchup: Option<(String, String, u64)> = None;
@@ -6058,7 +6517,7 @@ impl OrbitAppCore {
                     skills_or_rules_changed,
                     ..
                 } => {
-                    notify_git_cwd = Some(cwd);
+                    push_notify_git_cwd(cwd);
                     if skills_or_rules_changed {
                         notify_host = true;
                     }
@@ -7165,20 +7624,362 @@ impl OrbitAppCore {
                     }
                     push_notify_timeline(agent_id);
                 }
-                WireMessage::GitStatusResponse { status, .. } => {
+                WireMessage::GitStatusResponse { request_id, status } => {
                     let cwd = status.cwd.clone();
                     let norm_cwd = crate::sidebar::normalize_project_path(&cwd);
-                    state.git_repos_by_cwd.insert(
-                        norm_cwd.clone(),
-                        GitReposInspectionView {
-                            path: norm_cwd,
-                            is_git_repo: status.is_git_repo,
-                            git_branch: status.branch.clone(),
-                            nested_git_repos: status.nested_git_repos.clone(),
-                        },
-                    );
-                    state.git_statuses.insert(cwd.clone(), status);
-                    notify_git_cwd = Some(cwd);
+                    let git_cwd_key = state.canonical_git_cwd(&cwd);
+                    // R20-P1-3 / R22-P1-1: Validate dispatch sequence against the highest
+                    // already-accepted status/mutation sequence AND directory identity watermark
+                    // for `git_cwd_key` BEFORE mutating any state, root, prefix, or notification.
+                    // Untracked responses allocate a fresh higher sequence.
+                    let (effective_status_seq, req_origin_identity_epoch) =
+                        if let Some((_req_cwd, _raw_cwd, dispatch_seq, origin_epoch)) =
+                            state.pending_git_status_requests.remove(&request_id)
+                        {
+                            (dispatch_seq, Some(origin_epoch))
+                        } else {
+                            state.next_git_status_req_seq =
+                                state.next_git_status_req_seq.saturating_add(1);
+                            (state.next_git_status_req_seq, None)
+                        };
+                    let prev_accepted_seq = state
+                        .git_status_seq_by_cwd
+                        .get(&git_cwd_key)
+                        .copied()
+                        .unwrap_or(0);
+                    if effective_status_seq < prev_accepted_seq {
+                        // Out-of-order stale `GitStatusResponse` dispatched before an already
+                        // accepted status or mutation snapshot: drop with ZERO side effects.
+                    } else {
+                        let prev_root = state.git_repo_root_by_cwd.get(&git_cwd_key).cloned();
+                        let prev_prefix = state.git_repo_prefix_by_cwd.get(&git_cwd_key).cloned();
+                        let prev_was_non_git = state
+                            .git_statuses
+                            .get(&git_cwd_key)
+                            .is_some_and(|s| !s.is_git_repo);
+                        let new_root = if status.is_git_repo {
+                            status.repo_root.clone().or_else(|| {
+                                derive_git_repo_root(&git_cwd_key, status.repo_prefix.as_deref())
+                            })
+                        } else {
+                            None
+                        };
+                        let new_prefix = if status.is_git_repo {
+                            status.repo_prefix.as_deref().map(normalize_git_rel_path)
+                        } else {
+                            None
+                        };
+                        // R19-P1-1 / R20-P1-1 / R20-P1-2: Full physical directory identity is
+                        // `(repo_root, repo_prefix)`. Any change in worktree root, within-worktree
+                        // subdir prefix (`one` -> `two`), or non-git -> git transition bumps
+                        // `cwd_identity_epoch` and invalidates old diffs & in-flight UUIDs.
+                        let root_changed = match (&prev_root, &new_root) {
+                            (Some(old), Some(new)) => old != new,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        let prefix_changed = match (&prev_prefix, &new_prefix) {
+                            (Some(old), Some(new)) => old != new,
+                            (Some(_), None) if !status.is_git_repo => true,
+                            _ => false,
+                        };
+                        let became_git_repo = prev_was_non_git && status.is_git_repo;
+                        let identity_changed = root_changed || prefix_changed || became_git_repo;
+
+                        let current_identity_epoch = state
+                            .git_cwd_identity_epoch
+                            .get(&git_cwd_key)
+                            .copied()
+                            .unwrap_or(0);
+                        let identity_status_wm = state
+                            .git_cwd_identity_status_watermark
+                            .get(&git_cwd_key)
+                            .copied()
+                            .unwrap_or(0);
+                        let dispatched_before_current_identity = effective_status_seq
+                            <= identity_status_wm
+                            || req_origin_identity_epoch
+                                .is_some_and(|orig_epoch| orig_epoch < current_identity_epoch);
+
+                        if identity_changed && dispatched_before_current_identity {
+                            // R22-P1-1: Status query dispatched BEFORE the current directory
+                            // identity was established returned a conflicting `(repo_root,
+                            // repo_prefix)` (e.g. sampled A before symlink switched A -> B,
+                            // arriving after B's diff already established B). NEVER rebind back
+                            // to A or evict B's confirmed diffs; ensure ONE fresh verification
+                            // `GetGitStatus` (`dispatch_seq > identity_status_wm`) is in flight
+                            // to verify the directory's current target.
+                            let has_verification_in_flight = state
+                                .pending_git_status_requests
+                                .values()
+                                .any(|(req_norm_cwd, _, req_seq, orig_epoch)| {
+                                    req_norm_cwd == &git_cwd_key
+                                        && *req_seq > identity_status_wm
+                                        && *orig_epoch >= current_identity_epoch
+                                });
+                            if !has_verification_in_flight {
+                                git_statuses_to_redispatch.push(cwd);
+                            }
+                        } else {
+                            let completed_mutation_reverify = state
+                                .git_pending_mutation_reverify_by_cwd
+                                .get(&git_cwd_key)
+                                .is_some_and(|&reverify_wm| effective_status_seq > reverify_wm);
+                            if completed_mutation_reverify {
+                                state
+                                    .git_pending_mutation_reverify_by_cwd
+                                    .remove(&git_cwd_key);
+                            }
+
+                            if identity_changed {
+                                state
+                                    .git_pending_mutation_reverify_by_cwd
+                                    .remove(&git_cwd_key);
+                                state.bump_git_cwd_identity_epoch(&git_cwd_key);
+                                state
+                                    .git_cwd_identity_status_watermark
+                                    .insert(git_cwd_key.clone(), effective_status_seq);
+                                state
+                                    .git_cwd_identity_established_status_seq
+                                    .insert(git_cwd_key.clone(), effective_status_seq);
+                                state.next_git_diff_req_seq =
+                                    state.next_git_diff_req_seq.saturating_add(1);
+                                let root_change_watermark = state.next_git_diff_req_seq;
+                                state
+                                    .git_cwd_identity_watermark
+                                    .insert(git_cwd_key.clone(), root_change_watermark);
+                                state
+                                    .git_cwd_root_set_seq
+                                    .insert(git_cwd_key.clone(), root_change_watermark);
+                                for ((stored_cwd, _, _), latest_seq) in
+                                    state.latest_dispatched_git_diff_req_seq.iter_mut()
+                                {
+                                    if stored_cwd == &git_cwd_key
+                                        && *latest_seq < root_change_watermark
+                                    {
+                                        *latest_seq = root_change_watermark;
+                                    }
+                                }
+                                state
+                                    .git_diffs
+                                    .retain(|(stored_cwd, _, _), _| stored_cwd != &git_cwd_key);
+                                let mut drained_reqs: Vec<PendingGitDiffRequest> = Vec::new();
+                                state.pending_git_diff_requests.retain(|_, req| {
+                                    if req.norm_cwd == git_cwd_key {
+                                        drained_reqs.push(req.clone());
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                if status.is_git_repo && !status.files.is_empty() {
+                                    let remaining: Vec<RemainingGitStatusPath> = status
+                                        .files
+                                        .iter()
+                                        .map(|f| RemainingGitStatusPath {
+                                            norm_path: normalize_git_rel_path(&f.path),
+                                            staged: f.staged,
+                                            is_dir_summary: f.path.ends_with('/'),
+                                        })
+                                        .collect();
+                                    let new_prefix_ref = status.repo_prefix.as_deref();
+                                    let mut seen_rebind: HashSet<(Option<String>, bool)> =
+                                        HashSet::new();
+                                    for req in drained_reqs {
+                                        let still_present = match req.path.as_deref() {
+                                            None => {
+                                                remaining.iter().any(|e| e.staged == req.staged)
+                                            }
+                                            Some(req_path) => {
+                                                if new_prefix_ref.is_some() {
+                                                    git_status_paths_match_request(
+                                                        req_path,
+                                                        new_prefix_ref,
+                                                        req.staged,
+                                                        &remaining,
+                                                    )
+                                                } else {
+                                                    remaining.iter().any(|e| e.staged == req.staged)
+                                                }
+                                            }
+                                        };
+                                        if still_present
+                                            && seen_rebind.insert((req.path.clone(), req.staged))
+                                        {
+                                            git_diffs_to_redispatch.push((
+                                                req.raw_cwd,
+                                                req.path,
+                                                req.staged,
+                                            ));
+                                        }
+                                    }
+                                }
+                            } else if completed_mutation_reverify {
+                                // R22-P1-2: Post-mutation re-verification completed! Now that we
+                                // hold the authoritative post-completion snapshot, advance diff
+                                // watermarks, evict pre-reverify cached diffs for `git_cwd_key`,
+                                // and re-dispatch any invalidated in-flight diff requests still
+                                // matching the authoritative status.
+                                state.next_git_diff_req_seq =
+                                    state.next_git_diff_req_seq.saturating_add(1);
+                                let reverify_diff_wm = state.next_git_diff_req_seq;
+                                if let Some(ref root) = new_root {
+                                    state
+                                        .latest_mutation_watermark_by_repo_root
+                                        .entry(root.clone())
+                                        .and_modify(|wm| {
+                                            if *wm < reverify_diff_wm {
+                                                *wm = reverify_diff_wm;
+                                            }
+                                        })
+                                        .or_insert(reverify_diff_wm);
+                                }
+                                for ((stored_cwd, _, _), latest_seq) in
+                                    state.latest_dispatched_git_diff_req_seq.iter_mut()
+                                {
+                                    if stored_cwd == &git_cwd_key && *latest_seq < reverify_diff_wm
+                                    {
+                                        *latest_seq = reverify_diff_wm;
+                                    }
+                                }
+                                state
+                                    .git_diffs
+                                    .retain(|(stored_cwd, _, _), _| stored_cwd != &git_cwd_key);
+                                let mut drained_reqs: Vec<PendingGitDiffRequest> = Vec::new();
+                                state.pending_git_diff_requests.retain(|_, req| {
+                                    if req.norm_cwd == git_cwd_key && req.req_seq < reverify_diff_wm
+                                    {
+                                        drained_reqs.push(req.clone());
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                if status.is_git_repo && !status.files.is_empty() {
+                                    let remaining: Vec<RemainingGitStatusPath> = status
+                                        .files
+                                        .iter()
+                                        .map(|f| RemainingGitStatusPath {
+                                            norm_path: normalize_git_rel_path(&f.path),
+                                            staged: f.staged,
+                                            is_dir_summary: f.path.ends_with('/'),
+                                        })
+                                        .collect();
+                                    let new_prefix_ref = status.repo_prefix.as_deref();
+                                    let mut seen_reverify: HashSet<(Option<String>, bool)> =
+                                        HashSet::new();
+                                    for req in drained_reqs {
+                                        let still_present = match req.path.as_deref() {
+                                            None => {
+                                                remaining.iter().any(|e| e.staged == req.staged)
+                                            }
+                                            Some(req_path) => {
+                                                if new_prefix_ref.is_some() {
+                                                    git_status_paths_match_request(
+                                                        req_path,
+                                                        new_prefix_ref,
+                                                        req.staged,
+                                                        &remaining,
+                                                    )
+                                                } else {
+                                                    remaining.iter().any(|e| e.staged == req.staged)
+                                                }
+                                            }
+                                        };
+                                        if still_present
+                                            && seen_reverify.insert((req.path.clone(), req.staged))
+                                        {
+                                            git_diffs_to_redispatch.push((
+                                                req.raw_cwd,
+                                                req.path,
+                                                req.staged,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if status.is_git_repo {
+                                if let Some(ref repo_root) = new_root {
+                                    state
+                                        .git_repo_root_by_cwd
+                                        .insert(git_cwd_key.clone(), repo_root.clone());
+                                    if prev_root.is_none() {
+                                        state.git_cwd_root_set_seq.insert(
+                                            git_cwd_key.clone(),
+                                            state.next_git_diff_req_seq,
+                                        );
+                                        state
+                                            .git_cwd_identity_established_status_seq
+                                            .insert(git_cwd_key.clone(), effective_status_seq);
+                                    }
+                                } else {
+                                    state.git_repo_root_by_cwd.remove(&git_cwd_key);
+                                }
+                                if let Some(ref prefix) = new_prefix {
+                                    state
+                                        .git_repo_prefix_by_cwd
+                                        .insert(git_cwd_key.clone(), prefix.clone());
+                                } else {
+                                    state.git_repo_prefix_by_cwd.remove(&git_cwd_key);
+                                }
+                            } else {
+                                state.git_repo_root_by_cwd.remove(&git_cwd_key);
+                                state.git_repo_prefix_by_cwd.remove(&git_cwd_key);
+                            }
+
+                            // R22-P1-2: Record that a valid status snapshot was accepted while
+                            // a potentially overlapping mutation on the same worktree was in
+                            // flight, so a delayed mutation ack can coalesce ONE post-completion
+                            // verification `GetGitStatus` even after this read has finished.
+                            for pending_mut in state.pending_git_mutations.values_mut() {
+                                let may_overlap_worktree = git_cwd_key
+                                    == pending_mut.origin_norm_cwd
+                                    || pending_mut
+                                        .origin_repo_root
+                                        .as_deref()
+                                        .is_some_and(|mr| new_root.as_deref() == Some(mr))
+                                    || pending_mut.origin_repo_root.is_none();
+                                if may_overlap_worktree {
+                                    pending_mut
+                                        .accepted_overlapping_status_cwds
+                                        .entry(git_cwd_key.clone())
+                                        .or_insert_with(|| cwd.clone());
+                                }
+                            }
+
+                            state
+                                .git_status_seq_by_cwd
+                                .insert(git_cwd_key.clone(), effective_status_seq);
+                            state.bump_git_status_revision(&git_cwd_key);
+                            if status.is_git_repo
+                                && let Some(ref repo_root) = new_root
+                            {
+                                let should_update_wt = state
+                                    .latest_git_status_by_repo_root
+                                    .get(repo_root)
+                                    .is_none_or(|(prev_seq, _)| effective_status_seq >= *prev_seq);
+                                if should_update_wt {
+                                    state.latest_git_status_by_repo_root.insert(
+                                        repo_root.clone(),
+                                        (effective_status_seq, status.clone()),
+                                    );
+                                }
+                            }
+
+                            state.git_repos_by_cwd.insert(
+                                norm_cwd.clone(),
+                                GitReposInspectionView {
+                                    path: norm_cwd,
+                                    is_git_repo: status.is_git_repo,
+                                    git_branch: status.branch.clone(),
+                                    nested_git_repos: status.nested_git_repos.clone(),
+                                },
+                            );
+                            state.git_statuses.insert(git_cwd_key, status);
+                            push_notify_git_cwd(cwd);
+                        }
+                    }
                 }
                 WireMessage::GitReposResponse {
                     request_id,
@@ -7285,13 +8086,343 @@ impl OrbitAppCore {
                     notify_host = true;
                 }
                 WireMessage::GitDiffResponse {
-                    cwd,
-                    path,
+                    request_id,
                     unified_diff,
+                    repo_root,
+                    repo_prefix,
                     ..
                 } => {
-                    state.git_diffs.insert((cwd.clone(), path), unified_diff);
-                    notify_git_cwd = Some(cwd);
+                    if let Some(req) = state.pending_git_diff_requests.remove(&request_id) {
+                        // R19-P1-2: Keep response `repo_root` / `repo_prefix` strictly local until
+                        // ALL validity checks (identity watermark, slot sequence watermark, and
+                        // pre-switch guard) pass! Expired or superseded replies MUST NEVER
+                        // overwrite `git_repo_root_by_cwd` or `git_repo_prefix_by_cwd`.
+                        let resp_root_local = repo_root.clone().or_else(|| {
+                            derive_git_repo_root(&req.norm_cwd, repo_prefix.as_deref())
+                        });
+                        let resp_prefix_local = repo_prefix.as_deref().map(normalize_git_rel_path);
+
+                        let slot_key = (req.norm_cwd.clone(), req.path.clone(), req.staged);
+                        let latest_dispatched = state
+                            .latest_dispatched_git_diff_req_seq
+                            .get(&slot_key)
+                            .copied()
+                            .unwrap_or(0);
+                        let cwd_identity_wm = state
+                            .git_cwd_identity_watermark
+                            .get(&req.norm_cwd)
+                            .copied()
+                            .unwrap_or(0);
+                        let cwd_root_set_seq = state
+                            .git_cwd_root_set_seq
+                            .get(&req.norm_cwd)
+                            .copied()
+                            .unwrap_or(0);
+                        let existing_cwd_root =
+                            state.git_repo_root_by_cwd.get(&req.norm_cwd).cloned();
+                        let existing_cwd_prefix =
+                            state.git_repo_prefix_by_cwd.get(&req.norm_cwd).cloned();
+
+                        let identity_mismatch =
+                            existing_cwd_root.as_deref().is_some_and(|cur| {
+                                resp_root_local.as_deref().is_some_and(|resp| resp != cur)
+                            }) || existing_cwd_prefix.as_deref().is_some_and(|cur_p| {
+                                resp_prefix_local
+                                    .as_deref()
+                                    .is_some_and(|resp_p| resp_p != cur_p)
+                            });
+                        let cwd_established_status_seq = state
+                            .git_cwd_identity_established_status_seq
+                            .get(&req.norm_cwd)
+                            .copied()
+                            .unwrap_or(0);
+                        let stale_pre_switch_reply = identity_mismatch
+                            && req.req_seq <= cwd_root_set_seq
+                            && (cwd_established_status_seq == 0
+                                || req.status_seq_at_dispatch < cwd_established_status_seq);
+                        if req.req_seq < cwd_identity_wm
+                            || req.req_seq < latest_dispatched
+                            || stale_pre_switch_reply
+                        {
+                            // Stale/superseded/pre-switch reply: drop with ZERO map/status/cache
+                            // mutations. If a pre-switch reply was the last in-flight request for
+                            // this slot, notify `cwd` so visible UI observes `diff_in_flight=false`.
+                            if stale_pre_switch_reply
+                                && !state.has_live_git_diff_in_flight(&slot_key)
+                            {
+                                push_notify_git_cwd(req.raw_cwd);
+                            }
+                        } else {
+                            let resolved_root = resp_root_local
+                                .clone()
+                                .or_else(|| existing_cwd_root.clone());
+                            let worktree_watermark = resolved_root
+                                .as_deref()
+                                .and_then(|root| {
+                                    state
+                                        .latest_mutation_watermark_by_repo_root
+                                        .get(root)
+                                        .copied()
+                                })
+                                .unwrap_or(0);
+
+                            if req.req_seq < worktree_watermark {
+                                // Cold-start subdir/symlink received a pre-mutation reply for a
+                                // physical worktree that already mutated!
+                                // 1. Record identity ONLY if this cwd had no known identity yet
+                                //    (R19-P1-2 / R20-P1-2: never overwrite a newer root/prefix).
+                                if existing_cwd_root.is_none() && existing_cwd_prefix.is_none() {
+                                    if let Some(ref root) = resolved_root {
+                                        state
+                                            .git_repo_root_by_cwd
+                                            .insert(req.norm_cwd.clone(), root.clone());
+                                    }
+                                    if let Some(ref p) = resp_prefix_local {
+                                        state
+                                            .git_repo_prefix_by_cwd
+                                            .insert(req.norm_cwd.clone(), p.clone());
+                                    }
+                                }
+                                let slot_wm = state
+                                    .latest_dispatched_git_diff_req_seq
+                                    .entry(slot_key.clone())
+                                    .or_insert(0);
+                                if *slot_wm < worktree_watermark {
+                                    *slot_wm = worktree_watermark;
+                                }
+
+                                // 2. R19-P1-3 / R20-P1-3: Compare unified monotonic `status_seq` so
+                                //    a cold stale reply NEVER rolls back a newer status snapshot!
+                                let cwd_status_seq = state
+                                    .git_status_seq_by_cwd
+                                    .get(&req.norm_cwd)
+                                    .copied()
+                                    .unwrap_or(0);
+                                let wt_status_opt = resolved_root.as_deref().and_then(|r| {
+                                    state.latest_git_status_by_repo_root.get(r).cloned()
+                                });
+                                let resolved_prefix = resp_prefix_local
+                                    .or_else(|| {
+                                        state.git_repo_prefix_by_cwd.get(&req.norm_cwd).cloned()
+                                    })
+                                    .or_else(|| {
+                                        resolved_root.as_deref().and_then(|r| {
+                                            derive_repo_prefix_from_root(&req.norm_cwd, r)
+                                        })
+                                    });
+                                let authoritative_status: Option<GitStatusSnapshot> =
+                                    match wt_status_opt {
+                                        Some((wt_seq, mut wt_status))
+                                            if wt_seq > cwd_status_seq =>
+                                        {
+                                            wt_status.cwd = req.raw_cwd.clone();
+                                            wt_status.repo_prefix = resolved_prefix.clone();
+                                            wt_status.repo_root = resolved_root.clone();
+                                            state
+                                                .git_status_seq_by_cwd
+                                                .insert(req.norm_cwd.clone(), wt_seq);
+                                            state.bump_git_status_revision(&req.norm_cwd);
+                                            state
+                                                .git_statuses
+                                                .insert(req.norm_cwd.clone(), wt_status.clone());
+                                            Some(wt_status)
+                                        }
+                                        _ => state.git_statuses.get(&req.norm_cwd).cloned(),
+                                    };
+
+                                let mut should_redispatch = true;
+                                if let Some(ref eff_status) = authoritative_status {
+                                    let remaining: Vec<RemainingGitStatusPath> = eff_status
+                                        .files
+                                        .iter()
+                                        .map(|f| RemainingGitStatusPath {
+                                            norm_path: normalize_git_rel_path(&f.path),
+                                            staged: f.staged,
+                                            is_dir_summary: f.path.ends_with('/'),
+                                        })
+                                        .collect();
+                                    let eff_prefix = eff_status
+                                        .repo_prefix
+                                        .as_deref()
+                                        .or(resolved_prefix.as_deref());
+                                    should_redispatch = match req.path.as_deref() {
+                                        None => remaining.iter().any(|e| e.staged == req.staged),
+                                        Some(req_path) => {
+                                            if remaining.is_empty() {
+                                                false
+                                            } else if eff_prefix.is_some() {
+                                                git_status_paths_match_request(
+                                                    req_path, eff_prefix, req.staged, &remaining,
+                                                )
+                                            } else {
+                                                remaining.iter().any(|e| e.staged == req.staged)
+                                            }
+                                        }
+                                    };
+                                }
+
+                                // 3. R19-N1: Skip recovery re-dispatch if this slot ALREADY has
+                                //    a live in-flight request OR already confirmed a recovery
+                                //    diff with `source_req_seq >= worktree_watermark`!
+                                let already_recovered =
+                                    state.has_live_git_diff_in_flight(&slot_key)
+                                        || state.git_diffs.get(&slot_key).is_some_and(|d| {
+                                            d.source_req_seq >= worktree_watermark
+                                        });
+                                if should_redispatch && !already_recovered {
+                                    git_diffs_to_redispatch.push((
+                                        req.raw_cwd.clone(),
+                                        req.path.clone(),
+                                        req.staged,
+                                    ));
+                                }
+                                push_notify_git_cwd(req.raw_cwd);
+                            } else {
+                                // Valid, authoritative post-watermark reply!
+                                let first_diff_identity = !identity_mismatch
+                                    && existing_cwd_root.is_none()
+                                    && existing_cwd_prefix.is_none()
+                                    && (resp_root_local.is_some() || resp_prefix_local.is_some());
+                                if identity_mismatch {
+                                    state.bump_git_cwd_identity_epoch(&req.norm_cwd);
+                                    state.git_diffs.retain(|(stored_cwd, _, _), _| {
+                                        stored_cwd != &req.norm_cwd
+                                    });
+                                    // R21-P1-1 / R22-P1-1: Immediately evict the old identity's
+                                    // cached status when a diff reply reveals a directory/repo
+                                    // switch before the new identity's `GitStatusResponse` arrives,
+                                    // anchor the status identity watermark at
+                                    // `next_git_status_req_seq`, and automatically dispatch ONE
+                                    // verification `GetGitStatus` for `raw_cwd` so visible Review
+                                    // tabs converge without waiting for a manual refresh!
+                                    state.git_statuses.remove(&req.norm_cwd);
+                                    state.git_status_identity_epoch_by_cwd.remove(&req.norm_cwd);
+                                    state
+                                        .git_pending_mutation_reverify_by_cwd
+                                        .remove(&req.norm_cwd);
+                                    let identity_status_wm = state.next_git_status_req_seq;
+                                    state
+                                        .git_cwd_identity_status_watermark
+                                        .insert(req.norm_cwd.clone(), identity_status_wm);
+                                    state
+                                        .git_cwd_identity_established_status_seq
+                                        .insert(req.norm_cwd.clone(), 0);
+                                    let current_identity_epoch = state
+                                        .git_cwd_identity_epoch
+                                        .get(&req.norm_cwd)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    let has_verification_in_flight = state
+                                        .pending_git_status_requests
+                                        .values()
+                                        .any(|(req_norm_cwd, _, req_seq, orig_epoch)| {
+                                            req_norm_cwd == &req.norm_cwd
+                                                && *req_seq > identity_status_wm
+                                                && *orig_epoch >= current_identity_epoch
+                                        });
+                                    if !has_verification_in_flight {
+                                        git_statuses_to_redispatch.push(req.raw_cwd.clone());
+                                    }
+                                    state
+                                        .git_cwd_identity_watermark
+                                        .entry(req.norm_cwd.clone())
+                                        .and_modify(|wm| {
+                                            if *wm < req.req_seq {
+                                                *wm = req.req_seq;
+                                            }
+                                        })
+                                        .or_insert(req.req_seq);
+                                    state
+                                        .git_cwd_root_set_seq
+                                        .entry(req.norm_cwd.clone())
+                                        .and_modify(|seq| {
+                                            if *seq < state.next_git_diff_req_seq {
+                                                *seq = state.next_git_diff_req_seq;
+                                            }
+                                        })
+                                        .or_insert(state.next_git_diff_req_seq);
+                                } else if first_diff_identity {
+                                    // R22-P1-1 (cold start): First valid diff establishes physical
+                                    // identity `(repo_root, repo_prefix)` for a previously cold cwd.
+                                    // Advance `cwd_identity_epoch` and anchor the status identity
+                                    // watermark at `next_git_status_req_seq` so any earlier in-flight
+                                    // `GetGitStatus` that sampled a conflicting repo (e.g. A before
+                                    // symlink flip A -> B) is caught by the conflict guard instead of
+                                    // reverting B back to A (while a matching cold status for B is
+                                    // still adopted smoothly with 0 extra queries!). If no status
+                                    // query is in flight yet and `git_statuses` is empty, dispatch
+                                    // ONE verification `GetGitStatus` automatically.
+                                    state.bump_git_cwd_identity_epoch(&req.norm_cwd);
+                                    let identity_status_wm = state.next_git_status_req_seq;
+                                    state
+                                        .git_cwd_identity_status_watermark
+                                        .insert(req.norm_cwd.clone(), identity_status_wm);
+                                    state
+                                        .git_cwd_identity_established_status_seq
+                                        .insert(req.norm_cwd.clone(), 0);
+                                    state
+                                        .git_cwd_root_set_seq
+                                        .entry(req.norm_cwd.clone())
+                                        .and_modify(|seq| {
+                                            if *seq < state.next_git_diff_req_seq {
+                                                *seq = state.next_git_diff_req_seq;
+                                            }
+                                        })
+                                        .or_insert(state.next_git_diff_req_seq);
+                                    let has_any_status_in_flight =
+                                        state.pending_git_status_requests.values().any(
+                                            |(req_norm_cwd, _, _, _)| req_norm_cwd == &req.norm_cwd,
+                                        );
+                                    if !has_any_status_in_flight
+                                        && !state.git_statuses.contains_key(&req.norm_cwd)
+                                    {
+                                        git_statuses_to_redispatch.push(req.raw_cwd.clone());
+                                    }
+                                }
+                                if let Some(ref root) = resp_root_local {
+                                    state
+                                        .git_repo_root_by_cwd
+                                        .insert(req.norm_cwd.clone(), root.clone());
+                                    state
+                                        .git_cwd_root_set_seq
+                                        .entry(req.norm_cwd.clone())
+                                        .and_modify(|seq| {
+                                            if *seq < req.req_seq {
+                                                *seq = req.req_seq;
+                                            }
+                                        })
+                                        .or_insert(req.req_seq);
+                                }
+                                if let Some(ref p) = resp_prefix_local {
+                                    state
+                                        .git_repo_prefix_by_cwd
+                                        .insert(req.norm_cwd.clone(), p.clone());
+                                    state
+                                        .git_cwd_root_set_seq
+                                        .entry(req.norm_cwd.clone())
+                                        .and_modify(|seq| {
+                                            if *seq < req.req_seq {
+                                                *seq = req.req_seq;
+                                            }
+                                        })
+                                        .or_insert(req.req_seq);
+                                }
+                                state.git_diff_revision_counter =
+                                    state.git_diff_revision_counter.saturating_add(1);
+                                let diff_revision = state.git_diff_revision_counter;
+                                state.git_diffs.insert(
+                                    slot_key,
+                                    StoredGitDiff {
+                                        raw_cwd: req.raw_cwd.clone(),
+                                        unified_diff,
+                                        diff_revision,
+                                        source_req_seq: req.req_seq,
+                                    },
+                                );
+                                push_notify_git_cwd(req.raw_cwd);
+                            }
+                        }
+                    }
                 }
                 WireMessage::GitMutationResult {
                     request_id,
@@ -7299,44 +8430,626 @@ impl OrbitAppCore {
                     result,
                     status,
                 } => {
-                    let status_refreshed = if let Some(status_snap) = status {
-                        let norm_cwd = crate::sidebar::normalize_project_path(&cwd);
-                        state.git_repos_by_cwd.insert(
-                            norm_cwd.clone(),
-                            GitReposInspectionView {
-                                path: norm_cwd,
-                                is_git_repo: status_snap.is_git_repo,
-                                git_branch: status_snap.branch.clone(),
-                                nested_git_repos: status_snap.nested_git_repos.clone(),
-                            },
-                        );
-                        let remaining_paths: HashSet<&str> =
-                            status_snap.files.iter().map(|f| f.path.as_str()).collect();
-                        let auth_home = state.authoritative_home_dir.clone();
-                        state.git_diffs.retain(|(stored_cwd, stored_path), _| {
-                            if !crate::viewmodel::git_cache_paths_equivalent(
-                                stored_cwd,
-                                &cwd,
-                                auth_home.as_deref(),
-                            ) {
-                                return true;
+                    let git_cwd_key = state.canonical_git_cwd(&cwd);
+                    let mut pending_mut = state.pending_git_mutations.remove(&request_id);
+                    let origin_repo_root = pending_mut
+                        .as_ref()
+                        .and_then(|m| m.origin_repo_root.clone());
+                    let origin_identity_epoch =
+                        pending_mut.as_ref().map(|m| m.origin_identity_epoch);
+                    let mutation_dispatch_seq = pending_mut.as_ref().map(|m| m.dispatch_seq);
+                    let accepted_during_flight_cwds: HashMap<String, String> = pending_mut
+                        .as_mut()
+                        .map(|m| std::mem::take(&mut m.accepted_overlapping_status_cwds))
+                        .unwrap_or_default();
+                    // R21-P1-2: Allocate a fresh completion sequence strictly GREATER than every
+                    // previously dispatched `GetGitStatus` `dispatch_seq` so the post-write
+                    // snapshot supersedes any overlapping read that may have sampled pre-write
+                    // state (whether that read arrives before OR after this mutation result!).
+                    state.next_git_status_req_seq = state.next_git_status_req_seq.saturating_add(1);
+                    let mutation_status_seq = state.next_git_status_req_seq;
+
+                    let repo_prefix: Option<String> = status
+                        .as_ref()
+                        .and_then(|snap| snap.repo_prefix.as_deref().map(normalize_git_rel_path));
+                    let current_cwd_root = state.git_repo_root_by_cwd.get(&git_cwd_key).cloned();
+                    let current_cwd_prefix =
+                        state.git_repo_prefix_by_cwd.get(&git_cwd_key).cloned();
+                    let current_cwd_epoch = state
+                        .git_cwd_identity_epoch
+                        .get(&git_cwd_key)
+                        .copied()
+                        .unwrap_or(0);
+
+                    // R20-P1-4: Identify the mutation's ACTUAL physical worktree root (from the
+                    // mutation's own `status.repo_root`, falling back to `origin_repo_root`, then
+                    // legacy `derive_git_repo_root` only if untracked). Check whether `git_cwd_key`
+                    // has since been rebound to a DIFFERENT physical worktree (e.g. symlink A -> B).
+                    let status_reported_root = status.as_ref().and_then(|snap| {
+                        if snap.is_git_repo {
+                            snap.repo_root.clone()
+                        } else {
+                            None
+                        }
+                    });
+                    let mutation_repo_root: Option<String> = status_reported_root
+                        .or_else(|| origin_repo_root.clone())
+                        .or_else(|| {
+                            status.as_ref().and_then(|snap| {
+                                if snap.is_git_repo {
+                                    derive_git_repo_root(&git_cwd_key, snap.repo_prefix.as_deref())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .or_else(|| current_cwd_root.clone());
+
+                    let root_diverged = match (&current_cwd_root, &mutation_repo_root) {
+                        (Some(cur), Some(mut_root)) => cur != mut_root,
+                        (None, Some(_)) => {
+                            origin_identity_epoch.is_some_and(|orig| current_cwd_epoch != orig)
+                        }
+                        _ => false,
+                    };
+                    let origin_root_diverged = match (&current_cwd_root, &origin_repo_root) {
+                        (Some(cur), Some(orig)) => cur != orig,
+                        _ => false,
+                    };
+                    let rebound_to_other_worktree = root_diverged || origin_root_diverged;
+
+                    // Same-worktree subdir rebind (e.g. `one/` -> `two/` inside same `repo_root`):
+                    // do NOT overwrite `git_repo_prefix_by_cwd[git_cwd_key]` back to `one/`.
+                    let same_worktree_prefix_rebound = !rebound_to_other_worktree
+                        && origin_identity_epoch.is_some_and(|orig| current_cwd_epoch != orig)
+                        && current_cwd_prefix.is_some()
+                        && repo_prefix.is_some()
+                        && current_cwd_prefix != repo_prefix;
+
+                    if !rebound_to_other_worktree {
+                        if let Some(ref root) = mutation_repo_root {
+                            state
+                                .git_repo_root_by_cwd
+                                .insert(git_cwd_key.clone(), root.clone());
+                        }
+                        if !same_worktree_prefix_rebound && let Some(ref p) = repo_prefix {
+                            state
+                                .git_repo_prefix_by_cwd
+                                .insert(git_cwd_key.clone(), p.clone());
+                        }
+                    }
+
+                    // Helper matching ONLY cwds that belong to the mutation's physical worktree.
+                    // When `rebound_to_other_worktree` is true, `git_cwd_key` (now pointing to B)
+                    // is strictly EXCLUDED; only remaining cwds mapped to A are invalidated!
+                    let cwd_in_mutated_worktree = |candidate_cwd: &str,
+                                                   repo_root_map: &HashMap<String, String>|
+                     -> bool {
+                        if rebound_to_other_worktree {
+                            candidate_cwd != git_cwd_key
+                                && mutation_repo_root.as_deref().is_some_and(|mr| {
+                                    repo_root_map.get(candidate_cwd).map(String::as_str) == Some(mr)
+                                })
+                        } else {
+                            cwds_share_git_worktree(
+                                &git_cwd_key,
+                                candidate_cwd,
+                                repo_root_map,
+                                mutation_repo_root.as_deref(),
+                            )
+                        }
+                    };
+
+                    // Detect overlapping status reads BEFORE mutating `git_diffs`, `git_statuses`,
+                    // or `latest_git_status_by_repo_root` (R21-P1-2 / R22-P1-2):
+                    //   (a) in-flight `pending_git_status_requests` (`req_seq < mutation_status_seq`),
+                    //       kept intact so late pre-write replies are rejected on arrival;
+                    //   (b) already-returned reads accepted while this mutation was in flight OR
+                    //       with accepted seq `> mutation_dispatch_seq`.
+                    // Whenever an overlapping read has ALREADY been accepted (`has_accepted_overlapping_read`),
+                    // we CANNOT prove whether `mutation.status` or the already-accepted snapshot
+                    // sampled later on the daemon—so settle the write as "re-verification pending",
+                    // PRESERVE last-confirmed `git_statuses`, `git_diffs`, and `diff_revision`
+                    // continuously across the re-verify wait window, raise `git_status_seq_by_cwd`
+                    // to `mutation_status_seq` (rejecting any late pre-write in-flight reads), and
+                    // coalesce strictly ONE post-completion `GetGitStatus` per affected cwd!
+                    let prev_worktree_accepted_status_seq = mutation_repo_root
+                        .as_deref()
+                        .and_then(|root| {
+                            state
+                                .latest_git_status_by_repo_root
+                                .get(root)
+                                .map(|(seq, _)| *seq)
+                        })
+                        .unwrap_or(0);
+                    let mut overlapping_status_cwds: HashMap<String, String> = HashMap::new();
+                    for (req_norm_cwd, req_raw_cwd, req_seq, _) in
+                        state.pending_git_status_requests.values()
+                    {
+                        if *req_seq < mutation_status_seq
+                            && cwd_in_mutated_worktree(req_norm_cwd, &state.git_repo_root_by_cwd)
+                        {
+                            overlapping_status_cwds
+                                .entry(req_norm_cwd.clone())
+                                .or_insert_with(|| req_raw_cwd.clone());
+                        }
+                    }
+                    let mut has_accepted_overlapping_read = mutation_dispatch_seq
+                        .is_some_and(|disp_seq| prev_worktree_accepted_status_seq > disp_seq);
+                    for (acc_norm_cwd, acc_raw_cwd) in accepted_during_flight_cwds {
+                        if cwd_in_mutated_worktree(&acc_norm_cwd, &state.git_repo_root_by_cwd) {
+                            has_accepted_overlapping_read = true;
+                            overlapping_status_cwds
+                                .entry(acc_norm_cwd)
+                                .or_insert(acc_raw_cwd);
+                        }
+                    }
+                    if let Some(disp_seq) = mutation_dispatch_seq {
+                        if !rebound_to_other_worktree
+                            && state
+                                .git_status_seq_by_cwd
+                                .get(&git_cwd_key)
+                                .copied()
+                                .unwrap_or(0)
+                                > disp_seq
+                        {
+                            has_accepted_overlapping_read = true;
+                            overlapping_status_cwds
+                                .entry(git_cwd_key.clone())
+                                .or_insert_with(|| cwd.clone());
+                        }
+                        for (cand_norm_cwd, cand_seq) in &state.git_status_seq_by_cwd {
+                            if *cand_seq > disp_seq
+                                && cwd_in_mutated_worktree(
+                                    cand_norm_cwd,
+                                    &state.git_repo_root_by_cwd,
+                                )
+                            {
+                                has_accepted_overlapping_read = true;
+                                if cand_norm_cwd == &git_cwd_key {
+                                    if !rebound_to_other_worktree {
+                                        overlapping_status_cwds
+                                            .entry(git_cwd_key.clone())
+                                            .or_insert_with(|| cwd.clone());
+                                    }
+                                } else if let Some(raw) = state
+                                    .git_statuses
+                                    .get(cand_norm_cwd)
+                                    .map(|s| s.cwd.clone())
+                                    .or_else(|| {
+                                        state.git_diffs.iter().find_map(|((c, _, _), d)| {
+                                            (c == cand_norm_cwd).then(|| d.raw_cwd.clone())
+                                        })
+                                    })
+                                {
+                                    overlapping_status_cwds
+                                        .entry(cand_norm_cwd.clone())
+                                        .or_insert(raw);
+                                }
                             }
-                            if remaining_paths.is_empty() {
-                                return false;
+                        }
+                    }
+                    if (!overlapping_status_cwds.is_empty() || has_accepted_overlapping_read)
+                        && !rebound_to_other_worktree
+                    {
+                        overlapping_status_cwds
+                            .entry(git_cwd_key.clone())
+                            .or_insert_with(|| cwd.clone());
+                    }
+
+                    if has_accepted_overlapping_read {
+                        // Collect all cwds in the mutated worktree that hold cached state so every
+                        // affected view enters re-verification together without losing its last
+                        // confirmed status, diff body, or `diff_revision`.
+                        for (existing_norm_cwd, existing_snap) in &state.git_statuses {
+                            if existing_norm_cwd != &git_cwd_key
+                                && cwd_in_mutated_worktree(
+                                    existing_norm_cwd,
+                                    &state.git_repo_root_by_cwd,
+                                )
+                            {
+                                overlapping_status_cwds
+                                    .entry(existing_norm_cwd.clone())
+                                    .or_insert_with(|| existing_snap.cwd.clone());
                             }
-                            match stored_path.as_deref() {
-                                None => true,
-                                Some(file_path) => remaining_paths.contains(file_path),
+                        }
+                        for ((stored_cwd, _, _), stored_diff) in &state.git_diffs {
+                            if stored_cwd != &git_cwd_key
+                                && cwd_in_mutated_worktree(stored_cwd, &state.git_repo_root_by_cwd)
+                            {
+                                overlapping_status_cwds
+                                    .entry(stored_cwd.clone())
+                                    .or_insert_with(|| stored_diff.raw_cwd.clone());
+                            }
+                        }
+                        for req in state.pending_git_diff_requests.values() {
+                            if req.norm_cwd != git_cwd_key
+                                && cwd_in_mutated_worktree(
+                                    &req.norm_cwd,
+                                    &state.git_repo_root_by_cwd,
+                                )
+                            {
+                                overlapping_status_cwds
+                                    .entry(req.norm_cwd.clone())
+                                    .or_insert_with(|| req.raw_cwd.clone());
+                            }
+                        }
+                        if let Some(ref root) = mutation_repo_root
+                            && let Some((prev_seq, _)) =
+                                state.latest_git_status_by_repo_root.get_mut(root)
+                            && *prev_seq < mutation_status_seq
+                        {
+                            *prev_seq = mutation_status_seq;
+                        }
+                        let mut reverify_sorted: Vec<(String, String)> =
+                            overlapping_status_cwds.into_iter().collect();
+                        reverify_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                        for (rev_norm_cwd, rev_raw_cwd) in reverify_sorted {
+                            state
+                                .git_status_seq_by_cwd
+                                .entry(rev_norm_cwd.clone())
+                                .and_modify(|s| {
+                                    if *s < mutation_status_seq {
+                                        *s = mutation_status_seq;
+                                    }
+                                })
+                                .or_insert(mutation_status_seq);
+                            state
+                                .git_pending_mutation_reverify_by_cwd
+                                .insert(rev_norm_cwd, mutation_status_seq);
+                            git_statuses_to_redispatch.push(rev_raw_cwd.clone());
+                            push_notify_git_cwd(rev_raw_cwd);
+                        }
+                        if let Some(pending) = pending_mut {
+                            let _ = pending.tx.send(Ok(GitMutationAck {
+                                outcome: result,
+                                status_refreshed: true,
+                                origin_cwd_rebound: rebound_to_other_worktree,
+                                reverify_pending: true,
+                            }));
+                        }
+                    } else {
+                        let mut affected_sibling_raw_cwds: HashMap<String, String> = HashMap::new();
+
+                        // 1. Synchronously invalidate ALL pre-mutation in-flight diff requests across
+                        //    the mutation's physical Git worktree and raise watermarks.
+                        let mut invalidated_reqs: Vec<PendingGitDiffRequest> = Vec::new();
+                        state.pending_git_diff_requests.retain(|_, req| {
+                            if cwd_in_mutated_worktree(&req.norm_cwd, &state.git_repo_root_by_cwd) {
+                                if req.norm_cwd != git_cwd_key {
+                                    affected_sibling_raw_cwds
+                                        .entry(req.norm_cwd.clone())
+                                        .or_insert_with(|| req.raw_cwd.clone());
+                                }
+                                invalidated_reqs.push(req.clone());
+                                false
+                            } else {
+                                true
                             }
                         });
-                        state.git_statuses.insert(cwd.clone(), status_snap);
-                        notify_git_cwd = Some(cwd);
-                        true
-                    } else {
-                        false
-                    };
-                    if let Some(tx) = state.pending_git_mutations.remove(&request_id) {
-                        let _ = tx.send(Ok((result, status_refreshed)));
+                        state.next_git_diff_req_seq = state.next_git_diff_req_seq.saturating_add(1);
+                        let mutation_watermark = state.next_git_diff_req_seq;
+                        if !rebound_to_other_worktree {
+                            if current_cwd_root.as_deref().is_some_and(|old| {
+                                mutation_repo_root.as_deref().is_some_and(|new| old != new)
+                            }) {
+                                state
+                                    .git_cwd_identity_watermark
+                                    .insert(git_cwd_key.clone(), mutation_watermark);
+                            }
+                            if mutation_repo_root.is_some() {
+                                state
+                                    .git_cwd_root_set_seq
+                                    .insert(git_cwd_key.clone(), mutation_watermark);
+                            }
+                        }
+                        if let Some(ref root) = mutation_repo_root {
+                            state
+                                .latest_mutation_watermark_by_repo_root
+                                .entry(root.clone())
+                                .and_modify(|wm| {
+                                    if *wm < mutation_watermark {
+                                        *wm = mutation_watermark;
+                                    }
+                                })
+                                .or_insert(mutation_watermark);
+                            if let Some(status_snap) = status.as_ref() {
+                                let should_update_wt = state
+                                    .latest_git_status_by_repo_root
+                                    .get(root)
+                                    .is_none_or(|(prev_seq, _)| mutation_status_seq >= *prev_seq);
+                                if should_update_wt {
+                                    state.latest_git_status_by_repo_root.insert(
+                                        root.clone(),
+                                        (mutation_status_seq, status_snap.clone()),
+                                    );
+                                }
+                            }
+                        }
+                        for ((stored_cwd, _, _), latest_seq) in
+                            state.latest_dispatched_git_diff_req_seq.iter_mut()
+                        {
+                            if cwd_in_mutated_worktree(stored_cwd, &state.git_repo_root_by_cwd)
+                                && *latest_seq < mutation_watermark
+                            {
+                                *latest_seq = mutation_watermark;
+                            }
+                        }
+
+                        // 2. Unconditionally evict ALL cached `git_diffs` belonging to the mutation's
+                        //    physical Git worktree (never touching a rebound `git_cwd_key` pointing to B).
+                        let mut any_diff_evicted = false;
+                        state.git_diffs.retain(|(stored_cwd, _, _), stored_diff| {
+                            if cwd_in_mutated_worktree(stored_cwd, &state.git_repo_root_by_cwd) {
+                                any_diff_evicted = true;
+                                if stored_cwd != &git_cwd_key {
+                                    affected_sibling_raw_cwds
+                                        .entry(stored_cwd.clone())
+                                        .or_insert_with(|| stored_diff.raw_cwd.clone());
+                                }
+                                false
+                            } else {
+                                true
+                            }
+                        });
+
+                        // 3. Re-dispatch invalidated in-flight requests across BOTH `Some(path)` AND
+                        //    `None` (whole-repo) scopes using each cwd's latest effective status.
+                        let remaining_paths_opt: Option<Vec<RemainingGitStatusPath>> =
+                            status.as_ref().map(|snap| {
+                                snap.files
+                                    .iter()
+                                    .map(|f| RemainingGitStatusPath {
+                                        norm_path: normalize_git_rel_path(&f.path),
+                                        staged: f.staged,
+                                        is_dir_summary: f.path.ends_with('/'),
+                                    })
+                                    .collect()
+                            });
+
+                        let mut seen_redispatch: HashSet<(String, Option<String>, bool)> =
+                            HashSet::new();
+                        for req in invalidated_reqs {
+                            let req_cwd_has_newer_status = state
+                                .git_status_seq_by_cwd
+                                .get(&req.norm_cwd)
+                                .copied()
+                                .unwrap_or(0)
+                                > mutation_status_seq;
+                            let req_entries_owned: Option<Vec<RemainingGitStatusPath>> =
+                                if req_cwd_has_newer_status {
+                                    state.git_statuses.get(&req.norm_cwd).map(|snap| {
+                                        snap.files
+                                            .iter()
+                                            .map(|f| RemainingGitStatusPath {
+                                                norm_path: normalize_git_rel_path(&f.path),
+                                                staged: f.staged,
+                                                is_dir_summary: f.path.ends_with('/'),
+                                            })
+                                            .collect()
+                                    })
+                                } else {
+                                    None
+                                };
+                            let effective_entries =
+                                req_entries_owned.as_ref().or(remaining_paths_opt.as_ref());
+
+                            let still_present = match effective_entries {
+                                Some(entries) => {
+                                    if entries.is_empty() {
+                                        false
+                                    } else {
+                                        match req.path.as_deref() {
+                                            None => entries.iter().any(|e| e.staged == req.staged),
+                                            Some(req_path) => {
+                                                let req_prefix_opt: Option<String> = if req.norm_cwd
+                                                    == git_cwd_key
+                                                    && !same_worktree_prefix_rebound
+                                                {
+                                                    repo_prefix.clone().or_else(|| {
+                                                        state
+                                                            .git_repo_prefix_by_cwd
+                                                            .get(&req.norm_cwd)
+                                                            .cloned()
+                                                    })
+                                                } else {
+                                                    state
+                                                        .git_repo_prefix_by_cwd
+                                                        .get(&req.norm_cwd)
+                                                        .cloned()
+                                                        .or_else(|| {
+                                                            mutation_repo_root.as_deref().and_then(
+                                                                |root| {
+                                                                    derive_repo_prefix_from_root(
+                                                                        &req.norm_cwd,
+                                                                        root,
+                                                                    )
+                                                                },
+                                                            )
+                                                        })
+                                                };
+                                                match req_prefix_opt {
+                                                    Some(ref p) => git_status_paths_match_request(
+                                                        req_path,
+                                                        Some(p.as_str()),
+                                                        req.staged,
+                                                        entries,
+                                                    ),
+                                                    None => entries
+                                                        .iter()
+                                                        .any(|e| e.staged == req.staged),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None => true,
+                            };
+                            if still_present
+                                && seen_redispatch.insert((
+                                    req.norm_cwd.clone(),
+                                    req.path.clone(),
+                                    req.staged,
+                                ))
+                            {
+                                git_diffs_to_redispatch.push((req.raw_cwd, req.path, req.staged));
+                            }
+                        }
+
+                        // 4. Refresh `git_statuses` for `git_cwd_key` (ONLY if NOT rebound away!)
+                        //    AND every sibling `cwd` still in the mutation's physical worktree,
+                        //    honoring completion sequence `mutation_status_seq` and coalescing ONE
+                        //    fresh post-completion `GetGitStatus` for any still-in-flight
+                        //    overlapping reads (keeping old UUIDs intact so late pre-write replies
+                        //    are rejected on arrival).
+                        let status_refreshed = if let Some(mut status_snap) = status {
+                            for (existing_norm_cwd, existing_snap) in &state.git_statuses {
+                                if existing_norm_cwd != &git_cwd_key
+                                    && cwd_in_mutated_worktree(
+                                        existing_norm_cwd,
+                                        &state.git_repo_root_by_cwd,
+                                    )
+                                {
+                                    affected_sibling_raw_cwds
+                                        .entry(existing_norm_cwd.clone())
+                                        .or_insert_with(|| existing_snap.cwd.clone());
+                                }
+                            }
+                            let mut siblings_sorted: Vec<(String, String)> =
+                                affected_sibling_raw_cwds.into_iter().collect();
+                            siblings_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+                            for (sib_norm_cwd, sib_raw_cwd) in siblings_sorted {
+                                let prev_sib_seq = state
+                                    .git_status_seq_by_cwd
+                                    .get(&sib_norm_cwd)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if mutation_status_seq >= prev_sib_seq {
+                                    state
+                                        .git_pending_mutation_reverify_by_cwd
+                                        .remove(&sib_norm_cwd);
+                                    let mut sib_snap = status_snap.clone();
+                                    sib_snap.cwd = sib_raw_cwd.clone();
+                                    sib_snap.repo_prefix = state
+                                        .git_repo_prefix_by_cwd
+                                        .get(&sib_norm_cwd)
+                                        .cloned()
+                                        .or_else(|| {
+                                            mutation_repo_root.as_deref().and_then(|root| {
+                                                derive_repo_prefix_from_root(&sib_norm_cwd, root)
+                                            })
+                                        });
+                                    sib_snap.repo_root = mutation_repo_root.clone();
+                                    if let Some(ref root) = mutation_repo_root {
+                                        state
+                                            .git_repo_root_by_cwd
+                                            .entry(sib_norm_cwd.clone())
+                                            .or_insert_with(|| root.clone());
+                                    }
+                                    state
+                                        .git_status_seq_by_cwd
+                                        .insert(sib_norm_cwd.clone(), mutation_status_seq);
+                                    state.bump_git_status_revision(&sib_norm_cwd);
+                                    state.git_statuses.insert(sib_norm_cwd, sib_snap);
+                                }
+                                push_notify_git_cwd(sib_raw_cwd);
+                            }
+
+                            let mut cwd_status_adopted = false;
+                            if !rebound_to_other_worktree {
+                                let prev_cwd_seq = state
+                                    .git_status_seq_by_cwd
+                                    .get(&git_cwd_key)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if mutation_status_seq >= prev_cwd_seq {
+                                    state
+                                        .git_pending_mutation_reverify_by_cwd
+                                        .remove(&git_cwd_key);
+                                    if same_worktree_prefix_rebound {
+                                        status_snap.repo_prefix = current_cwd_prefix.clone();
+                                    }
+                                    let norm_cwd = crate::sidebar::normalize_project_path(&cwd);
+                                    state.git_repos_by_cwd.insert(
+                                        norm_cwd.clone(),
+                                        GitReposInspectionView {
+                                            path: norm_cwd,
+                                            is_git_repo: status_snap.is_git_repo,
+                                            git_branch: status_snap.branch.clone(),
+                                            nested_git_repos: status_snap.nested_git_repos.clone(),
+                                        },
+                                    );
+                                    state
+                                        .git_status_seq_by_cwd
+                                        .insert(git_cwd_key.clone(), mutation_status_seq);
+                                    state.bump_git_status_revision(&git_cwd_key);
+                                    state.git_statuses.insert(git_cwd_key.clone(), status_snap);
+                                    cwd_status_adopted = true;
+                                }
+                                push_notify_git_cwd(cwd);
+                            }
+                            let mut overlap_sorted: Vec<(String, String)> =
+                                overlapping_status_cwds.into_iter().collect();
+                            overlap_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                            for (_, overlap_raw_cwd) in overlap_sorted {
+                                git_statuses_to_redispatch.push(overlap_raw_cwd);
+                            }
+                            if rebound_to_other_worktree {
+                                true
+                            } else {
+                                cwd_status_adopted
+                            }
+                        } else {
+                            // Even when a legacy mutation returns `status: None`, advance status seq
+                            // watermark so pre-write overlapping `GetGitStatus` replies are rejected.
+                            if !rebound_to_other_worktree {
+                                state
+                                    .git_status_seq_by_cwd
+                                    .entry(git_cwd_key.clone())
+                                    .and_modify(|s| {
+                                        if *s < mutation_status_seq {
+                                            *s = mutation_status_seq;
+                                        }
+                                    })
+                                    .or_insert(mutation_status_seq);
+                                if any_diff_evicted {
+                                    push_notify_git_cwd(cwd);
+                                }
+                            }
+                            let mut siblings_sorted: Vec<(String, String)> =
+                                affected_sibling_raw_cwds.into_iter().collect();
+                            siblings_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                            for (sib_norm_cwd, sib_raw_cwd) in siblings_sorted {
+                                state
+                                    .git_status_seq_by_cwd
+                                    .entry(sib_norm_cwd)
+                                    .and_modify(|s| {
+                                        if *s < mutation_status_seq {
+                                            *s = mutation_status_seq;
+                                        }
+                                    })
+                                    .or_insert(mutation_status_seq);
+                                push_notify_git_cwd(sib_raw_cwd);
+                            }
+                            let mut overlap_sorted: Vec<(String, String)> =
+                                overlapping_status_cwds.into_iter().collect();
+                            overlap_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                            for (overlap_norm_cwd, overlap_raw_cwd) in overlap_sorted {
+                                if overlap_norm_cwd != git_cwd_key {
+                                    git_statuses_to_redispatch.push(overlap_raw_cwd);
+                                }
+                            }
+                            false
+                        };
+                        if let Some(pending) = pending_mut {
+                            let _ = pending.tx.send(Ok(GitMutationAck {
+                                outcome: result,
+                                status_refreshed,
+                                origin_cwd_rebound: rebound_to_other_worktree,
+                                reverify_pending: false,
+                            }));
+                        }
                     }
                 }
                 WireMessage::GitCollabResponse {
@@ -7350,7 +9063,7 @@ impl OrbitAppCore {
                 }
                 WireMessage::WorkspaceFilesResponse { cwd, files, .. } => {
                     state.workspace_files.insert(cwd.clone(), files);
-                    notify_git_cwd = Some(cwd);
+                    push_notify_git_cwd(cwd);
                 }
                 WireMessage::WorkspaceSymbolsResponse {
                     request_id,
@@ -8087,6 +9800,112 @@ impl OrbitAppCore {
                     message,
                 } => {
                     if let Some(req_id) = request_id
+                        && let Some((
+                            failed_norm_cwd,
+                            failed_raw_cwd,
+                            failed_seq,
+                            failed_orig_epoch,
+                        )) = state.pending_git_status_requests.remove(&req_id)
+                    {
+                        // R22-P1-1: If a pre-identity `GetGitStatus` failed with `RpcError` after
+                        // a diff reply already established `(repo_root, repo_prefix)` (so
+                        // `git_statuses[cwd]` is still `None`), dispatch ONE post-identity
+                        // verification `GetGitStatus` (`seq > wm`, `orig_epoch == cur_epoch`) so
+                        // cold/hot links converge without stranding (bounded: if that post-identity
+                        // query also errors, `was_pre_identity_query` is false -> 0 retry loop).
+                        let cur_epoch = state
+                            .git_cwd_identity_epoch
+                            .get(&failed_norm_cwd)
+                            .copied()
+                            .unwrap_or(0);
+                        let id_status_wm = state
+                            .git_cwd_identity_status_watermark
+                            .get(&failed_norm_cwd)
+                            .copied()
+                            .unwrap_or(0);
+                        let was_pre_identity_query =
+                            failed_seq <= id_status_wm || failed_orig_epoch < cur_epoch;
+                        if was_pre_identity_query
+                            && !state.git_statuses.contains_key(&failed_norm_cwd)
+                            && (state.git_repo_root_by_cwd.contains_key(&failed_norm_cwd)
+                                || state.git_repo_prefix_by_cwd.contains_key(&failed_norm_cwd))
+                        {
+                            let has_verification_in_flight = state
+                                .pending_git_status_requests
+                                .values()
+                                .any(|(req_norm_cwd, _, req_seq, orig_epoch)| {
+                                    req_norm_cwd == &failed_norm_cwd
+                                        && *req_seq > id_status_wm
+                                        && *orig_epoch >= cur_epoch
+                                });
+                            if !has_verification_in_flight {
+                                git_statuses_to_redispatch.push(failed_raw_cwd.clone());
+                            }
+                        }
+                        // R22-P1-2: If a post-mutation re-verification `GetGitStatus` failed and
+                        // no other post-reverify status is in flight, clear the pending reverify
+                        // marker so `status_reverify_pending` does not stay stuck `true`.
+                        if let Some(&reverify_wm) = state
+                            .git_pending_mutation_reverify_by_cwd
+                            .get(&failed_norm_cwd)
+                            && failed_seq > reverify_wm
+                        {
+                            let has_other_reverify_in_flight = state
+                                .pending_git_status_requests
+                                .values()
+                                .any(|(req_norm_cwd, _, req_seq, _)| {
+                                    req_norm_cwd == &failed_norm_cwd && *req_seq > reverify_wm
+                                });
+                            if !has_other_reverify_in_flight {
+                                state
+                                    .git_pending_mutation_reverify_by_cwd
+                                    .remove(&failed_norm_cwd);
+                                push_notify_git_cwd(failed_raw_cwd);
+                            }
+                        }
+                    }
+                    if let Some(req_id) = request_id
+                        && let Some(failed_diff_req) =
+                            state.pending_git_diff_requests.remove(&req_id)
+                    {
+                        // R19-P1-4 / R20-P1-5: Settle failed `GetGitDiff` requests by UUID so
+                        // `diff_in_flight` clears cleanly (while preserving any newer UUID on the
+                        // same slot). Advance `last_git_diff_error_revision` for non-superseded
+                        // requests so visible Review tabs can register recovery decoupled from
+                        // UI timers and prior non-zero `diff_revision`.
+                        let slot_key = (
+                            failed_diff_req.norm_cwd.clone(),
+                            failed_diff_req.path.clone(),
+                            failed_diff_req.staged,
+                        );
+                        let latest_dispatched = state
+                            .latest_dispatched_git_diff_req_seq
+                            .get(&slot_key)
+                            .copied()
+                            .unwrap_or(0);
+                        let cwd_identity_wm = state
+                            .git_cwd_identity_watermark
+                            .get(&failed_diff_req.norm_cwd)
+                            .copied()
+                            .unwrap_or(0);
+                        if failed_diff_req.req_seq >= latest_dispatched
+                            && failed_diff_req.req_seq >= cwd_identity_wm
+                        {
+                            state.git_diff_error_revision_counter =
+                                state.git_diff_error_revision_counter.saturating_add(1);
+                            let err_rev = state.git_diff_error_revision_counter;
+                            let error_status_rev = state
+                                .git_status_revision_by_cwd
+                                .get(&failed_diff_req.norm_cwd)
+                                .copied()
+                                .unwrap_or(0);
+                            state
+                                .last_git_diff_error_revision
+                                .insert(slot_key, (err_rev, error_status_rev));
+                        }
+                        push_notify_git_cwd(failed_diff_req.raw_cwd);
+                    }
+                    if let Some(req_id) = request_id
                         && clear_pending_queue_op_by_req(state, req_id, true)
                     {
                         notify_host = true;
@@ -8165,9 +9984,9 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
-                        && let Some(tx) = state.pending_git_mutations.remove(&req_id)
+                        && let Some(pending) = state.pending_git_mutations.remove(&req_id)
                     {
-                        let _ = tx.send(Err(formatted_err));
+                        let _ = pending.tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_git_collab_queries.remove(&req_id)
                     {
@@ -8789,7 +10608,13 @@ impl OrbitAppCore {
                 agent_id,
             });
         }
-        if let Some(cwd) = notify_git_cwd {
+        for (req_cwd, req_path, req_staged) in git_diffs_to_redispatch {
+            self.fetch_git_diff(host_id, &req_cwd, req_path.as_deref(), req_staged);
+        }
+        for req_cwd in git_statuses_to_redispatch {
+            self.fetch_git_status(host_id, &req_cwd);
+        }
+        for cwd in notify_git_cwds {
             self.emit(|revision| CoreNotification::GitChanged {
                 revision,
                 host_id: host_id.to_string(),
@@ -13689,10 +15514,41 @@ impl OrbitAppCore {
     }
 
     pub fn fetch_git_status(self: &Arc<Self>, host_id: &str, cwd: &str) {
+        let request_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            let norm_cwd = h.canonical_git_cwd(cwd);
+            let origin_identity_epoch = h
+                .git_cwd_identity_epoch
+                .get(&norm_cwd)
+                .copied()
+                .unwrap_or(0);
+            h.next_git_status_req_seq = h.next_git_status_req_seq.saturating_add(1);
+            let dispatch_seq = h.next_git_status_req_seq;
+            if h.pending_git_status_requests.len() >= MAX_PENDING_GIT_STATUS_REQUESTS
+                && let Some(oldest_id) = h
+                    .pending_git_status_requests
+                    .iter()
+                    .min_by_key(|(_, (_, _, seq, _))| *seq)
+                    .map(|(id, _)| *id)
+            {
+                h.pending_git_status_requests.remove(&oldest_id);
+            }
+            h.pending_git_status_requests.insert(
+                request_id,
+                (
+                    norm_cwd,
+                    cwd.to_string(),
+                    dispatch_seq,
+                    origin_identity_epoch,
+                ),
+            );
+        }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::GetGitStatus {
-                request_id: Uuid::new_v4(),
+                request_id,
                 cwd: cwd.to_string(),
             },
         );
@@ -13705,17 +15561,45 @@ impl OrbitAppCore {
         path: Option<&str>,
         staged: bool,
     ) {
+        let request_id = Uuid::new_v4();
+        let norm_path = canonical_git_rel_path(path);
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            h.last_git_diff_staged.insert(cwd.to_string(), staged);
+            let norm_cwd = h.canonical_git_cwd(cwd);
+            h.last_git_diff_staged.insert(norm_cwd.clone(), staged);
+            h.next_git_diff_req_seq = h.next_git_diff_req_seq.saturating_add(1);
+            let req_seq = h.next_git_diff_req_seq;
+            let status_seq_at_dispatch = h.next_git_status_req_seq;
+            h.latest_dispatched_git_diff_req_seq
+                .insert((norm_cwd.clone(), norm_path.clone(), staged), req_seq);
+            if h.pending_git_diff_requests.len() >= MAX_PENDING_GIT_DIFF_REQUESTS
+                && let Some(oldest_id) = h
+                    .pending_git_diff_requests
+                    .iter()
+                    .min_by_key(|(_, req)| req.req_seq)
+                    .map(|(id, _)| *id)
+            {
+                h.pending_git_diff_requests.remove(&oldest_id);
+            }
+            h.pending_git_diff_requests.insert(
+                request_id,
+                PendingGitDiffRequest {
+                    norm_cwd,
+                    raw_cwd: cwd.to_string(),
+                    path: norm_path.clone(),
+                    staged,
+                    req_seq,
+                    status_seq_at_dispatch,
+                },
+            );
         }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::GetGitDiff {
-                request_id: Uuid::new_v4(),
+                request_id,
                 cwd: cwd.to_string(),
-                path: path.map(ToOwned::to_owned),
+                path: norm_path,
                 staged,
             },
         );
@@ -13746,6 +15630,7 @@ impl OrbitAppCore {
 
         let core = Arc::clone(self);
         let owned_host_id = host_id.clone();
+        let owned_cwd = cwd.clone();
         let (res_tx, res_rx) = tokio::sync::oneshot::channel();
 
         struct PendingGitMutationGuard {
@@ -13780,7 +15665,26 @@ impl OrbitAppCore {
                 match core.hosts.write() {
                     Ok(mut guard) => match guard.get_mut(&owned_host_id) {
                         Some(h) if h.session.is_some() => {
-                            h.pending_git_mutations.insert(req_id, ack_tx);
+                            let norm_cwd = h.canonical_git_cwd(&owned_cwd);
+                            let origin_repo_root = h.git_repo_root_by_cwd.get(&norm_cwd).cloned();
+                            let origin_identity_epoch = h
+                                .git_cwd_identity_epoch
+                                .get(&norm_cwd)
+                                .copied()
+                                .unwrap_or(0);
+                            h.next_git_status_req_seq = h.next_git_status_req_seq.saturating_add(1);
+                            let dispatch_seq = h.next_git_status_req_seq;
+                            h.pending_git_mutations.insert(
+                                req_id,
+                                PendingGitMutation {
+                                    tx: ack_tx,
+                                    origin_norm_cwd: norm_cwd,
+                                    origin_repo_root,
+                                    origin_identity_epoch,
+                                    dispatch_seq,
+                                    accepted_overlapping_status_cwds: HashMap::new(),
+                                },
+                            );
                             None
                         }
                         Some(_) => Some(format!("Host disconnected before {op_label}")),
@@ -13828,31 +15732,40 @@ impl OrbitAppCore {
             let _ = res_tx.send(out);
         });
 
-        let (outcome, status_refreshed) = res_rx
+        let ack = res_rx
             .await
             .map_err(|_| format!("{op_label} task cancelled"))??;
 
         // Automatically refresh cached git review data (status fallback + unified diff) for both
-        // local and remote fleet hosts after the mutation succeeds.
-        if !status_refreshed {
-            self.fetch_git_status(&host_id, &cwd);
-        }
-        let refresh_staged = self
-            .hosts
-            .read()
-            .ok()
-            .and_then(|guard| {
-                let h = guard.get(&host_id)?;
-                h.last_git_diff_staged.get(&cwd).copied().or_else(|| {
-                    h.last_git_diff_staged
-                        .iter()
-                        .find_map(|(k, v)| cwd_paths_equivalent(k, &cwd).then_some(*v))
+        // local and remote fleet hosts after the mutation succeeds—UNLESS `cwd` was rebound to a
+        // different physical Git worktree while this mutation was in flight (R20-P1-4) OR a
+        // coalesced post-completion status re-verification is already pending (R22-P1-2).
+        if !ack.origin_cwd_rebound && !ack.reverify_pending {
+            if !ack.status_refreshed {
+                self.fetch_git_status(&host_id, &cwd);
+            }
+            let (refresh_staged, already_in_flight) = self
+                .hosts
+                .read()
+                .ok()
+                .and_then(|guard| {
+                    let h = guard.get(&host_id)?;
+                    let norm_cwd = h.canonical_git_cwd(&cwd);
+                    let staged = h
+                        .last_git_diff_staged
+                        .get(&norm_cwd)
+                        .copied()
+                        .unwrap_or(false);
+                    let in_flight = h.has_live_git_diff_in_flight(&(norm_cwd, None, staged));
+                    Some((staged, in_flight))
                 })
-            })
-            .unwrap_or(false);
-        self.fetch_git_diff(&host_id, &cwd, None, refresh_staged);
+                .unwrap_or((false, false));
+            if !already_in_flight {
+                self.fetch_git_diff(&host_id, &cwd, None, refresh_staged);
+            }
+        }
 
-        Ok(outcome)
+        Ok(ack.outcome)
     }
 
     pub async fn git_stage_files_on_host(
@@ -25207,7 +27120,37 @@ fn merge_and_rank_search_candidates(
     merged
 }
 
+fn prune_pending_git_diff_requests_not_queued(h: &mut HostMemoryState) {
+    let queued_git_diff_ids: HashSet<Uuid> = h
+        .transient_requests
+        .iter()
+        .filter_map(|msg| match msg {
+            WireMessage::GetGitDiff { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .collect();
+    h.pending_git_diff_requests
+        .retain(|req_id, _| queued_git_diff_ids.contains(req_id));
+    let queued_git_status_ids: HashSet<Uuid> = h
+        .transient_requests
+        .iter()
+        .filter_map(|msg| match msg {
+            WireMessage::GetGitStatus { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .collect();
+    h.pending_git_status_requests
+        .retain(|req_id, _| queued_git_status_ids.contains(req_id));
+    h.git_pending_mutation_reverify_by_cwd
+        .retain(|norm_cwd, reverify_wm| {
+            h.pending_git_status_requests
+                .values()
+                .any(|(req_cwd, _, req_seq, _)| req_cwd == norm_cwd && *req_seq > *reverify_wm)
+        });
+}
+
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
+    prune_pending_git_diff_requests_not_queued(h);
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -25253,8 +27196,8 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_git_repo_inspections.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
-    for (_, tx) in h.pending_git_mutations.drain() {
-        let _ = tx.send(Err(reason.to_string()));
+    for (_, pending) in h.pending_git_mutations.drain() {
+        let _ = pending.tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_git_collab_queries.drain() {
         let _ = tx.send(Err(reason.to_string()));
@@ -37394,35 +39337,5427 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_review_never_fuzzy_matches_tilde_cache_against_unrelated_absolute_path() {
-        let core = OrbitAppCore::open_in_memory().expect("open core");
-        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
-        let host_id = kp.host_id().expect("host_id");
-        let offer = PairingOffer {
+    fn setup_connected_git_test_core() -> (
+        Arc<OrbitAppCore>,
+        String,
+        tokio::sync::mpsc::Receiver<crate::OutboundPayload>,
+    ) {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        let host_id = "host_git_test".to_string();
+        let (handle, rx) = crate::HostSessionHandle::new_test_channel();
+        let mut mem = HostMemoryState::new(SavedHostProfile {
             host_id: host_id.clone(),
-            hostname: "git-target-host".into(),
-            daemon_pubkey_b64: kp.public_key_b64,
-            direct_endpoints: vec!["http://127.0.0.1:18870".into()],
+            hostname: "git-test-host".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::DirectOnly,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "test-key".into(),
+            direct_endpoints: Vec::new(),
             relay_url: None,
             pairing_secret: "secret".into(),
-        };
-        core.pair_host(&offer.to_qr_uri().expect("uri"))
-            .expect("pair");
+            pairing_secret_updated_at_ms: 0,
+            state: HostConnectionState::OnlineDirect,
+        });
+        mem.session_gen = 1;
+        mem.session = Some(handle);
+        core.hosts
+            .write()
+            .expect("hosts")
+            .insert(host_id.clone(), mem);
+        (core, host_id, rx)
+    }
 
-        let pa_diff = "diff --git a/pa-only.txt b/pa-only.txt\n--- a/pa-only.txt\n+++ b/pa-only.txt\n@@ -1 +1 @@\n-old\n+new\n";
-        let worker_diff = "diff --git a/worker-only.txt b/worker-only.txt\n--- a/worker-only.txt\n+++ b/worker-only.txt\n@@ -1 +1 @@\n-a\n+b\n";
+    fn recv_git_diff_request(
+        core: &OrbitAppCore,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>,
+    ) -> (Uuid, String, Option<String>, bool) {
+        let frame = core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("wire")
+        });
+        match frame {
+            crate::OutboundPayload::Wire(WireMessage::GetGitDiff {
+                request_id,
+                cwd,
+                path,
+                staged,
+            }) => (request_id, cwd, path, staged),
+            other => panic!("expected WireMessage::GetGitDiff, got {other:?}"),
+        }
+    }
 
-        // Cache PA diff/status under daemon shorthand `~/project`
+    #[test]
+    fn git_diff_isolates_concurrent_modes_and_drops_out_of_order_same_mode() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // 1. Concurrent Unstaged (req_u) and Staged (req_s) on identical (cwd, path)
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), false);
+        let (req_u, _, path_u, staged_u) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(path_u.as_deref(), Some("f"));
+        assert!(!staged_u);
+
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), true);
+        let (req_s, _, path_s, staged_s) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(path_s.as_deref(), Some("f"));
+        assert!(staged_s);
+
+        // Staged arrives first, late Unstaged arrives second -> strictly isolated!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_s,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+index-only\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_u,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+worktree-only\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+
+        let view_s = core.git_review_for_mode(&host_id, "/repo", Some("f"), true);
+        assert!(view_s.staged);
+        assert_eq!(view_s.diff_revision, 1);
+        assert!(view_s.raw_diff.contains("+index-only"));
+        assert!(!view_s.raw_diff.contains("+worktree-only"));
+
+        let view_u = core.git_review_for_mode(&host_id, "/repo", Some("f"), false);
+        assert!(!view_u.staged);
+        assert_eq!(view_u.diff_revision, 2);
+        assert!(view_u.raw_diff.contains("+worktree-only"));
+        assert!(!view_u.raw_diff.contains("+index-only"));
+
+        // 2. Same-mode out-of-order: req1 then req2; req2 arrives first, req1 arrives late -> req1 dropped!
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), false);
+        let (req1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), false);
+        let (req2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req2,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+newer-v2\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let after_req2 = core.git_review_for_mode(&host_id, "/repo", Some("f"), false);
+        assert_eq!(after_req2.diff_revision, 3);
+        assert!(after_req2.raw_diff.contains("+newer-v2"));
+
+        // Late req1 MUST be dropped by `req_seq` guard!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req1,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+stale-v1\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let after_stale = core.git_review_for_mode(&host_id, "/repo", Some("f"), false);
+        assert_eq!(after_stale.diff_revision, 3);
+        assert!(after_stale.raw_diff.contains("+newer-v2"));
+        assert!(!after_stale.raw_diff.contains("+stale-v1"));
+    }
+
+    #[test]
+    fn git_diff_isolates_whole_repo_none_from_literal_all_and_background_refreshes() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // 3. Whole-repo None vs literal file Some("__all__") (same-mode & cross-mode)
+        core.fetch_git_diff(&host_id, "/repo", None, false);
+        let (req_whole_u, _, p_wu, _) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(p_wu, None);
+
+        core.fetch_git_diff(&host_id, "/repo", Some("./__all__"), false);
+        let (req_file_u, _, p_fu, _) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(p_fu.as_deref(), Some("__all__"));
+
+        core.fetch_git_diff(&host_id, "/repo", None, true);
+        let (req_whole_s, _, p_ws, _) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(p_ws, None);
+
+        core.fetch_git_diff(&host_id, "/repo", Some("__all__"), true);
+        let (req_file_s, _, p_fs, _) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(p_fs.as_deref(), Some("__all__"));
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_whole_u,
+                cwd: "/repo".into(),
+                path: None,
+                unified_diff:
+                    "diff --git a/__all__ b/__all__\n+whole-u\ndiff --git a/g b/g\n+g-u\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_file_u,
+                cwd: "/repo".into(),
+                path: Some("__all__".into()),
+                unified_diff: "diff --git a/__all__ b/__all__\n+file-all-u\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_whole_s,
+                cwd: "/repo".into(),
+                path: None,
+                unified_diff: "diff --git a/f b/f\n+whole-s\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_file_s,
+                cwd: "/repo".into(),
+                path: Some("__all__".into()),
+                unified_diff: "diff --git a/__all__ b/__all__\n+file-all-s\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+
+        let whole_u = core.git_review_for_mode(&host_id, "/repo", None, false);
+        let file_u = core.git_review_for_mode(&host_id, "/repo", Some("__all__"), false);
+        let whole_s = core.git_review_for_mode(&host_id, "/repo", None, true);
+        let file_s = core.git_review_for_mode(&host_id, "/repo", Some("./__all__"), true);
+
+        assert!(whole_u.raw_diff.contains("+whole-u") && whole_u.raw_diff.contains("+g-u"));
+        assert!(file_u.raw_diff.contains("+file-all-u") && !file_u.raw_diff.contains("+g-u"));
+        assert!(whole_s.raw_diff.contains("+whole-s") && !whole_s.raw_diff.contains("+whole-u"));
+        assert!(file_s.raw_diff.contains("+file-all-s") && !file_s.raw_diff.contains("+whole-s"));
+
+        // 4. Auto whole-repo Unstaged (e.g. AgentRewound) and auto whole-repo Staged (mutation)
+        //    NEVER contaminate opposite mode slots or single-file slots!
+        let prev_whole_s_rev = whole_s.diff_revision;
+        let prev_file_s_rev = file_s.diff_revision;
+        core.fetch_git_diff(&host_id, "/repo", None, false);
+        let (req_rewind_u, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_rewind_u,
+                cwd: "/repo".into(),
+                path: None,
+                unified_diff: "diff --git a/f b/f\n+restored-worktree\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", None, true)
+                .diff_revision,
+            prev_whole_s_rev
+        );
+        assert!(
+            core.git_review_for_mode(&host_id, "/repo", None, true)
+                .raw_diff
+                .contains("+whole-s")
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("__all__"), true)
+                .diff_revision,
+            prev_file_s_rev
+        );
+
+        let prev_whole_u_rev = core
+            .git_review_for_mode(&host_id, "/repo", None, false)
+            .diff_revision;
+        core.fetch_git_diff(&host_id, "/repo", None, true);
+        let (req_mut_s, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_mut_s,
+                cwd: "/repo".into(),
+                path: None,
+                unified_diff: "diff --git a/f b/f\n+mut-auto-staged\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", None, false)
+                .diff_revision,
+            prev_whole_u_rev
+        );
+        assert!(
+            core.git_review_for_mode(&host_id, "/repo", None, false)
+                .raw_diff
+                .contains("+restored-worktree")
+        );
+    }
+
+    #[test]
+    fn git_diff_revision_ignores_status_bumps_on_unchanged_empty_large_and_preserves_spaces_and_disconnect()
+     {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // 5. GitStatusResponse NEVER increments diff_revision; unchanged / empty / >32 KiB
+        //    GitDiffResponse ALWAYS strictly increments diff_revision.
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "big.txt".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                },
+            },
+        );
+        let before_diff = core.git_review_for_mode(&host_id, "/repo", Some("big.txt"), false);
+        assert_eq!(before_diff.diff_revision, 0);
+        assert!(before_diff.status.is_some());
+
+        // >32 KiB diff body
+        let large_body = format!(
+            "diff --git a/big.txt b/big.txt\n--- a/big.txt\n+++ b/big.txt\n@@ -0,0 +1,2 @@\n+{}\n+tail-v1\n",
+            "x".repeat(33_000)
+        );
+        core.fetch_git_diff(&host_id, "/repo", Some("big.txt"), false);
+        let (req_l1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_l1,
+                cwd: "/repo".into(),
+                path: Some("big.txt".into()),
+                unified_diff: large_body.clone(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v1 = core.git_review_for_mode(&host_id, "/repo", Some("big.txt"), false);
+        assert_eq!(v1.diff_revision, 1);
+
+        // Identical unchanged body refresh still strictly increments diff_revision!
+        core.fetch_git_diff(&host_id, "/repo", Some("big.txt"), false);
+        let (req_l2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_l2,
+                cwd: "/repo".into(),
+                path: Some("big.txt".into()),
+                unified_diff: large_body,
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v2 = core.git_review_for_mode(&host_id, "/repo", Some("big.txt"), false);
+        assert_eq!(v2.diff_revision, 2);
+
+        // Another GitStatusResponse leaves diff_revision untouched at 2
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 1,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                },
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("big.txt"), false)
+                .diff_revision,
+            2
+        );
+
+        // Empty diff body ("") strictly increments diff_revision (2 -> 3)
+        core.fetch_git_diff(&host_id, "/repo", Some("big.txt"), false);
+        let (req_empty, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_empty,
+                cwd: "/repo".into(),
+                path: Some("big.txt".into()),
+                unified_diff: String::new(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v3 = core.git_review_for_mode(&host_id, "/repo", Some("big.txt"), false);
+        assert_eq!(v3.diff_revision, 3);
+        assert!(v3.raw_diff.is_empty());
+
+        // 6a. Trailing space path `"report.txt "` & `"./report.txt "` strictly isolated from `"report.txt"`
+        core.fetch_git_diff(&host_id, "/repo", Some("report.txt"), false);
+        let (req_trimmed, _, p_trimmed, _) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(p_trimmed.as_deref(), Some("report.txt"));
+
+        core.fetch_git_diff(&host_id, "/repo", Some("./report.txt "), false);
+        let (req_spaced, _, p_spaced, _) = recv_git_diff_request(&core, &mut rx);
+        assert_eq!(p_spaced.as_deref(), Some("report.txt "));
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_trimmed,
+                cwd: "/repo".into(),
+                path: Some("report.txt".into()),
+                unified_diff: "diff --git a/report.txt b/report.txt\n+trimmed-only\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_spaced,
+                cwd: "/repo".into(),
+                path: Some("report.txt ".into()),
+                unified_diff: "--- /dev/null\n+++ b/report.txt \n@@ -0,0 +1,1 @@\n+spaced-only\n"
+                    .into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let view_trimmed = core.git_review_for_mode(&host_id, "/repo", Some("report.txt"), false);
+        let view_spaced = core.git_review_for_mode(&host_id, "/repo", Some("report.txt "), false);
+        let view_dot_spaced =
+            core.git_review_for_mode(&host_id, "/repo", Some("./report.txt "), false);
+        assert!(view_trimmed.raw_diff.contains("+trimmed-only"));
+        assert!(!view_trimmed.raw_diff.contains("+spaced-only"));
+        assert!(view_spaced.raw_diff.contains("+spaced-only"));
+        assert_eq!(view_dot_spaced.raw_diff, view_spaced.raw_diff);
+        assert_eq!(view_dot_spaced.diff_revision, view_spaced.diff_revision);
+
+        // 6b. Disconnect purges in-flight pending_git_diff_requests -> late reply is dropped!
+        core.fetch_git_diff(&host_id, "/repo", Some("after_drop.txt"), false);
+        let (req_pre_drop, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_unexpected_disconnect(&host_id, Some(1));
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_pre_drop,
+                cwd: "/repo".into(),
+                path: Some("after_drop.txt".into()),
+                unified_diff: "diff --git a/after_drop.txt b/after_drop.txt\n+stale-after-disconnect\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let dropped_view =
+            core.git_review_for_mode(&host_id, "/repo", Some("after_drop.txt"), false);
+        assert_eq!(dropped_view.diff_revision, 0);
+        assert!(dropped_view.raw_diff.is_empty());
+
+        // Unknown request_id is also dropped!
         core.handle_inbound_wire(
             &host_id,
             WireMessage::GitDiffResponse {
                 request_id: Uuid::new_v4(),
-                cwd: "~/project".into(),
-                path: None,
-                unified_diff: pa_diff.into(),
+                cwd: "/repo".into(),
+                path: Some("after_drop.txt".into()),
+                unified_diff: "diff --git a/after_drop.txt b/after_drop.txt\n+unknown-req\n".into(),
+                repo_root: None,
+                repo_prefix: None,
             },
         );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("after_drop.txt"), false)
+                .diff_revision,
+            0
+        );
+    }
+
+    #[test]
+    fn git_diff_watermark_drops_stale_u1_after_mutation_eviction_and_while_u2_in_flight() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // Case A (R13-P1-2): U1 & U2 dispatched -> U2 arrives -> GitMutationResult clears cache
+        // with empty files -> late U1 MUST be dropped (diff_revision stays 0, raw_diff empty).
+        core.fetch_git_diff(&host_id, "/repo", Some("README.md"), false);
+        let (u1_id, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo", Some("README.md"), false);
+        let (u2_id, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: u2_id,
+                cwd: "/repo".into(),
+                path: Some("README.md".into()),
+                unified_diff: "diff --git a/README.md b/README.md\n+u2-body\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let after_u2 = core.git_review_for_mode(&host_id, "/repo", Some("README.md"), false);
+        assert_eq!(after_u2.diff_revision, 1);
+        assert!(after_u2.raw_diff.contains("+u2-body"));
+
+        // Mutation succeeds with clean empty status -> evicts cache AND invalidates pre-mutation U1!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::FilesUnstaged {
+                    paths: vec!["README.md".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        let after_evict = core.git_review_for_mode(&host_id, "/repo", Some("README.md"), false);
+        assert_eq!(after_evict.diff_revision, 0);
+        assert!(after_evict.raw_diff.is_empty());
+
+        // Late U1 arrives after mutation cache eviction -> MUST be rejected!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: u1_id,
+                cwd: "/repo".into(),
+                path: Some("README.md".into()),
+                unified_diff: "diff --git a/README.md b/README.md\n+old-uncommitted\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let after_late_u1 = core.git_review_for_mode(&host_id, "/repo", Some("README.md"), false);
+        assert_eq!(after_late_u1.diff_revision, 0);
+        assert!(after_late_u1.raw_diff.is_empty());
+        assert!(after_late_u1.diff_files.is_empty());
+
+        // Case B (R13-P1-2): U1 & U2 both in-flight -> U1 arrives FIRST -> MUST be dropped so
+        // refreshing view stays unconfirmed until U2 arrives!
+        core.fetch_git_diff(&host_id, "/repo", Some("app.rs"), false);
+        let (in_flight_u1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo", Some("app.rs"), false);
+        let (in_flight_u2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: in_flight_u1,
+                cwd: "/repo".into(),
+                path: Some("app.rs".into()),
+                unified_diff: "diff --git a/app.rs b/app.rs\n+old-of-two\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let while_waiting_u2 = core.git_review_for_mode(&host_id, "/repo", Some("app.rs"), false);
+        assert_eq!(while_waiting_u2.diff_revision, 0);
+        assert!(while_waiting_u2.raw_diff.is_empty());
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: in_flight_u2,
+                cwd: "/repo".into(),
+                path: Some("app.rs".into()),
+                unified_diff: "diff --git a/app.rs b/app.rs\n+new-of-two\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let after_in_flight_u2 = core.git_review_for_mode(&host_id, "/repo", Some("app.rs"), false);
+        assert_eq!(after_in_flight_u2.diff_revision, 2);
+        assert!(after_in_flight_u2.raw_diff.contains("+new-of-two"));
+        assert!(!after_in_flight_u2.raw_diff.contains("+old-of-two"));
+    }
+
+    #[test]
+    fn git_diff_canonical_cwd_key_isolates_same_basename_users_and_merges_dot_aliases() {
+        // Pure key normalization & idempotence checks
+        assert_eq!(canonical_git_cwd_key("/repo/.", None), "/repo");
+        assert_eq!(canonical_git_cwd_key("/a/./b/", None), "/a/b");
+        assert_eq!(canonical_git_cwd_key("/repo/dir ", None), "/repo/dir ");
+        assert_eq!(
+            canonical_git_cwd_key(r"/repo/foo\bar/.", None),
+            r"/repo/foo\bar"
+        );
+        assert_eq!(canonical_git_cwd_key("~/proj/.", None), "~/proj");
+        assert_eq!(
+            canonical_git_cwd_key("~/proj/.", Some("/Users/owner/")),
+            "/Users/owner/proj"
+        );
+        let win_drive = canonical_git_cwd_key(r"C:\Users\owner\.\proj\", None);
+        assert_eq!(win_drive, "C:/Users/owner/proj");
+        assert_eq!(canonical_git_cwd_key(&win_drive, None), win_drive);
+        let win_unc = canonical_git_cwd_key(r"\\server\share\.\proj\", None);
+        assert_eq!(win_unc, "//server/share/proj");
+        assert_eq!(canonical_git_cwd_key(&win_unc, None), win_unc);
+
+        // R13-P1-3 Part 1: Without authoritative home dir, `/Users/owner/proj`,
+        // `/Users/customer/proj`, and `~/proj` are 3 strictly isolated slots!
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        core.fetch_git_diff(&host_id, "/Users/owner/proj", Some("f"), false);
+        let (req_owner, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/Users/customer/proj", Some("f"), false);
+        let (req_customer, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "~/proj", Some("f"), false);
+        let (req_tilde, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_owner,
+                cwd: "/Users/owner/proj".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+owner-content\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_customer,
+                cwd: "/Users/customer/proj".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+customer-content\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_tilde,
+                cwd: "~/proj".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+home-updated\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+
+        let v_owner = core.git_review_for_mode(&host_id, "/Users/owner/proj", Some("f"), false);
+        let v_customer =
+            core.git_review_for_mode(&host_id, "/Users/customer/proj", Some("f"), false);
+        let v_tilde = core.git_review_for_mode(&host_id, "~/proj", Some("f"), false);
+        assert!(v_owner.raw_diff.contains("+owner-content"));
+        assert!(v_customer.raw_diff.contains("+customer-content"));
+        assert!(!v_customer.raw_diff.contains("+home-updated"));
+        assert!(v_tilde.raw_diff.contains("+home-updated"));
+
+        // R13-P1-3 Part 2: `/repo` and `/repo/.` share a single cache entry and revision!
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), false);
+        let (req_r1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_r1,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+repo-v1\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.fetch_git_diff(&host_id, "/repo/.", Some("f"), false);
+        let (req_r2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_r2,
+                cwd: "/repo/.".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+repo-v2\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let view_plain = core.git_review_for_mode(&host_id, "/repo", Some("f"), false);
+        let view_dot = core.git_review_for_mode(&host_id, "/repo/.", Some("f"), false);
+        assert_eq!(view_plain.diff_revision, view_dot.diff_revision);
+        assert_eq!(view_plain.raw_diff, view_dot.raw_diff);
+        assert!(view_plain.raw_diff.contains("+repo-v2"));
+
+        // R13-P1-3 Part 3: With explicit authoritative_home_dir = `/Users/owner`, `~/proj` maps
+        // strictly to `/Users/owner/proj` and NEVER touches `/Users/customer/proj`!
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts
+                .get_mut(&host_id)
+                .expect("host")
+                .authoritative_home_dir = Some("/Users/owner".to_string());
+        }
+        core.fetch_git_diff(&host_id, "~/proj", Some("f"), false);
+        let (req_auth_tilde, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_auth_tilde,
+                cwd: "~/proj".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+owner-home-expanded\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v_owner_after =
+            core.git_review_for_mode(&host_id, "/Users/owner/proj/.", Some("f"), false);
+        let v_customer_after =
+            core.git_review_for_mode(&host_id, "/Users/customer/proj", Some("f"), false);
+        assert!(v_owner_after.raw_diff.contains("+owner-home-expanded"));
+        assert!(v_customer_after.raw_diff.contains("+customer-content"));
+        assert!(!v_customer_after.raw_diff.contains("+owner-home-expanded"));
+    }
+
+    #[test]
+    fn legacy_three_arg_git_review_prefers_latest_diff_revision_per_path_across_other_file_requests()
+     {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // Part 1 (R13-P1-4): Cache f/S (rev 1) -> cache f/U (rev 2) -> request g/S ->
+        // 3-arg git_review(H, /repo, Some("f")) MUST still return f/U (rev 2), while explicit
+        // false -> rev 2 and explicit true -> rev 1!
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), true);
+        let (req_fs, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_fs,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+index-only\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+
+        core.fetch_git_diff(&host_id, "/repo", Some("f"), false);
+        let (req_fu, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_fu,
+                cwd: "/repo".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+worktree-newer\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+
+        let before_g = core.git_review(&host_id, "/repo", Some("f"));
+        assert!(!before_g.staged);
+        assert_eq!(before_g.diff_revision, 2);
+        assert!(before_g.raw_diff.contains("+worktree-newer"));
+
+        // Request g/S in the same cwd (updates cwd-level last_git_diff_staged to true)
+        core.fetch_git_diff(&host_id, "/repo", Some("g"), true);
+        let (_req_gs, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        let after_g_legacy = core.git_review(&host_id, "/repo", Some("f"));
+        assert!(!after_g_legacy.staged);
+        assert_eq!(after_g_legacy.diff_revision, 2);
+        assert!(after_g_legacy.raw_diff.contains("+worktree-newer"));
+
+        let explicit_u = core.git_review_for_mode(&host_id, "/repo", Some("f"), false);
+        let explicit_s = core.git_review_for_mode(&host_id, "/repo", Some("f"), true);
+        assert_eq!(explicit_u.diff_revision, 2);
+        assert!(explicit_u.raw_diff.contains("+worktree-newer"));
+        assert_eq!(explicit_s.diff_revision, 1);
+        assert!(explicit_s.raw_diff.contains("+index-only"));
+
+        // Part 2 (R13-P1-4): When `only_u.txt` has ONLY Unstaged cached (never Staged), requesting
+        // another file's Staged (`other.txt/S`) MUST NOT make 3-arg git_review return empty!
+        core.fetch_git_diff(&host_id, "/repo2", Some("only_u.txt"), false);
+        let (req_only_u, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_only_u,
+                cwd: "/repo2".into(),
+                path: Some("only_u.txt".into()),
+                unified_diff: "diff --git a/only_u.txt b/only_u.txt\n+only-u-body\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.fetch_git_diff(&host_id, "/repo2", Some("other.txt"), true);
+        let (_req_other_s, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        let legacy_only_u = core.git_review(&host_id, "/repo2", Some("only_u.txt"));
+        assert!(!legacy_only_u.staged);
+        assert!(legacy_only_u.diff_revision > 0);
+        assert!(legacy_only_u.raw_diff.contains("+only-u-body"));
+    }
+
+    #[test]
+    fn posix_double_slash_backslash_cwd_never_collides_and_windows_unc_stays_idempotent() {
+        use crate::viewmodel::{
+            GitPathFlavor, canonical_git_cwd_key, canonical_git_cwd_key_for_flavor,
+        };
+
+        // 1. Direct helper tests (R14-P1-4):
+        // Unknown platform: `//tmp/aa\bb` MUST NOT convert `\` to `/`!
+        assert_eq!(canonical_git_cwd_key(r"//tmp/aa\bb", None), r"//tmp/aa\bb");
+        assert_eq!(canonical_git_cwd_key("//tmp/aa/bb", None), "//tmp/aa/bb");
+        assert_ne!(
+            canonical_git_cwd_key(r"//tmp/aa\bb", None),
+            canonical_git_cwd_key("//tmp/aa/bb", None)
+        );
+        // Windows UNC backslash input normalizes to `//server/share/dir` and stays idempotent!
+        let unc_norm = canonical_git_cwd_key(r"\\server\share\.\proj\", None);
+        assert_eq!(unc_norm, "//server/share/proj");
+        assert_eq!(canonical_git_cwd_key(&unc_norm, None), unc_norm);
+        assert_eq!(
+            canonical_git_cwd_key("//server/share/./proj/", None),
+            unc_norm
+        );
+        // Confirmed POSIX host: `//tmp/aa\bb` collapses leading `//` to `/tmp/aa\bb` (same inode)
+        // while keeping `\` literal (distinct from `/tmp/aa/bb` and `//tmp/aa/bb`).
+        assert_eq!(
+            canonical_git_cwd_key_for_flavor(r"//tmp/aa\bb", None, GitPathFlavor::Posix),
+            r"/tmp/aa\bb"
+        );
+        assert_eq!(
+            canonical_git_cwd_key_for_flavor("//tmp/aa/bb", None, GitPathFlavor::Posix),
+            "/tmp/aa/bb"
+        );
+        // Confirmed Windows host: `//server/share\proj` and `\\server\share\proj` both match!
+        assert_eq!(
+            canonical_git_cwd_key_for_flavor(r"//server/share\proj", None, GitPathFlavor::Windows),
+            "//server/share/proj"
+        );
+
+        // 2. Full `OrbitAppCore` host-scoped isolation test with `//tmp/aa\bb` vs `//tmp/aa/bb`:
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+        // Unknown platform remote host (`is_local = false`, `authoritative_home_dir = None`):
+        core.fetch_git_diff(&host_id, r"//tmp/aa\bb", Some("f"), false);
+        let (req_bs, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_bs,
+                cwd: r"//tmp/aa\bb".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+single-dir-body\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.fetch_git_diff(&host_id, "//tmp/aa/bb", Some("f"), false);
+        let (req_nested, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_nested,
+                cwd: "//tmp/aa/bb".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+nested-dir-body\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v_bs = core.git_review_for_mode(&host_id, r"//tmp/aa\bb", Some("f"), false);
+        let v_nested = core.git_review_for_mode(&host_id, "//tmp/aa/bb", Some("f"), false);
+        assert!(v_bs.raw_diff.contains("+single-dir-body"));
+        assert!(!v_bs.raw_diff.contains("+nested-dir-body"));
+        assert!(v_nested.raw_diff.contains("+nested-dir-body"));
+        assert!(!v_nested.raw_diff.contains("+single-dir-body"));
+
+        // Confirmed POSIX host (explicit POSIX home `/Users/dev`): `//tmp/aa\bb` and `/tmp/aa\bb`
+        // address the same inode while remaining isolated from `//tmp/aa/bb` and `/tmp/aa/bb`.
+        {
+            let mut guard = core.hosts.write().expect("hosts write lock");
+            guard
+                .get_mut(&host_id)
+                .expect("host")
+                .authoritative_home_dir = Some("/Users/dev".into());
+        }
+        core.fetch_git_diff(&host_id, r"//tmp/aa\bb", Some("f"), false);
+        let (req_posix_bs, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_posix_bs,
+                cwd: r"//tmp/aa\bb".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+posix-single-dir\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.fetch_git_diff(&host_id, "//tmp/aa/bb", Some("f"), false);
+        let (req_posix_nested, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_posix_nested,
+                cwd: "//tmp/aa/bb".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+posix-nested-dir\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v_posix_single = core.git_review_for_mode(&host_id, r"/tmp/aa\bb", Some("f"), false);
+        let v_posix_double = core.git_review_for_mode(&host_id, r"//tmp/aa\bb", Some("f"), false);
+        let v_posix_nested = core.git_review_for_mode(&host_id, "/tmp/aa/bb", Some("f"), false);
+        assert!(v_posix_single.raw_diff.contains("+posix-single-dir"));
+        assert_eq!(v_posix_single.diff_revision, v_posix_double.diff_revision);
+        assert!(v_posix_nested.raw_diff.contains("+posix-nested-dir"));
+        assert!(!v_posix_single.raw_diff.contains("+posix-nested-dir"));
+    }
+
+    #[test]
+    fn mutation_redispatches_remaining_in_flight_single_file_and_retains_utf8_confirmed_diff() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // 1. Pre-confirm a UTF-8 file `说明.txt` (R14-P1-6) BEFORE staging sibling `f`.
+        core.fetch_git_diff(&host_id, "/repo", Some("说明.txt"), false);
+        let (req_utf8, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_utf8,
+                cwd: "/repo".into(),
+                path: Some("说明.txt".into()),
+                unified_diff: "diff --git a/说明.txt b/说明.txt\n+utf8-confirmed\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("说明.txt"), false)
+                .diff_revision,
+            1
+        );
+
+        // 2. While staging `f` is in flight, user opens `g` (dispatches pre-mutation `g/U`),
+        //    has an in-flight refresh for literal UTF-8 `说明.txt/U`, AND has an unrelated stale
+        //    request for `cleaned.txt/U` in flight.
+        core.fetch_git_diff(&host_id, "/repo", Some("g"), false);
+        let (req_g_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo", Some("说明.txt"), false);
+        let (req_utf8_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo", Some("cleaned.txt"), false);
+        let (req_cleaned_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        // 3. `f`'s Stage succeeds with `status` containing `f` (staged), `g` (unstaged), and
+        //    literal unquoted `说明.txt` (unstaged), while `cleaned.txt` is no longer dirty.
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "说明.txt".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+
+        // R17-P1-2 / R17-P1-4: All pre-mutation worktree cached diffs are unconditionally evicted
+        // while post-mutation status preserves literal unquoted `说明.txt` (R14-P1-6).
+        let utf8_after_evict = core.git_review_for_mode(&host_id, "/repo", Some("说明.txt"), false);
+        assert_eq!(utf8_after_evict.diff_revision, 0);
+        assert!(
+            utf8_after_evict
+                .status
+                .as_ref()
+                .is_some_and(|s| s.files.iter().any(|e| e.path == "说明.txt" && !e.staged))
+        );
+
+        // R14-P1-5 / R14-P1-6: Both `g/U` and literal UTF-8 `说明.txt/U` MUST be automatically
+        // re-dispatched with NEW request_ids while `cleaned.txt/U` MUST NOT be re-dispatched!
+        let mut redispatched = HashMap::new();
+        for _ in 0..2 {
+            let (req_id, cwd, path, staged) = recv_git_diff_request(&core, &mut rx);
+            assert_eq!(cwd, "/repo");
+            assert!(!staged);
+            redispatched.insert(path.expect("path"), req_id);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "cleaned.txt must NOT be re-dispatched when absent from post-mutation status"
+        );
+        let req_g_post = *redispatched.get("g").expect("g redispatched");
+        let req_utf8_post = *redispatched.get("说明.txt").expect("说明.txt redispatched");
+        assert_ne!(req_g_post, req_g_pre);
+        assert_ne!(req_utf8_post, req_utf8_pre);
+
+        // Pre-mutation replies for `g`, `说明.txt`, and `cleaned.txt` MUST still be dropped!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_g_pre,
+                cwd: "/repo".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/g b/g\n+stale-g-pre-mutation\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_utf8_pre,
+                cwd: "/repo".into(),
+                path: Some("说明.txt".into()),
+                unified_diff: "diff --git a/说明.txt b/说明.txt\n+stale-utf8-pre\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_cleaned_pre,
+                cwd: "/repo".into(),
+                path: Some("cleaned.txt".into()),
+                unified_diff: "diff --git a/cleaned.txt b/cleaned.txt\n+stale-cleaned\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("g"), false)
+                .diff_revision,
+            0
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("说明.txt"), false)
+                .diff_revision,
+            0
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo", Some("cleaned.txt"), false)
+                .diff_revision,
+            0
+        );
+
+        // Post-mutation replies for `g/U` and `说明.txt/U` MUST be accepted and confirm!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_g_post,
+                cwd: "/repo".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/g b/g\n+g-working\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_utf8_post,
+                cwd: "/repo".into(),
+                path: Some("说明.txt".into()),
+                unified_diff: "diff --git a/说明.txt b/说明.txt\n+utf8-confirmed\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let g_after = core.git_review_for_mode(&host_id, "/repo", Some("g"), false);
+        assert_eq!(g_after.diff_revision, 2);
+        assert!(g_after.raw_diff.contains("+g-working"));
+        let utf8_after = core.git_review_for_mode(&host_id, "/repo", Some("说明.txt"), false);
+        assert_eq!(utf8_after.diff_revision, 3);
+        assert!(utf8_after.raw_diff.contains("+utf8-confirmed"));
+    }
+
+    #[test]
+    fn mutation_redispatches_untracked_dir_subdir_cwd_and_dir_query_while_rejecting_stale_u1() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // Case 1 (R15-P1-3): Root cwd requests untracked `bucket/new.txt`, while porcelain status
+        // collapses the untracked directory to `bucket/`.
+        core.fetch_git_diff(&host_id, "/repo_a", Some("bucket/new.txt"), false);
+        let (req_untracked_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo_a", Some("bucket2/other.txt"), false);
+        let (_req_sibling_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo_a".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo_a".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "bucket/".into(),
+                            status: "??".into(),
+                            staged: false,
+                            untracked: true,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        let (req_untracked_post, cwd_a, path_a, staged_a) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_untracked_post, req_untracked_pre);
+        assert_eq!(cwd_a, "/repo_a");
+        assert_eq!(path_a.as_deref(), Some("bucket/new.txt"));
+        assert!(!staged_a);
+        assert!(
+            rx.try_recv().is_err(),
+            "unrelated `bucket2/other.txt` must NOT match `bucket/`"
+        );
+        // Pre-mutation reply dropped; post-mutation reply confirmed!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_untracked_pre,
+                cwd: "/repo_a".into(),
+                path: Some("bucket/new.txt".into()),
+                unified_diff: "--- /dev/null\n+++ b/bucket/new.txt\n+stale\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo_a", Some("bucket/new.txt"), false)
+                .diff_revision,
+            0
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_untracked_post,
+                cwd: "/repo_a".into(),
+                path: Some("bucket/new.txt".into()),
+                unified_diff: "--- /dev/null\n+++ b/bucket/new.txt\n+g-working\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v_a = core.git_review_for_mode(&host_id, "/repo_a", Some("bucket/new.txt"), false);
+        assert!(v_a.diff_revision > 0);
+        assert!(v_a.raw_diff.contains("+g-working"));
+
+        // Case 2 (R15-P1-3): Subdirectory cwd `/repo_b/pkg` requests `g`, while porcelain status
+        // lists repo-root-relative `pkg/g` (and duplicate in-flight `g` requests deduplicate to 1!).
+        core.fetch_git_diff(&host_id, "/repo_b/pkg", Some("g"), false);
+        let (req_sub_pre1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo_b/pkg", Some("g"), false);
+        let (_req_sub_pre2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo_b/pkg".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["pkg/f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo_b/pkg".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some("pkg".into()),
+                    repo_root: None,
+                }),
+            },
+        );
+        let (req_sub_post, cwd_b, path_b, staged_b) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_sub_post, req_sub_pre1);
+        assert_eq!(cwd_b, "/repo_b/pkg");
+        assert_eq!(path_b.as_deref(), Some("g"));
+        assert!(!staged_b);
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate invalidated `g` requests must deduplicate to a single re-dispatch"
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_sub_post,
+                cwd: "/repo_b/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+g-working\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v_b = core.git_review_for_mode(&host_id, "/repo_b/pkg", Some("g"), false);
+        assert!(v_b.diff_revision > 0);
+        assert!(v_b.raw_diff.contains("+g-working"));
+
+        // Case 3 (R15-P1-3): Directory query `d` while porcelain status lists child file `d/g`
+        // (and unrelated `docs/g` must NOT match directory `d`).
+        core.fetch_git_diff(&host_id, "/repo_c", Some("d"), false);
+        let (req_dir_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo_c", Some("other_dir"), false);
+        let (_req_other_dir_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo_c".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo_c".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "d/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        let (req_dir_post, cwd_c, path_c, staged_c) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_dir_post, req_dir_pre);
+        assert_eq!(cwd_c, "/repo_c");
+        assert_eq!(path_c.as_deref(), Some("d"));
+        assert!(!staged_c);
+        assert!(rx.try_recv().is_err());
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_dir_post,
+                cwd: "/repo_c".into(),
+                path: Some("d".into()),
+                unified_diff: "diff --git a/d/g b/d/g\n+g-working\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let v_c = core.git_review_for_mode(&host_id, "/repo_c", Some("d"), false);
+        assert!(v_c.diff_revision > 0);
+        assert!(v_c.raw_diff.contains("+g-working"));
+
+        // Negative control: clean repo (`files: []`) never re-dispatches and still drops stale U1!
+        core.fetch_git_diff(&host_id, "/repo_clean", Some("d"), false);
+        let (req_clean_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo_clean".into(),
+                result: GitMutationOutcome::FilesUnstaged {
+                    paths: vec!["d/g".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo_clean".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "clean repo must emit 0 re-dispatches"
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_clean_pre,
+                cwd: "/repo_clean".into(),
+                path: Some("d".into()),
+                unified_diff: "diff --git a/d/g b/d/g\n+stale-after-clean\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo_clean", Some("d"), false)
+                .diff_revision,
+            0
+        );
+    }
+
+    #[test]
+    fn repo_prefix_isolates_same_basename_root_file_and_staged_mode_evicts_am_to_a_unstaged() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // 1. R16-P1-1: Root `README.md` is confirmed (`+old-uncommitted`), then restored clean,
+        //    while ONLY `f` (staged) and `other/README.md` (unstaged) remain dirty.
+        //    Root `README.md` MUST be evicted (`diff_revision == 0`, 0 diff files) AND an in-flight
+        //    U1 for root `README.md` MUST NOT trigger any re-dispatch!
+        core.fetch_git_diff(&host_id, "/repo_same", Some("README.md"), false);
+        let (req_root_1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_root_1,
+                cwd: "/repo_same".into(),
+                path: Some("README.md".into()),
+                unified_diff: "diff --git a/README.md b/README.md\n+old-uncommitted\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo_same", Some("README.md"), false)
+                .diff_revision,
+            1
+        );
+
+        // Also leave a pre-mutation in-flight U1 for root `README.md`
+        core.fetch_git_diff(&host_id, "/repo_same", Some("README.md"), false);
+        let (req_root_inflight, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo_same".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo_same".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "other/README.md".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "clean root README.md must emit 0 re-dispatches even when other/README.md is dirty"
+        );
+        let root_after = core.git_review_for_mode(&host_id, "/repo_same", Some("README.md"), false);
+        assert_eq!(root_after.diff_revision, 0);
+        assert!(root_after.diff_files.is_empty());
+        assert!(root_after.raw_diff.is_empty());
+
+        // Late U1 reply MUST also be dropped!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_root_inflight,
+                cwd: "/repo_same".into(),
+                path: Some("README.md".into()),
+                unified_diff: "diff --git a/README.md b/README.md\n+late-old-uncommitted\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo_same", Some("README.md"), false)
+                .diff_revision,
+            0
+        );
+
+        // 2. R16-P1-2: `AM -> A ` transition on single-file `f/U`:
+        //    `f/U` was ALREADY confirmed with `+worktree-only` before Stage ack arrived; Stage
+        //    moves `f` to `A ` (staged=true ONLY, NO staged=false).
+        //    `f/U` MUST be evicted immediately (`diff_revision == 0`, 0 diff files, 0 re-dispatches),
+        //    while an in-flight `f/S` STILL matching `staged=true` IS re-dispatched once!
+        core.fetch_git_diff(&host_id, "/repo_am", Some("f"), false);
+        let (req_fu, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_fu,
+                cwd: "/repo_am".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+worktree-only\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert!(
+            core.git_review_for_mode(&host_id, "/repo_am", Some("f"), false)
+                .diff_revision
+                > 0
+        );
+        // Leave both `f/U` and `f/S` in-flight when Stage completes (`AM -> A `)
+        core.fetch_git_diff(&host_id, "/repo_am", Some("f"), false);
+        let (req_fu_inflight, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/repo_am", Some("f"), true);
+        let (req_fs_inflight, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/repo_am".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/repo_am".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "A".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+
+        // `f/U` MUST be evicted immediately and NOT re-dispatched!
+        let fu_after = core.git_review_for_mode(&host_id, "/repo_am", Some("f"), false);
+        assert_eq!(fu_after.diff_revision, 0);
+        assert!(fu_after.diff_files.is_empty());
+        assert!(fu_after.raw_diff.is_empty());
+
+        // ONLY `f/S` (staged=true) is re-dispatched with a fresh UUID!
+        let (req_fs_post, cwd_fs, path_fs, staged_fs) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_fs_post, req_fs_inflight);
+        assert_eq!(cwd_fs, "/repo_am");
+        assert_eq!(path_fs.as_deref(), Some("f"));
+        assert!(staged_fs);
+        assert!(
+            rx.try_recv().is_err(),
+            "f/U must NOT be re-dispatched when status has ONLY staged=true for f"
+        );
+
+        // Pre-mutation replies for `f/U` and `f/S` are dropped; post-mutation `f/S` confirms!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_fu_inflight,
+                cwd: "/repo_am".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+stale-worktree\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/repo_am", Some("f"), false)
+                .diff_revision,
+            0
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_fs_post,
+                cwd: "/repo_am".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+index-updated\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let fs_after = core.git_review_for_mode(&host_id, "/repo_am", Some("f"), true);
+        assert!(fs_after.diff_revision > 0);
+        assert!(fs_after.raw_diff.contains("+index-updated"));
+    }
+
+    #[test]
+    fn round17_worktree_eviction_cross_cwd_sync_untracked_dir_and_legacy_daemon_fallback() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        // Capture emitted `CoreNotification::GitChanged` cwds for R17-P1-2 verification.
+        struct GitChangedRecorder(Arc<Mutex<Vec<String>>>);
+        impl CoreEventSubscriber for GitChangedRecorder {
+            fn on_notification(&self, event: CoreNotification) {
+                if let CoreNotification::GitChanged { cwd, .. } = event
+                    && let Ok(mut g) = self.0.lock()
+                {
+                    g.push(cwd);
+                }
+            }
+        }
+        let git_changed_cwds = Arc::new(Mutex::new(Vec::<String>::new()));
+        core.subscribe(Arc::new(GitChangedRecorder(Arc::clone(&git_changed_cwds))));
+
+        // 1. R17-P1-2: Root `/tmp/wt` stages `pkg/f` while sibling `/tmp/wt/pkg` has confirmed
+        //    `f/U` (`+working-sub`), trailing-space `/tmp/wt ` has confirmed `f/U`, and nested
+        //    sub-repo `/tmp/wt/nested` (with its own `repo_prefix: Some("")`) has confirmed `f/U`.
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/wt/nested".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/wt/pkg", Some("f"), false);
+        let (req_sub_f, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/tmp/wt ", Some("f"), false);
+        let (req_spaced_f, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/tmp/wt/nested", Some("f"), false);
+        let (req_nested_f, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        for (rid, c, body, r_root, r_prefix) in [
+            (
+                req_sub_f,
+                "/tmp/wt/pkg",
+                "diff --git a/pkg/f b/pkg/f\n+working-sub\n",
+                Some("/tmp/wt".to_string()),
+                Some("pkg".to_string()),
+            ),
+            (
+                req_spaced_f,
+                "/tmp/wt ",
+                "diff --git a/f b/f\n+spaced-repo\n",
+                Some("/tmp/wt ".to_string()),
+                Some(String::new()),
+            ),
+            (
+                req_nested_f,
+                "/tmp/wt/nested",
+                "diff --git a/f b/f\n+nested-repo\n",
+                Some("/tmp/wt/nested".to_string()),
+                Some(String::new()),
+            ),
+        ] {
+            core.handle_inbound_wire(
+                &host_id,
+                WireMessage::GitDiffResponse {
+                    request_id: rid,
+                    cwd: c.into(),
+                    path: Some("f".into()),
+                    unified_diff: body.into(),
+                    repo_root: r_root,
+                    repo_prefix: r_prefix,
+                },
+            );
+            // R22-P1-1: cold cwds (`/tmp/wt/pkg`, `/tmp/wt `) auto-dispatch 1 GetGitStatus;
+            // `/tmp/wt/nested` already has status so emits 0.
+            if c != "/tmp/wt/nested" {
+                match core.runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                        .await
+                        .expect("wire timeout")
+                        .expect("wire closed")
+                }) {
+                    crate::OutboundPayload::Wire(WireMessage::GetGitStatus { cwd, .. }) => {
+                        assert_eq!(cwd, c);
+                    }
+                    other => panic!("expected auto GetGitStatus for cold {c}, got {other:?}"),
+                }
+            }
+        }
+        assert!(
+            core.git_review_for_mode(&host_id, "/tmp/wt/pkg", Some("f"), false)
+                .diff_revision
+                > 0
+        );
+        assert!(
+            core.git_review_for_mode(&host_id, "/tmp/wt ", Some("f"), false)
+                .diff_revision
+                > 0
+        );
+        assert!(
+            core.git_review_for_mode(&host_id, "/tmp/wt/nested", Some("f"), false)
+                .diff_revision
+                > 0
+        );
+
+        // Also place an in-flight `g/U` in `/tmp/wt/pkg` while `pkg/g` remains unstaged.
+        core.fetch_git_diff(&host_id, "/tmp/wt/pkg", Some("g"), false);
+        let (req_sub_g_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/wt".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["pkg/f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/wt".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+
+        // Subdir `/tmp/wt/pkg` `f/U` MUST be evicted immediately & receive updated status with
+        // `repo_prefix == Some("pkg")` plus a `GitChanged` notification!
+        let sub_f_after = core.git_review_for_mode(&host_id, "/tmp/wt/pkg", Some("f"), false);
+        assert_eq!(sub_f_after.diff_revision, 0);
+        assert!(sub_f_after.diff_files.is_empty());
+        assert!(sub_f_after.raw_diff.is_empty());
+        let sub_status = sub_f_after.status.expect("sibling status synced");
+        assert_eq!(sub_status.cwd, "/tmp/wt/pkg");
+        assert_eq!(sub_status.repo_prefix.as_deref(), Some("pkg"));
+
+        let notified = git_changed_cwds.lock().expect("lock").clone();
+        assert!(notified.iter().any(|c| c == "/tmp/wt"));
+        assert!(
+            notified.iter().any(|c| c == "/tmp/wt/pkg"),
+            "root mutation must notify sibling subdir `/tmp/wt/pkg`: {notified:?}"
+        );
+        assert!(!notified.iter().any(|c| c == "/tmp/wt "));
+        assert!(!notified.iter().any(|c| c == "/tmp/wt/nested"));
+
+        // Distinct repos (`/tmp/wt ` and nested `/tmp/wt/nested`) remain 100% isolated!
+        let spaced_after = core.git_review_for_mode(&host_id, "/tmp/wt ", Some("f"), false);
+        assert!(spaced_after.diff_revision > 0);
+        assert!(spaced_after.raw_diff.contains("+spaced-repo"));
+        let nested_after = core.git_review_for_mode(&host_id, "/tmp/wt/nested", Some("f"), false);
+        assert!(nested_after.diff_revision > 0);
+        assert!(nested_after.raw_diff.contains("+nested-repo"));
+
+        // Subdir in-flight `g/U` was invalidated & re-dispatched with a NEW UUID!
+        let (req_sub_g_post, cwd_sub_g, path_sub_g, staged_sub_g) =
+            recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_sub_g_post, req_sub_g_pre);
+        assert_eq!(cwd_sub_g, "/tmp/wt/pkg");
+        assert_eq!(path_sub_g.as_deref(), Some("g"));
+        assert!(!staged_sub_g);
+        // Drain coalesced post-mutation GetGitStatus(es) triggered by `/tmp/wt/pkg`'s in-flight
+        // cold status query overlapping with the root mutation:
+        while let Ok(frame) = rx.try_recv() {
+            match frame {
+                crate::OutboundPayload::Wire(WireMessage::GetGitStatus { cwd, .. }) => {
+                    assert!(cwd == "/tmp/wt" || cwd == "/tmp/wt/pkg");
+                }
+                other => panic!("unexpected extra wire in round17: {other:?}"),
+            }
+        }
+
+        // 2. R17-P1-4: Untracked directory summary (`bucket/`) MUST NOT preserve a stale confirmed
+        //    body for deleted `bucket/removed.txt` after a mutation!
+        core.fetch_git_diff(
+            &host_id,
+            "/tmp/bucket_repo",
+            Some("bucket/removed.txt"),
+            false,
+        );
+        let (req_bucket, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_bucket,
+                cwd: "/tmp/bucket_repo".into(),
+                path: Some("bucket/removed.txt".into()),
+                unified_diff: "--- /dev/null\n+++ b/bucket/removed.txt\n+obsolete-body\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert!(
+            core.git_review_for_mode(
+                &host_id,
+                "/tmp/bucket_repo",
+                Some("bucket/removed.txt"),
+                false
+            )
+            .diff_revision
+                > 0
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/bucket_repo".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/bucket_repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "bucket/".into(),
+                            status: "??".into(),
+                            staged: false,
+                            untracked: true,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
+                }),
+            },
+        );
+        let removed_after = core.git_review_for_mode(
+            &host_id,
+            "/tmp/bucket_repo",
+            Some("bucket/removed.txt"),
+            false,
+        );
+        assert_eq!(
+            removed_after.diff_revision, 0,
+            "R17-P1-4: deleted untracked child MUST be evicted even when `bucket/` summary remains"
+        );
+        assert!(removed_after.diff_files.is_empty());
+        assert!(removed_after.raw_diff.is_empty());
+
+        // 3. R17-P1-5: Legacy daemon omitting `repo_prefix` (`None`) on subdir `/tmp/legacy/pkg`
+        //    conservatively re-dispatches in-flight `g/U` when any unstaged file exists, drops old
+        //    UUID, and emits 0 re-dispatches when clean or staged-only!
+        core.fetch_git_diff(&host_id, "/tmp/legacy/pkg", Some("g"), false);
+        let (req_leg_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/legacy/pkg".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/legacy/pkg".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: None,
+                    repo_root: None,
+                }),
+            },
+        );
+        let (req_leg_post, cwd_leg, path_leg, staged_leg) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_leg_post, req_leg_pre);
+        assert_eq!(cwd_leg, "/tmp/legacy/pkg");
+        assert_eq!(path_leg.as_deref(), Some("g"));
+        assert!(!staged_leg);
+        // Old UUID dropped, new UUID confirmed:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_leg_pre,
+                cwd: "/tmp/legacy/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+stale-legacy\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/tmp/legacy/pkg", Some("g"), false)
+                .diff_revision,
+            0
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_leg_post,
+                cwd: "/tmp/legacy/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+g-working\n".into(),
+                repo_root: None,
+                repo_prefix: None,
+            },
+        );
+        let leg_after = core.git_review_for_mode(&host_id, "/tmp/legacy/pkg", Some("g"), false);
+        assert!(leg_after.diff_revision > 0);
+        assert!(leg_after.raw_diff.contains("+g-working"));
+
+        // Negative control for legacy daemon (`repo_prefix: None`): staged-only status emits 0
+        // re-dispatches for an in-flight unstaged request!
+        core.fetch_git_diff(&host_id, "/tmp/legacy_staged/pkg", Some("g"), false);
+        let (_req_leg_s_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/legacy_staged/pkg".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/legacy_staged/pkg".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "pkg/f".into(),
+                        status: "A".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: None,
+                    repo_root: None,
+                }),
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "legacy daemon with staged-only status must emit 0 re-dispatches for unstaged requests"
+        );
+    }
+
+    #[test]
+    fn round18_authoritative_repo_root_isolates_cold_nested_repo_syncs_symlinks_and_redispatches_whole_repo_none()
+     {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        struct GitChangedRecorder(Arc<Mutex<Vec<String>>>);
+        impl CoreEventSubscriber for GitChangedRecorder {
+            fn on_notification(&self, event: CoreNotification) {
+                if let CoreNotification::GitChanged { cwd, .. } = event
+                    && let Ok(mut g) = self.0.lock()
+                {
+                    g.push(cwd);
+                }
+            }
+        }
+        let git_changed_cwds = Arc::new(Mutex::new(Vec::<String>::new()));
+        core.subscribe(Arc::new(GitChangedRecorder(Arc::clone(&git_changed_cwds))));
+
+        // 1. R18-P1-1: Independent nested repo `/outer/vendor` receives its `GitDiffResponse`
+        //    (`+independent-body`) BEFORE its first `GitStatusResponse`. Outer `/outer` then
+        //    stages `f`. Outer MUST NOT clear `/outer/vendor`, copy outer status to it, or notify it!
+        core.fetch_git_diff(&host_id, "/outer/vendor", Some("f"), false);
+        let (req_vendor, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_vendor,
+                cwd: "/outer/vendor".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+independent-body\n".into(),
+                repo_root: Some("/private/outer/vendor".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // R22-P1-1: first cold diff on `/outer/vendor` auto-dispatches 1 GetGitStatus.
+        match core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("wire timeout")
+                .expect("wire closed")
+        }) {
+            crate::OutboundPayload::Wire(WireMessage::GetGitStatus { cwd, .. }) => {
+                assert_eq!(cwd, "/outer/vendor");
+            }
+            other => panic!("expected auto GetGitStatus for /outer/vendor, got {other:?}"),
+        }
+        let vendor_pre = core.git_review_for_mode(&host_id, "/outer/vendor", Some("f"), false);
+        assert!(vendor_pre.diff_revision > 0);
+        assert!(vendor_pre.raw_diff.contains("+independent-body"));
+
+        // Also start TWO completely cold-start in-flight diffs (neither status nor diff arrived yet):
+        // (a) independent `/outer/vendor2` (`f/U`)
+        // (b) same-worktree cold subdir `/outer/cold_pkg` (`g/U`)
+        core.fetch_git_diff(&host_id, "/outer/vendor2", Some("f"), false);
+        let (req_vendor2_cold, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/outer/cold_pkg", Some("g"), false);
+        let (req_cold_pkg_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/outer".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/outer".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "cold_pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/outer".into()),
+                }),
+            },
+        );
+        let notified_after_outer = git_changed_cwds.lock().expect("lock").clone();
+        assert_eq!(notified_after_outer, vec!["/outer".to_string()]);
+        let vendor_after = core.git_review_for_mode(&host_id, "/outer/vendor", Some("f"), false);
+        assert_eq!(vendor_after.diff_revision, vendor_pre.diff_revision);
+        assert!(vendor_after.raw_diff.contains("+independent-body"));
+        assert!(
+            vendor_after.status.is_none(),
+            "outer status must NEVER be copied onto independent nested vendor repo"
+        );
+
+        // Cold independent `/outer/vendor2` reply arrives -> accepted cleanly because its
+        // authoritative `repo_root` has no mutation watermark!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_vendor2_cold,
+                cwd: "/outer/vendor2".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+vendor2-independent\n".into(),
+                repo_root: Some("/private/outer/vendor2".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // R22-P1-1: first cold diff on `/outer/vendor2` auto-dispatches 1 GetGitStatus.
+        match core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("wire timeout")
+                .expect("wire closed")
+        }) {
+            crate::OutboundPayload::Wire(WireMessage::GetGitStatus { cwd, .. }) => {
+                assert_eq!(cwd, "/outer/vendor2");
+            }
+            other => panic!("expected auto GetGitStatus for /outer/vendor2, got {other:?}"),
+        }
+        let v2_after = core.git_review_for_mode(&host_id, "/outer/vendor2", Some("f"), false);
+        assert!(v2_after.diff_revision > 0);
+        assert!(v2_after.raw_diff.contains("+vendor2-independent"));
+
+        // Cold same-worktree `/outer/cold_pkg` stale pre-mutation reply arrives -> rejected by
+        // `latest_mutation_watermark_by_repo_root["/private/outer"]` and re-dispatched ONCE!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_cold_pkg_pre,
+                cwd: "/outer/cold_pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/cold_pkg/g b/cold_pkg/g\n+stale-cold-pkg\n".into(),
+                repo_root: Some("/private/outer".into()),
+                repo_prefix: Some("cold_pkg".into()),
+            },
+        );
+        let cold_pkg_rejected =
+            core.git_review_for_mode(&host_id, "/outer/cold_pkg", Some("g"), false);
+        assert_eq!(cold_pkg_rejected.diff_revision, 0);
+        assert!(cold_pkg_rejected.diff_in_flight);
+        let (req_cold_pkg_post, cwd_cp, path_cp, staged_cp) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_cold_pkg_post, req_cold_pkg_pre);
+        assert_eq!(cwd_cp, "/outer/cold_pkg");
+        assert_eq!(path_cp.as_deref(), Some("g"));
+        assert!(!staged_cp);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_cold_pkg_post,
+                cwd: "/outer/cold_pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/cold_pkg/g b/cold_pkg/g\n+fresh-cold-pkg\n".into(),
+                repo_root: Some("/private/outer".into()),
+                repo_prefix: Some("cold_pkg".into()),
+            },
+        );
+        let cold_pkg_confirmed =
+            core.git_review_for_mode(&host_id, "/outer/cold_pkg", Some("g"), false);
+        assert!(cold_pkg_confirmed.diff_revision > 0);
+        assert!(!cold_pkg_confirmed.diff_in_flight);
+        assert!(cold_pkg_confirmed.raw_diff.contains("+fresh-cold-pkg"));
+
+        // 2. R18-P1-2: Real dir `/real/repo` and POSIX directory symlink `/alias/link_repo` both
+        //    report `repo_prefix = ""` and identical authoritative `repo_root = "/private/real/repo"`.
+        //    Staging `f` via `/real/repo` MUST evict `/alias/link_repo` `f/U`, sync its status
+        //    preserving `cwd = "/alias/link_repo"` and `repo_prefix = ""`, and notify it, while
+        //    leaving trailing-space sibling `/real/repo ` untouched!
+        for (c, root) in [
+            ("/real/repo", "/private/real/repo"),
+            ("/alias/link_repo", "/private/real/repo"),
+            ("/real/repo ", "/private/real/repo "),
+        ] {
+            core.handle_inbound_wire(
+                &host_id,
+                WireMessage::GitStatusResponse {
+                    request_id: Uuid::new_v4(),
+                    status: GitStatusSnapshot {
+                        cwd: c.into(),
+                        is_git_repo: true,
+                        branch: Some("main".into()),
+                        upstream: None,
+                        ahead: 0,
+                        behind: 0,
+                        files: vec![orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        }],
+                        nested_git_repos: vec![],
+                        repo_prefix: Some(String::new()),
+                        repo_root: Some(root.into()),
+                    },
+                },
+            );
+            core.fetch_git_diff(&host_id, c, Some("f"), false);
+            let (rid, _, _, _) = recv_git_diff_request(&core, &mut rx);
+            core.handle_inbound_wire(
+                &host_id,
+                WireMessage::GitDiffResponse {
+                    request_id: rid,
+                    cwd: c.into(),
+                    path: Some("f".into()),
+                    unified_diff: format!("diff --git a/f b/f\n+body-{c}\n"),
+                    repo_root: Some(root.into()),
+                    repo_prefix: Some(String::new()),
+                },
+            );
+        }
+
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/real/repo".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/real/repo".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/real/repo".into()),
+                }),
+            },
+        );
+        let link_after = core.git_review_for_mode(&host_id, "/alias/link_repo", Some("f"), false);
+        assert_eq!(link_after.diff_revision, 0);
+        assert!(link_after.diff_files.is_empty());
+        let link_status = link_after.status.expect("symlink status synced");
+        assert_eq!(link_status.cwd, "/alias/link_repo");
+        assert_eq!(link_status.repo_prefix.as_deref(), Some(""));
+        assert_eq!(link_status.repo_root.as_deref(), Some("/private/real/repo"));
+        let alias_notified = git_changed_cwds.lock().expect("lock").clone();
+        assert!(alias_notified.iter().any(|c| c == "/real/repo"));
+        assert!(alias_notified.iter().any(|c| c == "/alias/link_repo"));
+        assert!(!alias_notified.iter().any(|c| c == "/real/repo "));
+        let spaced_still_ok = core.git_review_for_mode(&host_id, "/real/repo ", Some("f"), false);
+        assert!(spaced_still_ok.diff_revision > 0);
+        assert!(spaced_still_ok.raw_diff.contains("+body-/real/repo "));
+
+        // 3. R18-P1-3 + R18-N1: Root `/wtree` stages `f` while subdir `/wtree/pkg` has an in-flight
+        //    whole-repo `path: None, staged: false` request AND `/wtree` has a confirmed `f/S` with
+        //    an in-flight `f/S` refresh! Assert BOTH `("/wtree/pkg", None, U)` AND `("/wtree", Some("f"), S)`
+        //    are re-dispatched ONCE each with `diff_in_flight == true`, old UUIDs dropped, and
+        //    fresh replies confirm cleanly!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/wtree/pkg".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "pkg/g".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some("pkg".into()),
+                    repo_root: Some("/private/wtree".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/wtree", Some("f"), true);
+        let (req_fs_init, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_fs_init,
+                cwd: "/wtree".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+index-only\n".into(),
+                repo_root: Some("/private/wtree".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // R22-P1-1: cold `/wtree` auto-dispatches 1 GetGitStatus on first diff; deliver it before
+        // the subsequent root mutation so `/wtree` has a baseline status.
+        let req_wtree_st = match core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("wire timeout")
+                .expect("wire closed")
+        }) {
+            crate::OutboundPayload::Wire(WireMessage::GetGitStatus { request_id, cwd }) => {
+                assert_eq!(cwd, "/wtree");
+                request_id
+            }
+            other => panic!("expected auto GetGitStatus for cold /wtree, got {other:?}"),
+        };
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_wtree_st,
+                status: GitStatusSnapshot {
+                    cwd: "/wtree".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "A".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/wtree".into()),
+                },
+            },
+        );
+        // Launch in-flight whole-repo `None/U` in `/wtree/pkg` AND in-flight refresh `f/S` in `/wtree`
+        core.fetch_git_diff(&host_id, "/wtree/pkg", None, false);
+        let (req_pkg_none_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/wtree", Some("f"), true);
+        let (req_fs_refresh_pre, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/wtree".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/wtree".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "A".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/wtree".into()),
+                }),
+            },
+        );
+
+        let mut redispatched_slots = HashMap::new();
+        for _ in 0..2 {
+            let (rid, c, p, s) = recv_git_diff_request(&core, &mut rx);
+            redispatched_slots.insert((c, p, s), rid);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must re-dispatch strictly once per invalidated slot"
+        );
+        let req_pkg_none_post = *redispatched_slots
+            .get(&("/wtree/pkg".to_string(), None, false))
+            .expect("R18-P1-3: subdir whole-repo None/U must be re-dispatched");
+        let req_fs_post = *redispatched_slots
+            .get(&("/wtree".to_string(), Some("f".to_string()), true))
+            .expect("R18-N1: in-flight f/S must be re-dispatched once");
+        assert_ne!(req_pkg_none_post, req_pkg_none_pre);
+        assert_ne!(req_fs_post, req_fs_refresh_pre);
+
+        // Both slots report `diff_revision == 0` AND `diff_in_flight == true` immediately!
+        let pkg_none_view = core.git_review_for_mode(&host_id, "/wtree/pkg", None, false);
+        assert_eq!(pkg_none_view.diff_revision, 0);
+        assert!(pkg_none_view.diff_in_flight);
+        let fs_view = core.git_review_for_mode(&host_id, "/wtree", Some("f"), true);
+        assert_eq!(fs_view.diff_revision, 0);
+        assert!(fs_view.diff_in_flight);
+
+        // Pre-mutation whole-repo reply dropped; post-mutation reply confirms `+g-working`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_pkg_none_pre,
+                cwd: "/wtree/pkg".into(),
+                path: None,
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+stale-whole-repo\n".into(),
+                repo_root: Some("/private/wtree".into()),
+                repo_prefix: Some("pkg".into()),
+            },
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/wtree/pkg", None, false)
+                .diff_revision,
+            0
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_pkg_none_post,
+                cwd: "/wtree/pkg".into(),
+                path: None,
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+g-working\n".into(),
+                repo_root: Some("/private/wtree".into()),
+                repo_prefix: Some("pkg".into()),
+            },
+        );
+        let pkg_none_confirmed = core.git_review_for_mode(&host_id, "/wtree/pkg", None, false);
+        assert!(pkg_none_confirmed.diff_revision > 0);
+        assert!(!pkg_none_confirmed.diff_in_flight);
+        assert!(pkg_none_confirmed.raw_diff.contains("+g-working"));
+    }
+
+    #[test]
+    fn round19_repo_root_rebind_stale_identity_guard_status_seq_rpc_error_and_double_cold_reply() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        struct GitChangedRecorder(Arc<Mutex<Vec<String>>>);
+        impl CoreEventSubscriber for GitChangedRecorder {
+            fn on_notification(&self, event: CoreNotification) {
+                if let CoreNotification::GitChanged { cwd, .. } = event
+                    && let Ok(mut g) = self.0.lock()
+                {
+                    g.push(cwd);
+                }
+            }
+        }
+        let git_changed_cwds = Arc::new(Mutex::new(Vec::<String>::new()));
+        core.subscribe(Arc::new(GitChangedRecorder(Arc::clone(&git_changed_cwds))));
+
+        // 1. R19-P1-1: Same `cwd` (`/tmp/rebind_link`) changes physical `repo_root` from A -> B.
+        //    First confirm `f/U = +worktree-only` under A; an ordinary same-root status refresh
+        //    for A MUST retain the confirmed diff cache, whereas a `GitStatusResponse` with
+        //    `repo_root = B` MUST immediately evict A's cached diff (`diff_revision == 0`), drain
+        //    any old in-flight UUIDs, update the root mapping to B, and emit `GitChanged`.
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/rebind_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/repo_a".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/rebind_link", Some("f"), false);
+        let (req_a1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_a1,
+                cwd: "/tmp/rebind_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+worktree-only\n".into(),
+                repo_root: Some("/private/repo_a".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let rev_a = core
+            .git_review_for_mode(&host_id, "/tmp/rebind_link", Some("f"), false)
+            .diff_revision;
+        assert!(rev_a > 0);
+
+        // Same physical root refresh (`repo_root == A`): confirmed cache stays intact!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/rebind_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/repo_a".into()),
+                },
+            },
+        );
+        let still_a = core.git_review_for_mode(&host_id, "/tmp/rebind_link", Some("f"), false);
+        assert_eq!(
+            still_a.diff_revision, rev_a,
+            "fixed-target same-root status refresh must preserve confirmed diff cache"
+        );
+        assert!(still_a.raw_diff.contains("+worktree-only"));
+
+        // Now repoint `/tmp/rebind_link` to repo B (`repo_root = /private/repo_b`):
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/rebind_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/repo_b".into()),
+                },
+            },
+        );
+        let after_rebind = core.git_review_for_mode(&host_id, "/tmp/rebind_link", Some("f"), false);
+        assert_eq!(
+            after_rebind.diff_revision, 0,
+            "R19-P1-1: switching physical repo_root MUST immediately evict old repo A diff"
+        );
+        assert!(after_rebind.raw_diff.is_empty());
+        assert_eq!(
+            after_rebind
+                .status
+                .as_ref()
+                .and_then(|s| s.repo_root.as_deref()),
+            Some("/private/repo_b")
+        );
+        assert!(
+            git_changed_cwds
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|c| c == "/tmp/rebind_link")
+        );
+
+        // 2. R19-P1-2: Late/expired diff reply from Repo A (`req_a_old`, carrying `repo_root = A`)
+        //    arriving AFTER symlink switched to Repo B and refreshed (`+second-working`) MUST NOT
+        //    overwrite `git_repo_root_by_cwd`, so a subsequent Stage on B's real path STILL
+        //    notifies and evicts `/tmp/stale_id_link`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/stale_id_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/stale_a".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/stale_id_link", Some("f"), false);
+        let (req_a_old, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        // Switch link to B (`repo_root = /private/stale_b`); the drained in-flight `f/U` is
+        // re-dispatched under a fresh UUID (`req_b_fresh`)!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/stale_id_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/stale_b".into()),
+                },
+            },
+        );
+        let (req_b_fresh, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_b_fresh, req_a_old);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_b_fresh,
+                cwd: "/tmp/stale_id_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/stale_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // Also test a SECOND stale-identity path where a cold link dispatched `req_cold_a` BEFORE
+        // any status arrived, then switched to B, received B's status & confirmed B's diff, and
+        // THEN received `req_cold_a` (still present in pending if not drained, or dropped by seq):
+        core.fetch_git_diff(&host_id, "/tmp/cold_switch_link", Some("f"), false);
+        let (req_cold_a, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/cold_switch_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/stale_b".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/cold_switch_link", Some("f"), false);
+        let (req_cold_b, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_cold_b,
+                cwd: "/tmp/cold_switch_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/stale_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // Deliver BOTH stale Repo A replies now!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_a_old,
+                cwd: "/tmp/stale_id_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+stale-a\n".into(),
+                repo_root: Some("/private/stale_a".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_cold_a,
+                cwd: "/tmp/cold_switch_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+stale-cold-a\n".into(),
+                repo_root: Some("/private/stale_a".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // Stage `f` on Repo B's real path -> BOTH links MUST still map to `/private/stale_b`,
+        // be notified, and have `f/U` evicted to `diff_revision == 0`!
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/real/stale_b".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/real/stale_b".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/stale_b".into()),
+                }),
+            },
+        );
+        let stale_notified = git_changed_cwds.lock().expect("lock").clone();
+        assert!(stale_notified.iter().any(|c| c == "/tmp/stale_id_link"));
+        assert!(stale_notified.iter().any(|c| c == "/tmp/cold_switch_link"));
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/tmp/stale_id_link", Some("f"), false)
+                .diff_revision,
+            0
+        );
+        assert_eq!(
+            core.git_review_for_mode(&host_id, "/tmp/cold_switch_link", Some("f"), false)
+                .diff_revision,
+            0
+        );
+
+        // 3. R19-P1-3: Late cold `GitDiffResponse` MUST NOT roll back a newer `GitStatusResponse`
+        //    already delivered for `/tmp/r19_seq/pkg`!
+        core.fetch_git_diff(&host_id, "/tmp/r19_seq/pkg", Some("g"), false);
+        let (req_seq_cold, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        // Root stages unrelated `f` while `pkg/g` is still unstaged in the mutation snapshot:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/r19_seq".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r19_seq".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r19_seq".into()),
+                }),
+            },
+        );
+        // Subsequently, real `git add -- pkg/g` completes and a NEWER `GitStatusResponse` arrives
+        // for `/tmp/r19_seq/pkg` showing `pkg/g` is now ONLY `staged: true`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r19_seq/pkg".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some("pkg".into()),
+                    repo_root: Some("/private/r19_seq".into()),
+                },
+            },
+        );
+        // Now the late cold `req_seq_cold` arrives: body rejected by watermark, status MUST NOT
+        // roll back to unstaged, and exact U re-dispatch MUST be 0!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_seq_cold,
+                cwd: "/tmp/r19_seq/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+stale-g\n".into(),
+                repo_root: Some("/private/r19_seq".into()),
+                repo_prefix: Some("pkg".into()),
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "R19-P1-3: newer staged-only status MUST suppress unstaged re-dispatch (0 fetches)"
+        );
+        let seq_after = core.git_review_for_mode(&host_id, "/tmp/r19_seq/pkg", Some("g"), false);
+        assert_eq!(seq_after.diff_revision, 0);
+        assert!(!seq_after.diff_in_flight);
+        let pkg_g_entries: Vec<bool> = seq_after
+            .status
+            .expect("status present")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "pkg/g")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(
+            pkg_g_entries,
+            vec![true],
+            "R19-P1-3: late cold diff MUST NEVER roll back newer GitStatusResponse to unstaged"
+        );
+
+        // 4. R19-P1-4: `WireMessage::RpcError` for a `GetGitDiff` UUID MUST remove that pending
+        //    request so `diff_in_flight` becomes `false` and notify `cwd`, while preserving any
+        //    newer live UUID on the same slot!
+        core.fetch_git_diff(&host_id, "/tmp/r19_err", Some("f"), false);
+        let (req_err1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        assert!(
+            core.git_review_for_mode(&host_id, "/tmp/r19_err", Some("f"), false)
+                .diff_in_flight
+        );
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_err1),
+                code: "git_diff_error".into(),
+                message: "No such file or directory (os error 2)".into(),
+            },
+        );
+        assert!(
+            !core
+                .git_review_for_mode(&host_id, "/tmp/r19_err", Some("f"), false)
+                .diff_in_flight,
+            "R19-P1-4: RpcError MUST settle diff_in_flight to false"
+        );
+        assert!(
+            git_changed_cwds
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|c| c == "/tmp/r19_err")
+        );
+
+        // Overlapping old + new UUID on the same slot: RpcError on old UUID MUST keep
+        // `diff_in_flight == true` for the newer UUID!
+        core.fetch_git_diff(&host_id, "/tmp/r19_err", Some("f"), false);
+        let (req_err_old, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/tmp/r19_err", Some("f"), false);
+        let (req_err_new, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_err_old),
+                code: "git_diff_error".into(),
+                message: "stale error".into(),
+            },
+        );
+        assert!(
+            core.git_review_for_mode(&host_id, "/tmp/r19_err", Some("f"), false)
+                .diff_in_flight,
+            "RpcError for superseded UUID must preserve newer live UUID's diff_in_flight"
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_err_new,
+                cwd: "/tmp/r19_err".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+worktree-only\n".into(),
+                repo_root: Some("/private/r19_err".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // R22-P1-1: first cold diff on `/tmp/r19_err` auto-dispatches 1 GetGitStatus.
+        match core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("wire timeout")
+                .expect("wire closed")
+        }) {
+            crate::OutboundPayload::Wire(WireMessage::GetGitStatus { cwd, .. }) => {
+                assert_eq!(cwd, "/tmp/r19_err");
+            }
+            other => panic!("expected auto GetGitStatus for /tmp/r19_err, got {other:?}"),
+        }
+        let err_recovered = core.git_review_for_mode(&host_id, "/tmp/r19_err", Some("f"), false);
+        assert!(err_recovered.diff_revision > 0);
+        assert!(!err_recovered.diff_in_flight);
+        assert!(err_recovered.raw_diff.contains("+worktree-only"));
+
+        // 5. R19-N1: Two cold pre-mutation requests (`req_c1`, `req_c2`) for `/tmp/r19_n1/pkg` `g/U`.
+        //    `req_c2` arrives first -> triggers ONE recovery `req_c3` -> `req_c3` confirms
+        //    `+fresh-g` (`source_req_seq >= watermark`). Then `req_c1` arrives -> MUST emit 0
+        //    extra re-dispatches and keep `+fresh-g` and `diff_in_flight == false` intact!
+        core.fetch_git_diff(&host_id, "/tmp/r19_n1/pkg", Some("g"), false);
+        let (req_c1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/tmp/r19_n1/pkg", Some("g"), false);
+        let (req_c2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: Uuid::new_v4(),
+                cwd: "/tmp/r19_n1".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r19_n1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "pkg/g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r19_n1".into()),
+                }),
+            },
+        );
+        // `req_c2` arrives -> rejected & dispatches recovery `req_c3`:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_c2,
+                cwd: "/tmp/r19_n1/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+stale-c2\n".into(),
+                repo_root: Some("/private/r19_n1".into()),
+                repo_prefix: Some("pkg".into()),
+            },
+        );
+        let (req_c3, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        assert_ne!(req_c3, req_c1);
+        assert_ne!(req_c3, req_c2);
+        // `req_c3` confirms `+fresh-g`:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_c3,
+                cwd: "/tmp/r19_n1/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+fresh-g\n".into(),
+                repo_root: Some("/private/r19_n1".into()),
+                repo_prefix: Some("pkg".into()),
+            },
+        );
+        let rev_fresh = core
+            .git_review_for_mode(&host_id, "/tmp/r19_n1/pkg", Some("g"), false)
+            .diff_revision;
+        assert!(rev_fresh > 0);
+        // Now the OTHER cold pre-mutation reply `req_c1` arrives -> 0 extra re-dispatches!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_c1,
+                cwd: "/tmp/r19_n1/pkg".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/pkg/g b/pkg/g\n+stale-c1\n".into(),
+                repo_root: Some("/private/r19_n1".into()),
+                repo_prefix: Some("pkg".into()),
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "R19-N1: second cold pre-mutation reply MUST emit 0 extra re-dispatches after recovery"
+        );
+        let after_c1 = core.git_review_for_mode(&host_id, "/tmp/r19_n1/pkg", Some("g"), false);
+        assert_eq!(after_c1.diff_revision, rev_fresh);
+        assert!(!after_c1.diff_in_flight);
+        assert!(after_c1.raw_diff.contains("+fresh-g"));
+    }
+
+    #[test]
+    fn round20_status_dispatch_order_subdir_prefix_rebind_origin_mutation_and_review_meta() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        struct GitChangedRecorder(Arc<Mutex<Vec<String>>>);
+        impl CoreEventSubscriber for GitChangedRecorder {
+            fn on_notification(&self, event: CoreNotification) {
+                if let CoreNotification::GitChanged { cwd, .. } = event
+                    && let Ok(mut g) = self.0.lock()
+                {
+                    g.push(cwd);
+                }
+            }
+        }
+        let git_changed_cwds = Arc::new(Mutex::new(Vec::<String>::new()));
+        core.subscribe(Arc::new(GitChangedRecorder(Arc::clone(&git_changed_cwds))));
+
+        let recv_wire = |core: &OrbitAppCore,
+                         rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>|
+         -> WireMessage {
+            let frame = core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("wire")
+            });
+            match frame {
+                crate::OutboundPayload::Wire(msg) => msg,
+                other => panic!("unexpected outbound payload: {other:?}"),
+            }
+        };
+
+        // 1. R20-P1-1: Already-cleared (`diff_revision == 0`) link in Repo A switches to dirty
+        //    Repo B -> `cwd_identity_epoch` increments (`0 -> 1`) and `status_revision` advances.
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_p1_1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_a".into()),
+                },
+            },
+        );
+        let before_rebind = core.git_review_for_mode(&host_id, "/tmp/r20_p1_1", Some("f"), false);
+        assert_eq!(before_rebind.diff_revision, 0);
+        assert_eq!(before_rebind.cwd_identity_epoch, 0);
+        let status_rev_a = before_rebind.status_revision;
+        assert!(status_rev_a > 0);
+
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_p1_1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_b".into()),
+                },
+            },
+        );
+        let after_rebind = core.git_review_for_mode(&host_id, "/tmp/r20_p1_1", Some("f"), false);
+        assert_eq!(after_rebind.cwd_identity_epoch, 1);
+        assert!(after_rebind.status_revision > status_rev_a);
+        assert_eq!(
+            after_rebind
+                .status
+                .as_ref()
+                .and_then(|s| s.repo_root.as_deref()),
+            Some("/private/r20_b")
+        );
+
+        // 2. R20-P1-2: Same physical worktree (`repo_root == "/private/mono"`), link switches from
+        //    `repo_prefix: "one"` (confirmed `+one-working`) to `repo_prefix: "two"`.
+        //    Must increment `cwd_identity_epoch`, evict `+one-working`, drop stale `one` diff
+        //    without reverting prefix, and accept fresh `two` diff!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_sub_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "one/f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "two/f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some("one".into()),
+                    repo_root: Some("/private/mono".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/r20_sub_link", Some("f"), false);
+        let (req_one, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_one,
+                cwd: "/tmp/r20_sub_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/one/f b/one/f\n+one-working\n".into(),
+                repo_root: Some("/private/mono".into()),
+                repo_prefix: Some("one".into()),
+            },
+        );
+        let one_confirmed =
+            core.git_review_for_mode(&host_id, "/tmp/r20_sub_link", Some("f"), false);
+        assert!(one_confirmed.diff_revision > 0);
+        assert!(one_confirmed.raw_diff.contains("+one-working"));
+        assert_eq!(one_confirmed.cwd_identity_epoch, 0);
+
+        // Same-root same-prefix refresh keeps cache & epoch intact:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_sub_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "one/f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "two/f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some("one".into()),
+                    repo_root: Some("/private/mono".into()),
+                },
+            },
+        );
+        let still_one = core.git_review_for_mode(&host_id, "/tmp/r20_sub_link", Some("f"), false);
+        assert_eq!(still_one.diff_revision, one_confirmed.diff_revision);
+        assert_eq!(still_one.cwd_identity_epoch, 0);
+
+        // Switch link within same repo from `one` -> `two`:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_sub_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "one/f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "two/f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some("two".into()),
+                    repo_root: Some("/private/mono".into()),
+                },
+            },
+        );
+        let switched_two =
+            core.git_review_for_mode(&host_id, "/tmp/r20_sub_link", Some("f"), false);
+        assert_eq!(
+            switched_two.diff_revision, 0,
+            "R20-P1-2: same-repo subdir prefix switch one->two MUST evict old cached diff"
+        );
+        assert_eq!(switched_two.cwd_identity_epoch, 1);
+        assert!(switched_two.raw_diff.is_empty());
+
+        // 3. R20-P1-3: Two real `fetch_git_status` calls arrive out of order (second first, first
+        //    second) -> first MUST be dropped with ZERO rollback, ZERO status_revision bump, and
+        //    ZERO GitChanged notification!
+        core.fetch_git_status(&host_id, "/tmp/r20_status_order");
+        let req_st1 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_status(&host_id, "/tmp/r20_status_order");
+        let req_st2 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+
+        // Deliver newer `req_st2` (staged-only `[true]`) FIRST:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_st2,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_status_order".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_order".into()),
+                },
+            },
+        );
+        let rev_after_st2 = core
+            .git_review_for_mode(&host_id, "/tmp/r20_status_order", Some("f"), false)
+            .status_revision;
+        assert!(rev_after_st2 > 0);
+
+        // Now deliver stale earlier `req_st1` (`[true, false]`) SECOND:
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_st1,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_status_order".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_order".into()),
+                },
+            },
+        );
+        let after_stale_st1 =
+            core.git_review_for_mode(&host_id, "/tmp/r20_status_order", Some("f"), false);
+        let f_staged_flags: Vec<bool> = after_stale_st1
+            .status
+            .expect("status present")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(
+            f_staged_flags,
+            vec![true],
+            "R20-P1-3: out-of-order older GitStatusResponse MUST NOT roll back newer status"
+        );
+        assert_eq!(after_stale_st1.status_revision, rev_after_st2);
+        assert!(
+            git_changed_cwds.lock().expect("lock").is_empty(),
+            "dropped out-of-order GitStatusResponse must emit 0 GitChanged notifications"
+        );
+
+        // 4. R20-P1-4: Stage dispatched while `/tmp/r20_mut_link` points to Repo A (while
+        //    `/real/r20_mut_a` also has cached `f/U`). Link repoints to Repo B and confirms
+        //    `+second-working`. Then Repo A's `GitMutationResult` arrives -> resolves Ok, evicts
+        //    & notifies `/real/r20_mut_a`, leaves `/tmp/r20_mut_link` pointing to B with
+        //    `+second-working` intact, emits 0 notifications and 0 routine diff refreshes on B!
+        for (c, root, body) in [
+            ("/tmp/r20_mut_link", "/private/r20_mut_a", "+first-a"),
+            ("/real/r20_mut_a", "/private/r20_mut_a", "+first-a"),
+        ] {
+            core.handle_inbound_wire(
+                &host_id,
+                WireMessage::GitStatusResponse {
+                    request_id: Uuid::new_v4(),
+                    status: GitStatusSnapshot {
+                        cwd: c.into(),
+                        is_git_repo: true,
+                        branch: Some("main".into()),
+                        upstream: None,
+                        ahead: 0,
+                        behind: 0,
+                        files: vec![orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        }],
+                        nested_git_repos: vec![],
+                        repo_prefix: Some(String::new()),
+                        repo_root: Some(root.into()),
+                    },
+                },
+            );
+            core.fetch_git_diff(&host_id, c, Some("f"), false);
+            let (rid, _, _, _) = recv_git_diff_request(&core, &mut rx);
+            core.handle_inbound_wire(
+                &host_id,
+                WireMessage::GitDiffResponse {
+                    request_id: rid,
+                    cwd: c.into(),
+                    path: Some("f".into()),
+                    unified_diff: format!("diff --git a/f b/f\n{body}\n"),
+                    repo_root: Some(root.into()),
+                    repo_prefix: Some(String::new()),
+                },
+            );
+        }
+
+        // Launch real `git_stage_files_on_host` while `/tmp/r20_mut_link` points to A:
+        let stage_core = Arc::clone(&core);
+        let stage_host = host_id.clone();
+        let stage_task = core.runtime.spawn(async move {
+            stage_core
+                .git_stage_files_on_host(&stage_host, "/tmp/r20_mut_link", vec!["f".into()], false)
+                .await
+        });
+        let req_stage = match recv_wire(&core, &mut rx) {
+            WireMessage::GitStageFiles { request_id, .. } => request_id,
+            other => panic!("expected GitStageFiles, got {other:?}"),
+        };
+
+        // Repoint `/tmp/r20_mut_link` to Repo B and confirm `+second-working`:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_mut_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_mut_b".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/r20_mut_link", Some("f"), false);
+        let (req_b_diff, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_b_diff,
+                cwd: "/tmp/r20_mut_link".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/r20_mut_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let b_rev = core
+            .git_review_for_mode(&host_id, "/tmp/r20_mut_link", Some("f"), false)
+            .diff_revision;
+        assert!(b_rev > 0);
+
+        // Now deliver Repo A's withheld `GitMutationResult`!
+        git_changed_cwds.lock().expect("lock").clear();
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: req_stage,
+                cwd: "/tmp/r20_mut_link".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r20_mut_link".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_mut_a".into()),
+                }),
+            },
+        );
+        let stage_res = core
+            .runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), stage_task).await })
+            .expect("stage timeout")
+            .expect("stage join");
+        assert!(
+            stage_res.is_ok(),
+            "stale origin mutation must still resolve Ok"
+        );
+        // Zero routine GetGitDiff or GetGitStatus dispatched on rebound `/tmp/r20_mut_link`:
+        assert!(
+            rx.try_recv().is_err(),
+            "R20-P1-4: rebound origin cwd must emit 0 routine post-mutation refreshes"
+        );
+        let b_after = core.git_review_for_mode(&host_id, "/tmp/r20_mut_link", Some("f"), false);
+        assert_eq!(b_after.diff_revision, b_rev);
+        assert!(b_after.raw_diff.contains("+second-working"));
+        assert_eq!(
+            b_after.status.as_ref().and_then(|s| s.repo_root.as_deref()),
+            Some("/private/r20_mut_b")
+        );
+        // Real Repo A path WAS evicted and notified, while rebound link was NOT notified!
+        let a_after = core.git_review_for_mode(&host_id, "/real/r20_mut_a", Some("f"), false);
+        assert_eq!(a_after.diff_revision, 0);
+        let notified_after_rebound = git_changed_cwds.lock().expect("lock").clone();
+        assert!(
+            notified_after_rebound
+                .iter()
+                .any(|c| c == "/real/r20_mut_a")
+        );
+        assert!(
+            !notified_after_rebound
+                .iter()
+                .any(|c| c == "/tmp/r20_mut_link")
+        );
+
+        // 5. R20-P1-5 + R20-P1-6: `last_diff_error_revision` increments even with non-zero cached
+        //    `diff_revision` (while superseded UUID errors do NOT bump it), AND sibling `g/U`
+        //    `GitDiffResponse` NEVER increments `status_revision`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_err_meta".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "g".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_err_meta".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        let (req_f_init, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_f_init,
+                cwd: "/tmp/r20_err_meta".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+old-working\n".into(),
+                repo_root: Some("/private/r20_err_meta".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let f_before_err =
+            core.git_review_for_mode(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        assert!(f_before_err.diff_revision > 0);
+        assert_eq!(f_before_err.last_diff_error_revision, 0);
+        let st_rev_1 = f_before_err.status_revision;
+
+        // Manual refresh on `f/U` fails with `RpcError` while `diff_revision > 0`:
+        core.fetch_git_diff(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        let (req_f_fail, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_f_fail),
+                code: "git_diff_error".into(),
+                message: "No such file or directory".into(),
+            },
+        );
+        let f_after_err = core.git_review_for_mode(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        assert_eq!(f_after_err.diff_revision, f_before_err.diff_revision);
+        assert!(!f_after_err.diff_in_flight);
+        assert!(f_after_err.last_diff_error_revision > 0);
+        assert_eq!(f_after_err.status_revision, st_rev_1);
+
+        // Sibling `g/U` diff succeeds on the SAME `cwd` -> MUST NOT increment `status_revision`!
+        core.fetch_git_diff(&host_id, "/tmp/r20_err_meta", Some("g"), false);
+        let (req_g_ok, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_g_ok,
+                cwd: "/tmp/r20_err_meta".into(),
+                path: Some("g".into()),
+                unified_diff: "diff --git a/g b/g\n+g-sibling\n".into(),
+                repo_root: Some("/private/r20_err_meta".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let f_after_sib = core.git_review_for_mode(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        assert_eq!(
+            f_after_sib.status_revision, st_rev_1,
+            "R20-P1-6: sibling file GitDiffResponse MUST NOT increment status_revision"
+        );
+
+        // Fresh `GitStatusResponse` DOES increment `status_revision`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r20_err_meta".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r20_err_meta".into()),
+                },
+            },
+        );
+        let f_after_new_st =
+            core.git_review_for_mode(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        assert!(f_after_new_st.status_revision > st_rev_1);
+
+        // Superseded older UUID `RpcError` MUST NOT bump `last_diff_error_revision`!
+        let err_rev_before_superseded = f_after_new_st.last_diff_error_revision;
+        core.fetch_git_diff(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        let (req_old_f, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.fetch_git_diff(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        let (_req_new_f, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_old_f),
+                code: "git_diff_error".into(),
+                message: "stale".into(),
+            },
+        );
+        let f_after_superseded_err =
+            core.git_review_for_mode(&host_id, "/tmp/r20_err_meta", Some("f"), false);
+        assert_eq!(
+            f_after_superseded_err.last_diff_error_revision,
+            err_rev_before_superseded
+        );
+        assert!(f_after_superseded_err.diff_in_flight);
+    }
+
+    #[test]
+    fn round21_diff_first_rebind_mutation_completion_seq_and_error_status_rev() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        let recv_wire = |core: &OrbitAppCore,
+                         rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>|
+         -> WireMessage {
+            let frame = core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("wire")
+            });
+            match frame {
+                crate::OutboundPayload::Wire(msg) => msg,
+                other => panic!("unexpected outbound payload: {other:?}"),
+            }
+        };
+
+        // 1. R21-P1-1: Routine whole-repo diff arrives BEFORE Repo B's `GitStatusResponse` after
+        //    link repointed A -> B: MUST increment `cwd_identity_epoch` (0 -> 1) AND immediately
+        //    evict Repo A's clean status (`status == None`, `status_identity_epoch == 0 != 1`).
+        //    Once Repo B's real `GitStatusResponse` arrives, `status_identity_epoch == 1 == epoch`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_diff_first".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_a".into()),
+                },
+            },
+        );
+        let init_a = core.git_review_for_mode(&host_id, "/tmp/r21_diff_first", Some("f"), false);
+        assert_eq!(init_a.cwd_identity_epoch, 0);
+        assert_eq!(init_a.status_identity_epoch, 0);
+        assert!(init_a.status.is_some());
+
+        // Routine whole-repo `(link, None, U)` dispatched before link repointed to B:
+        core.fetch_git_diff(&host_id, "/tmp/r21_diff_first", None, false);
+        let (req_routine_whole, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        // Daemon reads Repo B for that routine whole-repo diff BEFORE B's status arrives!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_routine_whole,
+                cwd: "/tmp/r21_diff_first".into(),
+                path: None,
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/r21_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let after_diff_only =
+            core.git_review_for_mode(&host_id, "/tmp/r21_diff_first", Some("f"), false);
+        assert_eq!(after_diff_only.cwd_identity_epoch, 1);
+        assert!(
+            after_diff_only.status.is_none(),
+            "R21-P1-1: diff revealing A->B MUST evict Repo A's stale clean status immediately"
+        );
+        assert_eq!(after_diff_only.status_identity_epoch, 0);
+        // R22-P1-1: diff revealing A->B automatically dispatches ONE verification GetGitStatus!
+        let req_auto_verify_b = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r21_diff_first");
+                request_id
+            }
+            other => panic!("expected auto verification GetGitStatus, got {other:?}"),
+        };
+
+        // Now Repo B's real `GitStatusResponse` arrives for that verification query:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_auto_verify_b,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_diff_first".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_b".into()),
+                },
+            },
+        );
+        let after_b_status =
+            core.git_review_for_mode(&host_id, "/tmp/r21_diff_first", Some("f"), false);
+        assert_eq!(after_b_status.cwd_identity_epoch, 1);
+        assert_eq!(after_b_status.status_identity_epoch, 1);
+        assert_eq!(
+            after_b_status
+                .status
+                .as_ref()
+                .and_then(|s| s.repo_root.as_deref()),
+            Some("/private/r21_b")
+        );
+
+        // 2. R21-P1-2 (Order A & Order B): Overlapping `GetGitStatus` dispatched AFTER Stage
+        //    starts (`dispatch_seq = 2 > 1`) that sampled pre-write `[false]` MUST lose to
+        //    `GitMutationResult` (`[true]`) in BOTH arrival orders!
+        // Order A: overlapping `GetGitStatus` (`[false]`) arrives BEFORE `GitMutationResult` (`[true]`):
+        let stage_core_a = Arc::clone(&core);
+        let stage_host_a = host_id.clone();
+        let stage_task_a = core.runtime.spawn(async move {
+            stage_core_a
+                .git_stage_files_on_host(&stage_host_a, "/tmp/r21_ord_a", vec!["f".into()], false)
+                .await
+        });
+        let req_stage_a = match recv_wire(&core, &mut rx) {
+            WireMessage::GitStageFiles { request_id, .. } => request_id,
+            other => panic!("expected GitStageFiles, got {other:?}"),
+        };
+        core.fetch_git_status(&host_id, "/tmp/r21_ord_a");
+        let req_overlap_a = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        // Pre-write `[false]` arrives first:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_overlap_a,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_ord_a".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_ord_a".into()),
+                },
+            },
+        );
+        // Post-write `GitMutationResult` (`[true]`) arrives second -> MUST overwrite `[false]`!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: req_stage_a,
+                cwd: "/tmp/r21_ord_a".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r21_ord_a".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_ord_a".into()),
+                }),
+            },
+        );
+        assert!(
+            core.runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), stage_task_a).await
+                })
+                .expect("timeout")
+                .expect("join")
+                .is_ok()
+        );
+        // R22-P1-2: Because `req_overlap_a` was already accepted during `stage_task_a`'s flight,
+        // the client cannot prove daemon sampling order between the already-accepted read and the
+        // write receipt—so core enters `status_reverify_pending = true`, emits strictly ONE
+        // coalesced post-completion `GetGitStatus` (0 speculative `GetGitDiff`), and switches to
+        // the authoritative `[true]` snapshot once that re-verification reply lands!
+        let req_recheck_a = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r21_ord_a");
+                assert_ne!(request_id, req_overlap_a);
+                request_id
+            }
+            other => {
+                panic!("expected coalesced reverify GetGitStatus after stage A, got {other:?}")
+            }
+        };
+        assert!(rx.try_recv().is_err());
+        assert!(
+            core.git_review_for_mode(&host_id, "/tmp/r21_ord_a", Some("f"), true)
+                .status_reverify_pending
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_recheck_a,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_ord_a".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_ord_a".into()),
+                },
+            },
+        );
+        let ord_a_after_recheck =
+            core.git_review_for_mode(&host_id, "/tmp/r21_ord_a", Some("f"), true);
+        assert!(!ord_a_after_recheck.status_reverify_pending);
+        let ord_a_flags: Vec<bool> = ord_a_after_recheck
+            .status
+            .expect("status present")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(
+            ord_a_flags,
+            vec![true],
+            "R21-P1-2 Order A: authoritative post-completion reverify MUST converge to [true]"
+        );
+
+        // Order B: `GitMutationResult` (`[true]`) arrives FIRST while overlapping `GetGitStatus`
+        // (`[false]`) is STILL in flight -> MUST reject `[false]` on arrival AND coalesce 1 fresh
+        // post-mutation `GetGitStatus`!
+        let stage_core_b = Arc::clone(&core);
+        let stage_host_b = host_id.clone();
+        let stage_task_b = core.runtime.spawn(async move {
+            stage_core_b
+                .git_stage_files_on_host(&stage_host_b, "/tmp/r21_ord_b", vec!["f".into()], false)
+                .await
+        });
+        let req_stage_b = match recv_wire(&core, &mut rx) {
+            WireMessage::GitStageFiles { request_id, .. } => request_id,
+            other => panic!("expected GitStageFiles, got {other:?}"),
+        };
+        core.fetch_git_status(&host_id, "/tmp/r21_ord_b");
+        let req_overlap_b = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: req_stage_b,
+                cwd: "/tmp/r21_ord_b".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r21_ord_b".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_ord_b".into()),
+                }),
+            },
+        );
+        assert!(
+            core.runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), stage_task_b).await
+                })
+                .expect("timeout")
+                .expect("join")
+                .is_ok()
+        );
+        // Should emit the coalesced post-mutation GetGitStatus + routine GetGitDiff:
+        let mut saw_coalesced_status = None;
+        for _ in 0..2 {
+            match recv_wire(&core, &mut rx) {
+                WireMessage::GetGitStatus { request_id, cwd } => {
+                    assert_eq!(cwd, "/tmp/r21_ord_b");
+                    assert_ne!(request_id, req_overlap_b);
+                    saw_coalesced_status = Some(request_id);
+                }
+                WireMessage::GetGitDiff { .. } => {}
+                other => panic!("unexpected wire after stage B: {other:?}"),
+            }
+        }
+        assert!(saw_coalesced_status.is_some());
+        // Now stale pre-write `req_overlap_b` (`[false]`) arrives -> MUST be rejected!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_overlap_b,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_ord_b".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_ord_b".into()),
+                },
+            },
+        );
+        let ord_b_flags: Vec<bool> = core
+            .git_review_for_mode(&host_id, "/tmp/r21_ord_b", Some("f"), true)
+            .status
+            .expect("status present")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(
+            ord_b_flags,
+            vec![true],
+            "R21-P1-2 Order B: late pre-write overlapping GetGitStatus MUST be rejected"
+        );
+
+        // 3. R21-P1-3: `last_diff_error_status_revision` captures the exact `status_revision` at
+        //    the instant `RpcError` settled, distinguishing (Error -> Status) from (Status -> Error)
+        //    even when both arrive in the SAME coalesced UI frame!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_err_frame".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_err_frame".into()),
+                },
+            },
+        );
+        let st1 = core
+            .git_review_for_mode(&host_id, "/tmp/r21_err_frame", Some("f"), false)
+            .status_revision;
+        assert!(st1 > 0);
+
+        // Case 3a: Error settles at `st1`, then Status advances to `st2` BEFORE UI reads!
+        core.fetch_git_diff(&host_id, "/tmp/r21_err_frame", Some("f"), false);
+        let (req_err_first, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_err_first),
+                code: "git_diff_error".into(),
+                message: "No such file or directory".into(),
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_err_frame".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_err_frame".into()),
+                },
+            },
+        );
+        let snap_err_before_st =
+            core.git_review_for_mode(&host_id, "/tmp/r21_err_frame", Some("f"), false);
+        assert!(snap_err_before_st.last_diff_error_revision > 0);
+        assert_eq!(snap_err_before_st.last_diff_error_status_revision, st1);
+        assert!(
+            snap_err_before_st.status_revision > snap_err_before_st.last_diff_error_status_revision,
+            "R21-P1-3: error followed by status in same frame MUST expose status_revision > last_diff_error_status_revision"
+        );
+
+        // Case 3b (reverse control): Status advances to `st3`, THEN Error settles at `st3`!
+        core.fetch_git_diff(&host_id, "/tmp/r21_err_frame", Some("f"), false);
+        let (req_err_after_st, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r21_err_frame".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r21_err_frame".into()),
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_err_after_st),
+                code: "git_diff_error".into(),
+                message: "No such file or directory".into(),
+            },
+        );
+        let snap_st_before_err =
+            core.git_review_for_mode(&host_id, "/tmp/r21_err_frame", Some("f"), false);
+        assert_eq!(
+            snap_st_before_err.status_revision, snap_st_before_err.last_diff_error_status_revision,
+            "R21-P1-3 reverse control: status followed by error MUST expose status_revision == last_diff_error_status_revision"
+        );
+    }
+
+    #[test]
+    fn round22_diff_first_reverify_conflict_guard_and_delayed_mutation_overlap_recheck() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        let recv_wire = |core: &Arc<OrbitAppCore>,
+                         rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>|
+         -> WireMessage {
+            let frame = core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("wire timeout")
+                    .expect("wire closed")
+            });
+            match frame {
+                crate::OutboundPayload::Wire(msg) => msg,
+                other => panic!("unexpected outbound payload: {other:?}"),
+            }
+        };
+
+        // 1. R22-P1-1 Part A: Single-refresh split across symlink A -> B, Order 1
+        //    (B's exact `f/U` diff arrives FIRST, THEN A's old status arrives SECOND):
+        //    - Diff B establishes B (`epoch = 1`), confirms `+second-working`, evicts A's status,
+        //      and automatically dispatches ONE verification `GetGitStatus` (`req_verify_1`).
+        //    - Late conflicting status A (dispatched before B was established) MUST NOT rebind
+        //      back to A, MUST NOT evict B's confirmed diff, and emits 0 duplicate `GetGitStatus`
+        //      while `req_verify_1` is already in flight!
+        //    - When `req_verify_1` returns B's status, `status_identity_epoch == 1 == epoch` and
+        //      `+second-working` remains confirmed!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_a".into()),
+                },
+            },
+        );
+        // Single refresh dispatches status + diff:
+        core.fetch_git_status(&host_id, "/tmp/r22_split_1");
+        let req_s_a1 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r22_split_1", Some("f"), false);
+        let (req_d_b1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+
+        // Order 1: deliver B's diff FIRST!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_b1,
+                cwd: "/tmp/r22_split_1".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/r22_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let req_verify_1 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r22_split_1");
+                assert_ne!(request_id, req_s_a1);
+                request_id
+            }
+            other => panic!("expected verification GetGitStatus for B, got {other:?}"),
+        };
+        let after_d_b1 = core.git_review_for_mode(&host_id, "/tmp/r22_split_1", Some("f"), false);
+        assert_eq!(after_d_b1.cwd_identity_epoch, 1);
+        assert!(after_d_b1.status.is_none());
+        assert!(after_d_b1.diff_revision > 0);
+        assert!(after_d_b1.raw_diff.contains("+second-working"));
+
+        // Now deliver A's conflicting pre-switch status SECOND -> MUST NOT revert to A or wipe diff!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_s_a1,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_a".into()),
+                },
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "R22-P1-1: no duplicate verification GetGitStatus while req_verify_1 is already in flight"
+        );
+        let after_stale_s_a1 =
+            core.git_review_for_mode(&host_id, "/tmp/r22_split_1", Some("f"), false);
+        assert_eq!(
+            after_stale_s_a1.cwd_identity_epoch, 1,
+            "R22-P1-1: pre-identity conflicting status A MUST NOT bump epoch 1 -> 2"
+        );
+        assert_eq!(after_stale_s_a1.diff_revision, after_d_b1.diff_revision);
+        assert!(after_stale_s_a1.raw_diff.contains("+second-working"));
+
+        // Deliver `req_verify_1` returning B's real status:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_verify_1,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_b".into()),
+                },
+            },
+        );
+        let after_verify_1 =
+            core.git_review_for_mode(&host_id, "/tmp/r22_split_1", Some("f"), false);
+        assert_eq!(after_verify_1.cwd_identity_epoch, 1);
+        assert_eq!(after_verify_1.status_identity_epoch, 1);
+        assert_eq!(
+            after_verify_1
+                .status
+                .as_ref()
+                .and_then(|s| s.repo_root.as_deref()),
+            Some("/private/r22_b")
+        );
+        assert_eq!(after_verify_1.diff_revision, after_d_b1.diff_revision);
+        assert!(after_verify_1.raw_diff.contains("+second-working"));
+
+        // True flip-back control: a NEW `GetGitStatus` dispatched AFTER B was established that
+        // genuinely observes disk flipped back to A MUST cleanly rebind B -> A (`epoch 1 -> 2`)!
+        core.fetch_git_status(&host_id, "/tmp/r22_split_1");
+        let req_flip_back = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_flip_back,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_1".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_a".into()),
+                },
+            },
+        );
+        let after_flip_back =
+            core.git_review_for_mode(&host_id, "/tmp/r22_split_1", Some("f"), false);
+        assert_eq!(after_flip_back.cwd_identity_epoch, 2);
+        assert_eq!(after_flip_back.status_identity_epoch, 2);
+        assert_eq!(after_flip_back.diff_revision, 0);
+
+        // 2. R22-P1-1 Part B: Single-refresh split, Order 2 (A's status arrives FIRST, THEN B's
+        //    diff arrives SECOND — BOTH warm link AND cold link!):
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_2".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_a".into()),
+                },
+            },
+        );
+        core.fetch_git_status(&host_id, "/tmp/r22_split_2");
+        let req_s_a2 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r22_split_2", Some("f"), false);
+        let (req_d_b2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        // Deliver A's status FIRST:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_s_a2,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_2".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_a".into()),
+                },
+            },
+        );
+        // Deliver B's diff SECOND -> MUST NOT be dropped as stale_pre_switch_reply!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_b2,
+                cwd: "/tmp/r22_split_2".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/r22_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let req_verify_2 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r22_split_2");
+                request_id
+            }
+            other => panic!("expected auto verification GetGitStatus for Order 2, got {other:?}"),
+        };
+        let after_d_b2 = core.git_review_for_mode(&host_id, "/tmp/r22_split_2", Some("f"), false);
+        assert_eq!(after_d_b2.cwd_identity_epoch, 1);
+        assert!(after_d_b2.status.is_none());
+        assert!(after_d_b2.diff_revision > 0);
+        assert!(after_d_b2.raw_diff.contains("+second-working"));
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_verify_2,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_2".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_b".into()),
+                },
+            },
+        );
+        let after_verify_2 =
+            core.git_review_for_mode(&host_id, "/tmp/r22_split_2", Some("f"), false);
+        assert_eq!(after_verify_2.cwd_identity_epoch, 1);
+        assert_eq!(after_verify_2.status_identity_epoch, 1);
+        assert_eq!(after_verify_2.diff_revision, after_d_b2.diff_revision);
+
+        // Cold link Order 2 control (`/tmp/r22_split_cold`, no prior status):
+        core.fetch_git_status(&host_id, "/tmp/r22_split_cold");
+        let req_s_cold = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r22_split_cold", Some("f"), false);
+        let (req_d_cold, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_s_cold,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_split_cold".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_a".into()),
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_cold,
+                cwd: "/tmp/r22_split_cold".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/r22_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let _ = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r22_split_cold");
+                request_id
+            }
+            other => panic!("expected cold verification GetGitStatus, got {other:?}"),
+        };
+        let cold_after =
+            core.git_review_for_mode(&host_id, "/tmp/r22_split_cold", Some("f"), false);
+        assert_eq!(cold_after.cwd_identity_epoch, 1);
+        assert!(cold_after.diff_revision > 0);
+        assert!(cold_after.raw_diff.contains("+second-working"));
+
+        // 3. R22-P1-2: Delayed Stage ack (`[true]`) arriving AFTER user edited `f` and an
+        //    overlapping `GetGitStatus` (`[true, false]`) + `GetGitDiff` (`+edited-after-stage`)
+        //    ALREADY returned and cleared `pending_git_status_requests` MUST coalesce ONE fresh
+        //    post-completion `GetGitStatus` so `[true, false]` is automatically restored!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_delayed".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_delayed".into()),
+                },
+            },
+        );
+        let stage_core = Arc::clone(&core);
+        let stage_host = host_id.clone();
+        let stage_task = core.runtime.spawn(async move {
+            stage_core
+                .git_stage_files_on_host(&stage_host, "/tmp/r22_delayed", vec!["f".into()], false)
+                .await
+        });
+        let req_stage = match recv_wire(&core, &mut rx) {
+            WireMessage::GitStageFiles { request_id, .. } => request_id,
+            other => panic!("expected GitStageFiles, got {other:?}"),
+        };
+        // Stage wrote disk (`[true]`), ack held back; user edits `f` and refreshes -> BOTH status
+        // and diff return and settle BEFORE the delayed Stage ack lands!
+        core.fetch_git_status(&host_id, "/tmp/r22_delayed");
+        let req_post_edit_st = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_post_edit_st,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_delayed".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_delayed".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/r22_delayed", Some("f"), false);
+        let (req_post_edit_diff, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_post_edit_diff,
+                cwd: "/tmp/r22_delayed".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+edited-after-stage\n".into(),
+                repo_root: Some("/private/r22_delayed".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let before_delayed_ack =
+            core.git_review_for_mode(&host_id, "/tmp/r22_delayed", Some("f"), false);
+        assert!(before_delayed_ack.diff_revision > 0);
+        assert!(before_delayed_ack.raw_diff.contains("+edited-after-stage"));
+
+        // Now deliver the delayed Stage ack (`[true]`):
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: req_stage,
+                cwd: "/tmp/r22_delayed".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r22_delayed".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_delayed".into()),
+                }),
+            },
+        );
+        assert!(
+            core.runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(2), stage_task).await })
+                .expect("timeout")
+                .expect("join")
+                .is_ok()
+        );
+        // T2 (after delayed Stage ack, BEFORE recheck returns): MUST coalesce strictly ONE
+        // post-completion GetGitStatus (0 speculative GetGitDiff), set `status_reverify_pending`,
+        // AND preserve last-confirmed `[true, false]`, `diff_revision`, and `+edited-after-stage`!
+        let req_recheck = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r22_delayed");
+                assert_ne!(request_id, req_post_edit_st);
+                request_id
+            }
+            other => panic!("expected ONLY coalesced reverify GetGitStatus, got {other:?}"),
+        };
+        assert!(rx.try_recv().is_err());
+        let during_reverify =
+            core.git_review_for_mode(&host_id, "/tmp/r22_delayed", Some("f"), false);
+        assert!(during_reverify.status_reverify_pending);
+        assert_eq!(
+            during_reverify.diff_revision, before_delayed_ack.diff_revision,
+            "R22-P1-2 T2: MUST preserve confirmed diff_revision across reverify wait window"
+        );
+        assert!(during_reverify.raw_diff.contains("+edited-after-stage"));
+        let during_flags: Vec<bool> = during_reverify
+            .status
+            .expect("status preserved during reverify")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(
+            during_flags,
+            vec![true, false],
+            "R22-P1-2 T2: MUST NOT roll back status to stale [true] while reverify is pending"
+        );
+        let rev_after_ack = during_reverify.status_revision;
+
+        // T3: Post-completion recheck returns `[true, false]` -> clears `status_reverify_pending`,
+        // advances `status_revision`, and invalidates pre-reverify diff for authoritative refresh!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_recheck,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_delayed".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_delayed".into()),
+                },
+            },
+        );
+        let after_recheck =
+            core.git_review_for_mode(&host_id, "/tmp/r22_delayed", Some("f"), false);
+        assert!(!after_recheck.status_reverify_pending);
+        assert!(after_recheck.status_revision > rev_after_ack);
+        assert_eq!(after_recheck.diff_revision, 0);
+        let recheck_flags: Vec<bool> = after_recheck
+            .status
+            .expect("status present")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(recheck_flags, vec![true, false]);
+
+        // 4. R22-P1-2 Negative Control: Ordinary Stage with NO overlapping status read MUST emit
+        //    ZERO extra `GetGitStatus` requests (only the single routine `GetGitDiff`)!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r22_no_overlap".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_no_overlap".into()),
+                },
+            },
+        );
+        let clean_stage_core = Arc::clone(&core);
+        let clean_stage_host = host_id.clone();
+        let clean_stage_task = core.runtime.spawn(async move {
+            clean_stage_core
+                .git_stage_files_on_host(
+                    &clean_stage_host,
+                    "/tmp/r22_no_overlap",
+                    vec!["f".into()],
+                    false,
+                )
+                .await
+        });
+        let req_clean_stage = match recv_wire(&core, &mut rx) {
+            WireMessage::GitStageFiles { request_id, .. } => request_id,
+            other => panic!("expected GitStageFiles, got {other:?}"),
+        };
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: req_clean_stage,
+                cwd: "/tmp/r22_no_overlap".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r22_no_overlap".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r22_no_overlap".into()),
+                }),
+            },
+        );
+        assert!(
+            core.runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), clean_stage_task).await
+                })
+                .expect("timeout")
+                .expect("join")
+                .is_ok()
+        );
+        match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitDiff { cwd, .. } => assert_eq!(cwd, "/tmp/r22_no_overlap"),
+            other => {
+                panic!("expected ONLY routine GetGitDiff on non-overlapping Stage, got {other:?}")
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "R22-P1-2 negative control: non-overlapping Stage MUST emit 0 extra GetGitStatus"
+        );
+    }
+
+    #[test]
+    fn round23_cold_diff_first_guard_and_reverify_wait_preserves_confirmed_state() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        let recv_wire = |core: &Arc<OrbitAppCore>,
+                         rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>|
+         -> WireMessage {
+            let frame = core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("wire timeout")
+                    .expect("wire closed")
+            });
+            match frame {
+                crate::OutboundPayload::Wire(msg) => msg,
+                other => panic!("unexpected outbound payload: {other:?}"),
+            }
+        };
+
+        // 1. R22-P1-1 Cold-start "clean A / dirty B" — B's diff arrives FIRST, A's earlier status SECOND!
+        core.fetch_git_status(&host_id, "/tmp/r23_cold_cd");
+        let req_s_a1 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r23_cold_cd", Some("f"), false);
+        let (req_d_b1, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        // Deliver B's diff FIRST on cold link:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_b1,
+                cwd: "/tmp/r23_cold_cd".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+second-working\n".into(),
+                repo_root: Some("/private/r23_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // Because `req_s_a1` is still in flight, 0 redundant GetGitStatus yet:
+        assert!(rx.try_recv().is_err());
+        let after_cold_diff =
+            core.git_review_for_mode(&host_id, "/tmp/r23_cold_cd", Some("f"), false);
+        assert_eq!(after_cold_diff.cwd_identity_epoch, 1);
+        assert!(after_cold_diff.diff_revision > 0);
+        assert!(after_cold_diff.raw_diff.contains("+second-working"));
+
+        // Now deliver earlier-sampled A status (`repo_root = A`, clean) SECOND -> MUST be rejected!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_s_a1,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_cold_cd".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_a".into()),
+                },
+            },
+        );
+        let req_verify_cd = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r23_cold_cd");
+                assert_ne!(request_id, req_s_a1);
+                request_id
+            }
+            other => panic!("expected cold conflict verification GetGitStatus, got {other:?}"),
+        };
+        assert!(rx.try_recv().is_err());
+        let after_conflict_a =
+            core.git_review_for_mode(&host_id, "/tmp/r23_cold_cd", Some("f"), false);
+        assert_eq!(after_conflict_a.cwd_identity_epoch, 1);
+        assert!(after_conflict_a.status.is_none());
+        assert_eq!(
+            after_conflict_a.diff_revision,
+            after_cold_diff.diff_revision
+        );
+        assert!(after_conflict_a.raw_diff.contains("+second-working"));
+
+        // Deliver verification status for B -> converges cleanly to B!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_verify_cd,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_cold_cd".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_b".into()),
+                },
+            },
+        );
+        let after_verify_cd =
+            core.git_review_for_mode(&host_id, "/tmp/r23_cold_cd", Some("f"), false);
+        assert_eq!(after_verify_cd.cwd_identity_epoch, 1);
+        assert_eq!(after_verify_cd.status_identity_epoch, 1);
+        assert_eq!(
+            after_verify_cd
+                .status
+                .as_ref()
+                .and_then(|s| s.repo_root.as_deref()),
+            Some("/private/r23_b")
+        );
+        assert_eq!(after_verify_cd.diff_revision, after_cold_diff.diff_revision);
+        assert!(rx.try_recv().is_err());
+
+        // 2. R22-P1-1 Cold-start "dirty A / clean B" — B's clean diff FIRST, A's dirty status SECOND:
+        //    MUST reject A, emit 1 verification GetGitStatus, emit 0 extra GetGitDiff for clean B!
+        core.fetch_git_status(&host_id, "/tmp/r23_cold_dc");
+        let req_s_a2 = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r23_cold_dc", Some("f"), false);
+        let (req_d_b2, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_b2,
+                cwd: "/tmp/r23_cold_dc".into(),
+                path: Some("f".into()),
+                unified_diff: String::new(),
+                repo_root: Some("/private/r23_b_clean".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        let clean_b_rev = core
+            .git_review_for_mode(&host_id, "/tmp/r23_cold_dc", Some("f"), false)
+            .diff_revision;
+        assert!(clean_b_rev > 0);
+        // Earlier dirty A status arrives SECOND -> rejected, 1 verification GetGitStatus, 0 GetGitDiff!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_s_a2,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_cold_dc".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_a_dirty".into()),
+                },
+            },
+        );
+        let req_verify_dc = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r23_cold_dc");
+                request_id
+            }
+            other => panic!("expected clean-B verification GetGitStatus, got {other:?}"),
+        };
+        assert!(
+            rx.try_recv().is_err(),
+            "dirty A / clean B MUST emit 0 target f/U GetGitDiff fetches"
+        );
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_verify_dc,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_cold_dc".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_b_clean".into()),
+                },
+            },
+        );
+        let after_dc = core.git_review_for_mode(&host_id, "/tmp/r23_cold_dc", Some("f"), false);
+        assert_eq!(after_dc.cwd_identity_epoch, 1);
+        assert_eq!(after_dc.status_identity_epoch, 1);
+        assert_eq!(after_dc.diff_revision, clean_b_rev);
+        assert_eq!(
+            after_dc
+                .status
+                .as_ref()
+                .and_then(|s| s.repo_root.as_deref()),
+            Some("/private/r23_b_clean")
+        );
+        assert!(rx.try_recv().is_err());
+
+        // 3. R22-P1-1 Cold-start controls: (a) NO in-flight status when first diff arrives ->
+        //    auto-dispatches 1 GetGitStatus; (b) pre-identity status RpcError -> auto-dispatches
+        //    1 bounded verification GetGitStatus (0 infinite retries if that also errors);
+        //    (c) normal no-switch cold start (B diff then B status) -> 0 extra GetGitStatus!
+        core.fetch_git_diff(&host_id, "/tmp/r23_cold_nost", Some("f"), false);
+        let (req_nost, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_nost,
+                cwd: "/tmp/r23_cold_nost".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+solo\n".into(),
+                repo_root: Some("/private/r23_solo".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { cwd, .. } => assert_eq!(cwd, "/tmp/r23_cold_nost"),
+            other => panic!(
+                "expected auto GetGitStatus when cold diff had no status in flight, got {other:?}"
+            ),
+        }
+        assert!(rx.try_recv().is_err());
+
+        core.fetch_git_status(&host_id, "/tmp/r23_cold_err");
+        let req_s_err = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r23_cold_err", Some("f"), false);
+        let (req_d_err, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_err,
+                cwd: "/tmp/r23_cold_err".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+b-body\n".into(),
+                repo_root: Some("/private/r23_err_b".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        assert!(rx.try_recv().is_err());
+        // Pre-identity `req_s_err` fails with RpcError -> dispatches strictly 1 post-identity verify!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_s_err),
+                code: "git_status_error".into(),
+                message: "transient error".into(),
+            },
+        );
+        let req_s_retry = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r23_cold_err");
+                assert_ne!(request_id, req_s_err);
+                request_id
+            }
+            other => panic!(
+                "expected bounded verification retry after pre-identity RpcError, got {other:?}"
+            ),
+        };
+        // If that post-identity verification query ALSO errors -> 0 further retries!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::RpcError {
+                request_id: Some(req_s_retry),
+                code: "git_status_error".into(),
+                message: "still failing".into(),
+            },
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Normal no-switch cold start: B diff then matching B status -> 0 extra GetGitStatus!
+        core.fetch_git_status(&host_id, "/tmp/r23_cold_ok");
+        let req_s_ok = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        core.fetch_git_diff(&host_id, "/tmp/r23_cold_ok", Some("f"), false);
+        let (req_d_ok, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_d_ok,
+                cwd: "/tmp/r23_cold_ok".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+ok\n".into(),
+                repo_root: Some("/private/r23_ok".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        assert!(rx.try_recv().is_err());
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_s_ok,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_cold_ok".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_ok".into()),
+                },
+            },
+        );
+        assert!(rx.try_recv().is_err());
+        let ok_view = core.git_review_for_mode(&host_id, "/tmp/r23_cold_ok", Some("f"), false);
+        assert_eq!(ok_view.cwd_identity_epoch, 1);
+        assert_eq!(ok_view.status_identity_epoch, 1);
+        assert!(ok_view.diff_revision > 0);
+
+        // 4. R22-P1-2 Three-timepoint test (T1 / T2 / T3) with BOTH already-returned post-write
+        //    read `[true, false]` AND an additional still-in-flight overlapping read `[false]`:
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: Uuid::new_v4(),
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_both_ov".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_both_ov".into()),
+                },
+            },
+        );
+        let st_core = Arc::clone(&core);
+        let st_host = host_id.clone();
+        let st_task = core.runtime.spawn(async move {
+            st_core
+                .git_stage_files_on_host(&st_host, "/tmp/r23_both_ov", vec!["f".into()], false)
+                .await
+        });
+        let req_stage_ov = match recv_wire(&core, &mut rx) {
+            WireMessage::GitStageFiles { request_id, .. } => request_id,
+            other => panic!("expected GitStageFiles, got {other:?}"),
+        };
+        // Read #1 (post-write edit) returns & confirms `[true, false]` + 112B `+edited-after-stage`:
+        core.fetch_git_status(&host_id, "/tmp/r23_both_ov");
+        let req_ov_done = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected GetGitStatus, got {other:?}"),
+        };
+        // Read #2 remains IN FLIGHT while Stage ack lands:
+        core.fetch_git_status(&host_id, "/tmp/r23_both_ov");
+        let req_ov_inflight = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, .. } => request_id,
+            other => panic!("expected in-flight GetGitStatus, got {other:?}"),
+        };
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_ov_done,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_both_ov".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_both_ov".into()),
+                },
+            },
+        );
+        core.fetch_git_diff(&host_id, "/tmp/r23_both_ov", Some("f"), false);
+        let (req_ov_diff, _, _, _) = recv_git_diff_request(&core, &mut rx);
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitDiffResponse {
+                request_id: req_ov_diff,
+                cwd: "/tmp/r23_both_ov".into(),
+                path: Some("f".into()),
+                unified_diff: "diff --git a/f b/f\n+edited-after-stage\n".into(),
+                repo_root: Some("/private/r23_both_ov".into()),
+                repo_prefix: Some(String::new()),
+            },
+        );
+        // T1 assertions:
+        let t1 = core.git_review_for_mode(&host_id, "/tmp/r23_both_ov", Some("f"), false);
+        assert!(!t1.status_reverify_pending);
+        assert!(t1.diff_revision > 0);
+        assert!(t1.raw_diff.contains("+edited-after-stage"));
+
+        // Deliver delayed Stage ack (`[true]`):
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitMutationResult {
+                request_id: req_stage_ov,
+                cwd: "/tmp/r23_both_ov".into(),
+                result: GitMutationOutcome::FilesStaged {
+                    paths: vec!["f".into()],
+                    all: false,
+                },
+                status: Some(GitStatusSnapshot {
+                    cwd: "/tmp/r23_both_ov".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: true,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_both_ov".into()),
+                }),
+            },
+        );
+        assert!(
+            core.runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(2), st_task).await })
+                .expect("timeout")
+                .expect("join")
+                .is_ok()
+        );
+        // T2 assertions: BOTH already-returned + still-in-flight reads coalesce to strictly ONE
+        // `req_recheck_both` (0 speculative `GetGitDiff`), `status_reverify_pending == true`,
+        // `[true, false]` & `t1.diff_revision` & `+edited-after-stage` ALL preserved!
+        let req_recheck_both = match recv_wire(&core, &mut rx) {
+            WireMessage::GetGitStatus { request_id, cwd } => {
+                assert_eq!(cwd, "/tmp/r23_both_ov");
+                assert_ne!(request_id, req_ov_done);
+                assert_ne!(request_id, req_ov_inflight);
+                request_id
+            }
+            other => panic!("expected 1 coalesced reverify GetGitStatus, got {other:?}"),
+        };
+        assert!(rx.try_recv().is_err());
+        let t2 = core.git_review_for_mode(&host_id, "/tmp/r23_both_ov", Some("f"), false);
+        assert!(t2.status_reverify_pending);
+        assert_eq!(t2.diff_revision, t1.diff_revision);
+        assert!(t2.raw_diff.contains("+edited-after-stage"));
+        let t2_flags: Vec<bool> = t2
+            .status
+            .expect("T2 status preserved")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(t2_flags, vec![true, false]);
+
+        // Late in-flight pre-write `[false]` arrives during T2 -> MUST be rejected with 0 side effects!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_ov_inflight,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_both_ov".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![orbit_protocol::GitFileEntry {
+                        path: "f".into(),
+                        status: "M".into(),
+                        staged: false,
+                        untracked: false,
+                    }],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_both_ov".into()),
+                },
+            },
+        );
+        let t2_after_late =
+            core.git_review_for_mode(&host_id, "/tmp/r23_both_ov", Some("f"), false);
+        assert!(t2_after_late.status_reverify_pending);
+        assert_eq!(t2_after_late.diff_revision, t1.diff_revision);
+        let t2_late_flags: Vec<bool> = t2_after_late
+            .status
+            .expect("T2 status still preserved")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(t2_late_flags, vec![true, false]);
+
+        // T3: Authoritative recheck `[true, false]` arrives -> clears `status_reverify_pending`,
+        // advances `status_revision`, and invalidates pre-reverify diff for fresh fetch!
+        core.handle_inbound_wire(
+            &host_id,
+            WireMessage::GitStatusResponse {
+                request_id: req_recheck_both,
+                status: GitStatusSnapshot {
+                    cwd: "/tmp/r23_both_ov".into(),
+                    is_git_repo: true,
+                    branch: Some("main".into()),
+                    upstream: None,
+                    ahead: 0,
+                    behind: 0,
+                    files: vec![
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: true,
+                            untracked: false,
+                        },
+                        orbit_protocol::GitFileEntry {
+                            path: "f".into(),
+                            status: "M".into(),
+                            staged: false,
+                            untracked: false,
+                        },
+                    ],
+                    nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: Some("/private/r23_both_ov".into()),
+                },
+            },
+        );
+        let t3 = core.git_review_for_mode(&host_id, "/tmp/r23_both_ov", Some("f"), false);
+        assert!(!t3.status_reverify_pending);
+        assert!(t3.status_revision > t1.status_revision);
+        assert_eq!(t3.diff_revision, 0);
+        let t3_flags: Vec<bool> = t3
+            .status
+            .expect("T3 authoritative status")
+            .files
+            .into_iter()
+            .filter(|e| e.path == "f")
+            .map(|e| e.staged)
+            .collect();
+        assert_eq!(t3_flags, vec![true, false]);
+    }
+
+    #[test]
+    fn git_review_never_fuzzy_matches_tilde_cache_against_unrelated_absolute_path() {
+        let (core, host_id, mut rx) = setup_connected_git_test_core();
+
+        let pa_diff = "diff --git a/pa-only.txt b/pa-only.txt\n--- a/pa-only.txt\n+++ b/pa-only.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let worker_diff = "diff --git a/worker-only.txt b/worker-only.txt\n--- a/worker-only.txt\n+++ b/worker-only.txt\n@@ -1 +1 @@\n-a\n+b\n";
+
+        let deliver_diff =
+            |cwd: &str,
+             path: Option<&str>,
+             diff: &str,
+             rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundPayload>| {
+                core.fetch_git_diff(&host_id, cwd, path, false);
+                let (req_id, _, _, _) = recv_git_diff_request(&core, rx);
+                core.handle_inbound_wire(
+                    &host_id,
+                    WireMessage::GitDiffResponse {
+                        request_id: req_id,
+                        cwd: cwd.into(),
+                        path: path.map(ToOwned::to_owned),
+                        unified_diff: diff.into(),
+                        repo_root: None,
+                        repo_prefix: None,
+                    },
+                );
+            };
+
+        // Cache PA diff/status under daemon shorthand `~/project`
+        deliver_diff("~/project", None, pa_diff, &mut rx);
         core.handle_inbound_wire(
             &host_id,
             WireMessage::GitStatusResponse {
@@ -37436,6 +44771,8 @@ mod tests {
                     behind: 0,
                     files: vec![],
                     nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
                 },
             },
         );
@@ -37464,38 +44801,14 @@ mod tests {
         assert!(auth_worker_miss.status.is_none());
 
         // Once `/home/worker/project` arrives, it resolves cleanly without mixing with `~/project`
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/home/worker/project".into(),
-                path: None,
-                unified_diff: worker_diff.into(),
-            },
-        );
+        deliver_diff("/home/worker/project", None, worker_diff, &mut rx);
         let hydrated_worker = core.git_review(&host_id, "/home/worker/project", None);
         assert_eq!(hydrated_worker.diff_files.len(), 1);
         assert_eq!(hydrated_worker.diff_files[0].path, "worker-only.txt");
 
         // POSIX literal backslash directory `/tmp/team\project` vs `/tmp/team/project` must stay distinct
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/tmp/team\\project".into(),
-                path: None,
-                unified_diff: worker_diff.into(),
-            },
-        );
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/tmp/team/project".into(),
-                path: None,
-                unified_diff: pa_diff.into(),
-            },
-        );
+        deliver_diff("/tmp/team\\project", None, worker_diff, &mut rx);
+        deliver_diff("/tmp/team/project", None, pa_diff, &mut rx);
         assert_eq!(
             core.git_review(&host_id, "/tmp/team\\project", None)
                 .diff_files[0]
@@ -37509,28 +44822,12 @@ mod tests {
             "pa-only.txt"
         );
 
-        // Structured `(cwd, Option<path>)` keys MUST eliminate `::` delimiter collisions both on
+        // Structured `(cwd, Option<path>, staged)` keys MUST eliminate `::` delimiter collisions both on
         // reads and on `GitMutationResult` eviction!
         let colon_diff = "diff --git a/team::index.txt b/team::index.txt\n--- a/team::index.txt\n+++ b/team::index.txt\n@@ -1 +1 @@\n-old\n+new\n";
         let release_diff = "diff --git a/release::notes.txt b/release::notes.txt\n--- a/release::notes.txt\n+++ b/release::notes.txt\n@@ -1 +1 @@\n-v1\n+v2\n";
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/repo".into(),
-                path: Some("team::index.txt".into()),
-                unified_diff: colon_diff.into(),
-            },
-        );
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/repo".into(),
-                path: Some("release::notes.txt".into()),
-                unified_diff: release_diff.into(),
-            },
-        );
+        deliver_diff("/repo", Some("team::index.txt"), colon_diff, &mut rx);
+        deliver_diff("/repo", Some("release::notes.txt"), release_diff, &mut rx);
         // Querying `(/repo::team, Some("index.txt"))` MUST miss (never collide with `(/repo, Some("team::index.txt"))`)
         let colon_collision_probe = core.git_review(&host_id, "/repo::team", Some("index.txt"));
         assert!(
@@ -37564,6 +44861,8 @@ mod tests {
                     behind: 0,
                     files: vec![],
                     nested_git_repos: vec![],
+                    repo_prefix: Some(String::new()),
+                    repo_root: None,
                 }),
             },
         );
@@ -37581,24 +44880,8 @@ mod tests {
 
         // Legal POSIX directory names differing only by trailing whitespace (`/tmp/project` vs
         // `/tmp/project `) MUST remain strictly distinct in both lookup and eviction.
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/tmp/project".into(),
-                path: None,
-                unified_diff: worker_diff.into(),
-            },
-        );
-        core.handle_inbound_wire(
-            &host_id,
-            WireMessage::GitDiffResponse {
-                request_id: Uuid::new_v4(),
-                cwd: "/tmp/project ".into(),
-                path: None,
-                unified_diff: pa_diff.into(),
-            },
-        );
+        deliver_diff("/tmp/project", None, worker_diff, &mut rx);
+        deliver_diff("/tmp/project ", None, pa_diff, &mut rx);
         assert_eq!(
             core.git_review(&host_id, "/tmp/project", None).diff_files[0].path,
             "worker-only.txt"

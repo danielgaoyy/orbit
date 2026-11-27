@@ -604,6 +604,10 @@ export struct OmniComposer {
                     .objectFit(ImageFit.Cover)
                     .borderRadius(OrbitTokens.RADIUS_MD)
                     .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                    .accessibilityText(`Preview ${att.filename}`)
+                    .onClick(() => {
+                      this.store.openImageViewerModal(att.localUri, att.filename);
+                    })
                   Button({ type: ButtonType.Circle, stateEffect: true }) {
                     SymbolGlyph($r('sys.symbol.xmark'))
                       .fontSize(10)
@@ -957,6 +961,12 @@ export struct OmniComposer {
               right: OrbitTokens.SPACE_LG,
               top: 10,
               bottom: 2
+            })
+            .onFocus(() => {
+              this.store.shellStore.setTextInputFocused(true);
+            })
+            .onBlur(() => {
+              this.store.shellStore.setTextInputFocused(false);
             })
             .onChange((val: string) => {
               if (val !== this.store.composerText) {

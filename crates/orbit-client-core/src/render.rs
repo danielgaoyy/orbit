@@ -462,12 +462,9 @@ fn count_newlines(bytes: &[u8]) -> usize {
     const LO_BITS: u64 = 0x0101_0101_0101_0101;
     const HI_BITS: u64 = 0x8080_8080_8080_8080;
     let mut total = 0usize;
-    let chunks = bytes.chunks_exact(8);
-    let rem = chunks.remainder();
+    let (chunks, rem) = bytes.as_chunks::<8>();
     for chunk in chunks {
-        let word = u64::from_ne_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
+        let word = u64::from_ne_bytes(*chunk);
         let xored = word ^ LF_MASK;
         let has_lf = xored.wrapping_sub(LO_BITS) & !xored & HI_BITS;
         total += has_lf.count_ones() as usize;
@@ -486,11 +483,9 @@ fn find_newline(bytes: &[u8]) -> Option<usize> {
     const LO_BITS: u64 = 0x0101_0101_0101_0101;
     const HI_BITS: u64 = 0x8080_8080_8080_8080;
     let mut offset = 0usize;
-    let chunks = bytes.chunks_exact(8);
+    let (chunks, rem) = bytes.as_chunks::<8>();
     for chunk in chunks {
-        let word = u64::from_ne_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
+        let word = u64::from_ne_bytes(*chunk);
         let xored = word ^ LF_MASK;
         let has_lf = xored.wrapping_sub(LO_BITS) & !xored & HI_BITS;
         if has_lf != 0 {
@@ -502,7 +497,7 @@ fn find_newline(bytes: &[u8]) -> Option<usize> {
         }
         offset += 8;
     }
-    for (i, &b) in bytes[offset..].iter().enumerate() {
+    for (i, &b) in rem.iter().enumerate() {
         if b == b'\n' {
             return Some(offset + i);
         }

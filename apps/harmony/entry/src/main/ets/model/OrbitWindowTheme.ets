@@ -16,11 +16,17 @@ export function orbitBindThemeWindow(win: window.Window | null): void {
   boundMainWindow = win;
 }
 
+export function orbitIsLegacyThemeMode(mode: string): boolean {
+  const clean = mode.trim().toLowerCase();
+  return clean === 'graphite' || clean === 'oled';
+}
+
 export function orbitNormalizeThemeMode(mode: string): string {
-  if (mode === 'light') {
+  const clean = mode.trim().toLowerCase();
+  if (clean === 'light') {
     return 'light';
   }
-  if (mode === 'dark') {
+  if (clean === 'dark' || clean === 'graphite' || clean === 'oled') {
     return 'dark';
   }
   return 'system';

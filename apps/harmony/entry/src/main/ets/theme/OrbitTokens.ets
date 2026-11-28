@@ -354,6 +354,7 @@ export class OrbitButtonModifier implements AttributeModifier<ButtonAttribute> {
     instance.fontWeight(FontWeight.Medium);
     instance.fontColor(this.fgColor);
     instance.backgroundColor(this.bgColor);
+    instance.maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME);
     instance.stateEffect(true);
   }
 }

@@ -274,7 +274,7 @@ export struct ModelPickerSheet {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(Color.Transparent)
-        .accessibilityText('Refresh Model Catalog')
+        .accessibilityText($r('app.string.model_picker_refresh_a11y'))
         .onClick(() => {
           this.store.refreshModelsAndQuotas(true);
         })
@@ -333,7 +333,7 @@ export struct ModelPickerSheet {
               )
               .onClick(() => {
                 if (this.isSelectedModel(spec)) {
-                  this.store.triggerHaptic(6);
+                  this.store.triggerHapticPreset('selection');
                   this.store.showModelPickerSheet = false;
                   return;
                 }
@@ -368,7 +368,7 @@ export struct ModelPickerSheet {
 
         Column({ space: 6 }) {
           Row({ space: OrbitTokens.SPACE_SM }) {
-            Text('Thinking')
+            Text($r('app.string.model_picker_thinking'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
             Blank()
             if (this.activeEffortDescription.length > 0) {

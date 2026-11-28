@@ -44,10 +44,29 @@ export class OrbitTheme {
     curve: Curve.FastOutSlowIn
   };
 
+  public static readonly MOTION_ZERO: OrbitMotionConfig = {
+    duration: 0,
+    curve: Curve.Linear
+  };
+
   public static readonly MOTION_EXIT: OrbitMotionConfig = {
     duration: OrbitTokens.DUR_EXIT,
     curve: Curve.EaseOut
   };
+
+  public static resolveMotion(base: OrbitMotionConfig, reducedMotion: boolean): OrbitMotionConfig {
+    if (reducedMotion) {
+      return OrbitTheme.MOTION_ZERO;
+    }
+    return base;
+  }
+
+  public static resolveDuration(durationMs: number, reducedMotion: boolean): number {
+    if (reducedMotion) {
+      return 0;
+    }
+    return durationMs;
+  }
 
   public static raisedCard(palette: OrbitThemePalette): OrbitSurfaceModifier {
     return orbitSurface(

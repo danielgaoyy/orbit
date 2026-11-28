@@ -555,14 +555,14 @@ export struct OrbitScopedTerminalTabView {
     if (this.rawMode) {
       if (info.insertValue.length > 0) {
         this.sendWithStickyModifiers(info.insertValue);
-        this.store.triggerHaptic(4);
+        this.store.triggerHapticPreset('selection');
       }
       return false;
     }
     if (this.ctrlSticky || this.altSticky) {
       if (info.insertValue.length === 1) {
         this.sendWithStickyModifiers(info.insertValue);
-        this.store.triggerHaptic(6);
+        this.store.triggerHapticPreset('selection');
         return false;
       }
       this.ctrlSticky = false;
@@ -601,12 +601,12 @@ export struct OrbitScopedTerminalTabView {
   private handleDevKeyTap(item: DevKeyItem): void {
     if (item.id === 'ctrl') {
       this.ctrlSticky = !this.ctrlSticky;
-      this.store.triggerHaptic(8);
+      this.store.triggerHapticPreset('selection');
       return;
     }
     if (item.id === 'alt') {
       this.altSticky = !this.altSticky;
-      this.store.triggerHaptic(8);
+      this.store.triggerHapticPreset('selection');
       return;
     }
     const host = this.tab.hostId.trim();
@@ -618,7 +618,7 @@ export struct OrbitScopedTerminalTabView {
     } else {
       this.sendWithStickyModifiers(item.sequence);
     }
-    this.store.triggerHaptic(6);
+    this.store.triggerHapticPreset('selection');
   }
 
   private submitCommand(): void {
@@ -628,7 +628,7 @@ export struct OrbitScopedTerminalTabView {
     }
     if (this.rawMode) {
       this.store.sendScopedTerminalBytes(host, this.activeSlot, new Uint8Array([0x0D]));
-      this.store.triggerHaptic(6);
+      this.store.triggerHapticPreset('selection');
       return;
     }
     if (this.ctrlSticky || this.altSticky) {
@@ -701,7 +701,7 @@ export struct OrbitScopedTerminalTabView {
               this.rawMode = !this.rawMode;
               this.lineInput = '';
               this.saveSlotState(this.currentTargetKey(), this.activeSlot);
-              this.store.triggerHaptic(8);
+              this.store.triggerHapticPreset('selection');
             })
 
           Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -1273,7 +1273,7 @@ export struct OrbitScopedBoardTabView {
     this.casConflictRemoteContent = '';
     this.showCasConflictDialog = false;
     this.editing = true;
-    this.store.triggerHaptic(6);
+    this.store.triggerHapticPreset('selection');
   }
 
   private async saveBoard(forceOverwrite: boolean = false): Promise<void> {
@@ -1345,7 +1345,7 @@ export struct OrbitScopedBoardTabView {
       this.casConflictRemoteContent = '';
       this.showCasConflictDialog = false;
       this.store.showToastResource($r('app.string.board_saved_toast'), false);
-      this.store.triggerHaptic(10);
+      this.store.triggerHapticPreset('success');
       this.reloadBoard(false);
       return;
     }
@@ -1378,7 +1378,7 @@ export struct OrbitScopedBoardTabView {
       this.store.setWorkspaceBoardDraft(this.editingTargetKey, merged, this.casConflictRevision);
     }
     this.showCasConflictDialog = false;
-    this.store.triggerHaptic(8);
+    this.store.triggerHapticPreset('selection');
   }
 
   private resolvePeerTitle(peer: AgentCardDto): string {

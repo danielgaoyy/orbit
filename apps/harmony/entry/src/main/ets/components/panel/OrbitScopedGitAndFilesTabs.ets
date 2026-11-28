@@ -45,6 +45,7 @@ import {
 } from '../../theme/OrbitTokens';
 import { OrbitTheme } from '../../theme/OrbitTheme';
 import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
+import { OrbitPullRefreshController } from '../settings/OrbitSettingsNavModel';
 import { RichMarkdownView } from '../stage/RichMarkdownView';
 
 const INITIAL_DIFF_LINE_CAP: number = 120;
@@ -112,6 +113,8 @@ export struct OrbitScopedGitTabView {
   private lastBoundCwd: string | null = null;
   private lastBoundPath: string | null = null;
   private targetVersion: number = 0;
+  @Local private isRefreshing: boolean = false;
+  private readonly pullRefreshCtrl: OrbitPullRefreshController = new OrbitPullRefreshController();
   private collabSeq: number = 0;
   private writeSeq: number = 0;
   private commitDraftVersion: number = 0;
@@ -143,6 +146,8 @@ export struct OrbitScopedGitTabView {
 
   aboutToDisappear(): void {
     this.disposed = true;
+    this.pullRefreshCtrl.unmount();
+    this.isRefreshing = false;
     this.targetVersion += 1;
     this.collabSeq += 1;
     this.writeSeq += 1;
@@ -171,6 +176,9 @@ export struct OrbitScopedGitTabView {
         this.store.releaseGitDiffTrackerIfUnused(prevHost, prevCwd, prevPath);
       }
       this.targetVersion += 1;
+      if (this.pullRefreshCtrl.onScopeChanged(nextKey)) {
+        this.isRefreshing = false;
+      }
       this.collabSeq += 1;
       this.writeSeq += 1;
       this.commitDraftVersion += 1;
@@ -256,6 +264,21 @@ export struct OrbitScopedGitTabView {
     if (!this.disposed && tv === this.targetVersion && cSeq === this.collabSeq && targetKey === this.currentTargetKey()) {
       this.collabData = loaded;
     }
+  }
+
+  private handlePullRefresh(): void {
+    const targetKey = this.currentTargetKey();
+    this.store.triggerHaptic('selection');
+    void this.pullRefreshCtrl.run(
+      targetKey,
+      async (): Promise<void> => {
+        this.reloadScopedGit(true, true, false);
+        await this.refreshCollabStatus();
+      },
+      (refreshing: boolean): void => {
+        this.isRefreshing = refreshing;
+      }
+    );
   }
 
   private async runScopedWrite(fn: (host: string, cwd: string) => Promise<boolean>): Promise<boolean> {
@@ -424,7 +447,7 @@ export struct OrbitScopedGitTabView {
         ? this.manuallyCollapsedPaths.concat([filePath])
         : this.manuallyCollapsedPaths.filter((p: string) => p !== filePath);
     }
-    this.store.triggerHaptic(6);
+    this.store.triggerHapticPreset('selection');
   }
 
   private toggleCollapseExpandAll(): void {
@@ -440,7 +463,7 @@ export struct OrbitScopedGitTabView {
       this.manuallyExpandedPaths = [];
       this.manuallyCollapsedPaths = collapsed;
     }
-    this.store.triggerHaptic(8);
+    this.store.triggerHapticPreset('selection');
   }
 
   private expandAllLinesForFile(filePath: string): void {
@@ -448,7 +471,7 @@ export struct OrbitScopedGitTabView {
       return;
     }
     this.uncappedPaths = this.uncappedPaths.concat([filePath]);
-    this.store.triggerHaptic(8);
+    this.store.triggerHapticPreset('selection');
   }
 
   private resolveRowActionPath(rowPath: string): string {
@@ -943,7 +966,7 @@ export struct OrbitScopedGitTabView {
                   if (!this.disposed && tv === this.targetVersion && tKey === this.currentTargetKey()) {
                     if (res.ok && res.data !== null) {
                       this.store.showToastResource($r('app.string.git_discard_success', res.data), false);
-                      this.store.triggerHaptic(12);
+                      this.store.triggerHapticPreset('warning');
                     } else {
                       this.store.showToastResource(
                         res.errorDetail.length > 0
@@ -1064,7 +1087,7 @@ export struct OrbitScopedGitTabView {
                         $r('app.string.git_push_success', res.data.branch, res.data.remote),
                         false
                       );
-                      this.store.triggerHaptic(10);
+                      this.store.triggerHapticPreset('action');
                     } else {
                       this.store.showToastResource(
                         res.errorDetail.length > 0
@@ -1384,11 +1407,12 @@ export struct OrbitScopedGitTabView {
 
       Search({ value: this.filterQuery, placeholder: $r('app.string.git_filter_changed_placeholder') })
         .width('100%')
-        .height(36)
+        .constraintSize({ minHeight: 36 })
         .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
         .backgroundColor(this.store.palette.recessed)
         .fontColor(this.store.palette.fgPrimary)
         .placeholderColor(this.store.palette.fgMuted)
+        .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
         .onFocus(() => {
           this.store.shellStore.setTextInputFocused(true);
         })
@@ -1399,86 +1423,102 @@ export struct OrbitScopedGitTabView {
           this.filterQuery = val;
         })
 
-      if (this.diffModeState === 'loading' && this.flatDiffRows.length === 0) {
-        Column({ space: OrbitTokens.SPACE_SM }) {
-          Blank()
-          LoadingProgress()
-            .width(24)
-            .height(24)
-            .color(this.store.palette.accentPrimary)
-          Text(this.stagedMode ? 'Loading staged diff…' : 'Loading unstaged diff…')
-            .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
-          Blank()
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Center)
-      } else if (this.diffModeState === 'unverified' && this.flatDiffRows.length === 0) {
-        Column({ space: OrbitTokens.SPACE_SM }) {
-          Blank()
-          SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
-            .fontSize(24)
-            .fontColor([this.store.palette.statusWarning])
-          Text(
-            this.stagedMode
-              ? 'Staged diff could not be verified for this scope'
-              : 'Unstaged diff could not be verified for this scope'
-          )
-            .attributeModifier(orbitTextBody(this.store.palette.fgPrimary))
-            .textAlign(TextAlign.Center)
-          Text($r('app.string.git_diff_unconfirmed_notice'))
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-            .textAlign(TextAlign.Center)
-            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
-          Button($r('app.string.git_refresh_diff'), { type: ButtonType.Capsule, stateEffect: true })
-            .attributeModifier(
-              orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+      Refresh({ refreshing: $$this.isRefreshing }) {
+        if (this.diffModeState === 'loading' && this.flatDiffRows.length === 0) {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Blank()
+            LoadingProgress()
+              .width(24)
+              .height(24)
+              .color(this.store.palette.accentPrimary)
+            Text(
+              this.stagedMode
+                ? $r('app.string.git_loading_staged_diff')
+                : $r('app.string.git_loading_unstaged_diff')
             )
-            .height(32)
-            .padding({ left: 14, right: 14 })
-            .onClick(() => {
-              this.reloadScopedGit(true, true);
-            })
-          Blank()
+              .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
+              .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+            Blank()
+          }
+          .width('100%')
+          .height('100%')
+          .alignItems(HorizontalAlign.Center)
+        } else if (this.diffModeState === 'unverified' && this.flatDiffRows.length === 0) {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Blank()
+            SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
+              .fontSize(24)
+              .fontColor([this.store.palette.statusWarning])
+            Text(
+              this.stagedMode
+                ? $r('app.string.git_staged_unverified')
+                : $r('app.string.git_unstaged_unverified')
+            )
+              .attributeModifier(orbitTextBody(this.store.palette.fgPrimary))
+              .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+              .textAlign(TextAlign.Center)
+            Text($r('app.string.git_diff_unconfirmed_notice'))
+              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+              .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+              .textAlign(TextAlign.Center)
+              .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+            Button($r('app.string.git_refresh_diff'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(
+                orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+              )
+              .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+              .padding({ left: 14, right: 14 })
+              .accessibilityText($r('app.string.git_refresh_diff'))
+              .onClick(() => {
+                this.reloadScopedGit(true, true);
+              })
+            Blank()
+          }
+          .width('100%')
+          .height('100%')
+          .alignItems(HorizontalAlign.Center)
+        } else if (this.flatDiffRows.length === 0) {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Blank()
+            SymbolGlyph($r('sys.symbol.checkmark_circle'))
+              .fontSize(26)
+              .fontColor([this.store.palette.fgMuted])
+            Text($r('app.string.git_working_tree_clean_scope'))
+              .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
+              .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+            Blank()
+          }
+          .width('100%')
+          .height('100%')
+          .alignItems(HorizontalAlign.Center)
+        } else {
+          List({ space: 0 }) {
+            Repeat<FlatDiffRowDto>(this.flatDiffRows)
+              .each((ri: RepeatItem<FlatDiffRowDto>) => {
+                ListItem() {
+                  this.renderFlatRow(ri.item)
+                }
+              })
+              .key((r: FlatDiffRowDto): string => r.key)
+              .virtualScroll()
+          }
+          .width('100%')
+          .height('100%')
+          .cachedCount(8)
+          .padding({
+            left: OrbitTokens.SPACE_MD,
+            right: OrbitTokens.SPACE_MD,
+            bottom: Math.max(OrbitTokens.SPACE_MD, this.store.safeBottomVp)
+          })
+          .scrollBar(BarState.Auto)
+          .edgeEffect(EdgeEffect.Spring)
         }
-        .width('100%')
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Center)
-      } else if (this.flatDiffRows.length === 0) {
-        Column({ space: OrbitTokens.SPACE_SM }) {
-          Blank()
-          SymbolGlyph($r('sys.symbol.checkmark_circle'))
-            .fontSize(26)
-            .fontColor([this.store.palette.fgMuted])
-          Text($r('app.string.git_working_tree_clean_scope'))
-            .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
-          Blank()
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Center)
-      } else {
-        List({ space: 0 }) {
-          Repeat<FlatDiffRowDto>(this.flatDiffRows)
-            .each((ri: RepeatItem<FlatDiffRowDto>) => {
-              ListItem() {
-                this.renderFlatRow(ri.item)
-              }
-            })
-            .key((r: FlatDiffRowDto): string => r.key)
-            .virtualScroll()
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .cachedCount(8)
-        .padding({
-          left: OrbitTokens.SPACE_MD,
-          right: OrbitTokens.SPACE_MD,
-          bottom: Math.max(OrbitTokens.SPACE_MD, this.store.safeBottomVp)
-        })
-        .scrollBar(BarState.Auto)
-        .edgeEffect(EdgeEffect.Spring)
       }
+      .width('100%')
+      .layoutWeight(1)
+      .onRefreshing(() => {
+        this.handlePullRefresh();
+      })
     }
     .width('100%')
     .height('100%')

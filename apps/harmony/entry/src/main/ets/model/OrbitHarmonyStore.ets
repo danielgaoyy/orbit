@@ -2,6 +2,9 @@ import { common } from '@kit.AbilityKit';
 import { UIContext } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import {
+  AcpAgentAvailabilityDto,
+  AcpAgentSpecDto,
+  AcpAgentTestResultDto,
   AgentCardDto,
   AgentStageDeltaDto,
   AskSideQuestionRequestDto,
@@ -30,6 +33,7 @@ import {
   ExecuteWorktreeHandoffRequestDto,
   ExportOptionsDto,
   ExportedTranscriptDto,
+  ExternalMcpServerRecordDto,
   FleetOverviewDto,
   FleetSidebarDto,
   ForkAgentRequestDto,
@@ -49,12 +53,15 @@ import {
   GithubDeviceFlowPollDto,
   GithubDeviceFlowStartDto,
   GoalRunRecordDto,
+  GuardianPolicyConfigDto,
   HighlightWorkspaceCodeRequestDto,
   HighlightedCodeDto,
   HostCardDto,
   HostDetailDto,
   InlineMentionRegistration,
+  InstalledPluginDto,
   LaunchpadProjectDto,
+  ManagedSkillRecordDto,
   MentionCandidateDto,
   MentionRankRequestDto,
   ModelOptionDto,
@@ -66,10 +73,12 @@ import {
   OrbitWorkspaceBoardDraft,
   PendingPlanApprovalDto,
   PermissionBatchItemDto,
+  PermissionRuleRecordDto,
   PersonalAgentActivityEntryDto,
   PersonalAgentBriefingDto,
   PersonalRouterConfigDto,
   PreviewWorktreeHandoffRequestDto,
+  ProjectMemoryItemDto,
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
@@ -87,6 +96,7 @@ import {
   RewindAgentResultDto,
   RouterHostCapabilitiesDto,
   RouterStatusSnapshotDto,
+  SandboxPolicyDto,
   ScheduleRunRecordDto,
   ScheduleSpecDto,
   SearchMessagesRequestDto,
@@ -109,6 +119,8 @@ import {
   TimerConditionDto,
   ToolStepDescriptorDto,
   UpdateWorkspaceBoardCasRequestDto,
+  UpsertPermissionRuleInputDto,
+  UsageInsightsSnapshotDto,
   WorkflowRunRecordDto,
   WorkspaceBoardCasResultDto,
   WorkspaceBoardSnapshotDto,
@@ -148,7 +160,11 @@ import {
 import { OrbitCoreBridge } from './OrbitCoreBridge';
 import { OrbitVoiceInputController } from './OrbitVoiceInput';
 import { orbitLogInfo, orbitLogWarn } from './OrbitLogger';
-import { OrbitPreferencesStore } from './OrbitPreferences';
+import {
+  OrbitHostDefaultAgentPrefs,
+  OrbitKeyValuePrefsBackend,
+  OrbitPreferencesStore
+} from './OrbitPreferences';
 import { OrbitPerfProbe } from './OrbitPerfProbe';
 import {
   OrbitEventFlushHandler,
@@ -237,7 +253,10 @@ import {
   snapshotBatchApprovalTargets
 } from '../components/personal-agent/PersonalAgentBriefingModel';
 import {
+  OrbitHapticPreset,
+  applyNativeAppLanguage,
   checkHarmonyNotificationEnabled,
+  normalizeOrbitAppLanguage,
   publishOrbitDeepLinkNotification,
   readAuthorizedClipboardText,
   readUriBytesAsync,
@@ -732,11 +751,16 @@ export class OrbitHarmonyStore {
   private readonly scopedTerminalGridByKey: Map<string, string> = new Map<string, string>();
   private draftSelectionByProvider: Map<string, DraftModelSelection> = new Map<string, DraftModelSelection>();
   private hasUserCustomizedDraftModel: boolean = false;
+  private hostDefaultPrefsByHost: Map<string, OrbitHostDefaultAgentPrefs> = new Map<string, OrbitHostDefaultAgentPrefs>();
+  @Trace public hostDefaultPrefsRevision: number = 0;
 
   // Theme & Window Safe Area State
   @Trace public themeMode: string = 'system';
+  @Trace public appLanguage: string = 'system';
+  @Trace public activeTurnSendBehavior: string = 'queue';
   @Trace public systemIsDark: boolean = false;
   @Trace public palette: OrbitThemePalette = LIGHT_PALETTE;
+  private appContext: common.ApplicationContext | null = null;
   @Trace public safeTopVp: number = 0;
   @Trace public safeBottomVp: number = 0;
   @Trace public safeLeftVp: number = 0;
@@ -821,6 +845,9 @@ export class OrbitHarmonyStore {
   @Trace public selectedAgentId: string = '';
   @Trace public currentAgent: AgentCardDto | null = null;
   @Trace public activeCwd: string = '~';
+  // R7-P1-1: Isolate active workspace directory per hostId so switching hosts never leaks h1's activeCwd to h2/h3.
+  private hostActiveCwdMap: Map<string, string> = new Map<string, string>();
+  private activeCwdHostId: string = '';
   // R3-P1-4: Monotonic epoch bumped on every host switch so late Archive/Restore/Rename
   // outcomes from h1 never surface toast/haptics/sheet-close after h1->h2 or h1->h2->h1.
   @Trace public hostSelectionEpoch: number = 0;
@@ -1804,6 +1831,7 @@ export class OrbitHarmonyStore {
     this.personalAgentStore.bindBridge(this.bridge);
     this.composerStore.bindBridge(this.bridge);
     this.composerStore.hydrate();
+    this.loadDraftPrefsFromDisk();
 
     if (migrateLegacyPrefs && !this.prefsStore.hasMigratedThreadPrefsV1()) {
       const legacyPinned = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
@@ -1888,17 +1916,26 @@ export class OrbitHarmonyStore {
 
   // Theme & Layout Management
 
+  public bindPreferencesBackendForTest(backend: OrbitKeyValuePrefsBackend | null): void {
+    this.prefsStore.bindTestBackend(backend);
+    this.loadDraftPrefsFromDisk();
+  }
+
   public bindContext(ctx: common.Context): void {
     this.abilityContext = ctx;
     this.prefsStore.init(ctx);
+    this.appLanguage = normalizeOrbitAppLanguage(this.prefsStore.getAppLanguage());
+    this.activeTurnSendBehavior = this.prefsStore.getActiveTurnSendBehavior();
     this.shellStore.bindWidthStorage(this.prefsStore);
     this.sidePanelStore.bindStorage(this.prefsStore);
     this.sidePanelStore.hydrate();
     this.sidePanelStore.setDefaultWidthVp(this.shellStore.sidePanelWidthVp);
     this.hydratePushPreferencesFromStorage();
+    this.loadDraftPrefsFromDisk();
   }
 
   public bindApplicationContext(ctx: common.ApplicationContext): void {
+    this.appContext = ctx;
     orbitBindThemeApplicationContext(ctx);
   }
 
@@ -1908,6 +1945,9 @@ export class OrbitHarmonyStore {
     this.palette = resolveOrbitPalette(this.themeMode, this.systemIsDark);
     orbitSetThemeModePreference(saved);
     orbitApplySystemBarTheme(this.palette.isDark);
+    if (this.appLanguage !== 'system') {
+      applyNativeAppLanguage(this.appLanguage, this.appContext);
+    }
   }
 
   public setThemeMode(mode: string): void {
@@ -1917,7 +1957,40 @@ export class OrbitHarmonyStore {
     this.prefsStore.setThemeMode(normalized);
     orbitSetThemeModePreference(normalized);
     orbitApplySystemBarTheme(this.palette.isDark);
-    this.triggerHaptic(8);
+    this.triggerHaptic('selection');
+  }
+
+  public setAppLanguage(lang: string): void {
+    const normalized = normalizeOrbitAppLanguage(lang);
+    this.appLanguage = normalized;
+    this.prefsStore.setAppLanguage(normalized);
+    applyNativeAppLanguage(normalized, this.appContext);
+    this.triggerHaptic('selection');
+  }
+
+  public setActiveTurnSendBehavior(behavior: string): void {
+    const normalized = (behavior === 'steer' || behavior === 'interrupt') ? behavior : 'queue';
+    this.activeTurnSendBehavior = normalized;
+    this.prefsStore.setActiveTurnSendBehavior(normalized);
+    this.triggerHaptic('selection');
+  }
+
+  public setAccountDefaultPermissionMode(mode: string): OrbitScopedActionOutcome<string> {
+    const normalized = normalizeModeSlug(mode);
+    this.composerMode = normalized;
+    if (this.bridge === null) {
+      return { ok: false, data: null, errorDetail: 'Native core unavailable' };
+    }
+    try {
+      this.bridge.setAccountDefaultMode(normalized, Date.now());
+      return { ok: true, data: normalized, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to update default permission mode'
+      };
+    }
   }
 
   public setSystemDark(isDark: boolean): void {
@@ -2030,7 +2103,7 @@ export class OrbitHarmonyStore {
     this.shellStore.toggleSidebar(this.sidePanelStore.isOpen, (): void => {
       this.sidePanelStore.dismissPanel();
     });
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public threadKey(hostId: string, agentId: string): string {
@@ -2067,37 +2140,89 @@ export class OrbitHarmonyStore {
     this.sidebarProjectSort = sort;
     this.saveDraftPrefsToDisk();
     this.refreshSidebar();
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public setSidebarThreadFilter(filter: string): void {
     this.sidebarThreadFilter = filter;
     this.saveDraftPrefsToDisk();
     this.refreshSidebar();
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   private loadDraftPrefsFromDisk(): void {
+    const perHostMap = this.prefsStore.getHostDefaultAgentPrefsMap();
+    const hostKeys = Object.keys(perHostMap);
+    for (let i = 0; i < hostKeys.length; i++) {
+      const k = hostKeys[i];
+      const entry = perHostMap[k];
+      if (entry !== undefined && entry !== null) {
+        this.hostDefaultPrefsByHost.set(k, {
+          provider: typeof entry.provider === 'string' ? entry.provider.trim() : '',
+          model: typeof entry.model === 'string' ? entry.model.trim() : '',
+          effort: typeof entry.effort === 'string' ? entry.effort.trim() : ''
+        });
+      }
+    }
     const loaded = this.prefsStore.loadDraftPrefs(this.draftPrefsFilePath);
-    if (loaded === null) {
+    if (loaded !== null) {
+      if (loaded.sidebarProjectSort === 'recent' || loaded.sidebarProjectSort === 'alphabetical') {
+        this.sidebarProjectSort = loaded.sidebarProjectSort;
+      }
+      if (loaded.sidebarThreadFilter === 'all' || loaded.sidebarThreadFilter === 'active_unread') {
+        this.sidebarThreadFilter = loaded.sidebarThreadFilter;
+      }
+      if (loaded.permissionMode === 'worktree') {
+        this.draftUseWorktree = true;
+      }
+      if (loaded.provider.trim().length > 0) {
+        this.composerProvider = loaded.provider.trim();
+      }
+      if (loaded.model.trim().length > 0 || loaded.effort.trim().length > 0) {
+        const cleanModel = loaded.model.trim();
+        const cleanEffort = loaded.effort.trim();
+        this.composerModel = cleanModel;
+        this.composerEffort = cleanEffort;
+        this.hasUserCustomizedDraftModel = true;
+        this.draftSelectionByProvider.set(this.composerProvider, {
+          model: cleanModel,
+          effort: cleanEffort
+        });
+      }
+    }
+    this.applyPersistedHostDefaultsToDraft(this.selectedHostId);
+    this.hostDefaultPrefsRevision += 1;
+  }
+
+  private applyPersistedHostDefaultsToDraft(hostId: string): void {
+    if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
       return;
     }
-    if (loaded.sidebarProjectSort === 'recent' || loaded.sidebarProjectSort === 'alphabetical') {
-      this.sidebarProjectSort = loaded.sidebarProjectSort;
+    const cleanHost = hostId.trim();
+    const saved = (cleanHost.length > 0 ? this.hostDefaultPrefsByHost.get(cleanHost) : undefined) ??
+      this.hostDefaultPrefsByHost.get('__default__');
+    if (saved === undefined) {
+      return;
     }
-    if (loaded.sidebarThreadFilter === 'all' || loaded.sidebarThreadFilter === 'active_unread') {
-      this.sidebarThreadFilter = loaded.sidebarThreadFilter;
+    if (saved.provider.length > 0) {
+      this.composerProvider = saved.provider;
     }
-    if (loaded.permissionMode === 'worktree') {
-      this.draftUseWorktree = true;
+    if (saved.model.length > 0 || saved.effort.length > 0) {
+      this.composerModel = saved.model;
+      this.composerEffort = saved.effort;
+      this.hasUserCustomizedDraftModel = true;
+      this.draftSelectionByProvider.set(this.composerProvider, {
+        model: saved.model,
+        effort: saved.effort
+      });
     }
   }
 
-  private saveDraftPrefsToDisk(): void {
+  private saveDraftPrefsToDisk(overrideDefaults?: OrbitHostDefaultAgentPrefs): void {
     this.prefsStore.saveDraftPrefs({
-      provider: this.composerProvider,
-      model: this.composerModel,
-      effort: this.composerEffort,
+      provider: overrideDefaults !== undefined ? overrideDefaults.provider : this.composerProvider,
+      model: overrideDefaults !== undefined ? overrideDefaults.model : this.composerModel,
+      effort: overrideDefaults !== undefined ? overrideDefaults.effort : this.composerEffort,
       permissionMode: this.draftUseWorktree ? 'worktree' : 'local',
       sidebarProjectSort: this.sidebarProjectSort,
       sidebarThreadFilter: this.sidebarThreadFilter
@@ -2107,7 +2232,7 @@ export class OrbitHarmonyStore {
   public setDraftUseWorktree(useWorktree: boolean): void {
     this.draftUseWorktree = useWorktree;
     this.saveDraftPrefsToDisk();
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public activeGitBranch(): string {
@@ -2143,12 +2268,12 @@ export class OrbitHarmonyStore {
     } else {
       this.collapsedProjectIds = this.collapsedProjectIds.filter((id: string) => id !== projectId);
     }
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public toggleProjectMoreExpanded(projectId: string): void {
     this.fleetStore.toggleProjectMoreExpanded(projectId);
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public isThreadPinned(hostId: string, agentId: string): boolean {
@@ -2170,7 +2295,7 @@ export class OrbitHarmonyStore {
     }
     this.bridge.togglePinAgent(hostId, agentId);
     this.refreshSidebar();
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public markAgentRead(hostId: string, agentId: string): void {
@@ -2191,7 +2316,7 @@ export class OrbitHarmonyStore {
     }
     this.bridge.markAgentUnread(hostId, agentId);
     this.refreshSidebar();
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public isThreadUnread(hostId: string, agent: AgentCardDto): boolean {
@@ -2530,26 +2655,37 @@ export class OrbitHarmonyStore {
 
   // Haptics, Clipboard & Native ScanKit QR Pairing
 
-  public triggerHaptic(durationMs: number = 12): void {
-    triggerNativeHaptic(durationMs);
+  public triggerHaptic(presetOrMs: OrbitHapticPreset | number = 'selection'): void {
+    triggerNativeHaptic(presetOrMs);
   }
 
-  public copyToClipboard(content: string, label: string = 'Copied to clipboard'): void {
+  public triggerHapticPreset(preset: OrbitHapticPreset): void {
+    triggerNativeHaptic(preset);
+  }
+
+  public copyToClipboard(content: string, label?: ResourceStr): void {
     if (content.length === 0) {
       return;
     }
     if (writeClipboardText(content)) {
-      this.showToast(label, false);
-      this.triggerHaptic(10);
+      if (label === undefined || label === 'Copied to clipboard') {
+        this.showToastResource($r('app.string.toast_copied_clipboard'), false);
+      } else if (typeof label === 'string') {
+        this.showToast(label, false);
+      } else {
+        this.showToastResource(label, false);
+      }
+      this.triggerHapticPreset('selection');
     } else {
-      this.showToast('Failed to copy to clipboard', true);
+      this.showToastResource($r('app.string.toast_copy_failed'), true);
+      this.triggerHapticPreset('warning');
     }
   }
 
   public pasteAuthorizedPairingUri(onFilled?: (uri: string) => void): void {
     readAuthorizedClipboardText().then((raw: string) => {
       if (raw.length === 0) {
-        this.showToast('Clipboard is empty', true);
+        this.showToastResource($r('app.string.toast_clipboard_empty'), true);
         return;
       }
       const match = /orbit:\/\/pair[^\s"'<>]*/.exec(raw);
@@ -2562,20 +2698,23 @@ export class OrbitHarmonyStore {
       } else if (onFilled !== undefined) {
         onFilled(raw);
       } else {
-        this.showToast('No orbit://pair URI found in clipboard', true);
+        this.showToastResource($r('app.string.toast_no_pair_uri_clipboard'), true);
       }
     }).catch((err: Object) => {
       orbitLogWarn('OrbitStore', 'pasteAuthorizedPairingUri failed', err);
-      this.showToast('Unable to read clipboard', true);
+      this.showToastResource($r('app.string.toast_clipboard_read_failed'), true);
     });
   }
 
-  public openHostSettings(): void {
+  public openHostSettings(initialPath?: string, hostId?: string): void {
+    const targetHost = hostId !== undefined && hostId.trim().length > 0 ? hostId.trim() : this.selectedHostId;
+    const cleanPath = initialPath !== undefined ? initialPath.trim() : '';
     this.shellStore.openModal({
       kind: 'host_settings',
-      hostId: this.selectedHostId
+      hostId: targetHost,
+      initialPath: cleanPath.length > 0 ? cleanPath : undefined
     });
-    this.triggerHaptic(8);
+    this.triggerHaptic('selection');
   }
 
   public openImageViewerModal(imageUri: string, imageLabel: string = ''): void {
@@ -2588,7 +2727,7 @@ export class OrbitHarmonyStore {
       imageUri: cleanUri,
       imageLabel: imageLabel
     });
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public openDiagramViewerModal(
@@ -2606,7 +2745,7 @@ export class OrbitHarmonyStore {
       diagramSource: source,
       diagramSvg: svg
     });
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public scanQrAndPair(context: common.Context | undefined): void {
@@ -2615,7 +2754,7 @@ export class OrbitHarmonyStore {
         return;
       }
       if (outcome.uri.length > 0) {
-        this.triggerHaptic(18);
+        this.triggerHapticPreset('warning');
         this.pairHost(outcome.uri);
       } else if (outcome.errorMessage.length > 0) {
         this.showToast(outcome.errorMessage, true);
@@ -3027,6 +3166,17 @@ export class OrbitHarmonyStore {
     }
     this.pushPrefs = clonePushPreferences(this.getPushPreferencesForHost(hostId));
     if (changed) {
+      const prevHostKey = prevHostId.trim();
+      if (
+        prevHostKey.length > 0 &&
+        this.activeCwdHostId === prevHostKey &&
+        this.activeCwd.length > 0
+      ) {
+        this.hostActiveCwdMap.set(prevHostKey, this.activeCwd);
+      }
+      const nextHostKey = hostId.trim();
+      this.activeCwd = this.hostActiveCwdMap.get(nextHostKey) ?? '~';
+      this.activeCwdHostId = nextHostKey;
       if (prevWasPa && prevHostId.length > 0 && prevAgentId.length > 0) {
         this.markPersonalAgentVisitedNow(prevHostId, prevAgentId);
         this.personalAgentStore.clearActiveVisitKey();
@@ -3168,7 +3318,7 @@ export class OrbitHarmonyStore {
       // (even when the user already switched away from the optimistic scope).
       this.applyReplacedOptimisticMappings(hostId, detail);
 
-      if (this.activeCwd === '~' || this.activeCwd.length === 0) {
+      if (hostId === this.selectedHostId && (this.activeCwd === '~' || this.activeCwd.length === 0)) {
         if (detail.workspaces.length > 0) {
           this.setActiveCwd(detail.workspaces[0].cwd);
         } else if (detail.discovered_projects.length > 0) {
@@ -3212,6 +3362,7 @@ export class OrbitHarmonyStore {
       }
 
       if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+        this.applyPersistedHostDefaultsToDraft(hostId);
         const available = detail.host.available_providers;
         const targetProvider =
           available.length > 0 && !available.includes(this.composerProvider)
@@ -3269,12 +3420,44 @@ export class OrbitHarmonyStore {
     }
   }
 
+  /**
+   * Returns the exact (untrimmed) active workspace directory owned strictly by `hostId`,
+   * or `''` when `hostId` has no recorded non-default (`~`) active directory.
+   * NEVER returns another host's `activeCwd`.
+   */
+  public getActiveCwdForHost(hostId: string): string {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return '';
+    }
+    const mapped = this.hostActiveCwdMap.get(cleanHost);
+    if (mapped !== undefined) {
+      const exactMapped = nonBlankPath(mapped);
+      if (exactMapped.length > 0 && exactMapped !== '~') {
+        return exactMapped;
+      }
+      return '';
+    }
+    if (cleanHost === this.selectedHostId.trim() && cleanHost === this.activeCwdHostId.trim()) {
+      const exactLive = nonBlankPath(this.activeCwd);
+      if (exactLive.length > 0 && exactLive !== '~') {
+        return exactLive;
+      }
+    }
+    return '';
+  }
+
   public setActiveCwd(cwd: string): void {
     if (cwd.length === 0) {
       return;
     }
-    const changed = this.activeCwd !== cwd;
+    const targetHost = this.selectedHostId.trim();
+    const changed = this.activeCwd !== cwd || this.activeCwdHostId !== targetHost;
     this.activeCwd = cwd;
+    if (targetHost.length > 0) {
+      this.hostActiveCwdMap.set(targetHost, cwd);
+      this.activeCwdHostId = targetHost;
+    }
     if (changed && (this.isNewSessionDraft || this.selectedAgentId.length === 0) && this.selectedHostId.length > 0) {
       const nextWsId = this.resolveScopedWorkspaceId(this.selectedHostId, cwd, null);
       this.sidePanelStore.rebindDraftCwd(this.selectedHostId, cwd, nextWsId);
@@ -3338,6 +3521,7 @@ export class OrbitHarmonyStore {
       this.sidePanelStore.switchScope(this.selectedHostId, null);
     }
     this.activeSessionUsage = null;
+    this.applyPersistedHostDefaultsToDraft(this.selectedHostId);
     this.syncDefaultModelAndEffort(this.composerProvider);
     this.syncActiveQueuedPrompts();
     if (cwd !== undefined && cwd.length > 0) {
@@ -3351,7 +3535,7 @@ export class OrbitHarmonyStore {
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('action');
   }
 
   public buildManagedSubagentTab(
@@ -3533,7 +3717,7 @@ export class OrbitHarmonyStore {
         orbitLogWarn('OrbitStore', 'openAgentTimeline for subagent failed', err as Object);
       }
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   private optimisticAgentKey(hostId: string, agentId: string): string {
@@ -3793,7 +3977,7 @@ export class OrbitHarmonyStore {
       }
       this.refreshSidebarAsync();
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public reloadStage(forceFull: boolean = false): void {
@@ -3833,8 +4017,13 @@ export class OrbitHarmonyStore {
         prevAgent.model !== delta.agent.model ||
         prevAgent.effort !== delta.agent.effort;
       this.currentAgent = delta.agent;
-      if (this.activeCwd !== delta.agent.cwd) {
+      if (this.activeCwd !== delta.agent.cwd || this.activeCwdHostId !== this.selectedHostId.trim()) {
         this.activeCwd = delta.agent.cwd;
+        const activeHost = this.selectedHostId.trim();
+        if (activeHost.length > 0) {
+          this.hostActiveCwdMap.set(activeHost, delta.agent.cwd);
+          this.activeCwdHostId = activeHost;
+        }
       }
       if (modelChanged) {
         this.composerProvider = delta.agent.provider;
@@ -3921,7 +4110,7 @@ export class OrbitHarmonyStore {
       this.reloadFleet();
       this.selectHost(card.host_id);
       this.showHostSettingsSheet = false;
-      this.triggerHaptic(18);
+      this.triggerHapticPreset('success');
     } catch (e) {
       this.showToast((e as Error).message, true);
     }
@@ -3972,7 +4161,7 @@ export class OrbitHarmonyStore {
       if (hostId === this.selectedHostId) {
         this.reloadHost(hostId);
       }
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
     } catch (e) {
       this.showToast((e as Error).message, true);
     }
@@ -3992,9 +4181,22 @@ export class OrbitHarmonyStore {
         this.reloadHost(hostId);
       }
       this.showToast('Reconnecting to host…', false);
-      this.triggerHaptic(10);
+      this.triggerHaptic('action');
     } catch (e) {
       this.showToast((e as Error).message, true);
+    }
+  }
+
+  public refreshQuotasForHostSilent(hostId: string): void {
+    const clean = hostId.trim();
+    if (this.bridge === null || clean.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.refreshQuotas(clean);
+      this.reloadHost(clean);
+    } catch (_e) {
+      // Best-effort silent refresh for settings scope.
     }
   }
 
@@ -4005,7 +4207,7 @@ export class OrbitHarmonyStore {
     this.bridge.refreshQuotas(this.selectedHostId);
     this.reloadHost(this.selectedHostId);
     this.showToast('Refreshing account quotas…', false);
-    this.triggerHaptic(8);
+    this.triggerHaptic('selection');
   }
 
   public refreshModelsAndQuotas(forceModels: boolean = true): void {
@@ -4016,7 +4218,7 @@ export class OrbitHarmonyStore {
     this.bridge.refreshProviderModels(this.selectedHostId, forceModels);
     this.reloadHost(this.selectedHostId);
     this.showToast('Refreshing models…', false);
-    this.triggerHaptic(8);
+    this.triggerHaptic('selection');
   }
 
   public removeHost(hostId: string): void {
@@ -4053,7 +4255,7 @@ export class OrbitHarmonyStore {
       this.setActiveCwd(dirPath);
       const displayName = name.trim().length > 0 ? name.trim() : name;
       this.showToast(`Pinned ${displayName}`, false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
     } catch (e) {
       this.showToast((e as Error).message, true);
     }
@@ -4084,7 +4286,7 @@ export class OrbitHarmonyStore {
     }
     this.removePinnedProject(projId);
     this.showToast(`Unpinned ${basenameOfPath(cwd)}`, false);
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public removePinnedProject(projectId: string): void {
@@ -4149,7 +4351,7 @@ export class OrbitHarmonyStore {
       this.reloadWorkspaceFiles();
     }
     this.showContextPickerSheet = true;
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   private addUniqueComposerBadge(kind: string, label: string): void {
@@ -4168,17 +4370,17 @@ export class OrbitHarmonyStore {
 
   public attachFileBadge(relPath: string): void {
     this.addUniqueComposerBadge('file', `@${relPath}`);
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public attachWorkingTreeDiffBadge(): void {
     this.addUniqueComposerBadge('diff', '@diff');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public attachStagedDiffBadge(): void {
     this.addUniqueComposerBadge('staged', '@staged');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public attachTerminalOutputBadge(): void {
@@ -4186,7 +4388,7 @@ export class OrbitHarmonyStore {
       this.reloadTerminal();
     }
     this.addUniqueComposerBadge('terminal', '@terminal');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public filterSlashCommands(query: string): SlashCommandDto[] {
@@ -4266,18 +4468,18 @@ export class OrbitHarmonyStore {
     if (kind === 'terminal' && this.terminalRows.length === 0 && this.bridge !== null && this.selectedHostId.length > 0) {
       this.reloadTerminal();
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public setSlashDirective(slash: string): void {
     this.activeSlashDirective = slash.trim();
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public clearSlashDirective(): void {
     if (this.activeSlashDirective.length > 0) {
       this.activeSlashDirective = '';
-      this.triggerHaptic(6);
+      this.triggerHapticPreset('selection');
     }
   }
 
@@ -4372,7 +4574,7 @@ export class OrbitHarmonyStore {
       }
     }
     this.stagedAttachments = next;
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   private async stageUriAttachment(
@@ -4408,7 +4610,7 @@ export class OrbitHarmonyStore {
         localUri: isImage ? uri : ''
       };
       this.stagedAttachments = this.stagedAttachments.concat([item]);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (e) {
       orbitLogWarn('OrbitStore', 'stageUriAttachment failed', e as Object);
       this.showToast((e as Error).message || 'Failed to attach file', true);
@@ -4448,7 +4650,7 @@ export class OrbitHarmonyStore {
     if (!this.canShowInlineDiffInspector()) {
       this.showGitDiffSheet = false;
     }
-    this.triggerHaptic(12);
+    this.triggerHapticPreset('success');
   }
 
   public quoteAssistantReplyIntoComposer(replyText: string, turnIndex: number): void {
@@ -4479,7 +4681,7 @@ export class OrbitHarmonyStore {
     next.push(snippet);
     this.quotedSnippets = next;
     this.showToast('Quoted reply into composer', false);
-    this.triggerHaptic(12);
+    this.triggerHapticPreset('success');
   }
 
   public removeQuotedSnippet(id: string): void {
@@ -4502,7 +4704,7 @@ export class OrbitHarmonyStore {
         this.bridge.setAccountDefaultMode(normalized, Date.now());
       }
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public cycleSessionMode(): void {
@@ -4522,6 +4724,10 @@ export class OrbitHarmonyStore {
         }
       }
     }
+    return this.fallbackCatalogForProvider(provider);
+  }
+
+  private fallbackCatalogForProvider(provider: string): ProviderModelCatalogDto | null {
     for (let i = 0; i < this.cachedFallbackCatalogs.length; i++) {
       if (this.cachedFallbackCatalogs[i].provider === provider) {
         return this.cachedFallbackCatalogs[i];
@@ -4537,6 +4743,30 @@ export class OrbitHarmonyStore {
       }
     }
     return null;
+  }
+
+  /**
+   * Returns the ProviderModelCatalog strictly scoped to `hostId`.
+   * When `hostId` differs from `selectedHostId`, NEVER reads `this.currentHostDetail`.
+   */
+  public catalogForHostProvider(hostId: string, provider: string): ProviderModelCatalogDto | null {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return this.catalogForProvider(provider);
+    }
+    const detail = this.hostDetailFor(cleanHost);
+    if (detail !== null) {
+      for (let i = 0; i < detail.provider_catalogs.length; i++) {
+        if (detail.provider_catalogs[i].provider === provider) {
+          return detail.provider_catalogs[i];
+        }
+      }
+      return null;
+    }
+    if (cleanHost === this.selectedHostId.trim()) {
+      return this.catalogForProvider(provider);
+    }
+    return this.fallbackCatalogForProvider(provider);
   }
 
   public resolveModelSelectionFromCore(
@@ -4579,18 +4809,27 @@ export class OrbitHarmonyStore {
   public resolveDefaultModelAndEffort(
     provider: string,
     desiredModel: string,
-    desiredEffort: string
+    desiredEffort: string,
+    hostId?: string
   ): DraftModelSelection {
-    const fromCore = this.resolveModelSelectionFromCore(provider, desiredModel, desiredEffort);
-    if (fromCore !== null) {
-      return {
-        model: fromCore.selected_model_id ?? '',
-        effort: fromCore.selected_effort ?? ''
-      };
+    const cleanHost = hostId !== undefined ? hostId.trim() : '';
+    const useHostOverride = cleanHost.length > 0 && cleanHost !== this.selectedHostId.trim();
+    if (!useHostOverride) {
+      const fromCore = this.resolveModelSelectionFromCore(provider, desiredModel, desiredEffort);
+      if (fromCore !== null) {
+        return {
+          model: fromCore.selected_model_id ?? '',
+          effort: fromCore.selected_effort ?? ''
+        };
+      }
     }
 
-    const models = this.modelsForProvider(provider);
-    const catalog = this.catalogForProvider(provider);
+    const models = cleanHost.length > 0
+      ? this.modelsForHostProvider(cleanHost, provider)
+      : this.modelsForProvider(provider);
+    const catalog = cleanHost.length > 0
+      ? this.catalogForHostProvider(cleanHost, provider)
+      : this.catalogForProvider(provider);
 
     let resolvedModel = '';
     if (desiredModel.trim().length > 0) {
@@ -4600,8 +4839,17 @@ export class OrbitHarmonyStore {
         resolvedModel = cleanDesired;
       }
     }
-    if (resolvedModel.length === 0 && catalog !== null && catalog.configured_default_model !== null && catalog.configured_default_model.trim().length > 0) {
-      resolvedModel = catalog.configured_default_model.trim();
+    if (
+      resolvedModel.length === 0 &&
+      catalog !== null &&
+      catalog.configured_default_model !== null &&
+      catalog.configured_default_model.trim().length > 0
+    ) {
+      const configuredDefault = catalog.configured_default_model.trim();
+      const validOnTarget = models.length === 0 || models.some((m: ProviderModelSpecDto) => m.id === configuredDefault);
+      if (validOnTarget) {
+        resolvedModel = configuredDefault;
+      }
     }
     if (resolvedModel.length === 0) {
       for (let i = 0; i < models.length; i++) {
@@ -4626,12 +4874,23 @@ export class OrbitHarmonyStore {
       spec = models[0];
     }
 
+    const cleanDesiredEffort = desiredEffort.trim();
     const options = spec !== null ? spec.thinking_options : [];
     if (options.length === 0) {
+      if (cleanDesiredEffort.length > 0) {
+        return { model: resolvedModel, effort: cleanDesiredEffort };
+      }
       const fallbackEff = (spec !== null && spec.default_effort !== undefined && spec.default_effort !== null)
         ? spec.default_effort
         : '';
       return { model: resolvedModel, effort: fallbackEff };
+    }
+    if (cleanDesiredEffort.length > 0) {
+      for (let o = 0; o < options.length; o++) {
+        if (options[o].effort === cleanDesiredEffort) {
+          return { model: resolvedModel, effort: cleanDesiredEffort };
+        }
+      }
     }
     for (let o = 0; o < options.length; o++) {
       if (options[o].is_default) {
@@ -4676,6 +4935,211 @@ export class OrbitHarmonyStore {
     this.applyProviderModelEffort(provider, resolved.model, resolved.effort);
   }
 
+  public getHostDefaultProvider(hostId: string): string {
+    const cleanHost = hostId.trim();
+    const saved = cleanHost.length > 0
+      ? this.hostDefaultPrefsByHost.get(cleanHost)
+      : this.hostDefaultPrefsByHost.get('__default__');
+    if (saved !== undefined && saved.provider.length > 0) {
+      return saved.provider;
+    }
+    if (cleanHost.length === 0 || cleanHost === this.selectedHostId.trim()) {
+      return this.composerProvider;
+    }
+    const detail = this.hostDetailFor(cleanHost);
+    if (detail !== null && detail.provider_catalogs.length > 0) {
+      return detail.provider_catalogs[0].provider;
+    }
+    return this.composerProvider;
+  }
+
+  public getHostDefaultModel(hostId: string): string {
+    const cleanHost = hostId.trim();
+    const saved = cleanHost.length > 0
+      ? this.hostDefaultPrefsByHost.get(cleanHost)
+      : this.hostDefaultPrefsByHost.get('__default__');
+    if (saved !== undefined && saved.model.length > 0) {
+      return saved.model;
+    }
+    if (cleanHost.length === 0 || cleanHost === this.selectedHostId.trim()) {
+      return this.composerModel;
+    }
+    const prov = this.getHostDefaultProvider(cleanHost);
+    const resolved = this.resolveDefaultModelAndEffort(prov, '', '', cleanHost);
+    return resolved.model;
+  }
+
+  public getHostDefaultEffort(hostId: string): string {
+    const cleanHost = hostId.trim();
+    const saved = cleanHost.length > 0
+      ? this.hostDefaultPrefsByHost.get(cleanHost)
+      : this.hostDefaultPrefsByHost.get('__default__');
+    if (saved !== undefined && saved.effort.length > 0) {
+      return saved.effort;
+    }
+    if (cleanHost.length === 0 || cleanHost === this.selectedHostId.trim()) {
+      return this.composerEffort;
+    }
+    const prov = this.getHostDefaultProvider(cleanHost);
+    const model = this.getHostDefaultModel(cleanHost);
+    const resolved = this.resolveDefaultModelAndEffort(prov, model, '', cleanHost);
+    return resolved.effort;
+  }
+
+  private persistHostDefaultAgentPrefs(
+    hostId: string,
+    provider: string,
+    model: string,
+    effort: string
+  ): void {
+    const cleanHost = hostId.trim();
+    const scopeKey = cleanHost.length > 0 ? cleanHost : '__default__';
+    const nextPrefs: OrbitHostDefaultAgentPrefs = {
+      provider: provider.trim(),
+      model: model.trim(),
+      effort: effort.trim()
+    };
+    this.hostDefaultPrefsByHost.set(scopeKey, nextPrefs);
+    this.prefsStore.saveHostDefaultAgentPrefs(scopeKey, nextPrefs);
+    this.hostDefaultPrefsRevision += 1;
+
+    const matchesSelectedHost = cleanHost.length === 0 || cleanHost === this.selectedHostId.trim();
+    if (matchesSelectedHost) {
+      this.saveDraftPrefsToDisk(nextPrefs);
+      if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+        this.composerProvider = nextPrefs.provider;
+        this.composerModel = nextPrefs.model;
+        this.composerEffort = nextPrefs.effort;
+        this.hasUserCustomizedDraftModel = true;
+        this.draftSelectionByProvider.set(nextPrefs.provider, {
+          model: nextPrefs.model,
+          effort: nextPrefs.effort
+        });
+      }
+    }
+  }
+
+  /**
+   * Settings-only host-scoped default provider selection.
+   * Persists to Preferences for `hostId` without EVER invoking `switchAgentProvider` on a live agent.
+   */
+  public setHostDefaultProvider(hostId: string, provider: string): void {
+    const cleanProvider = provider.trim();
+    if (cleanProvider.length === 0) {
+      return;
+    }
+    const cleanHost = hostId.trim();
+    const resolved = this.resolveDefaultModelAndEffort(cleanProvider, '', '', cleanHost);
+    const hostModels = this.modelsForHostProvider(cleanHost, cleanProvider);
+    let safeModel = resolved.model;
+    if (hostModels.length > 0) {
+      const inTarget = safeModel.length > 0 && hostModels.some((m: ProviderModelSpecDto): boolean => m.id === safeModel);
+      if (!inTarget) {
+        safeModel = hostModels[0].id;
+      }
+    }
+    const finalSelection = safeModel === resolved.model
+      ? resolved
+      : this.resolveDefaultModelAndEffort(cleanProvider, safeModel, resolved.effort, cleanHost);
+    this.persistHostDefaultAgentPrefs(cleanHost, cleanProvider, finalSelection.model, finalSelection.effort);
+    this.triggerHapticPreset('selection');
+  }
+
+  /**
+   * Settings-only host-scoped default model selection.
+   * Persists to Preferences for `hostId` without mutating any active session on another host.
+   */
+  public setHostDefaultModel(hostId: string, modelId: string): void {
+    const cleanHost = hostId.trim();
+    const curProvider = this.getHostDefaultProvider(cleanHost);
+    const curEffort = this.getHostDefaultEffort(cleanHost);
+    const resolved = this.resolveDefaultModelAndEffort(curProvider, modelId, curEffort, cleanHost);
+    this.persistHostDefaultAgentPrefs(cleanHost, curProvider, resolved.model, resolved.effort);
+    this.triggerHapticPreset('selection');
+  }
+
+  /**
+   * Settings-only host-scoped default effort selection.
+   * Persists to Preferences for `hostId` without mutating any active session on another host.
+   */
+  public setHostDefaultEffort(hostId: string, effort: string): void {
+    const cleanHost = hostId.trim();
+    const curProvider = this.getHostDefaultProvider(cleanHost);
+    const curModel = this.getHostDefaultModel(cleanHost);
+    const resolved = this.resolveDefaultModelAndEffort(curProvider, curModel, effort, cleanHost);
+    this.persistHostDefaultAgentPrefs(cleanHost, curProvider, resolved.model, resolved.effort);
+    this.triggerHapticPreset('selection');
+  }
+
+  public setComposerProvider(provider: string): void {
+    this.switchDraftProvider(provider);
+  }
+
+  public setComposerModel(modelId: string, hostId?: string): void {
+    if (hostId !== undefined && hostId.trim().length > 0 && hostId.trim() !== this.selectedHostId.trim()) {
+      this.setHostDefaultModel(hostId, modelId);
+      return;
+    }
+    this.applyProviderModelEffort(this.composerProvider, modelId, this.composerEffort, hostId);
+  }
+
+  public setComposerEffort(effort: string, hostId?: string): void {
+    if (hostId !== undefined && hostId.trim().length > 0 && hostId.trim() !== this.selectedHostId.trim()) {
+      this.setHostDefaultEffort(hostId, effort);
+      return;
+    }
+    this.applyProviderModelEffort(this.composerProvider, this.composerModel, effort, hostId);
+  }
+
+  public modelsForHostProvider(hostId: string, provider: string): ProviderModelSpecDto[] {
+    const cleanHost = hostId.trim();
+    if (cleanHost.length === 0) {
+      return this.modelsForProvider(provider);
+    }
+    const detail = this.hostDetailFor(cleanHost);
+    if (detail !== null) {
+      for (let i = 0; i < detail.provider_catalogs.length; i++) {
+        if (detail.provider_catalogs[i].provider === provider) {
+          return detail.provider_catalogs[i].models;
+        }
+      }
+      return [];
+    }
+    if (cleanHost === this.selectedHostId.trim()) {
+      return this.modelsForProvider(provider);
+    }
+    const fallback = this.fallbackCatalogForProvider(provider);
+    return fallback !== null ? fallback.models : [];
+  }
+
+  public refreshModelsForHostSilent(hostId: string, forceRefresh: boolean = true): void {
+    const clean = hostId.trim();
+    if (this.bridge === null || clean.length === 0) {
+      return;
+    }
+    try {
+      this.bridge.refreshProviderModels(clean, forceRefresh);
+      this.reloadHost(clean);
+    } catch (_e) {
+      // Best-effort silent refresh scoped to settings target host.
+    }
+  }
+
+  public refreshActiveModels(forceRefresh: boolean = true): void {
+    this.refreshModelsAndQuotas(forceRefresh);
+  }
+
+  public hostDetailFor(hostId: string): HostDetailDto | null {
+    const clean = hostId.trim();
+    if (clean.length === 0) {
+      return null;
+    }
+    if (clean === this.selectedHostId && this.currentHostDetail !== null) {
+      return this.currentHostDetail;
+    }
+    return this.fleetStore.getCachedHostDetail(clean);
+  }
+
   public selectEffort(effort: string): void {
     this.applyProviderModelEffort(this.composerProvider, this.composerModel, effort);
   }
@@ -4684,17 +5148,41 @@ export class OrbitHarmonyStore {
     this.applyProviderModelEffort(this.composerProvider, modelId, effort);
   }
 
-  public applyProviderModelEffort(provider: string, model: string, effort: string): void {
+  public applyProviderModelEffort(
+    provider: string,
+    model: string,
+    effort: string,
+    hostId?: string
+  ): void {
     const prevProvider = this.composerProvider;
-    const resolved = this.resolveDefaultModelAndEffort(provider, model, effort);
+    const cleanHost = hostId !== undefined ? hostId.trim() : '';
+    const resolved = this.resolveDefaultModelAndEffort(provider, model, effort, hostId);
     this.composerProvider = provider;
     this.composerModel = resolved.model;
     this.composerEffort = resolved.effort;
     if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
       this.hasUserCustomizedDraftModel = true;
       this.draftSelectionByProvider.set(provider, resolved);
+      const scopeHost = cleanHost.length > 0 ? cleanHost : this.selectedHostId.trim();
+      const prefsKey = scopeHost.length > 0 ? scopeHost : '__default__';
+      const nextPrefs: OrbitHostDefaultAgentPrefs = {
+        provider: provider.trim(),
+        model: resolved.model.trim(),
+        effort: resolved.effort.trim()
+      };
+      this.hostDefaultPrefsByHost.set(prefsKey, nextPrefs);
+      this.prefsStore.saveHostDefaultAgentPrefs(prefsKey, nextPrefs);
+      this.saveDraftPrefsToDisk(nextPrefs);
+      this.hostDefaultPrefsRevision += 1;
     }
-    if (this.bridge !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+    const matchesSelectedHost = cleanHost.length === 0 || cleanHost === this.selectedHostId.trim();
+    if (
+      matchesSelectedHost &&
+      this.bridge !== null &&
+      this.selectedHostId.length > 0 &&
+      this.selectedAgentId.length > 0 &&
+      !this.isNewSessionDraft
+    ) {
       const modelOpt = resolved.model.trim().length > 0 ? resolved.model.trim() : null;
       const effortOpt = resolved.effort.trim().length > 0 ? resolved.effort.trim() : null;
       if (prevProvider !== provider) {
@@ -4710,7 +5198,7 @@ export class OrbitHarmonyStore {
         this.bridge.setAgentConfig(this.selectedHostId, this.selectedAgentId, modelOpt, effortOpt);
       }
     }
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('action');
   }
 
   public currentModelDisplayLabel(): string {
@@ -5029,7 +5517,7 @@ export class OrbitHarmonyStore {
         badgesJson
       );
       this.reloadStage();
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
     } catch (e) {
       this.showToast((e as Error).message, true);
     }
@@ -5135,7 +5623,7 @@ export class OrbitHarmonyStore {
     this.inlineMentions = [];
     this.quotedSnippets = [];
     this.showToast('Queued next prompt', false);
-    this.triggerHaptic(12);
+    this.triggerHapticPreset('success');
   }
 
   public removeQueuedPrompt(itemId: string): void {
@@ -5165,7 +5653,7 @@ export class OrbitHarmonyStore {
       }
     }
     this.syncActiveQueuedPrompts();
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public editQueuedPrompt(itemId: string): void {
@@ -5256,7 +5744,7 @@ export class OrbitHarmonyStore {
       mergedMentions.push(target.inlineMentions[i]);
     }
     this.inlineMentions = mergedMentions;
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public sendQueuedPromptNow(itemId: string): void {
@@ -5289,7 +5777,7 @@ export class OrbitHarmonyStore {
         // Ignore transient disconnect
       }
       this.syncActiveQueuedPrompts();
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
       return;
     }
     const existing = this.queuedPromptsByAgent.get(key);
@@ -5327,7 +5815,7 @@ export class OrbitHarmonyStore {
         target.badgesJson
       );
       this.reloadStage();
-      this.triggerHaptic(14);
+      this.triggerHapticPreset('success');
     } catch (e) {
       this.showToast((e as Error).message, true);
     }
@@ -5380,24 +5868,41 @@ export class OrbitHarmonyStore {
     }
 
     if (this.isActiveAgentRunning()) {
-      if (overridePrompt === undefined) {
-        this.enqueueCurrentDraft();
-        return;
+      const hasPendingDecision =
+        this.pendingPermissions.length > 0 || this.pendingQuestions.length > 0;
+      const effectiveBehavior = hasPendingDecision ? 'queue' : this.activeTurnSendBehavior;
+      if (effectiveBehavior === 'queue') {
+        if (overridePrompt === undefined) {
+          this.enqueueCurrentDraft();
+          return;
+        }
+        if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+          const badgesJsonOverride = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
+          const queueId = `q_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+          this.bridge.enqueuePrompt(
+            this.selectedHostId,
+            this.selectedAgentId,
+            composed.wire_prompt,
+            composed.display_prompt,
+            badgesJsonOverride,
+            queueId
+          );
+          this.reloadStage();
+          this.triggerHaptic('action');
+          return;
+        }
+      } else if (
+        effectiveBehavior === 'interrupt' &&
+        this.selectedAgentId.length > 0 &&
+        !this.isNewSessionDraft
+      ) {
+        try {
+          this.bridge.interruptAgent(this.selectedHostId, this.selectedAgentId);
+        } catch (err) {
+          orbitLogWarn('OrbitStore', 'interrupt before send failed', err as Object);
+        }
       }
-      if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
-        const badgesJsonOverride = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
-        const queueId = `q_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
-        this.bridge.enqueuePrompt(
-          this.selectedHostId,
-          this.selectedAgentId,
-          composed.wire_prompt,
-          composed.display_prompt,
-          badgesJsonOverride,
-          queueId
-        );
-        this.reloadStage();
-        return;
-      }
+      // For 'steer' or post-'interrupt', fall through to sendPromptWithMeta below.
     }
 
     const badgesJson = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
@@ -5462,16 +5967,55 @@ export class OrbitHarmonyStore {
         this.quotedSnippets = [];
         this.worktreeBranch = '';
       }
-      this.triggerHaptic(14);
+      this.triggerHaptic('action');
     } catch (e) {
       this.showToast((e as Error).message, true);
+      this.triggerHaptic('warning');
     }
   }
 
   // Native Pull-to-Refresh Actions
 
+  public async pullRefreshFleetAsync(): Promise<void> {
+    this.triggerHaptic('selection');
+    if (this.bridge === null) {
+      return;
+    }
+    try {
+      this.bridge.connectAllHosts();
+      for (let i = 0; i < this.hosts.length; i++) {
+        try {
+          this.bridge.refreshHost(this.hosts[i].host_id);
+        } catch (err) {
+          orbitLogWarn('OrbitStore', 'pullRefreshFleetAsync refreshHost failed', err as Object);
+        }
+      }
+      await this.reloadFleetAsync();
+      if (this.selectedHostId.length > 0) {
+        await this.reloadHostAsync(this.selectedHostId);
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'pullRefreshFleetAsync failed', err as Object);
+    }
+  }
+
+  public async pullRefreshStageAsync(): Promise<void> {
+    this.pullRefreshStage();
+    if (this.bridge === null) {
+      return;
+    }
+    try {
+      await this.reloadFleetAsync();
+      if (this.selectedHostId.length > 0) {
+        await this.reloadHostAsync(this.selectedHostId);
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'pullRefreshStageAsync failed', err as Object);
+    }
+  }
+
   public pullRefreshStage(): void {
-    this.triggerHaptic(10);
+    this.triggerHaptic('selection');
     if (this.bridge === null) {
       return;
     }
@@ -5506,7 +6050,7 @@ export class OrbitHarmonyStore {
   }
 
   public pullRefreshGitReview(): void {
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('action');
     const targetHost = this.resolvedDiffHostId();
     const targetCwd = this.resolvedDiffCwd();
     if (this.bridge === null || targetHost.length === 0) {
@@ -5537,7 +6081,7 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.interruptAgent(this.selectedHostId, this.selectedAgentId);
-      this.triggerHaptic(16);
+      this.triggerHaptic('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'interruptCurrentAgent failed', err as Object);
       this.showToast('Failed to stop agent', true);
@@ -5557,7 +6101,7 @@ export class OrbitHarmonyStore {
         this.startNewSessionDraft();
       }
       this.reloadHost(this.selectedHostId);
-      this.triggerHaptic(12);
+      this.triggerHaptic('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'archiveSession failed', err as Object);
       this.showToast('Failed to archive session', true);
@@ -5572,7 +6116,8 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.resolvePermission(this.selectedHostId, this.selectedAgentId, requestId, decision);
-      this.triggerHaptic(14);
+      const lower = decision.trim().toLowerCase();
+      this.triggerHaptic(lower.includes('deny') || lower.includes('reject') ? 'warning' : 'success');
       this.reloadStage();
     } catch (err) {
       orbitLogWarn('OrbitStore', 'resolvePermission failed', err as Object);
@@ -5591,7 +6136,7 @@ export class OrbitHarmonyStore {
         requestId,
         JSON.stringify(answers)
       );
-      this.triggerHaptic(14);
+      this.triggerHapticPreset('success');
       this.reloadStage();
     } catch (err) {
       orbitLogWarn('OrbitStore', 'answerQuestion failed', err as Object);
@@ -5640,7 +6185,7 @@ export class OrbitHarmonyStore {
   public toggleTopBarGitDiff(): void {
     if (this.sidePanelStore.isOpen && this.sidePanelStore.activeTab?.kind === 'review') {
       this.sidePanelStore.dismissPanel();
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return;
     }
     // Reuse `openGitInspector()` so wide-screen right-rail mutual exclusion (yielding docked
@@ -5696,19 +6241,19 @@ export class OrbitHarmonyStore {
         true
       );
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public setGitStagedMode(staged: boolean): void {
     this.gitStagedMode = staged;
     this.refreshGitReview(staged, this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null);
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public selectGitFileFilter(path: string): void {
     this.gitSelectedPath = path;
     this.refreshGitReview(this.gitStagedMode, path.length > 0 ? path : null);
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public refreshGitReview(staged: boolean, path: string | null): void {
@@ -5861,7 +6406,7 @@ export class OrbitHarmonyStore {
         this.startScopedTerminal(targetHost, clean.length > 0 ? clean : this.activeCwd);
       }
     }
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('action');
   }
 
   public openPtyTerminal(): void {
@@ -5876,7 +6421,7 @@ export class OrbitHarmonyStore {
         this.reloadTerminal();
       }
     }
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('action');
   }
 
   public startNewTerminal(): void {
@@ -5890,7 +6435,7 @@ export class OrbitHarmonyStore {
         this.terminalCols,
         this.terminalGridRows
       );
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'startNewTerminal failed', err as Object);
       this.showToast('Failed to start terminal', true);
@@ -5905,7 +6450,7 @@ export class OrbitHarmonyStore {
       this.bridge.attachTerminal(this.selectedHostId, terminalId, Math.max(1, slot));
       this.reloadHost(this.selectedHostId);
       this.reloadTerminal();
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'attachTerminal failed', err as Object);
     }
@@ -5918,7 +6463,7 @@ export class OrbitHarmonyStore {
     try {
       this.bridge.killTerminal(this.selectedHostId, terminalId);
       this.reloadHost(this.selectedHostId);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'killTerminal failed', err as Object);
     }
@@ -5985,7 +6530,7 @@ export class OrbitHarmonyStore {
     const snapshot = this.extractVisibleTerminalSnapshot();
     if (snapshot.length === 0) {
       this.showToast('Terminal output is empty', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return;
     }
     this.copyToClipboard(snapshot, 'Copied terminal output');
@@ -6195,7 +6740,7 @@ export class OrbitHarmonyStore {
       }
     }
     this.showToast(next ? 'Fast Mode enabled' : 'Fast Mode disabled', false);
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public async forkCurrentSession(useWorktree: boolean): Promise<void> {
@@ -6233,7 +6778,7 @@ export class OrbitHarmonyStore {
         useWorktree ? 'Forked into new worktree' : 'Forked conversation',
         false
       );
-      this.triggerHaptic(14);
+      this.triggerHapticPreset('success');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'forkAgentJson failed', err as Object);
       if (this.selectedHostId === hostId) {
@@ -6286,7 +6831,7 @@ export class OrbitHarmonyStore {
       this.sidebarOpen = false;
     }
     this.openSidePanelToolTab('side_question', null, 'user');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public clearSideQuestion(): void {
@@ -6311,7 +6856,7 @@ export class OrbitHarmonyStore {
       kind: 'archived',
       hostId: this.selectedHostId
     });
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public archivedAgents(): AgentCardDto[] {
@@ -6344,7 +6889,7 @@ export class OrbitHarmonyStore {
       this.clearArchivedSubagentLocalMark(targetHost, agentId);
       this.reloadHost(targetHost);
       this.showToast('Session restored', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'unarchiveSession failed', err as Object);
       this.showToast('Failed to restore session', true);
@@ -6365,7 +6910,7 @@ export class OrbitHarmonyStore {
       }
       this.reloadHost(this.selectedHostId);
       this.showToast('Session deleted', false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'deleteSessionPermanently failed', err as Object);
       this.showToast('Failed to delete session', true);
@@ -6463,7 +7008,7 @@ export class OrbitHarmonyStore {
       this.sidebarOpen = false;
     }
     this.openSidePanelToolTab('board', null, 'user');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public refreshWorkspaceBoard(): void {
@@ -6512,7 +7057,7 @@ export class OrbitHarmonyStore {
       this.workspaceBoardContent = content;
       this.workspaceBoardRevision += 1;
       this.showToast('Saved BOARD.md', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'saveWorkspaceBoard failed', err as Object);
       this.showToast('Failed to save BOARD.md', true);
@@ -6552,7 +7097,7 @@ export class OrbitHarmonyStore {
           false
         );
       }
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'spawnWorkspacePeer failed', err as Object);
@@ -6568,7 +7113,7 @@ export class OrbitHarmonyStore {
       this.sidebarOpen = false;
     }
     this.openSidePanelToolTab('automations', null, 'user');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   private async settleAutomationJson(promise: Promise<string>, label: string): Promise<string | null> {
@@ -6686,7 +7231,7 @@ export class OrbitHarmonyStore {
       this.bridge.createScheduleJson(JSON.stringify(payload));
       this.showToast(`Created schedule "${cleanName}"`, false);
       this.bridge.refreshHost(this.selectedHostId);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createScheduleJson failed', err as Object);
@@ -6702,7 +7247,7 @@ export class OrbitHarmonyStore {
     try {
       this.bridge.pauseSchedule(this.selectedHostId, scheduleId);
       this.showToast('Schedule paused', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'pauseSchedule failed', err as Object);
       this.showToast((err as Error).message || 'Failed to pause schedule', true);
@@ -6716,7 +7261,7 @@ export class OrbitHarmonyStore {
     try {
       this.bridge.resumeSchedule(this.selectedHostId, scheduleId);
       this.showToast('Schedule resumed', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'resumeSchedule failed', err as Object);
       this.showToast((err as Error).message || 'Failed to resume schedule', true);
@@ -6730,7 +7275,7 @@ export class OrbitHarmonyStore {
     try {
       this.bridge.runScheduleOnce(this.selectedHostId, scheduleId);
       this.showToast('Triggered schedule run', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'runScheduleOnce failed', err as Object);
       this.showToast((err as Error).message || 'Failed to trigger schedule', true);
@@ -6745,7 +7290,7 @@ export class OrbitHarmonyStore {
       this.bridge.deleteSchedule(this.selectedHostId, scheduleId);
       this.reloadHost(this.selectedHostId);
       this.showToast('Schedule deleted', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'deleteSchedule failed', err as Object);
       this.showToast((err as Error).message || 'Failed to delete schedule', true);
@@ -6773,7 +7318,7 @@ export class OrbitHarmonyStore {
       }
       this.conditionalTimers = next;
       this.showToast('Timer canceled', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cancelConditionalTimer failed', err as Object);
       if (this.selectedHostId === hostId) {
@@ -6793,7 +7338,7 @@ export class OrbitHarmonyStore {
         return;
       }
       this.showToast('Timer fired', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       await this.refreshAutomations();
     } catch (err) {
       orbitLogWarn('OrbitStore', 'fireConditionalTimerNow failed', err as Object);
@@ -6837,7 +7382,7 @@ export class OrbitHarmonyStore {
         ? 'Goal paused'
         : (action === 'resume' ? 'Goal resumed' : (action === 'cancel' ? 'Goal stopped' : 'Goal verifying'));
       this.showToast(label, false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'controlGoalRun failed', err as Object);
       if (this.selectedHostId === hostId) {
@@ -6871,7 +7416,7 @@ export class OrbitHarmonyStore {
       }
       this.monitorWatches = next;
       this.showToast('Monitor stopped', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'stopMonitorWatch failed', err as Object);
       if (this.selectedHostId === hostId) {
@@ -6905,7 +7450,7 @@ export class OrbitHarmonyStore {
       }
       this.workflowRuns = next;
       this.showToast('Workflow canceled', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cancelWorkflowRun failed', err as Object);
       if (this.selectedHostId === hostId) {
@@ -6949,7 +7494,7 @@ export class OrbitHarmonyStore {
       const json = await this.bridge.cloudSyncLoginWithTokenJson(clean);
       this.cloudSyncStatus = JSON.parse(json) as CloudSyncStatusDto;
       this.showToast('Connected GitHub account', false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncLoginWithTokenJson failed', err as Object);
@@ -6975,7 +7520,7 @@ export class OrbitHarmonyStore {
         `Vault unlocked (rev ${res.vault_revision})`,
         false
       );
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncUnlockWithPassphraseJson failed', err as Object);
@@ -6997,7 +7542,7 @@ export class OrbitHarmonyStore {
       this.refreshCloudSyncStatus();
       this.reloadFleet();
       this.showToast(`Synced vault rev ${res.vault_revision}`, false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncNowJson failed', err as Object);
       this.showToast((err as Error).message || 'Cloud sync failed', true);
@@ -7014,7 +7559,7 @@ export class OrbitHarmonyStore {
       this.cloudSyncStatus = JSON.parse(
         this.bridge.cloudSyncSetAutoSyncJson(enabled)
       ) as CloudSyncStatusDto;
-      this.triggerHaptic(6);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncSetAutoSyncJson failed', err as Object);
       this.showToast((err as Error).message || 'Failed to update auto-sync', true);
@@ -7032,7 +7577,7 @@ export class OrbitHarmonyStore {
       ) as CloudSyncStatusDto;
       this.reloadFleet();
       this.showToast('Disconnected Cloud Sync', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncLogoutJson failed', err as Object);
       this.showToast((err as Error).message || 'Failed to disconnect', true);
@@ -7123,26 +7668,51 @@ export class OrbitHarmonyStore {
     try {
       await this.bridge.updatePushPreferencesJson(this.selectedHostId, JSON.stringify(copy));
       this.showToast('Push preferences updated', false);
-      this.triggerHaptic(6);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'updatePushPreferencesJson failed', err as Object);
       this.showToast((err as Error).message || 'Failed to update push preferences', true);
     }
   }
 
-  public async sendTestPushNotification(): Promise<void> {
-    if (this.bridge === null || this.selectedHostId.length === 0) {
-      this.showToast('Connect a host first', true);
-      return;
+  public async sendTestPushNotificationScoped(
+    hostId: string
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Connect a host first' };
     }
     try {
       const deviceId = this.prefsStore.getOrCreateDeviceId();
-      await this.bridge.testPushNotificationJson(this.selectedHostId, deviceId);
-      this.showToast('Test push sent from host', false);
-      this.triggerHaptic(10);
+      await this.bridge.testPushNotificationJson(cleanHost, deviceId);
+      return { ok: true, data: true, errorDetail: '' };
     } catch (err) {
       orbitLogWarn('OrbitStore', 'testPushNotificationJson failed', err as Object);
-      this.showToast((err as Error).message || 'Test push failed', true);
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Test push failed'
+      };
+    }
+  }
+
+  public async sendTestPushNotification(): Promise<void> {
+    const targetHost = this.selectedHostId.trim();
+    const originEpoch = this.hostSelectionEpoch;
+    if (this.bridge === null || targetHost.length === 0) {
+      this.showToastResource($r('app.string.toast_connect_host_first'), true);
+      return;
+    }
+    const res = await this.sendTestPushNotificationScoped(targetHost);
+    if (this.selectedHostId.trim() !== targetHost || this.hostSelectionEpoch !== originEpoch) {
+      return;
+    }
+    if (res.ok) {
+      this.showToastResource($r('app.string.toast_test_push_sent'), false);
+      this.triggerHapticPreset('action');
+    } else {
+      this.showToastResource($r('app.string.toast_test_push_failed'), true, res.errorDetail);
+      this.triggerHapticPreset('warning');
     }
   }
 
@@ -7178,7 +7748,7 @@ export class OrbitHarmonyStore {
     } else {
       this.showToast(outcome.errorMessage || 'Notifications unavailable', true);
     }
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('success');
   }
 
   public async notifyDeepLinkForActiveSession(
@@ -7266,7 +7836,7 @@ export class OrbitHarmonyStore {
       if (this.shellStore.breakpoint === 'sm') {
         this.sidebarOpen = false;
       }
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return;
     }
     this.showPersonalAgentSetup = true;
@@ -7280,7 +7850,7 @@ export class OrbitHarmonyStore {
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public toggleBriefingPanel(): void {
@@ -7301,7 +7871,7 @@ export class OrbitHarmonyStore {
     } else if (this.isCurrentSessionPersonalAgent()) {
       this.briefingDismissedByUserForPaKey = `${this.selectedHostId}::${this.selectedAgentId}`;
     }
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public closeBriefingPanel(): void {
@@ -7322,7 +7892,7 @@ export class OrbitHarmonyStore {
       this.closeGitInspector();
       this.showBriefingPanel = true;
       this.personalAgentStore.ensureFreshBriefing();
-      this.triggerHaptic(6);
+      this.triggerHapticPreset('selection');
       return;
     }
     this.showBriefingPanel = false;
@@ -7333,7 +7903,7 @@ export class OrbitHarmonyStore {
     if (pa !== null && pa.host_id.length > 0) {
       this.refreshPersonalAgentActivity(pa.host_id, 50, null, false);
     }
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public closeBriefingSheet(): void {
@@ -7364,7 +7934,7 @@ export class OrbitHarmonyStore {
       this.reloadHostAsync(hostId);
       this.refreshSidebarAsync();
       this.personalAgentStore.refreshBriefing(true);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'archiveAgentOnHost failed', err as Object);
       this.showToast('Failed to archive session', true);
@@ -7410,7 +7980,7 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.resolvePermission(item.host_id, item.agent_id, item.request_id, decision);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       this.reloadFleetAsync();
       this.personalAgentStore.refreshBriefing(true);
       if (this.selectedHostId === item.host_id && this.selectedAgentId === item.agent_id) {
@@ -7477,7 +8047,7 @@ export class OrbitHarmonyStore {
         false,
         [feedback.resolvedCount]
       );
-      this.triggerHaptic(14);
+      this.triggerHapticPreset('success');
     } else if (feedback.kind === 'approved_with_skipped') {
       this.showLocalizedToast(
         $r('app.string.briefing_batchApprovedWithSkipped', feedback.resolvedCount, feedback.skippedCount),
@@ -7485,7 +8055,7 @@ export class OrbitHarmonyStore {
         false,
         [feedback.resolvedCount, feedback.skippedCount]
       );
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
     } else if (feedback.kind === 'partial_failure') {
       this.showLocalizedToast(
         $r(
@@ -7561,7 +8131,7 @@ export class OrbitHarmonyStore {
     }
     this.voiceInterimTranscript = '';
     this.voiceElapsedSeconds = 0;
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('action');
     this.voiceController.start(context, {
       onPartialResult: (partial: string): void => {
         this.voiceInterimTranscript = partial;
@@ -7574,7 +8144,7 @@ export class OrbitHarmonyStore {
         if (clean.length > 0) {
           const prefix = this.composerText.trim().length > 0 ? `${this.composerText.trimEnd()} ` : '';
           this.composerText = `${prefix}${clean}`;
-          this.triggerHaptic(8);
+          this.triggerHapticPreset('selection');
         }
       },
       onStateChanged: (recording: boolean): void => {
@@ -7607,7 +8177,7 @@ export class OrbitHarmonyStore {
     if (candidate.length > 0) {
       const prefix = this.composerText.trim().length > 0 ? `${this.composerText.trimEnd()} ` : '';
       this.composerText = `${prefix}${candidate}`;
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     }
   }
 
@@ -7616,7 +8186,7 @@ export class OrbitHarmonyStore {
     this.stopVoiceTimer();
     this.isVoiceRecording = false;
     this.voiceInterimTranscript = '';
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   private startVoiceTimer(): void {
@@ -7643,7 +8213,7 @@ export class OrbitHarmonyStore {
     }
     const inserted = this.stageStore.loadOlder(active);
     if (inserted > 0) {
-      this.triggerHaptic(6);
+      this.triggerHapticPreset('selection');
     }
     return inserted;
   }
@@ -7683,7 +8253,7 @@ export class OrbitHarmonyStore {
           : (action === 'request_changes' ? 'Requested plan revisions' : 'Plan dismissed'),
         false
       );
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'resolvePlanApprovalJson failed', err as Object);
@@ -7699,7 +8269,7 @@ export class OrbitHarmonyStore {
     try {
       this.bridge.interruptAgentAndContinue(this.selectedHostId, this.selectedAgentId);
       this.showToast('Interrupted & continuing turn', false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'interruptAgentAndContinue failed', err as Object);
       this.showToast((err as Error).message || 'Interrupt failed', true);
@@ -7806,7 +8376,7 @@ export class OrbitHarmonyStore {
           subagentCallId: sub.id
         };
         this.sidePanelStore.openSubagentTab(finalRootHost, finalRootAgent, asyncTab, { source: 'user', activate: true });
-        this.triggerHaptic(8);
+        this.triggerHapticPreset('selection');
       }).catch((err: Object) => {
         orbitLogWarn('OrbitStore', 'openSubagentEntryInRootScope chain resolution failed', err);
       });
@@ -7842,7 +8412,7 @@ export class OrbitHarmonyStore {
       subTab,
       { source: 'user', activate: true }
     );
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   // 11. File Explorer & Code Viewer (Read / Edit / Create / Rename / Delete)
@@ -7859,7 +8429,7 @@ export class OrbitHarmonyStore {
     } else {
       this.openSidePanelToolTab('files', null, 'user', cleanCwd, cleanHost);
     }
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public async openWorkspaceFileInViewer(path: string): Promise<void> {
@@ -7924,7 +8494,7 @@ export class OrbitHarmonyStore {
       this.bridge?.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
       this.reloadWorkspaceFiles();
       this.showToast(`Created ${basenameOfPath(clean)}`, false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createWorkspaceEntryJson failed', err as Object);
@@ -8008,7 +8578,7 @@ export class OrbitHarmonyStore {
         this.pullRefreshGitReview();
       }
       this.showToast(all ? 'Staged all changes' : 'Staged file', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitStagePathsJson failed', err as Object);
@@ -8032,7 +8602,7 @@ export class OrbitHarmonyStore {
         this.pullRefreshGitReview();
       }
       this.showToast(all ? 'Unstaged all changes' : 'Unstaged file', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitUnstagePathsJson failed', err as Object);
@@ -8086,7 +8656,7 @@ export class OrbitHarmonyStore {
         this.refreshGitCollabStatus();
       }
       this.showToast(`Committed ${res.short_sha}`, false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitCommitJson failed', err as Object);
@@ -8190,7 +8760,7 @@ export class OrbitHarmonyStore {
         this.refreshGitCollabStatus();
       }
       this.showToast(`Created PR: ${res.title}`, false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return res;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitCreatePrJson failed', err as Object);
@@ -8300,7 +8870,7 @@ export class OrbitHarmonyStore {
       kind: 'global_search',
       hostId: this.selectedHostId
     });
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public runLocalGlobalSearch(query: string): void {
@@ -8361,10 +8931,10 @@ export class OrbitHarmonyStore {
     this.shellStore.openModal({
       kind: 'host_settings',
       hostId: this.selectedHostId,
-      initialPath: 'router_mesh'
+      initialPath: 'personal_agent'
     });
     this.refreshRouterAndMesh();
-    this.triggerHaptic(8);
+    this.triggerHaptic('selection');
   }
 
   public async refreshRouterAndMesh(): Promise<void> {
@@ -8488,7 +9058,7 @@ export class OrbitHarmonyStore {
         'Personal Agent settings saved',
         false
       );
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'updateRouterConfigJson failed', err as Object);
@@ -8512,7 +9082,7 @@ export class OrbitHarmonyStore {
       await this.bridge.updateMeshPeerJson(ownerHostId, registrationId, label, enabled);
       await this.refreshRouterAndMesh();
       this.showToast(enabled ? `Enabled ${label}` : `Paused ${label}`, false);
-      this.triggerHaptic(6);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'updateMeshPeerJson failed', err as Object);
       this.showToast((err as Error).message || 'Failed to update mesh peer', true);
@@ -8547,7 +9117,7 @@ export class OrbitHarmonyStore {
       this.refreshCloudSyncStatus();
       this.reloadFleet();
       this.showToast('Device linked & vault synced', false);
-      this.triggerHaptic(14);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncImportDeviceLinkUriJson failed', err as Object);
@@ -8585,7 +9155,7 @@ export class OrbitHarmonyStore {
         requireManual ? 'Manual passphrase required' : 'Zero-passphrase instant unlock enabled',
         false
       );
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'cloudSyncSetManualPassphraseModeJson failed', err as Object);
       this.showToast((err as Error).message || 'Failed to update unlock mode', true);
@@ -8626,7 +9196,7 @@ export class OrbitHarmonyStore {
         this.refreshCloudSyncStatus();
         this.reloadFleet();
         this.showToast('Signed in with GitHub', false);
-        this.triggerHaptic(14);
+        this.triggerHapticPreset('success');
       } else if (polled.status === 'expired' || polled.status === 'denied') {
         this.githubDeviceFlow = null;
         this.showToast(`GitHub sign-in ${polled.status}`, true);
@@ -8647,7 +9217,7 @@ export class OrbitHarmonyStore {
       const summary = await this.bridge.upgradeHostDaemonOverWire(hostId, null);
       this.showToast(summary.length > 0 ? summary : 'Host daemon upgraded', false);
       this.reloadFleet();
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'upgradeHostDaemonOverWire failed', err as Object);
       this.showToast((err as Error).message || 'Daemon upgrade failed', true);
@@ -8703,7 +9273,7 @@ export class OrbitHarmonyStore {
       );
       await this.refreshAutomations();
       this.showToast('Conditional timer armed', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createTimerJson failed', err as Object);
@@ -8741,7 +9311,7 @@ export class OrbitHarmonyStore {
       await this.bridge.startGoalJson(JSON.stringify(req));
       await this.refreshAutomations();
       this.showToast('Goal loop started', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'startGoalJson failed', err as Object);
@@ -8783,7 +9353,7 @@ export class OrbitHarmonyStore {
       await this.bridge.createMonitorJson(JSON.stringify(req));
       await this.refreshAutomations();
       this.showToast('Monitor watch started', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createMonitorJson failed', err as Object);
@@ -8822,7 +9392,7 @@ export class OrbitHarmonyStore {
       await this.bridge.startWorkflowJson(JSON.stringify(req));
       await this.refreshAutomations();
       this.showToast('Workflow started', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'startWorkflowJson failed', err as Object);
@@ -8839,7 +9409,7 @@ export class OrbitHarmonyStore {
       hostId: this.selectedHostId,
       agentId: this.selectedAgentId
     });
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   // 18. Side Panel Tab Openers & Strictly Scoped Data-Isolation Helpers (PR-4)
@@ -9013,7 +9583,7 @@ export class OrbitHarmonyStore {
       closable: true
     };
     this.sidePanelStore.openTab(tab, { source: 'user', activate: true });
-    this.triggerHaptic(6);
+    this.triggerHapticPreset('selection');
   }
 
   public openSubagentCrewPanel(hostId?: string, rootAgentId?: string): void {
@@ -9063,7 +9633,7 @@ export class OrbitHarmonyStore {
           crewTab,
           { source: 'user', activate: true }
         );
-        this.triggerHaptic(8);
+        this.triggerHapticPreset('selection');
       }).catch((err: Object) => {
         orbitLogWarn('OrbitStore', 'openSubagentCrewPanel async parent resolution failed', err);
       });
@@ -9091,7 +9661,7 @@ export class OrbitHarmonyStore {
       crewTab,
       { source: 'user', activate: true }
     );
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   /**
@@ -9180,12 +9750,12 @@ export class OrbitHarmonyStore {
       closable: true
     };
     this.sidePanelStore.openTab(tab, { source: 'user', activate: true });
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public openBriefingPanelTab(): void {
     this.openSidePanelToolTab('briefing', null, 'user');
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   public getScopedBriefing(hostId: string, agentId: string | null = null): PersonalAgentBriefingDto | null {
@@ -10190,7 +10760,7 @@ export class OrbitHarmonyStore {
       );
       this.gitPanelRevision += 1;
       this.showToast(all ? 'Staged all changes' : 'Staged file', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitStageScopedPaths failed', err as Object);
@@ -10221,7 +10791,7 @@ export class OrbitHarmonyStore {
       );
       this.gitPanelRevision += 1;
       this.showToast(all ? 'Unstaged all changes' : 'Unstaged file', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitUnstageScopedPaths failed', err as Object);
@@ -10278,7 +10848,7 @@ export class OrbitHarmonyStore {
       );
       this.gitPanelRevision += 1;
       this.showToast(`Committed ${res.short_sha}`, false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitCommitScoped failed', err as Object);
@@ -10313,7 +10883,7 @@ export class OrbitHarmonyStore {
       const res = JSON.parse(json) as GitCreatePrResultDto;
       this.gitPanelRevision += 1;
       this.showToast(`Created PR: ${res.title}`, false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return res;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'gitCreateScopedPr failed', err as Object);
@@ -10396,7 +10966,7 @@ export class OrbitHarmonyStore {
         false
       );
       this.gitPanelRevision += 1;
-      this.showToast('Continued rebase', false);
+      this.showToastResource($r('app.string.toast_rebase_continued'), false);
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Rebase continue failed', true);
@@ -10420,7 +10990,7 @@ export class OrbitHarmonyStore {
         false
       );
       this.gitPanelRevision += 1;
-      this.showToast('Aborted rebase', false);
+      this.showToastResource($r('app.string.toast_rebase_aborted'), false);
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Rebase abort failed', true);
@@ -10774,7 +11344,7 @@ export class OrbitHarmonyStore {
         };
       }
       this.showToast(`Saved ${basenameOfPath(cleanPath)}`, false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
       return {
         ok: true,
         conflict: false,
@@ -10821,7 +11391,7 @@ export class OrbitHarmonyStore {
       this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
       this.gitPanelRevision += 1;
       this.showToast(`Created ${basenameOfPath(cleanPath)}`, false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createScopedWorkspaceEntry failed', err as Object);
@@ -10860,7 +11430,7 @@ export class OrbitHarmonyStore {
       this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
       this.gitPanelRevision += 1;
       this.showToast(`Renamed to ${basenameOfPath(cleanNew)}`, false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'renameScopedWorkspaceEntry failed', err as Object);
@@ -10890,7 +11460,7 @@ export class OrbitHarmonyStore {
       this.bridge.fetchWorkspaceFiles(cleanHost, cleanCwd);
       this.gitPanelRevision += 1;
       this.showToast(`Deleted ${basenameOfPath(cleanPath)}`, false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'deleteScopedWorkspaceEntry failed', err as Object);
@@ -10946,7 +11516,7 @@ export class OrbitHarmonyStore {
     };
     this.quotedSnippets = this.quotedSnippets.concat([next]);
     this.showToast(`Quoted ${basenameOfPath(relPath)} into composer`, false);
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   // --- Scoped PTY Terminal Helpers ---
@@ -11085,7 +11655,7 @@ export class OrbitHarmonyStore {
         normalizedSlot
       );
       this.clearScopedTerminalGridCache(cleanHost, normalizedSlot);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'startScopedTerminal failed', err as Object);
       this.showToastResource($r('app.string.terminal_start_failed'), true);
@@ -11102,7 +11672,7 @@ export class OrbitHarmonyStore {
       this.bridge.attachTerminal(cleanHost, terminalId, normalizedSlot);
       this.clearScopedTerminalGridCache(cleanHost, normalizedSlot);
       this.terminalPanelRevision += 1;
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'attachScopedTerminal failed', err as Object);
     }
@@ -11120,7 +11690,7 @@ export class OrbitHarmonyStore {
       this.reloadHostAsync(cleanHost);
       this.terminalPanelRevision += 1;
       this.showToastResource($r('app.string.terminal_closed_toast'), false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       orbitLogWarn('OrbitStore', 'killScopedTerminal failed', err as Object);
       this.showToastResource($r('app.string.terminal_close_failed'), true);
@@ -11163,7 +11733,7 @@ export class OrbitHarmonyStore {
     };
     this.quotedSnippets = this.quotedSnippets.concat([next]);
     this.showToast('Quoted terminal output into composer', false);
-    this.triggerHaptic(8);
+    this.triggerHapticPreset('selection');
   }
 
   // --- Scoped Mission Workspace Board & Peers Helpers (P0-3 + R2-P0-2 + P1-8) ---
@@ -11713,7 +12283,7 @@ export class OrbitHarmonyStore {
       this.reloadHostAsync(cleanHost);
       this.panelDataRevision += 1;
       this.showToastResource($r('app.string.workspace_create_dispatched'), false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createWorkspaceV2 failed', err as Object);
@@ -11833,7 +12403,7 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.startWorkspaceScriptJson(cleanHost, cleanWs, cleanName);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'startWorkspaceScript failed', err as Object);
@@ -11858,7 +12428,7 @@ export class OrbitHarmonyStore {
     }
     try {
       this.bridge.stopWorkspaceScriptJson(cleanHost, cleanWs, cleanName);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'stopWorkspaceScript failed', err as Object);
@@ -12117,7 +12687,7 @@ export class OrbitHarmonyStore {
         );
       }
       this.panelDataRevision += 1;
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'spawnScopedWorkspacePeer failed', err as Object);
@@ -12941,7 +13511,7 @@ export class OrbitHarmonyStore {
           // Best-effort refresh
         });
       }
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'steerScopedAgent failed', err as Object);
@@ -12994,7 +13564,7 @@ export class OrbitHarmonyStore {
       this.syncArchivedSubagentKeys();
       this.panelDataRevision += 1;
       this.reloadHostAsync(actualChildHost);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('success');
       return true;
     }
 
@@ -13029,7 +13599,7 @@ export class OrbitHarmonyStore {
     );
     this.syncArchivedSubagentKeys();
     this.panelDataRevision += 1;
-    this.triggerHaptic(10);
+    this.triggerHapticPreset('success');
     return true;
   }
 
@@ -13170,7 +13740,7 @@ export class OrbitHarmonyStore {
       this.bridge.refreshHost(cleanHost);
       this.reloadHostAsync(cleanHost);
       this.showToast(`Created schedule "${cleanName}"`, false);
-      this.triggerHaptic(12);
+      this.triggerHapticPreset('success');
       return true;
     } catch (err) {
       orbitLogWarn('OrbitStore', 'createScopedSchedule failed', err as Object);
@@ -13188,7 +13758,7 @@ export class OrbitHarmonyStore {
       this.bridge.pauseSchedule(cleanHost, scheduleId);
       this.reloadHostAsync(cleanHost);
       this.showToast('Schedule paused', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to pause schedule', true);
     }
@@ -13203,7 +13773,7 @@ export class OrbitHarmonyStore {
       this.bridge.resumeSchedule(cleanHost, scheduleId);
       this.reloadHostAsync(cleanHost);
       this.showToast('Schedule resumed', false);
-      this.triggerHaptic(8);
+      this.triggerHapticPreset('selection');
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to resume schedule', true);
     }
@@ -13217,7 +13787,7 @@ export class OrbitHarmonyStore {
     try {
       this.bridge.runScheduleOnce(cleanHost, scheduleId);
       this.showToast('Triggered schedule run', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to trigger schedule', true);
     }
@@ -13232,7 +13802,7 @@ export class OrbitHarmonyStore {
       this.bridge.deleteSchedule(cleanHost, scheduleId);
       this.reloadHostAsync(cleanHost);
       this.showToast('Schedule deleted', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to delete schedule', true);
     }
@@ -13277,7 +13847,7 @@ export class OrbitHarmonyStore {
         JSON.stringify(condObj)
       );
       this.showToast('Conditional timer armed', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to arm timer', true);
@@ -13293,7 +13863,7 @@ export class OrbitHarmonyStore {
     try {
       await this.bridge.cancelConditionalTimerJson(cleanHost, timerId);
       this.showToast('Timer canceled', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to cancel timer', true);
@@ -13309,7 +13879,7 @@ export class OrbitHarmonyStore {
     try {
       await this.bridge.fireConditionalTimerNowJson(cleanHost, timerId);
       this.showToast('Timer fired', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to fire timer', true);
@@ -13343,7 +13913,7 @@ export class OrbitHarmonyStore {
       };
       await this.bridge.startGoalJson(JSON.stringify(req));
       this.showToast('Goal loop started', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to start goal', true);
@@ -13367,7 +13937,7 @@ export class OrbitHarmonyStore {
         ? 'Goal paused'
         : (action === 'resume' ? 'Goal resumed' : (action === 'cancel' ? 'Goal stopped' : 'Goal verifying'));
       this.showToast(label, false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to update goal', true);
@@ -13411,7 +13981,7 @@ export class OrbitHarmonyStore {
       };
       await this.bridge.createMonitorJson(JSON.stringify(req));
       this.showToast('Monitor watch started', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to start monitor', true);
@@ -13431,7 +14001,7 @@ export class OrbitHarmonyStore {
       };
       await this.bridge.stopMonitorWatchJson(JSON.stringify(req));
       this.showToast('Monitor stopped', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to stop monitor', true);
@@ -13470,7 +14040,7 @@ export class OrbitHarmonyStore {
       };
       await this.bridge.startWorkflowJson(JSON.stringify(req));
       this.showToast('Workflow started', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('action');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to start workflow', true);
@@ -13490,7 +14060,7 @@ export class OrbitHarmonyStore {
       };
       await this.bridge.cancelWorkflowRunJson(JSON.stringify(req));
       this.showToast('Workflow canceled', false);
-      this.triggerHaptic(10);
+      this.triggerHapticPreset('warning');
       return true;
     } catch (err) {
       this.showToast((err as Error).message || 'Failed to cancel workflow', true);
@@ -13572,6 +14142,494 @@ export class OrbitHarmonyStore {
       orbitLogWarn('OrbitStore', 'exportAgentTranscriptJson failed', err as Object);
       this.showToast((err as Error).message || 'Export failed', true);
       return null;
+    }
+  }
+
+  // --- PR-6 Settings & Tier-2 Extensions Scoped Actions (Zero Global Toast Side-Effects) ---
+
+  public exportHostPairingUriScoped(hostId: string): OrbitScopedActionOutcome<string> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const uri = this.bridge.exportHostPairingUri(cleanHost).trim();
+      if (uri.length === 0) {
+        return { ok: false, data: null, errorDetail: 'Pairing URI is empty' };
+      }
+      return { ok: true, data: uri, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to export pairing URI'
+      };
+    }
+  }
+
+  public applyRelayToFleetScoped(rawRelayUrl: string): OrbitScopedActionOutcome<number> {
+    if (this.bridge === null) {
+      return { ok: false, data: null, errorDetail: 'Native core unavailable' };
+    }
+    try {
+      const count = this.bridge.applyRelayToFleet(rawRelayUrl.trim());
+      this.reloadFleet();
+      return { ok: true, data: count, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to apply relay across fleet'
+      };
+    }
+  }
+
+  public async getUsageInsightsScoped(
+    hostId: string,
+    days: number
+  ): Promise<OrbitScopedActionOutcome<UsageInsightsSnapshotDto>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.getUsageInsightsJson(cleanHost, days);
+      const parsed = JSON.parse(raw) as UsageInsightsSnapshotDto;
+      return { ok: true, data: parsed, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load usage insights'
+      };
+    }
+  }
+
+  public async listExternalMcpServersScoped(
+    hostId: string,
+    cwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<ExternalMcpServerRecordDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const exactCwd = cwd !== undefined && cwd !== null && cwd.trim().length > 0 ? cwd : null;
+      const raw = await this.bridge.listExternalMcpServersJson(cleanHost, exactCwd);
+      const parsed = JSON.parse(raw) as ExternalMcpServerRecordDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load MCP servers'
+      };
+    }
+  }
+
+  public async toggleExternalMcpServerScoped(
+    hostId: string,
+    serverId: string,
+    enabled: boolean,
+    cwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanServer = serverId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanServer.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid MCP server parameters' };
+    }
+    try {
+      const exactCwd = cwd !== undefined && cwd !== null && cwd.trim().length > 0 ? cwd : null;
+      await this.bridge.toggleExternalMcpServerJson(cleanHost, cleanServer, enabled, exactCwd);
+      return { ok: true, data: enabled, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to toggle MCP server'
+      };
+    }
+  }
+
+  public async listManagedSkillsScoped(
+    hostId: string,
+    cwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<ManagedSkillRecordDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const exactCwd = cwd !== undefined && cwd !== null && cwd.trim().length > 0 ? cwd : null;
+      const raw = await this.bridge.listManagedSkillsJson(cleanHost, exactCwd);
+      const parsed = JSON.parse(raw) as ManagedSkillRecordDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load skills'
+      };
+    }
+  }
+
+  public async listProjectMemoriesScoped(
+    hostId: string,
+    cwd: string,
+    limit: number = 100
+  ): Promise<OrbitScopedActionOutcome<ProjectMemoryItemDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cwd.trim().length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host or project directory unavailable' };
+    }
+    try {
+      const raw = await this.bridge.listProjectMemoriesJson(cleanHost, cwd, limit);
+      const parsed = JSON.parse(raw) as ProjectMemoryItemDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load project memories'
+      };
+    }
+  }
+
+  public async confirmProjectMemoryScoped(
+    hostId: string,
+    memoryId: string,
+    cwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanId = memoryId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanId.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid memory parameters' };
+    }
+    try {
+      const exactCwd = cwd !== undefined && cwd !== null && cwd.trim().length > 0 ? cwd : null;
+      await this.bridge.confirmProjectMemoryJson(cleanHost, cleanId, exactCwd);
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to confirm project memory'
+      };
+    }
+  }
+
+  public async deleteProjectMemoryScoped(
+    hostId: string,
+    memoryId: string,
+    cwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanId = memoryId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanId.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid memory parameters' };
+    }
+    try {
+      const exactCwd = cwd !== undefined && cwd !== null && cwd.trim().length > 0 ? cwd : null;
+      await this.bridge.deleteProjectMemoryJson(cleanHost, cleanId, exactCwd);
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to delete project memory'
+      };
+    }
+  }
+
+  public async listPluginsScoped(
+    hostId: string
+  ): Promise<OrbitScopedActionOutcome<InstalledPluginDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.listPluginsJson(cleanHost);
+      const parsed = JSON.parse(raw) as InstalledPluginDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load plugins'
+      };
+    }
+  }
+
+  public async setPluginEnabledScoped(
+    hostId: string,
+    pluginId: string,
+    enabled: boolean
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanPlugin = pluginId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanPlugin.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid plugin parameters' };
+    }
+    try {
+      await this.bridge.setPluginEnabledJson(cleanHost, cleanPlugin, enabled);
+      return { ok: true, data: enabled, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to update plugin state'
+      };
+    }
+  }
+
+  public async getSandboxConfigScoped(
+    hostId: string
+  ): Promise<OrbitScopedActionOutcome<SandboxPolicyDto | null>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.getSandboxConfigJson(cleanHost);
+      const parsed = raw.trim() === 'null' ? null : (JSON.parse(raw) as SandboxPolicyDto | null);
+      return { ok: true, data: parsed, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load sandbox config'
+      };
+    }
+  }
+
+  public async getGuardianConfigScoped(
+    hostId: string
+  ): Promise<OrbitScopedActionOutcome<GuardianPolicyConfigDto>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.getGuardianConfigJson(cleanHost);
+      const parsed = JSON.parse(raw) as GuardianPolicyConfigDto;
+      return { ok: true, data: parsed, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load Guardian policy'
+      };
+    }
+  }
+
+  public async updateGuardianConfigScoped(
+    hostId: string,
+    config: GuardianPolicyConfigDto
+  ): Promise<OrbitScopedActionOutcome<GuardianPolicyConfigDto>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.updateGuardianConfigJson(cleanHost, JSON.stringify(config));
+      const parsed = JSON.parse(raw) as GuardianPolicyConfigDto;
+      return { ok: true, data: parsed, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to save Guardian policy'
+      };
+    }
+  }
+
+  public async listPermissionRulesScoped(
+    hostId: string,
+    projectCwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<PermissionRuleRecordDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const cleanCwd =
+        projectCwd !== undefined && projectCwd !== null && projectCwd.trim().length > 0
+          ? projectCwd.trim()
+          : null;
+      const raw = await this.bridge.listPermissionRulesJson(cleanHost, cleanCwd);
+      const parsed = JSON.parse(raw) as PermissionRuleRecordDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to load permission rules'
+      };
+    }
+  }
+
+  public async upsertPermissionRuleScoped(
+    hostId: string,
+    input: UpsertPermissionRuleInputDto
+  ): Promise<OrbitScopedActionOutcome<PermissionRuleRecordDto>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.upsertPermissionRuleJson(cleanHost, JSON.stringify(input));
+      const parsed = JSON.parse(raw) as PermissionRuleRecordDto;
+      return { ok: true, data: parsed, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to save permission rule'
+      };
+    }
+  }
+
+  public async deletePermissionRuleScoped(
+    hostId: string,
+    ruleId: string
+  ): Promise<OrbitScopedActionOutcome<boolean>> {
+    const cleanHost = hostId.trim();
+    const cleanRule = ruleId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanRule.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid permission rule parameters' };
+    }
+    try {
+      await this.bridge.deletePermissionRuleJson(cleanHost, cleanRule);
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to delete permission rule'
+      };
+    }
+  }
+
+  public listAcpAgentsScoped(hostId: string): OrbitScopedActionOutcome<AcpAgentAvailabilityDto[]> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = this.bridge.listAcpAgentsJson(cleanHost);
+      const parsed = JSON.parse(raw) as AcpAgentAvailabilityDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to list ACP agents'
+      };
+    }
+  }
+
+  public refreshAcpAgentsScoped(hostId: string): OrbitScopedActionOutcome<boolean> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      this.bridge.refreshAcpAgents(cleanHost);
+      return { ok: true, data: true, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to refresh ACP agents'
+      };
+    }
+  }
+
+  public async refreshAcpRegistryScoped(
+    hostId: string,
+    registryUrl?: string | null
+  ): Promise<OrbitScopedActionOutcome<AcpAgentAvailabilityDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.refreshAcpRegistryJson(cleanHost, registryUrl ?? null);
+      const parsed = JSON.parse(raw) as AcpAgentAvailabilityDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to refresh ACP registry'
+      };
+    }
+  }
+
+  public async testAcpAgentScoped(
+    hostId: string,
+    agentId: string,
+    cwd?: string | null
+  ): Promise<OrbitScopedActionOutcome<AcpAgentTestResultDto>> {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanAgent.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid ACP agent parameters' };
+    }
+    try {
+      const raw = await this.bridge.testAcpAgentJson(cleanHost, cleanAgent, cwd ?? null);
+      const parsed = JSON.parse(raw) as AcpAgentTestResultDto;
+      return { ok: true, data: parsed, errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'ACP agent test failed'
+      };
+    }
+  }
+
+  public async upsertCustomAcpAgentScoped(
+    hostId: string,
+    spec: AcpAgentSpecDto
+  ): Promise<OrbitScopedActionOutcome<AcpAgentAvailabilityDto[]>> {
+    const cleanHost = hostId.trim();
+    if (this.bridge === null || cleanHost.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Host unavailable' };
+    }
+    try {
+      const raw = await this.bridge.upsertCustomAcpAgentJson(cleanHost, JSON.stringify(spec));
+      const parsed = JSON.parse(raw) as AcpAgentAvailabilityDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to save custom ACP agent'
+      };
+    }
+  }
+
+  public async deleteCustomAcpAgentScoped(
+    hostId: string,
+    agentId: string
+  ): Promise<OrbitScopedActionOutcome<AcpAgentAvailabilityDto[]>> {
+    const cleanHost = hostId.trim();
+    const cleanAgent = agentId.trim();
+    if (this.bridge === null || cleanHost.length === 0 || cleanAgent.length === 0) {
+      return { ok: false, data: null, errorDetail: 'Invalid ACP agent parameters' };
+    }
+    try {
+      const raw = await this.bridge.deleteCustomAcpAgentJson(cleanHost, cleanAgent);
+      const parsed = JSON.parse(raw) as AcpAgentAvailabilityDto[];
+      return { ok: true, data: Array.isArray(parsed) ? parsed : [], errorDetail: '' };
+    } catch (err) {
+      return {
+        ok: false,
+        data: null,
+        errorDetail: (err as Error).message || 'Failed to delete custom ACP agent'
+      };
     }
   }
 }

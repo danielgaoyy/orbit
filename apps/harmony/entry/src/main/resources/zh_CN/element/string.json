@@ -9,6 +9,70 @@
       "value": "Orbit"
     },
     {
+      "name": "a11y_access_permissions",
+      "value": "访问权限：%s"
+    },
+    {
+      "name": "a11y_attach_media_files",
+      "value": "添加照片、拍照或文件"
+    },
+    {
+      "name": "a11y_close_side_panel",
+      "value": "关闭侧边面板"
+    },
+    {
+      "name": "a11y_close_tab",
+      "value": "关闭 %s"
+    },
+    {
+      "name": "a11y_exec_env_local",
+      "value": "执行环境：本地目录"
+    },
+    {
+      "name": "a11y_exec_env_worktree",
+      "value": "执行环境：独立 Worktree"
+    },
+    {
+      "name": "a11y_fast_mode_off",
+      "value": "快速模式已关闭"
+    },
+    {
+      "name": "a11y_fast_mode_on",
+      "value": "快速模式已开启"
+    },
+    {
+      "name": "a11y_next_decision",
+      "value": "下一条待处理决策"
+    },
+    {
+      "name": "a11y_open_panel_launchpad",
+      "value": "打开面板工具启动页"
+    },
+    {
+      "name": "a11y_prev_decision",
+      "value": "上一条待处理决策"
+    },
+    {
+      "name": "a11y_queue_prompt",
+      "value": "发送或排队消息"
+    },
+    {
+      "name": "a11y_remove_queued_prompt",
+      "value": "移除排队消息"
+    },
+    {
+      "name": "a11y_scroll_latest_message",
+      "value": "滚动到最新消息"
+    },
+    {
+      "name": "a11y_scroll_latest_streaming",
+      "value": "滚动到最新流式输出"
+    },
+    {
+      "name": "a11y_stop_agent",
+      "value": "停止代理"
+    },
+    {
       "name": "action_allow_once",
       "value": "仅本次允许"
     },
@@ -157,6 +221,10 @@
       "value": "查看 Diff"
     },
     {
+      "name": "automations_create_schedule",
+      "value": "创建定时任务"
+    },
+    {
       "name": "automations_goals",
       "value": "目标循环"
     },
@@ -181,6 +249,70 @@
       "value": "新建工作流"
     },
     {
+      "name": "automations_no_run_history",
+      "value": "暂无运行历史记录。"
+    },
+    {
+      "name": "automations_ph_cron",
+      "value": "Cron 表达式（如 0 9 * * *）"
+    },
+    {
+      "name": "automations_ph_goal_objective",
+      "value": "自主目标说明…"
+    },
+    {
+      "name": "automations_ph_max",
+      "value": "上限"
+    },
+    {
+      "name": "automations_ph_monitor_name",
+      "value": "监听任务名称"
+    },
+    {
+      "name": "automations_ph_regex",
+      "value": "正则 / 匹配模式（可选）"
+    },
+    {
+      "name": "automations_ph_schedule_name",
+      "value": "定时任务名称"
+    },
+    {
+      "name": "automations_ph_seconds",
+      "value": "秒数"
+    },
+    {
+      "name": "automations_ph_seconds_example",
+      "value": "秒数（如 300）"
+    },
+    {
+      "name": "automations_ph_timer_prompt",
+      "value": "计时器触发时的后续提示词…"
+    },
+    {
+      "name": "automations_ph_trigger_prompt",
+      "value": "每次触发时执行的提示词…"
+    },
+    {
+      "name": "automations_ph_verify_cmd",
+      "value": "校验命令（可选）"
+    },
+    {
+      "name": "automations_ph_workflow_name",
+      "value": "工作流名称"
+    },
+    {
+      "name": "automations_ph_workflow_steps",
+      "value": "主步骤指令…"
+    },
+    {
+      "name": "automations_refresh_a11y",
+      "value": "刷新自动化"
+    },
+    {
+      "name": "automations_run_in_worktree",
+      "value": "在隔离的 Git Worktree 中运行"
+    },
+    {
       "name": "automations_schedules",
       "value": "定时任务"
     },
@@ -189,8 +321,16 @@
       "value": "条件计时器"
     },
     {
+      "name": "automations_title",
+      "value": "自动化"
+    },
+    {
       "name": "automations_verify_now",
       "value": "立即验收"
+    },
+    {
+      "name": "automations_winner_badge",
+      "value": "胜出方案"
     },
     {
       "name": "automations_workflows",
@@ -322,7 +462,11 @@
     },
     {
       "name": "board_editor_placeholder",
-      "value": "## 目标\n\n## 契约"
+      "value": "## 目标\n\n## 接口契约\n\n## 关键发现"
+    },
+    {
+      "name": "board_empty_hint",
+      "value": "BOARD.md 为空。点击编辑以记录共享目标、接口契约或发现，供协作智能体共享。"
     },
     {
       "name": "board_empty_notice",
@@ -345,8 +489,24 @@
       "value": "从主机加载初始快照后自动解锁编辑。"
     },
     {
+      "name": "board_no_peers_subtitle",
+      "value": "在下方启动新成员，即可在同一共享黑板上协作。"
+    },
+    {
+      "name": "board_no_peers_title",
+      "value": "此工作区暂无协作成员"
+    },
+    {
       "name": "board_peer_aliases",
       "value": "曾用 %s"
+    },
+    {
+      "name": "board_peer_brief_placeholder",
+      "value": "给新成员的任务简报…"
+    },
+    {
+      "name": "board_peer_handle_placeholder",
+      "value": "可选 @代号（如 reviewer）"
     },
     {
       "name": "board_peers_tab_count",
@@ -355,6 +515,10 @@
     {
       "name": "board_recent_activity",
       "value": "最近动态"
+    },
+    {
+      "name": "board_refresh_a11y",
+      "value": "刷新共享黑板"
     },
     {
       "name": "board_refresh_aria",
@@ -375,6 +539,10 @@
     {
       "name": "board_saved_toast",
       "value": "已保存 BOARD.md"
+    },
+    {
+      "name": "board_sheet_title",
+      "value": "共享黑板与成员"
     },
     {
       "name": "board_snapshot_not_loaded",
@@ -869,6 +1037,70 @@
       "value": "SSH"
     },
     {
+      "name": "decision_custom_answer_placeholder",
+      "value": "输入自定义回答…"
+    },
+    {
+      "name": "diagram_code_view",
+      "value": "代码视图"
+    },
+    {
+      "name": "diagram_copy_source_a11y",
+      "value": "复制图表源码"
+    },
+    {
+      "name": "diagram_expand_a11y",
+      "value": "全屏查看图表"
+    },
+    {
+      "name": "diagram_open_fullscreen",
+      "value": "全屏查看图表"
+    },
+    {
+      "name": "diagram_ready_summary",
+      "value": "已渲染 %1$s · %2$d × %3$d · 点击全屏查看"
+    },
+    {
+      "name": "diagram_rendering",
+      "value": "正在渲染 %s…"
+    },
+    {
+      "name": "diagram_tab_code",
+      "value": "代码"
+    },
+    {
+      "name": "diagram_tab_preview",
+      "value": "预览"
+    },
+    {
+      "name": "dir_cancel_path_a11y",
+      "value": "取消路径输入"
+    },
+    {
+      "name": "dir_enter_path_a11y",
+      "value": "手动输入路径"
+    },
+    {
+      "name": "dir_filter_placeholder",
+      "value": "筛选文件夹或仓库…"
+    },
+    {
+      "name": "dir_git_badge",
+      "value": "git"
+    },
+    {
+      "name": "dir_loading",
+      "value": "正在加载目录…"
+    },
+    {
+      "name": "dir_parent_a11y",
+      "value": "上一级目录"
+    },
+    {
+      "name": "dir_path_placeholder",
+      "value": "/工作区路径"
+    },
+    {
       "name": "export_copy_action",
       "value": "复制导出内容"
     },
@@ -1053,6 +1285,38 @@
       "value": "创建 PR"
     },
     {
+      "name": "git_diff_clean_subtitle",
+      "value": "当前工作区没有未暂存或会话改动。"
+    },
+    {
+      "name": "git_diff_clean_title",
+      "value": "工作区干净"
+    },
+    {
+      "name": "git_diff_close_a11y",
+      "value": "关闭 Git 差异检查器"
+    },
+    {
+      "name": "git_diff_filter_placeholder",
+      "value": "筛选改动文件…"
+    },
+    {
+      "name": "git_diff_generated_badge",
+      "value": "生成文件"
+    },
+    {
+      "name": "git_diff_no_matching_subtitle",
+      "value": "清除上方筛选条件以查看全部改动文件。"
+    },
+    {
+      "name": "git_diff_no_matching_title",
+      "value": "没有匹配的改动文件"
+    },
+    {
+      "name": "git_diff_refresh_a11y",
+      "value": "刷新 Git 差异"
+    },
+    {
       "name": "git_diff_unconfirmed_notice",
       "value": "并发切换或仅状态刷新导致 Diff 归属待确认。"
     },
@@ -1099,6 +1363,14 @@
     {
       "name": "git_generate_message",
       "value": "AI 生成"
+    },
+    {
+      "name": "git_loading_staged_diff",
+      "value": "正在加载已暂存差异…"
+    },
+    {
+      "name": "git_loading_unstaged_diff",
+      "value": "正在加载未暂存差异…"
     },
     {
       "name": "git_pr_body_placeholder",
@@ -1173,6 +1445,10 @@
       "value": "全部暂存"
     },
     {
+      "name": "git_staged_unverified",
+      "value": "无法核验当前作用域的已暂存差异"
+    },
+    {
       "name": "git_stash_list_title",
       "value": "已保存的暂存"
     },
@@ -1195,6 +1471,10 @@
     {
       "name": "git_unstage_all",
       "value": "全部取消暂存"
+    },
+    {
+      "name": "git_unstaged_unverified",
+      "value": "无法核验当前作用域的未暂存差异"
     },
     {
       "name": "git_working_tree_clean_scope",
@@ -1303,6 +1583,14 @@
     {
       "name": "handoff_untracked_conflict",
       "value": "未跟踪文件冲突不支持三方合并"
+    },
+    {
+      "name": "model_picker_refresh_a11y",
+      "value": "刷新模型目录"
+    },
+    {
+      "name": "model_picker_thinking",
+      "value": "思考深度"
     },
     {
       "name": "module_desc",
@@ -1681,8 +1969,972 @@
       "value": "全局搜索"
     },
     {
+      "name": "settings_about_encryption",
+      "value": "加密传输"
+    },
+    {
+      "name": "settings_about_encryption_value",
+      "value": "Noise NK · 端到端加密"
+    },
+    {
+      "name": "settings_about_platform",
+      "value": "运行平台"
+    },
+    {
+      "name": "settings_about_platform_value",
+      "value": "HarmonyOS NEXT · ArkUI V2"
+    },
+    {
+      "name": "settings_acp_add_custom",
+      "value": "添加自定义 ACP 代理"
+    },
+    {
+      "name": "settings_acp_args_input_a11y",
+      "value": "自定义 ACP 启动参数输入框"
+    },
+    {
+      "name": "settings_acp_args_placeholder",
+      "value": "启动参数（空格分隔，可选）"
+    },
+    {
+      "name": "settings_acp_cmd_input_a11y",
+      "value": "自定义 ACP 启动命令输入框"
+    },
+    {
+      "name": "settings_acp_cmd_placeholder",
+      "value": "可执行命令（例如 npx）"
+    },
+    {
+      "name": "settings_acp_empty",
+      "value": "此主机暂未报告任何 ACP 代理。"
+    },
+    {
+      "name": "settings_acp_id_input_a11y",
+      "value": "自定义 ACP 代理 ID 输入框"
+    },
+    {
+      "name": "settings_acp_id_placeholder",
+      "value": "代理 ID（例如 my-acp）"
+    },
+    {
+      "name": "settings_acp_installed",
+      "value": "已安装"
+    },
+    {
+      "name": "settings_acp_name_input_a11y",
+      "value": "自定义 ACP 代理名称输入框"
+    },
+    {
+      "name": "settings_acp_name_placeholder",
+      "value": "显示名称"
+    },
+    {
+      "name": "settings_acp_not_installed",
+      "value": "未安装"
+    },
+    {
+      "name": "settings_acp_registry_section",
+      "value": "ACP 注册表"
+    },
+    {
+      "name": "settings_acp_test_btn",
+      "value": "测试"
+    },
+    {
+      "name": "settings_acp_test_ok",
+      "value": "%1$s 探测成功（%2$d ms）"
+    },
+    {
+      "name": "settings_agents_defaults_section",
+      "value": "当前默认配置"
+    },
+    {
+      "name": "settings_agents_effort_label",
+      "value": "推理深度"
+    },
+    {
+      "name": "settings_agents_model_count",
+      "value": "可用模型 %d 个"
+    },
+    {
+      "name": "settings_agents_model_label",
+      "value": "默认模型"
+    },
+    {
+      "name": "settings_agents_models_subtitle",
+      "value": "提供商、默认模型与 ACP 注册表"
+    },
+    {
+      "name": "settings_agents_no_catalogs",
+      "value": "连接主机并刷新后即可查看可用提供商模型目录。"
+    },
+    {
+      "name": "settings_agents_no_models",
+      "value": "该主机尚未发现可用模型。"
+    },
+    {
+      "name": "settings_agents_provider_label",
+      "value": "默认提供商"
+    },
+    {
+      "name": "settings_agents_providers_section",
+      "value": "主机已安装提供商"
+    },
+    {
+      "name": "settings_agents_select_effort_hint",
+      "value": "点击选择推理深度"
+    },
+    {
+      "name": "settings_agents_select_model_hint",
+      "value": "点击选择默认模型"
+    },
+    {
+      "name": "settings_appearance_a11y_section",
+      "value": "无障碍与显示"
+    },
+    {
+      "name": "settings_appearance_dark",
+      "value": "深色"
+    },
+    {
+      "name": "settings_appearance_font_scale_cap",
+      "value": "控件字体缩放上限"
+    },
+    {
+      "name": "settings_appearance_light",
+      "value": "浅色"
+    },
+    {
+      "name": "settings_appearance_reduced_motion",
+      "value": "减弱动态效果（跟随系统）"
+    },
+    {
+      "name": "settings_appearance_system",
+      "value": "跟随系统"
+    },
+    {
+      "name": "settings_appearance_theme_hint",
+      "value": "支持跟随系统、浅色与深色三档外观，旧版暗色预设会自动迁移至深色模式。"
+    },
+    {
+      "name": "settings_appearance_theme_section",
+      "value": "主题模式"
+    },
+    {
+      "name": "settings_apply_relay_fleet",
+      "value": "一键同步中继到全部主机"
+    },
+    {
+      "name": "settings_apply_relay_fleet_done",
+      "value": "已同步更新 %d 台主机的中继配置。"
+    },
+    {
+      "name": "settings_copy_pairing_uri",
+      "value": "复制配对 URI"
+    },
+    {
+      "name": "settings_direct_endpoint_placeholder",
+      "value": "ws://192.168.1.x:6868/ws"
+    },
+    {
+      "name": "settings_ext_scope_host",
+      "value": "作用域：主机全局"
+    },
+    {
+      "name": "settings_ext_scope_project",
+      "value": "作用域：主机 + 当前项目"
+    },
+    {
+      "name": "settings_ext_scope_toggle_a11y",
+      "value": "切换主机或项目作用域"
+    },
+    {
+      "name": "settings_fleet_relay_hint",
+      "value": "将统一的 BYOR 中继地址一键同步至全部已配对主机；留空将清除中继配置。"
+    },
+    {
+      "name": "settings_fleet_relay_input_a11y",
+      "value": "全局中继地址输入框"
+    },
+    {
+      "name": "settings_fleet_relay_section",
+      "value": "全局中继同步"
+    },
+    {
+      "name": "settings_general_default_mode_section",
+      "value": "默认权限模式"
+    },
+    {
+      "name": "settings_general_language_hint",
+      "value": "切换后将持久化并在支持的页面即时生效。"
+    },
+    {
+      "name": "settings_general_language_section",
+      "value": "界面语言"
+    },
+    {
+      "name": "settings_general_send_section",
+      "value": "代理运行时的默认发送行为"
+    },
+    {
+      "name": "settings_group_about",
+      "value": "关于"
+    },
+    {
+      "name": "settings_group_agents_safety",
+      "value": "代理与安全"
+    },
+    {
+      "name": "settings_group_context_extensions",
+      "value": "上下文与扩展"
+    },
+    {
+      "name": "settings_group_fleet_sync",
+      "value": "主机与同步"
+    },
+    {
+      "name": "settings_group_preferences",
+      "value": "偏好设置"
+    },
+    {
+      "name": "settings_guardian_enable",
+      "value": "启用 Guardian 自动审批"
+    },
+    {
+      "name": "settings_guardian_max_risk",
+      "value": "自动审批风险上限"
+    },
+    {
+      "name": "settings_guardian_read_only",
+      "value": "自动放行只读工具"
+    },
+    {
+      "name": "settings_guardian_section",
+      "value": "Guardian 策略"
+    },
+    {
+      "name": "settings_guardian_tier2",
+      "value": "启用二级 AI 风险复核"
+    },
+    {
+      "name": "settings_guardian_workspace_tests",
+      "value": "自动放行工作区构建与测试"
+    },
+    {
+      "name": "settings_host_connection",
+      "value": "连接设置"
+    },
+    {
+      "name": "settings_host_daemon",
+      "value": "守护进程"
+    },
+    {
+      "name": "settings_host_diagnostics",
+      "value": "连接诊断"
+    },
+    {
+      "name": "settings_host_direct_endpoint",
+      "value": "直连地址"
+    },
+    {
+      "name": "settings_host_direct_endpoint_a11y",
+      "value": "直连地址输入框"
+    },
+    {
+      "name": "settings_host_display_name",
+      "value": "显示名称"
+    },
+    {
+      "name": "settings_host_display_name_a11y",
+      "value": "主机显示名称输入框"
+    },
+    {
+      "name": "settings_host_latency",
+      "value": "延迟"
+    },
+    {
+      "name": "settings_host_not_found",
+      "value": "该主机已移除。"
+    },
+    {
+      "name": "settings_host_pubkey",
+      "value": "公钥指纹"
+    },
+    {
+      "name": "settings_host_relay_url",
+      "value": "中继地址"
+    },
+    {
+      "name": "settings_host_relay_url_a11y",
+      "value": "主机中继地址输入框"
+    },
+    {
+      "name": "settings_host_route_mode",
+      "value": "路由模式"
+    },
+    {
+      "name": "settings_hosts_active_badge",
+      "value": "当前"
+    },
+    {
+      "name": "settings_hosts_count_summary",
+      "value": "已配对 %d 台主机"
+    },
+    {
+      "name": "settings_hosts_empty",
+      "value": "暂未配对任何主机。"
+    },
+    {
+      "name": "settings_hosts_paired_section",
+      "value": "已配对主机"
+    },
+    {
+      "name": "settings_item_agents_models",
+      "value": "代理与模型"
+    },
+    {
+      "name": "settings_item_appearance",
+      "value": "外观"
+    },
+    {
+      "name": "settings_item_cloud_sync",
+      "value": "云同步"
+    },
+    {
+      "name": "settings_item_general",
+      "value": "通用"
+    },
+    {
+      "name": "settings_item_host_detail",
+      "value": "主机详情与配对二维码"
+    },
+    {
+      "name": "settings_item_hosts",
+      "value": "主机管理"
+    },
+    {
+      "name": "settings_item_mcp",
+      "value": "MCP 服务器"
+    },
+    {
+      "name": "settings_item_memory",
+      "value": "项目记忆"
+    },
+    {
+      "name": "settings_item_notifications",
+      "value": "通知"
+    },
+    {
+      "name": "settings_item_permissions_guardian",
+      "value": "权限与 Guardian"
+    },
+    {
+      "name": "settings_item_plugins",
+      "value": "插件"
+    },
+    {
+      "name": "settings_item_sandbox",
+      "value": "沙箱"
+    },
+    {
+      "name": "settings_item_skills",
+      "value": "技能"
+    },
+    {
+      "name": "settings_item_usage_quotas",
+      "value": "用量与配额"
+    },
+    {
+      "name": "settings_lang_en",
+      "value": "English"
+    },
+    {
+      "name": "settings_lang_ja",
+      "value": "日本語"
+    },
+    {
+      "name": "settings_lang_system",
+      "value": "跟随系统语言"
+    },
+    {
+      "name": "settings_lang_zh",
+      "value": "简体中文"
+    },
+    {
+      "name": "settings_mcp_empty",
+      "value": "此主机暂未配置外部 MCP 服务器。"
+    },
+    {
+      "name": "settings_mcp_probe_ok",
+      "value": "%1$d 个工具 · %2$d ms"
+    },
+    {
+      "name": "settings_mcp_subtitle",
+      "value": "查看与启停外部 MCP 服务器"
+    },
+    {
+      "name": "settings_memory_confirm_a11y",
+      "value": "确认该条项目记忆"
+    },
+    {
+      "name": "settings_memory_delete_a11y",
+      "value": "删除该条项目记忆"
+    },
+    {
+      "name": "settings_memory_delete_message",
+      "value": "确定要永久删除项目记忆“%s”吗？"
+    },
+    {
+      "name": "settings_memory_delete_title",
+      "value": "删除项目记忆？"
+    },
+    {
+      "name": "settings_memory_empty",
+      "value": "该项目暂无记录的项目记忆。"
+    },
+    {
+      "name": "settings_memory_no_workspace",
+      "value": "请先在此主机打开或固定一个项目目录以查看项目记忆。"
+    },
+    {
+      "name": "settings_memory_status_confirmed",
+      "value": "已确认"
+    },
+    {
+      "name": "settings_memory_status_hypothesis",
+      "value": "待确认"
+    },
+    {
+      "name": "settings_memory_status_recheck",
+      "value": "需复核"
+    },
+    {
+      "name": "settings_memory_subtitle",
+      "value": "查看、确认或删除工作区项目记忆"
+    },
+    {
+      "name": "settings_memory_workspace_label",
+      "value": "工作区目录"
+    },
+    {
+      "name": "settings_mode_accept_edits",
+      "value": "自动接受编辑"
+    },
+    {
+      "name": "settings_mode_auto",
+      "value": "自动"
+    },
+    {
+      "name": "settings_mode_default",
+      "value": "默认"
+    },
+    {
+      "name": "settings_mode_full_access",
+      "value": "完全访问"
+    },
+    {
+      "name": "settings_no_host_selected",
+      "value": "请先配对或选择一台主机以查看主机级设置。"
+    },
+    {
+      "name": "settings_pa_memory_capable",
+      "value": "支持本地记忆引擎"
+    },
+    {
+      "name": "settings_pa_mesh_empty",
+      "value": "暂未配置主机互联节点。"
+    },
+    {
+      "name": "settings_pa_no_hosts",
+      "value": "暂未发现可用的候选主机。"
+    },
+    {
+      "name": "settings_pa_prereview_assist",
+      "value": "辅助建议"
+    },
+    {
+      "name": "settings_pa_prereview_label",
+      "value": "预审策略"
+    },
+    {
+      "name": "settings_pa_prereview_medium",
+      "value": "中风险预审"
+    },
+    {
+      "name": "settings_pa_row_subtitle",
+      "value": "%d 个互联节点"
+    },
+    {
+      "name": "settings_pa_scope_fleet",
+      "value": "全局主机群"
+    },
+    {
+      "name": "settings_pa_scope_label",
+      "value": "调度范围"
+    },
+    {
+      "name": "settings_pa_scope_local",
+      "value": "仅本机"
+    },
+    {
+      "name": "settings_pair_host_submit",
+      "value": "配对主机"
+    },
+    {
+      "name": "settings_pair_new_host",
+      "value": "配对新主机"
+    },
+    {
+      "name": "settings_pairing_qr_warning",
+      "value": "此二维码包含主机配对密钥，请仅向您本人信任的 Orbit 设备分享。"
+    },
+    {
+      "name": "settings_pairing_uri_input_a11y",
+      "value": "配对 URI 输入框"
+    },
+    {
+      "name": "settings_pairing_uri_label",
+      "value": "配对 URI"
+    },
+    {
+      "name": "settings_pairing_uri_placeholder",
+      "value": "orbit://pair/…"
+    },
+    {
+      "name": "settings_permissions_subtitle",
+      "value": "默认模式、Guardian 策略与工具规则"
+    },
+    {
+      "name": "settings_plugins_caps_summary",
+      "value": "%1$d 个 MCP 操作 · %2$d 个钩子"
+    },
+    {
+      "name": "settings_plugins_empty",
+      "value": "此主机暂未安装任何 WASM 插件。"
+    },
+    {
+      "name": "settings_plugins_subtitle",
+      "value": "查看与启停已安装 WASM 插件"
+    },
+    {
+      "name": "settings_push_master_switch",
+      "value": "启用通知提醒"
+    },
+    {
+      "name": "settings_push_not_registered",
+      "value": "未注册"
+    },
+    {
+      "name": "settings_push_pref_timers",
+      "value": "定时任务与条件定时器触发"
+    },
+    {
+      "name": "settings_push_synced_daemons",
+      "value": "已同步主机"
+    },
+    {
+      "name": "settings_push_token_label",
+      "value": "Push Kit 令牌"
+    },
+    {
+      "name": "settings_readonly_badge",
+      "value": "只读视图"
+    },
+    {
+      "name": "settings_relay_url_placeholder",
+      "value": "wss://relay.orbit.dev"
+    },
+    {
+      "name": "settings_remove_host",
+      "value": "移除主机"
+    },
+    {
+      "name": "settings_remove_host_confirm",
+      "value": "移除"
+    },
+    {
+      "name": "settings_remove_host_message",
+      "value": "此操作不会终止该主机上正在运行的远程代理会话。"
+    },
+    {
+      "name": "settings_remove_host_title",
+      "value": "移除 %s？"
+    },
+    {
+      "name": "settings_risk_low",
+      "value": "低风险"
+    },
+    {
+      "name": "settings_risk_medium",
+      "value": "中风险"
+    },
+    {
+      "name": "settings_route_auto",
+      "value": "自动"
+    },
+    {
+      "name": "settings_route_direct",
+      "value": "仅直连"
+    },
+    {
+      "name": "settings_route_relay",
+      "value": "仅中继"
+    },
+    {
+      "name": "settings_rule_add_title",
+      "value": "新增权限规则"
+    },
+    {
+      "name": "settings_rule_decision_a11y",
+      "value": "规则动作：%s"
+    },
+    {
+      "name": "settings_rule_delete_message",
+      "value": "确定要删除匹配“%s”的权限规则吗？"
+    },
+    {
+      "name": "settings_rule_delete_title",
+      "value": "删除权限规则？"
+    },
+    {
+      "name": "settings_rule_pattern_input_a11y",
+      "value": "权限规则匹配模式输入框"
+    },
+    {
+      "name": "settings_rule_pattern_placeholder",
+      "value": "前缀匹配规则（例如 cargo test）"
+    },
+    {
+      "name": "settings_rule_tool_kind_a11y",
+      "value": "规则工具类型：%s"
+    },
+    {
+      "name": "settings_rules_empty",
+      "value": "暂未配置自定义工具权限规则。"
+    },
+    {
+      "name": "settings_rules_section",
+      "value": "工具权限规则"
+    },
+    {
+      "name": "settings_sandbox_default_notice",
+      "value": "当前未配置自定义沙箱覆盖项，主机按默认隔离策略运行。"
+    },
+    {
+      "name": "settings_sandbox_denied_reads",
+      "value": "受保护禁止读取路径"
+    },
+    {
+      "name": "settings_sandbox_mode_label",
+      "value": "隔离模式"
+    },
+    {
+      "name": "settings_sandbox_mode_off",
+      "value": "关闭"
+    },
+    {
+      "name": "settings_sandbox_mode_readonly",
+      "value": "严格只读"
+    },
+    {
+      "name": "settings_sandbox_mode_workspace",
+      "value": "仅允许写入工作区"
+    },
+    {
+      "name": "settings_sandbox_network_label",
+      "value": "网络访问"
+    },
+    {
+      "name": "settings_sandbox_subtitle",
+      "value": "只读查看操作系统沙箱与凭据隔离"
+    },
+    {
+      "name": "settings_sandbox_writable_roots",
+      "value": "额外可写目录"
+    },
+    {
+      "name": "settings_save_reconnect",
+      "value": "保存并重连"
+    },
+    {
+      "name": "settings_scan_qr_code",
+      "value": "扫描二维码"
+    },
+    {
+      "name": "settings_search_a11y",
+      "value": "搜索设置项"
+    },
+    {
+      "name": "settings_search_clear",
+      "value": "清空搜索"
+    },
+    {
+      "name": "settings_search_clear_a11y",
+      "value": "清空设置搜索"
+    },
+    {
+      "name": "settings_search_empty",
+      "value": "未找到匹配的设置项。"
+    },
+    {
+      "name": "settings_search_placeholder",
+      "value": "搜索设置（支持中 / 英 / 日三语）…"
+    },
+    {
+      "name": "settings_send_interrupt",
+      "value": "中断并发送"
+    },
+    {
+      "name": "settings_send_interrupt_desc",
+      "value": "取消当前回合后立即发送（待审批门期间仍自动安全排队）。"
+    },
+    {
+      "name": "settings_send_queue",
+      "value": "排队发送（推荐）"
+    },
+    {
+      "name": "settings_send_queue_desc",
+      "value": "待当前回合完成后按顺序自动投递。"
+    },
+    {
+      "name": "settings_send_steer",
+      "value": "引导追问（Steer）"
+    },
+    {
+      "name": "settings_send_steer_desc",
+      "value": "在代理运行期间直接注入引导消息（待审批门期间仍自动排队）。"
+    },
+    {
+      "name": "settings_share_pairing_desc",
+      "value": "生成配对二维码或 URI，方便其他可信 Orbit 客户端直接配对此主机。"
+    },
+    {
+      "name": "settings_share_pairing_section",
+      "value": "分享配对 URI / 二维码"
+    },
+    {
+      "name": "settings_show_pairing_qr",
+      "value": "生成配对二维码与 URI"
+    },
+    {
+      "name": "settings_skills_empty",
+      "value": "此主机暂未发现已安装的技能。"
+    },
+    {
+      "name": "settings_skills_subtitle",
+      "value": "只读浏览主机已发现的 SKILL.md 技能"
+    },
+    {
+      "name": "settings_skills_tokens",
+      "value": "约 %d 令牌"
+    },
+    {
+      "name": "settings_state_enabled",
+      "value": "已开启"
+    },
+    {
+      "name": "settings_state_off",
+      "value": "关闭"
+    },
+    {
+      "name": "settings_switch_host",
+      "value": "切换到此主机"
+    },
+    {
+      "name": "settings_sync_auto_sync",
+      "value": "自动同步"
+    },
+    {
+      "name": "settings_sync_connect_github",
+      "value": "连接 GitHub"
+    },
+    {
+      "name": "settings_sync_connected",
+      "value": "已连接"
+    },
+    {
+      "name": "settings_sync_device_link_desc",
+      "value": "扫描另一台 Orbit 设备的关联二维码，无需手动输入口令即可瞬间同步。"
+    },
+    {
+      "name": "settings_sync_disconnect",
+      "value": "断开云同步"
+    },
+    {
+      "name": "settings_sync_disconnect_confirm",
+      "value": "断开连接"
+    },
+    {
+      "name": "settings_sync_disconnect_message",
+      "value": "您在 GitHub Gist 上的加密库与本地主机配置均会完整保留。"
+    },
+    {
+      "name": "settings_sync_disconnect_title",
+      "value": "断开云同步？"
+    },
+    {
+      "name": "settings_sync_error",
+      "value": "同步异常"
+    },
+    {
+      "name": "settings_sync_export_qr_desc",
+      "value": "用另一台手机、平板或桌面端扫码，即可安全同步您的端到端加密库密钥。"
+    },
+    {
+      "name": "settings_sync_fleet_counts",
+      "value": "%1$d 台主机 · %2$d 个项目"
+    },
+    {
+      "name": "settings_sync_fleet_label",
+      "value": "已同步内容"
+    },
+    {
+      "name": "settings_sync_generate",
+      "value": "随机生成"
+    },
+    {
+      "name": "settings_sync_link_uri_input_a11y",
+      "value": "设备关联 URI 输入框"
+    },
+    {
+      "name": "settings_sync_link_uri_placeholder",
+      "value": "orbit://link/…"
+    },
+    {
+      "name": "settings_sync_locked",
+      "value": "已锁定"
+    },
+    {
+      "name": "settings_sync_not_connected",
+      "value": "未连接"
+    },
+    {
+      "name": "settings_sync_now",
+      "value": "立即同步"
+    },
+    {
+      "name": "settings_sync_passphrase_input_a11y",
+      "value": "云同步加密口令输入框"
+    },
+    {
+      "name": "settings_sync_passphrase_placeholder",
+      "value": "输入端到端加密口令"
+    },
+    {
+      "name": "settings_sync_passphrase_title",
+      "value": "加密库口令"
+    },
+    {
+      "name": "settings_sync_pat_desc",
+      "value": "需要 gist 权限。所有同步数据在上传前均在本地压缩并使用 AES-256-GCM 加密。"
+    },
+    {
+      "name": "settings_sync_pat_input_a11y",
+      "value": "GitHub 个人访问令牌输入框"
+    },
+    {
+      "name": "settings_sync_pat_placeholder",
+      "value": "ghp_…"
+    },
+    {
+      "name": "settings_sync_pat_title",
+      "value": "GitHub 个人访问令牌"
+    },
+    {
+      "name": "settings_sync_status_label",
+      "value": "状态"
+    },
+    {
+      "name": "settings_sync_syncing",
+      "value": "同步中…"
+    },
+    {
+      "name": "settings_sync_unlock",
+      "value": "解锁并同步"
+    },
+    {
+      "name": "settings_sync_unlocking",
+      "value": "正在解锁…"
+    },
+    {
+      "name": "settings_sync_verify_signin",
+      "value": "验证登录"
+    },
+    {
+      "name": "settings_target_host_label",
+      "value": "当前配置主机"
+    },
+    {
       "name": "settings_upgrade_daemon",
       "value": "远程热升级守护进程"
+    },
+    {
+      "name": "settings_usage_30d",
+      "value": "近 30 天"
+    },
+    {
+      "name": "settings_usage_7d",
+      "value": "近 7 天"
+    },
+    {
+      "name": "settings_usage_by_model",
+      "value": "按模型分布"
+    },
+    {
+      "name": "settings_usage_by_project",
+      "value": "按项目分布"
+    },
+    {
+      "name": "settings_usage_cache_savings",
+      "value": "缓存节省费用"
+    },
+    {
+      "name": "settings_usage_daily",
+      "value": "近期每日用量"
+    },
+    {
+      "name": "settings_usage_forecasts",
+      "value": "配额消耗预测"
+    },
+    {
+      "name": "settings_usage_live_quotas",
+      "value": "实时提供商配额"
+    },
+    {
+      "name": "settings_usage_no_quotas",
+      "value": "暂未上报活跃的速率限制窗口。"
+    },
+    {
+      "name": "settings_usage_subtitle",
+      "value": "令牌账本、费用洞察与实时配额"
+    },
+    {
+      "name": "settings_usage_summary_section",
+      "value": "周期汇总"
+    },
+    {
+      "name": "settings_usage_tokens_turns",
+      "value": "令牌数 · 回合数"
+    },
+    {
+      "name": "settings_usage_total_cost",
+      "value": "估算费用"
+    },
+    {
+      "name": "side_panel_launchpad_subtitle",
+      "value": "每个会话都会独立记住自己打开的标签页。"
+    },
+    {
+      "name": "side_panel_launchpad_title",
+      "value": "在侧边面板打开"
+    },
+    {
+      "name": "side_panel_reopen_closed",
+      "value": "重新打开最近关闭的标签页"
+    },
+    {
+      "name": "side_panel_resize_a11y",
+      "value": "调整侧边面板宽度"
     },
     {
       "name": "side_question_clear",
@@ -2097,8 +3349,28 @@
       "value": "主机已离线 · 重连后自动同步"
     },
     {
+      "name": "stage_pair_first_host_body",
+      "value": "通过局域网、SSH 或端到端加密 Noise Relay 连接到工作站、Linux 开发机或 Mac mini 上的 orbit daemon。"
+    },
+    {
+      "name": "stage_pair_first_host_title",
+      "value": "配对你的第一台主机"
+    },
+    {
+      "name": "stage_pair_uri_placeholder",
+      "value": "orbit://pair/..."
+    },
+    {
       "name": "stage_reconnecting_banner",
       "value": "正在重连主机…"
+    },
+    {
+      "name": "stage_thought_label",
+      "value": "思考过程"
+    },
+    {
+      "name": "stage_welcome_prompt",
+      "value": "今天想构建什么？"
     },
     {
       "name": "sync_device_link_qr",
@@ -2157,6 +3429,10 @@
       "value": "已复制终端输出"
     },
     {
+      "name": "terminal_copy_output_a11y",
+      "value": "复制终端输出"
+    },
+    {
       "name": "terminal_delta_rev",
       "value": "版本 %d"
     },
@@ -2185,12 +3461,28 @@
       "value": "当前终端槽暂无活跃输出。"
     },
     {
+      "name": "terminal_pty_ready",
+      "value": "orbit shim 托管终端已就绪"
+    },
+    {
+      "name": "terminal_quote_output_a11y",
+      "value": "引用终端输出到输入框"
+    },
+    {
       "name": "terminal_raw_placeholder",
       "value": "实时发送原始按键…"
     },
     {
+      "name": "terminal_send_input_a11y",
+      "value": "发送终端输入"
+    },
+    {
       "name": "terminal_slot_label",
       "value": "槽%d"
+    },
+    {
+      "name": "terminal_spawn_a11y",
+      "value": "新建终端会话"
     },
     {
       "name": "terminal_spawn_shell",
@@ -2235,6 +3527,54 @@
     {
       "name": "time_weeksShort",
       "value": "%d周"
+    },
+    {
+      "name": "toast_clipboard_empty",
+      "value": "剪贴板为空"
+    },
+    {
+      "name": "toast_clipboard_read_failed",
+      "value": "无法读取剪贴板"
+    },
+    {
+      "name": "toast_connect_host_first",
+      "value": "请先连接主机"
+    },
+    {
+      "name": "toast_copied_clipboard",
+      "value": "已复制到剪贴板"
+    },
+    {
+      "name": "toast_copy_failed",
+      "value": "复制到剪贴板失败"
+    },
+    {
+      "name": "toast_enter_peer_instructions",
+      "value": "请输入给协作成员的任务指令"
+    },
+    {
+      "name": "toast_no_pair_uri_clipboard",
+      "value": "剪贴板中未找到 orbit://pair 配对链接"
+    },
+    {
+      "name": "toast_pair_or_select_host_first",
+      "value": "请先配对或选择主机"
+    },
+    {
+      "name": "toast_rebase_aborted",
+      "value": "已中止变基"
+    },
+    {
+      "name": "toast_rebase_continued",
+      "value": "已继续变基"
+    },
+    {
+      "name": "toast_test_push_failed",
+      "value": "测试通知发送失败"
+    },
+    {
+      "name": "toast_test_push_sent",
+      "value": "已从主机发送测试通知"
     },
     {
       "name": "topbar_conversationActions",

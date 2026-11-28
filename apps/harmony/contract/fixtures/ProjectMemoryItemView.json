@@ -1,0 +1,22 @@
+{
+  "access_count": 3,
+  "category": "convention",
+  "confidence": 0.949999988079071,
+  "content": "Always route colors through $r('app.color.*').",
+  "created_at_ms": 1760000000000,
+  "file_paths": [
+    "apps/harmony/AGENTS.md"
+  ],
+  "id": "mem-1",
+  "last_accessed_ms": 1760000002000,
+  "source_agent_id": "ag-1",
+  "source_path": null,
+  "source_provider": "claude",
+  "status": "confirmed",
+  "tags": [
+    "harmony"
+  ],
+  "title": "Use Orbit tokens",
+  "updated_at_ms": 1760000001000,
+  "workspace_root": "/repo"
+}

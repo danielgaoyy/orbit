@@ -243,6 +243,17 @@ export class OrbitHarmonyCore {
   stopWorkspaceScriptJson(hostId: string, workspaceId: string, scriptName: string): void;
   updateWorkspaceBoardCasJson(reqJson: string): Promise<string>;
   startTerminalSlot(hostId: string, cwd: string, cols: number, rows: number, slot: number): void;
+  exportHostPairingUri(hostId: string): string;
+  getUsageInsightsJson(hostId: string, days: number): Promise<string>;
+  listExternalMcpServersJson(hostId: string, cwd?: string | null): Promise<string>;
+  toggleExternalMcpServerJson(hostId: string, serverId: string, enabled: boolean, cwd?: string | null): Promise<void>;
+  listManagedSkillsJson(hostId: string, cwd?: string | null): Promise<string>;
+  listProjectMemoriesJson(hostId: string, cwd: string, limit: number): Promise<string>;
+  confirmProjectMemoryJson(hostId: string, memoryId: string, cwd?: string | null): Promise<void>;
+  deleteProjectMemoryJson(hostId: string, memoryId: string, cwd?: string | null): Promise<void>;
+  listPluginsJson(hostId: string): Promise<string>;
+  setPluginEnabledJson(hostId: string, pluginId: string, enabled: boolean): Promise<void>;
+  getSandboxConfigJson(hostId: string): Promise<string>;
   personalAgentBriefingJson(primaryRouterHostId?: string | null): string;
   agentStageTurnsSliceJson(hostId: string, agentId: string, startTurnIndex: number, count: number): string;
   listPersonalAgentActivityJson(hostId: string, limit: number, sinceMs?: number | null): Promise<string>;

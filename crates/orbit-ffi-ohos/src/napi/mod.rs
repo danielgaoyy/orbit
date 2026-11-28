@@ -3,6 +3,7 @@ pub mod core;
 pub mod fleet_stage;
 pub mod git_files_terminal;
 pub mod pr5_tools;
+pub mod pr6_settings;
 pub mod settings_sync;
 pub mod state;
 pub mod workspace_auto;

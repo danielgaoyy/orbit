@@ -2148,5 +2148,1685 @@
     "en": "Clear",
     "zh-CN": "清空",
     "ja": "クリア"
+  },
+  "a11y_access_permissions": {
+    "en": "Access permissions: %s",
+    "zh-CN": "访问权限：%s",
+    "ja": "アクセス権限：%s"
+  },
+  "a11y_attach_media_files": {
+    "en": "Attach photos, camera, or files",
+    "zh-CN": "添加照片、拍照或文件",
+    "ja": "写真・カメラ・ファイルを添付"
+  },
+  "a11y_close_side_panel": {
+    "en": "Close side panel",
+    "zh-CN": "关闭侧边面板",
+    "ja": "サイドパネルを閉じる"
+  },
+  "a11y_close_tab": {
+    "en": "Close %s",
+    "zh-CN": "关闭 %s",
+    "ja": "%s を閉じる"
+  },
+  "a11y_exec_env_local": {
+    "en": "Execution environment: Local",
+    "zh-CN": "执行环境：本地目录",
+    "ja": "実行環境：ローカル"
+  },
+  "a11y_exec_env_worktree": {
+    "en": "Execution environment: Worktree",
+    "zh-CN": "执行环境：独立 Worktree",
+    "ja": "実行環境：Worktree"
+  },
+  "a11y_fast_mode_off": {
+    "en": "Fast mode off",
+    "zh-CN": "快速模式已关闭",
+    "ja": "高速モード：オフ"
+  },
+  "a11y_fast_mode_on": {
+    "en": "Fast mode on",
+    "zh-CN": "快速模式已开启",
+    "ja": "高速モード：オン"
+  },
+  "a11y_next_decision": {
+    "en": "Next pending decision",
+    "zh-CN": "下一条待处理决策",
+    "ja": "次の保留中の確認へ"
+  },
+  "a11y_open_panel_launchpad": {
+    "en": "Open panel launchpad",
+    "zh-CN": "打开面板工具启动页",
+    "ja": "パネルランチャーを開く"
+  },
+  "a11y_prev_decision": {
+    "en": "Previous pending decision",
+    "zh-CN": "上一条待处理决策",
+    "ja": "前の保留中の確認へ"
+  },
+  "a11y_queue_prompt": {
+    "en": "Send or queue prompt",
+    "zh-CN": "发送或排队消息",
+    "ja": "プロンプトを送信またはキュー追加"
+  },
+  "a11y_remove_queued_prompt": {
+    "en": "Remove queued prompt",
+    "zh-CN": "移除排队消息",
+    "ja": "キューのプロンプトを削除"
+  },
+  "a11y_scroll_latest_message": {
+    "en": "Scroll to latest message",
+    "zh-CN": "滚动到最新消息",
+    "ja": "最新のメッセージへ移動"
+  },
+  "a11y_scroll_latest_streaming": {
+    "en": "Scroll to latest streaming output",
+    "zh-CN": "滚动到最新流式输出",
+    "ja": "最新のストリーミング出力へ移動"
+  },
+  "a11y_stop_agent": {
+    "en": "Stop agent",
+    "zh-CN": "停止代理",
+    "ja": "エージェントを停止"
+  },
+  "git_loading_staged_diff": {
+    "en": "Loading staged diff…",
+    "zh-CN": "正在加载已暂存差异…",
+    "ja": "ステージ済み差分を読み込み中…"
+  },
+  "git_loading_unstaged_diff": {
+    "en": "Loading unstaged diff…",
+    "zh-CN": "正在加载未暂存差异…",
+    "ja": "未ステージ差分を読み込み中…"
+  },
+  "git_staged_unverified": {
+    "en": "Staged diff could not be verified for this scope",
+    "zh-CN": "无法核验当前作用域的已暂存差异",
+    "ja": "このスコープのステージ済み差分を確認できませんでした"
+  },
+  "git_unstaged_unverified": {
+    "en": "Unstaged diff could not be verified for this scope",
+    "zh-CN": "无法核验当前作用域的未暂存差异",
+    "ja": "このスコープの未ステージ差分を確認できませんでした"
+  },
+  "settings_about_encryption": {
+    "en": "Encryption",
+    "zh-CN": "加密传输",
+    "ja": "暗号化"
+  },
+  "settings_about_encryption_value": {
+    "en": "Noise NK · E2EE",
+    "zh-CN": "Noise NK · 端到端加密",
+    "ja": "Noise NK · E2EE"
+  },
+  "settings_about_platform": {
+    "en": "Platform",
+    "zh-CN": "运行平台",
+    "ja": "プラットフォーム"
+  },
+  "settings_about_platform_value": {
+    "en": "HarmonyOS NEXT · ArkUI V2",
+    "zh-CN": "HarmonyOS NEXT · ArkUI V2",
+    "ja": "HarmonyOS NEXT · ArkUI V2"
+  },
+  "settings_acp_add_custom": {
+    "en": "Add Custom ACP Agent",
+    "zh-CN": "添加自定义 ACP 代理",
+    "ja": "カスタム ACP エージェントを追加"
+  },
+  "settings_acp_args_placeholder": {
+    "en": "Arguments (space-separated, optional)",
+    "zh-CN": "启动参数（空格分隔，可选）",
+    "ja": "引数（スペース区切り・任意）"
+  },
+  "settings_acp_cmd_placeholder": {
+    "en": "Executable command (e.g. npx)",
+    "zh-CN": "可执行命令（例如 npx）",
+    "ja": "実行コマンド（例：npx）"
+  },
+  "settings_acp_empty": {
+    "en": "No ACP agents reported on this host.",
+    "zh-CN": "此主机暂未报告任何 ACP 代理。",
+    "ja": "このホストに ACP エージェントはありません。"
+  },
+  "settings_acp_id_placeholder": {
+    "en": "Agent ID (e.g. my-acp)",
+    "zh-CN": "代理 ID（例如 my-acp）",
+    "ja": "エージェント ID（例：my-acp）"
+  },
+  "settings_acp_installed": {
+    "en": "Installed",
+    "zh-CN": "已安装",
+    "ja": "インストール済み"
+  },
+  "settings_acp_name_placeholder": {
+    "en": "Display name",
+    "zh-CN": "显示名称",
+    "ja": "表示名"
+  },
+  "settings_acp_not_installed": {
+    "en": "Not installed",
+    "zh-CN": "未安装",
+    "ja": "未インストール"
+  },
+  "settings_acp_registry_section": {
+    "en": "ACP Registry",
+    "zh-CN": "ACP 注册表",
+    "ja": "ACP レジストリ"
+  },
+  "settings_acp_test_btn": {
+    "en": "Test",
+    "zh-CN": "测试",
+    "ja": "テスト"
+  },
+  "settings_acp_test_ok": {
+    "en": "%1$s responded in %2$d ms",
+    "zh-CN": "%1$s 探测成功（%2$d ms）",
+    "ja": "%1$s が %2$d ms で応答しました"
+  },
+  "settings_agents_defaults_section": {
+    "en": "Active Defaults",
+    "zh-CN": "当前默认配置",
+    "ja": "現在のデフォルト"
+  },
+  "settings_agents_effort_label": {
+    "en": "Reasoning Effort",
+    "zh-CN": "推理深度",
+    "ja": "推論レベル"
+  },
+  "settings_agents_model_count": {
+    "en": "%d models available",
+    "zh-CN": "可用模型 %d 个",
+    "ja": "%d 件のモデルが利用可能"
+  },
+  "settings_agents_model_label": {
+    "en": "Default Model",
+    "zh-CN": "默认模型",
+    "ja": "デフォルトモデル"
+  },
+  "settings_agents_models_subtitle": {
+    "en": "Providers, default model & ACP registry",
+    "zh-CN": "提供商、默认模型与 ACP 注册表",
+    "ja": "プロバイダー・既定モデル・ACP レジストリ"
+  },
+  "settings_agents_no_catalogs": {
+    "en": "Connect to a host and refresh to inspect available provider catalogs.",
+    "zh-CN": "连接主机并刷新后即可查看可用提供商模型目录。",
+    "ja": "ホストに接続して更新するとプロバイダーのモデル一覧を確認できます。"
+  },
+  "settings_agents_provider_label": {
+    "en": "Default Provider",
+    "zh-CN": "默认提供商",
+    "ja": "デフォルトプロバイダー"
+  },
+  "settings_agents_providers_section": {
+    "en": "Providers on Host",
+    "zh-CN": "主机已安装提供商",
+    "ja": "ホストのプロバイダー"
+  },
+  "settings_appearance_a11y_section": {
+    "en": "Accessibility & Display",
+    "zh-CN": "无障碍与显示",
+    "ja": "アクセシビリティと表示"
+  },
+  "settings_appearance_dark": {
+    "en": "Dark",
+    "zh-CN": "深色",
+    "ja": "ダーク"
+  },
+  "settings_appearance_font_scale_cap": {
+    "en": "Chrome Font Scale Cap",
+    "zh-CN": "控件字体缩放上限",
+    "ja": "UI 文字拡大上限"
+  },
+  "settings_appearance_light": {
+    "en": "Light",
+    "zh-CN": "浅色",
+    "ja": "ライト"
+  },
+  "settings_appearance_reduced_motion": {
+    "en": "Reduced Motion (System)",
+    "zh-CN": "减弱动态效果（跟随系统）",
+    "ja": "視差効果を減らす（システム）"
+  },
+  "settings_appearance_system": {
+    "en": "System",
+    "zh-CN": "跟随系统",
+    "ja": "システム"
+  },
+  "settings_appearance_theme_hint": {
+    "en": "Switch between System, Light, and Dark palettes. Legacy dark theme preferences automatically migrate to Dark.",
+    "zh-CN": "支持跟随系统、浅色与深色三档外观，旧版暗色预设会自动迁移至深色模式。",
+    "ja": "システム・ライト・ダークの3段階から選択できます。旧ダーク設定は自動的にダークへ移行されます。"
+  },
+  "settings_appearance_theme_section": {
+    "en": "Theme Mode",
+    "zh-CN": "主题模式",
+    "ja": "テーマモード"
+  },
+  "settings_apply_relay_fleet": {
+    "en": "Apply Relay to All Hosts",
+    "zh-CN": "一键同步中继到全部主机",
+    "ja": "全ホストへリレーを一括適用"
+  },
+  "settings_apply_relay_fleet_done": {
+    "en": "Updated relay on %d host(s).",
+    "zh-CN": "已同步更新 %d 台主机的中继配置。",
+    "ja": "%d 台のホストのリレー設定を更新しました。"
+  },
+  "settings_copy_pairing_uri": {
+    "en": "Copy Pairing URI",
+    "zh-CN": "复制配对 URI",
+    "ja": "ペアリング URI をコピー"
+  },
+  "settings_direct_endpoint_placeholder": {
+    "en": "ws://192.168.1.x:6868/ws",
+    "zh-CN": "ws://192.168.1.x:6868/ws",
+    "ja": "ws://192.168.1.x:6868/ws"
+  },
+  "settings_ext_scope_host": {
+    "en": "Scope: Host",
+    "zh-CN": "作用域：主机全局",
+    "ja": "スコープ：ホスト全体"
+  },
+  "settings_ext_scope_project": {
+    "en": "Scope: Host + Project",
+    "zh-CN": "作用域：主机 + 当前项目",
+    "ja": "スコープ：ホスト + プロジェクト"
+  },
+  "settings_ext_scope_toggle_a11y": {
+    "en": "Toggle host or project scope",
+    "zh-CN": "切换主机或项目作用域",
+    "ja": "ホスト・プロジェクトのスコープ切替"
+  },
+  "settings_fleet_relay_hint": {
+    "en": "Apply a shared BYOR relay URL across every paired host in one step. Leave blank to clear relay.",
+    "zh-CN": "将统一的 BYOR 中继地址一键同步至全部已配对主机；留空将清除中继配置。",
+    "ja": "すべてのペアリング済みホストへ共通のリレー URL を一括適用します。空欄で解除します。"
+  },
+  "settings_fleet_relay_section": {
+    "en": "Fleet Relay Sync",
+    "zh-CN": "全局中继同步",
+    "ja": "フリートリレー同期"
+  },
+  "settings_general_default_mode_section": {
+    "en": "Default Permission Mode",
+    "zh-CN": "默认权限模式",
+    "ja": "デフォルト権限モード"
+  },
+  "settings_general_language_hint": {
+    "en": "Changes apply immediately where supported and persist across restarts.",
+    "zh-CN": "切换后将持久化并在支持的页面即时生效。",
+    "ja": "変更は保存され、対応画面に即時反映されます。"
+  },
+  "settings_general_language_section": {
+    "en": "Language",
+    "zh-CN": "界面语言",
+    "ja": "表示言語"
+  },
+  "settings_general_send_section": {
+    "en": "Default Send Behavior While Running",
+    "zh-CN": "代理运行时的默认发送行为",
+    "ja": "実行中のデフォルト送信動作"
+  },
+  "settings_group_about": {
+    "en": "About",
+    "zh-CN": "关于",
+    "ja": "このアプリについて"
+  },
+  "settings_group_agents_safety": {
+    "en": "Agents & Safety",
+    "zh-CN": "代理与安全",
+    "ja": "エージェントと安全"
+  },
+  "settings_group_context_extensions": {
+    "en": "Context & Extensions",
+    "zh-CN": "上下文与扩展",
+    "ja": "コンテキストと拡張"
+  },
+  "settings_group_fleet_sync": {
+    "en": "Fleet & Sync",
+    "zh-CN": "主机与同步",
+    "ja": "フリートと同期"
+  },
+  "settings_group_preferences": {
+    "en": "Preferences",
+    "zh-CN": "偏好设置",
+    "ja": "環境設定"
+  },
+  "settings_guardian_enable": {
+    "en": "Enable Guardian Auto-Approval",
+    "zh-CN": "启用 Guardian 自动审批",
+    "ja": "Guardian 自動承認を有効化"
+  },
+  "settings_guardian_max_risk": {
+    "en": "Max Auto-Approve Risk",
+    "zh-CN": "自动审批风险上限",
+    "ja": "自動承認の最大リスク"
+  },
+  "settings_guardian_read_only": {
+    "en": "Auto-Approve Read-Only Tools",
+    "zh-CN": "自动放行只读工具",
+    "ja": "読み取り専用ツールを自動承認"
+  },
+  "settings_guardian_section": {
+    "en": "Guardian Policy",
+    "zh-CN": "Guardian 策略",
+    "ja": "Guardian ポリシー"
+  },
+  "settings_guardian_tier2": {
+    "en": "Enable Tier-2 AI Risk Classifier",
+    "zh-CN": "启用二级 AI 风险复核",
+    "ja": "Tier-2 AI リスク分類を有効化"
+  },
+  "settings_guardian_workspace_tests": {
+    "en": "Auto-Approve Workspace Build & Tests",
+    "zh-CN": "自动放行工作区构建与测试",
+    "ja": "ワークスペースのビルドとテストを自動承認"
+  },
+  "settings_host_connection": {
+    "en": "Connection",
+    "zh-CN": "连接设置",
+    "ja": "接続設定"
+  },
+  "settings_host_daemon": {
+    "en": "Daemon",
+    "zh-CN": "守护进程",
+    "ja": "デーモン"
+  },
+  "settings_host_diagnostics": {
+    "en": "Diagnostics",
+    "zh-CN": "连接诊断",
+    "ja": "診断"
+  },
+  "settings_host_direct_endpoint": {
+    "en": "Direct Endpoint",
+    "zh-CN": "直连地址",
+    "ja": "ダイレクトエンドポイント"
+  },
+  "settings_host_display_name": {
+    "en": "Display Name",
+    "zh-CN": "显示名称",
+    "ja": "表示名"
+  },
+  "settings_host_latency": {
+    "en": "Latency",
+    "zh-CN": "延迟",
+    "ja": "レイテンシ"
+  },
+  "settings_host_not_found": {
+    "en": "Host is no longer paired.",
+    "zh-CN": "该主机已移除。",
+    "ja": "このホストはペアリング解除されています。"
+  },
+  "settings_host_pubkey": {
+    "en": "Public Key",
+    "zh-CN": "公钥指纹",
+    "ja": "公開鍵"
+  },
+  "settings_host_relay_url": {
+    "en": "Relay URL",
+    "zh-CN": "中继地址",
+    "ja": "リレー URL"
+  },
+  "settings_host_route_mode": {
+    "en": "Route Mode",
+    "zh-CN": "路由模式",
+    "ja": "ルートモード"
+  },
+  "settings_hosts_active_badge": {
+    "en": "Active",
+    "zh-CN": "当前",
+    "ja": "使用中"
+  },
+  "settings_hosts_count_summary": {
+    "en": "%d host(s) paired",
+    "zh-CN": "已配对 %d 台主机",
+    "ja": "%d 台のホストをペアリング済み"
+  },
+  "settings_hosts_empty": {
+    "en": "No hosts paired yet.",
+    "zh-CN": "暂未配对任何主机。",
+    "ja": "ペアリング済みのホストはありません。"
+  },
+  "settings_hosts_paired_section": {
+    "en": "Paired Hosts",
+    "zh-CN": "已配对主机",
+    "ja": "ペアリング済みホスト"
+  },
+  "settings_item_agents_models": {
+    "en": "Agents & Models",
+    "zh-CN": "代理与模型",
+    "ja": "エージェントとモデル"
+  },
+  "settings_item_appearance": {
+    "en": "Appearance",
+    "zh-CN": "外观",
+    "ja": "外観"
+  },
+  "settings_item_cloud_sync": {
+    "en": "Cloud Sync",
+    "zh-CN": "云同步",
+    "ja": "クラウド同期"
+  },
+  "settings_item_general": {
+    "en": "General",
+    "zh-CN": "通用",
+    "ja": "一般"
+  },
+  "settings_item_hosts": {
+    "en": "Hosts",
+    "zh-CN": "主机管理",
+    "ja": "ホスト"
+  },
+  "settings_item_mcp": {
+    "en": "MCP Servers",
+    "zh-CN": "MCP 服务器",
+    "ja": "MCP サーバー"
+  },
+  "settings_item_memory": {
+    "en": "Project Memory",
+    "zh-CN": "项目记忆",
+    "ja": "プロジェクトメモリ"
+  },
+  "settings_item_notifications": {
+    "en": "Notifications",
+    "zh-CN": "通知",
+    "ja": "通知"
+  },
+  "settings_item_permissions_guardian": {
+    "en": "Permissions & Guardian",
+    "zh-CN": "权限与 Guardian",
+    "ja": "権限と Guardian"
+  },
+  "settings_item_plugins": {
+    "en": "Plugins",
+    "zh-CN": "插件",
+    "ja": "プラグイン"
+  },
+  "settings_item_sandbox": {
+    "en": "Sandbox",
+    "zh-CN": "沙箱",
+    "ja": "サンドボックス"
+  },
+  "settings_item_skills": {
+    "en": "Skills",
+    "zh-CN": "技能",
+    "ja": "スキル"
+  },
+  "settings_item_usage_quotas": {
+    "en": "Usage & Quotas",
+    "zh-CN": "用量与配额",
+    "ja": "使用量とクォータ"
+  },
+  "settings_lang_en": {
+    "en": "English",
+    "zh-CN": "English",
+    "ja": "English"
+  },
+  "settings_lang_ja": {
+    "en": "日本語",
+    "zh-CN": "日本語",
+    "ja": "日本語"
+  },
+  "settings_lang_system": {
+    "en": "Follow System",
+    "zh-CN": "跟随系统语言",
+    "ja": "システムに従う"
+  },
+  "settings_lang_zh": {
+    "en": "简体中文",
+    "zh-CN": "简体中文",
+    "ja": "简体中文"
+  },
+  "settings_mcp_empty": {
+    "en": "No external MCP servers configured on this host.",
+    "zh-CN": "此主机暂未配置外部 MCP 服务器。",
+    "ja": "このホストに外部 MCP サーバーは設定されていません。"
+  },
+  "settings_mcp_probe_ok": {
+    "en": "%1$d tool(s) · %2$d ms",
+    "zh-CN": "%1$d 个工具 · %2$d ms",
+    "ja": "%1$d ツール · %2$d ms"
+  },
+  "settings_mcp_subtitle": {
+    "en": "List and toggle external MCP servers",
+    "zh-CN": "查看与启停外部 MCP 服务器",
+    "ja": "外部 MCP サーバーの一覧と有効/無効切替"
+  },
+  "settings_memory_confirm_a11y": {
+    "en": "Confirm project memory",
+    "zh-CN": "确认该条项目记忆",
+    "ja": "プロジェクトメモリを確認済みにする"
+  },
+  "settings_memory_delete_a11y": {
+    "en": "Delete project memory",
+    "zh-CN": "删除该条项目记忆",
+    "ja": "プロジェクトメモリを削除"
+  },
+  "settings_memory_delete_message": {
+    "en": "Delete \"%s\" permanently from this workspace's project memory?",
+    "zh-CN": "确定要永久删除项目记忆“%s”吗？",
+    "ja": "プロジェクトメモリ「%s」を完全に削除しますか？"
+  },
+  "settings_memory_delete_title": {
+    "en": "Delete Project Memory?",
+    "zh-CN": "删除项目记忆？",
+    "ja": "プロジェクトメモリを削除しますか？"
+  },
+  "settings_memory_empty": {
+    "en": "No memories recorded for this project yet.",
+    "zh-CN": "该项目暂无记录的项目记忆。",
+    "ja": "このプロジェクトにはまだメモリが記録されていません。"
+  },
+  "settings_memory_no_workspace": {
+    "en": "Open or pin a project on this host to inspect its memories.",
+    "zh-CN": "请先在此主机打开或固定一个项目目录以查看项目记忆。",
+    "ja": "このホストでプロジェクトを開くか固定するとメモリを確認できます。"
+  },
+  "settings_memory_status_confirmed": {
+    "en": "Confirmed",
+    "zh-CN": "已确认",
+    "ja": "確認済み"
+  },
+  "settings_memory_status_hypothesis": {
+    "en": "Hypothesis",
+    "zh-CN": "待确认",
+    "ja": "仮説"
+  },
+  "settings_memory_status_recheck": {
+    "en": "Needs Recheck",
+    "zh-CN": "需复核",
+    "ja": "再確認が必要"
+  },
+  "settings_memory_subtitle": {
+    "en": "Inspect, confirm, or delete workspace memories",
+    "zh-CN": "查看、确认或删除工作区项目记忆",
+    "ja": "ワークスペースメモリの確認・削除"
+  },
+  "settings_memory_workspace_label": {
+    "en": "Workspace Directory",
+    "zh-CN": "工作区目录",
+    "ja": "ワークスペースディレクトリ"
+  },
+  "settings_mode_accept_edits": {
+    "en": "Accept Edits",
+    "zh-CN": "自动接受编辑",
+    "ja": "編集を自動承認"
+  },
+  "settings_mode_auto": {
+    "en": "Auto",
+    "zh-CN": "自动",
+    "ja": "自動"
+  },
+  "settings_mode_default": {
+    "en": "Default",
+    "zh-CN": "默认",
+    "ja": "デフォルト"
+  },
+  "settings_mode_full_access": {
+    "en": "Full Access",
+    "zh-CN": "完全访问",
+    "ja": "フルアクセス"
+  },
+  "settings_no_host_selected": {
+    "en": "Pair or select a host first to view host-scoped settings.",
+    "zh-CN": "请先配对或选择一台主机以查看主机级设置。",
+    "ja": "ホスト設定を表示するには先にホストをペアリングまたは選択してください。"
+  },
+  "settings_pa_memory_capable": {
+    "en": "Local Memory Engine",
+    "zh-CN": "支持本地记忆引擎",
+    "ja": "ローカルメモリ対応"
+  },
+  "settings_pa_mesh_empty": {
+    "en": "No daemon-to-daemon mesh peers configured yet.",
+    "zh-CN": "暂未配置主机互联节点。",
+    "ja": "メッシュピアはまだ構成されていません。"
+  },
+  "settings_pa_no_hosts": {
+    "en": "No eligible hosts discovered yet.",
+    "zh-CN": "暂未发现可用的候选主机。",
+    "ja": "利用可能な候補ホストがまだ見つかりません。"
+  },
+  "settings_pa_prereview_assist": {
+    "en": "Assist",
+    "zh-CN": "辅助建议",
+    "ja": "アシスト"
+  },
+  "settings_pa_prereview_label": {
+    "en": "Pre-Review Policy",
+    "zh-CN": "预审策略",
+    "ja": "事前審査ポリシー"
+  },
+  "settings_pa_prereview_medium": {
+    "en": "Medium Risk",
+    "zh-CN": "中风险预审",
+    "ja": "中リスクのみ"
+  },
+  "settings_pa_row_subtitle": {
+    "en": "%d mesh peer(s)",
+    "zh-CN": "%d 个互联节点",
+    "ja": "メッシュピア %d 件"
+  },
+  "settings_pa_scope_fleet": {
+    "en": "Global Fleet",
+    "zh-CN": "全局主机群",
+    "ja": "フリート全体"
+  },
+  "settings_pa_scope_label": {
+    "en": "Orchestration Scope",
+    "zh-CN": "调度范围",
+    "ja": "オーケストレーション範囲"
+  },
+  "settings_pa_scope_local": {
+    "en": "Local Host Only",
+    "zh-CN": "仅本机",
+    "ja": "ローカルホストのみ"
+  },
+  "settings_pair_host_submit": {
+    "en": "Pair Host",
+    "zh-CN": "配对主机",
+    "ja": "ホストをペアリング"
+  },
+  "settings_pair_new_host": {
+    "en": "Pair New Host",
+    "zh-CN": "配对新主机",
+    "ja": "新しいホストをペアリング"
+  },
+  "settings_pairing_qr_warning": {
+    "en": "This QR code contains the host pairing secret. Share only with your own trusted Orbit devices.",
+    "zh-CN": "此二维码包含主机配对密钥，请仅向您本人信任的 Orbit 设备分享。",
+    "ja": "この QR コードにはペアリングシークレットが含まれます。信頼できるご自身の Orbit 端末のみに共有してください。"
+  },
+  "settings_pairing_uri_label": {
+    "en": "Pairing URI",
+    "zh-CN": "配对 URI",
+    "ja": "ペアリング URI"
+  },
+  "settings_pairing_uri_placeholder": {
+    "en": "orbit://pair/…",
+    "zh-CN": "orbit://pair/…",
+    "ja": "orbit://pair/…"
+  },
+  "settings_permissions_subtitle": {
+    "en": "Default mode, Guardian policy & tool rules",
+    "zh-CN": "默认模式、Guardian 策略与工具规则",
+    "ja": "既定モード・Guardian ポリシー・ツールルール"
+  },
+  "settings_plugins_caps_summary": {
+    "en": "%1$d MCP op(s) · %2$d hook(s)",
+    "zh-CN": "%1$d 个 MCP 操作 · %2$d 个钩子",
+    "ja": "MCP 操作 %1$d 件 · フック %2$d 件"
+  },
+  "settings_plugins_empty": {
+    "en": "No WASM plugins installed on this host.",
+    "zh-CN": "此主机暂未安装任何 WASM 插件。",
+    "ja": "このホストに WASM プラグインはインストールされていません。"
+  },
+  "settings_plugins_subtitle": {
+    "en": "Inspect and toggle installed WASM plugins",
+    "zh-CN": "查看与启停已安装 WASM 插件",
+    "ja": "WASM プラグインの確認と有効/無効切替"
+  },
+  "settings_push_master_switch": {
+    "en": "Enable Notifications",
+    "zh-CN": "启用通知提醒",
+    "ja": "通知を有効にする"
+  },
+  "settings_push_not_registered": {
+    "en": "Not registered",
+    "zh-CN": "未注册",
+    "ja": "未登録"
+  },
+  "settings_push_pref_timers": {
+    "en": "Scheduled & Conditional Timers",
+    "zh-CN": "定时任务与条件定时器触发",
+    "ja": "スケジュール・条件タイマー発火"
+  },
+  "settings_push_synced_daemons": {
+    "en": "Synced Daemons",
+    "zh-CN": "已同步主机",
+    "ja": "同期済みデーモン"
+  },
+  "settings_push_token_label": {
+    "en": "Push Kit Token",
+    "zh-CN": "Push Kit 令牌",
+    "ja": "Push Kit トークン"
+  },
+  "settings_readonly_badge": {
+    "en": "Read-only",
+    "zh-CN": "只读视图",
+    "ja": "読み取り専用"
+  },
+  "settings_relay_url_placeholder": {
+    "en": "wss://relay.orbit.dev",
+    "zh-CN": "wss://relay.orbit.dev",
+    "ja": "wss://relay.orbit.dev"
+  },
+  "settings_remove_host": {
+    "en": "Remove Host",
+    "zh-CN": "移除主机",
+    "ja": "ホストを削除"
+  },
+  "settings_remove_host_confirm": {
+    "en": "Remove",
+    "zh-CN": "移除",
+    "ja": "削除"
+  },
+  "settings_remove_host_message": {
+    "en": "Running remote agent sessions on this host will not be terminated.",
+    "zh-CN": "此操作不会终止该主机上正在运行的远程代理会话。",
+    "ja": "このホストで実行中のリモートエージェントセッションは終了されません。"
+  },
+  "settings_remove_host_title": {
+    "en": "Remove %s?",
+    "zh-CN": "移除 %s？",
+    "ja": "%s を削除しますか？"
+  },
+  "settings_risk_low": {
+    "en": "Low",
+    "zh-CN": "低风险",
+    "ja": "低リスク"
+  },
+  "settings_risk_medium": {
+    "en": "Medium",
+    "zh-CN": "中风险",
+    "ja": "中リスク"
+  },
+  "settings_route_auto": {
+    "en": "Auto",
+    "zh-CN": "自动",
+    "ja": "自動"
+  },
+  "settings_route_direct": {
+    "en": "Direct",
+    "zh-CN": "仅直连",
+    "ja": "ダイレクト"
+  },
+  "settings_route_relay": {
+    "en": "Relay",
+    "zh-CN": "仅中继",
+    "ja": "リレー"
+  },
+  "settings_rule_add_title": {
+    "en": "Add Permission Rule",
+    "zh-CN": "新增权限规则",
+    "ja": "権限ルールを追加"
+  },
+  "settings_rule_delete_message": {
+    "en": "Remove permission rule matching \"%s\"?",
+    "zh-CN": "确定要删除匹配“%s”的权限规则吗？",
+    "ja": "「%s」に一致する権限ルールを削除しますか？"
+  },
+  "settings_rule_delete_title": {
+    "en": "Delete Permission Rule?",
+    "zh-CN": "删除权限规则？",
+    "ja": "権限ルールを削除しますか？"
+  },
+  "settings_rule_pattern_placeholder": {
+    "en": "Prefix pattern (e.g. cargo test)",
+    "zh-CN": "前缀匹配规则（例如 cargo test）",
+    "ja": "プレフィックスパターン（例：cargo test）"
+  },
+  "settings_rules_empty": {
+    "en": "No custom tool permission rules configured.",
+    "zh-CN": "暂未配置自定义工具权限规则。",
+    "ja": "カスタム権限ルールは設定されていません。"
+  },
+  "settings_rules_section": {
+    "en": "Tool Permission Rules",
+    "zh-CN": "工具权限规则",
+    "ja": "ツール権限ルール"
+  },
+  "settings_sandbox_default_notice": {
+    "en": "No custom sandbox override is active; host default isolation policy applies.",
+    "zh-CN": "当前未配置自定义沙箱覆盖项，主机按默认隔离策略运行。",
+    "ja": "カスタムサンドボックス設定はなく、ホストの既定隔離ポリシーが適用されています。"
+  },
+  "settings_sandbox_denied_reads": {
+    "en": "Protected Read-Denied Paths",
+    "zh-CN": "受保护禁止读取路径",
+    "ja": "読み取り禁止の保護パス"
+  },
+  "settings_sandbox_mode_label": {
+    "en": "Isolation Mode",
+    "zh-CN": "隔离模式",
+    "ja": "隔離モード"
+  },
+  "settings_sandbox_mode_off": {
+    "en": "Off",
+    "zh-CN": "关闭",
+    "ja": "オフ"
+  },
+  "settings_sandbox_mode_readonly": {
+    "en": "Strict Read-Only",
+    "zh-CN": "严格只读",
+    "ja": "厳格な読み取り専用"
+  },
+  "settings_sandbox_mode_workspace": {
+    "en": "Workspace Write",
+    "zh-CN": "仅允许写入工作区",
+    "ja": "ワークスペース書込のみ"
+  },
+  "settings_sandbox_network_label": {
+    "en": "Network Access",
+    "zh-CN": "网络访问",
+    "ja": "ネットワークアクセス"
+  },
+  "settings_sandbox_subtitle": {
+    "en": "Read-only OS sandbox & credential isolation",
+    "zh-CN": "只读查看操作系统沙箱与凭据隔离",
+    "ja": "OS サンドボックスと認証情報保護（閲覧専用）"
+  },
+  "settings_sandbox_writable_roots": {
+    "en": "Additional Writable Roots",
+    "zh-CN": "额外可写目录",
+    "ja": "追加の書き込み許可パス"
+  },
+  "settings_save_reconnect": {
+    "en": "Save & Reconnect",
+    "zh-CN": "保存并重连",
+    "ja": "保存して再接続"
+  },
+  "settings_scan_qr_code": {
+    "en": "Scan QR Code",
+    "zh-CN": "扫描二维码",
+    "ja": "QR コードをスキャン"
+  },
+  "settings_search_a11y": {
+    "en": "Search settings",
+    "zh-CN": "搜索设置项",
+    "ja": "設定を検索"
+  },
+  "settings_search_clear": {
+    "en": "Clear Search",
+    "zh-CN": "清空搜索",
+    "ja": "検索をクリア"
+  },
+  "settings_search_clear_a11y": {
+    "en": "Clear settings search",
+    "zh-CN": "清空设置搜索",
+    "ja": "設定検索をクリア"
+  },
+  "settings_search_empty": {
+    "en": "No matching settings found.",
+    "zh-CN": "未找到匹配的设置项。",
+    "ja": "一致する設定が見つかりません。"
+  },
+  "settings_search_placeholder": {
+    "en": "Search settings (EN / 中文 / 日本語)…",
+    "zh-CN": "搜索设置（支持中 / 英 / 日三语）…",
+    "ja": "設定を検索（日 / 英 / 中 対応）…"
+  },
+  "settings_send_interrupt": {
+    "en": "Interrupt & Send",
+    "zh-CN": "中断并发送",
+    "ja": "中断して送信"
+  },
+  "settings_send_interrupt_desc": {
+    "en": "Cancel the current turn and send immediately (pending approvals still queue safely).",
+    "zh-CN": "取消当前回合后立即发送（待审批门期间仍自动安全排队）。",
+    "ja": "現在のターンを中断して即時送信します（承認待ち中は安全にキューされます）。"
+  },
+  "settings_send_queue": {
+    "en": "Queue (Recommended)",
+    "zh-CN": "排队发送（推荐）",
+    "ja": "キューに追加（推奨）"
+  },
+  "settings_send_queue_desc": {
+    "en": "Deliver in order once the active turn finishes.",
+    "zh-CN": "待当前回合完成后按顺序自动投递。",
+    "ja": "実行中のターン完了後に順番に送信します。"
+  },
+  "settings_send_steer": {
+    "en": "Steer Follow-Up",
+    "zh-CN": "引导追问（Steer）",
+    "ja": "ステア送信"
+  },
+  "settings_send_steer_desc": {
+    "en": "Send follow-up guidance while the agent is working (pending approvals still queue).",
+    "zh-CN": "在代理运行期间直接注入引导消息（待审批门期间仍自动排队）。",
+    "ja": "エージェント実行中に追加指示を送信します（承認待ち中はキューされます）。"
+  },
+  "settings_share_pairing_desc": {
+    "en": "Generate a pairing QR code or URI so another trusted Orbit client can pair with this host.",
+    "zh-CN": "生成配对二维码或 URI，方便其他可信 Orbit 客户端直接配对此主机。",
+    "ja": "他の信頼できる Orbit クライアントからこのホストへペアリングするための QR コードまたは URI を生成します。"
+  },
+  "settings_share_pairing_section": {
+    "en": "Share Pairing URI / QR",
+    "zh-CN": "分享配对 URI / 二维码",
+    "ja": "ペアリング URI / QR を共有"
+  },
+  "settings_show_pairing_qr": {
+    "en": "Show Pairing QR & URI",
+    "zh-CN": "生成配对二维码与 URI",
+    "ja": "ペアリング QR・URI を表示"
+  },
+  "settings_skills_empty": {
+    "en": "No managed skills discovered on this host.",
+    "zh-CN": "此主机暂未发现已安装的技能。",
+    "ja": "このホストにスキルは見つかりませんでした。"
+  },
+  "settings_skills_subtitle": {
+    "en": "Read-only list of discovered SKILL.md skills",
+    "zh-CN": "只读浏览主机已发现的 SKILL.md 技能",
+    "ja": "検出された SKILL.md スキルの一覧（閲覧専用）"
+  },
+  "settings_skills_tokens": {
+    "en": "~%d tokens",
+    "zh-CN": "约 %d 令牌",
+    "ja": "約 %d トークン"
+  },
+  "settings_state_enabled": {
+    "en": "On",
+    "zh-CN": "已开启",
+    "ja": "オン"
+  },
+  "settings_state_off": {
+    "en": "Off",
+    "zh-CN": "关闭",
+    "ja": "オフ"
+  },
+  "settings_switch_host": {
+    "en": "Switch to This Host",
+    "zh-CN": "切换到此主机",
+    "ja": "このホストへ切替"
+  },
+  "settings_sync_auto_sync": {
+    "en": "Auto-Sync",
+    "zh-CN": "自动同步",
+    "ja": "自動同期"
+  },
+  "settings_sync_connect_github": {
+    "en": "Connect GitHub",
+    "zh-CN": "连接 GitHub",
+    "ja": "GitHub に接続"
+  },
+  "settings_sync_connected": {
+    "en": "Connected",
+    "zh-CN": "已连接",
+    "ja": "接続済み"
+  },
+  "settings_sync_device_link_desc": {
+    "en": "Link instantaneously from another Orbit device with zero passphrase typing.",
+    "zh-CN": "扫描另一台 Orbit 设备的关联二维码，无需手动输入口令即可瞬间同步。",
+    "ja": "別の Orbit 端末のリンク QR をスキャンしてパスフレーズ入力なしで即座に連携します。"
+  },
+  "settings_sync_disconnect": {
+    "en": "Disconnect Cloud Sync",
+    "zh-CN": "断开云同步",
+    "ja": "クラウド同期を解除"
+  },
+  "settings_sync_disconnect_confirm": {
+    "en": "Disconnect",
+    "zh-CN": "断开连接",
+    "ja": "解除する"
+  },
+  "settings_sync_disconnect_message": {
+    "en": "Your encrypted GitHub Gist vault remains intact, and local hosts are preserved.",
+    "zh-CN": "您在 GitHub Gist 上的加密库与本地主机配置均会完整保留。",
+    "ja": "暗号化された GitHub Gist ボールトとローカルのホスト設定はそのまま保持されます。"
+  },
+  "settings_sync_disconnect_title": {
+    "en": "Disconnect Cloud Sync?",
+    "zh-CN": "断开云同步？",
+    "ja": "クラウド同期を解除しますか？"
+  },
+  "settings_sync_error": {
+    "en": "Sync error",
+    "zh-CN": "同步异常",
+    "ja": "同期エラー"
+  },
+  "settings_sync_export_qr_desc": {
+    "en": "Scan from another phone, tablet, or desktop to transfer your E2EE vault key securely.",
+    "zh-CN": "用另一台手机、平板或桌面端扫码，即可安全同步您的端到端加密库密钥。",
+    "ja": "別の端末からスキャンして E2EE ボールト鍵を安全に引き継ぎます。"
+  },
+  "settings_sync_fleet_counts": {
+    "en": "%1$d host(s) · %2$d project(s)",
+    "zh-CN": "%1$d 台主机 · %2$d 个项目",
+    "ja": "%1$d ホスト · %2$d プロジェクト"
+  },
+  "settings_sync_fleet_label": {
+    "en": "Synced Fleet",
+    "zh-CN": "已同步内容",
+    "ja": "同期済みフリート"
+  },
+  "settings_sync_generate": {
+    "en": "Generate",
+    "zh-CN": "随机生成",
+    "ja": "生成"
+  },
+  "settings_sync_link_uri_placeholder": {
+    "en": "orbit://link/…",
+    "zh-CN": "orbit://link/…",
+    "ja": "orbit://link/…"
+  },
+  "settings_sync_locked": {
+    "en": "Locked",
+    "zh-CN": "已锁定",
+    "ja": "ロック中"
+  },
+  "settings_sync_not_connected": {
+    "en": "Not connected",
+    "zh-CN": "未连接",
+    "ja": "未接続"
+  },
+  "settings_sync_now": {
+    "en": "Sync Now",
+    "zh-CN": "立即同步",
+    "ja": "今すぐ同期"
+  },
+  "settings_sync_passphrase_placeholder": {
+    "en": "Enter E2EE passphrase",
+    "zh-CN": "输入端到端加密口令",
+    "ja": "E2EE パスフレーズを入力"
+  },
+  "settings_sync_passphrase_title": {
+    "en": "Vault Passphrase",
+    "zh-CN": "加密库口令",
+    "ja": "ボールトパスフレーズ"
+  },
+  "settings_sync_pat_desc": {
+    "en": "Requires gist scope. Vault payloads are compressed and AES-256-GCM encrypted locally before upload.",
+    "zh-CN": "需要 gist 权限。所有同步数据在上传前均在本地压缩并使用 AES-256-GCM 加密。",
+    "ja": "gist スコープが必要です。データはアップロード前にローカルで圧縮・AES-256-GCM 暗号化されます。"
+  },
+  "settings_sync_pat_placeholder": {
+    "en": "ghp_…",
+    "zh-CN": "ghp_…",
+    "ja": "ghp_…"
+  },
+  "settings_sync_pat_title": {
+    "en": "GitHub Personal Access Token",
+    "zh-CN": "GitHub 个人访问令牌",
+    "ja": "GitHub パーソナルアクセストークン"
+  },
+  "settings_sync_status_label": {
+    "en": "Status",
+    "zh-CN": "状态",
+    "ja": "ステータス"
+  },
+  "settings_sync_syncing": {
+    "en": "Syncing…",
+    "zh-CN": "同步中…",
+    "ja": "同期中…"
+  },
+  "settings_sync_unlock": {
+    "en": "Unlock & Sync",
+    "zh-CN": "解锁并同步",
+    "ja": "ロック解除して同期"
+  },
+  "settings_sync_unlocking": {
+    "en": "Unlocking…",
+    "zh-CN": "正在解锁…",
+    "ja": "ロック解除中…"
+  },
+  "settings_sync_verify_signin": {
+    "en": "Verify Sign-In",
+    "zh-CN": "验证登录",
+    "ja": "サインインを確認"
+  },
+  "settings_target_host_label": {
+    "en": "Host Scope",
+    "zh-CN": "当前配置主机",
+    "ja": "設定対象ホスト"
+  },
+  "settings_usage_30d": {
+    "en": "30 Days",
+    "zh-CN": "近 30 天",
+    "ja": "30日間"
+  },
+  "settings_usage_7d": {
+    "en": "7 Days",
+    "zh-CN": "近 7 天",
+    "ja": "7日間"
+  },
+  "settings_usage_by_model": {
+    "en": "Breakdown by Model",
+    "zh-CN": "按模型分布",
+    "ja": "モデル別内訳"
+  },
+  "settings_usage_by_project": {
+    "en": "Breakdown by Project",
+    "zh-CN": "按项目分布",
+    "ja": "プロジェクト別内訳"
+  },
+  "settings_usage_cache_savings": {
+    "en": "Cache Savings",
+    "zh-CN": "缓存节省费用",
+    "ja": "キャッシュ節約額"
+  },
+  "settings_usage_daily": {
+    "en": "Recent Daily Activity",
+    "zh-CN": "近期每日用量",
+    "ja": "日別アクティビティ"
+  },
+  "settings_usage_forecasts": {
+    "en": "Quota Burn Forecasts",
+    "zh-CN": "配额消耗预测",
+    "ja": "クォータ消費予測"
+  },
+  "settings_usage_live_quotas": {
+    "en": "Live Provider Quotas",
+    "zh-CN": "实时提供商配额",
+    "ja": "プロバイダー別クォータ"
+  },
+  "settings_usage_no_quotas": {
+    "en": "No active rate-limit windows reported yet.",
+    "zh-CN": "暂未上报活跃的速率限制窗口。",
+    "ja": "アクティブなレート制限ウィンドウはありません。"
+  },
+  "settings_usage_subtitle": {
+    "en": "Token ledger, cost insights & rate limits",
+    "zh-CN": "令牌账本、费用洞察与实时配额",
+    "ja": "トークン履歴・コスト分析・クォータ"
+  },
+  "settings_usage_summary_section": {
+    "en": "Period Summary",
+    "zh-CN": "周期汇总",
+    "ja": "期間サマリー"
+  },
+  "settings_usage_tokens_turns": {
+    "en": "Tokens · Turns",
+    "zh-CN": "令牌数 · 回合数",
+    "ja": "トークン・ターン数"
+  },
+  "settings_usage_total_cost": {
+    "en": "Estimated Cost",
+    "zh-CN": "估算费用",
+    "ja": "推定コスト"
+  },
+  "settings_item_host_detail": {
+    "en": "Host Details & Pairing QR",
+    "zh-CN": "主机详情与配对二维码",
+    "ja": "ホスト詳細とペアリングQR"
+  },
+  "settings_agents_select_model_hint": {
+    "en": "Tap to choose default model",
+    "zh-CN": "点击选择默认模型",
+    "ja": "タップしてデフォルトモデルを選択"
+  },
+  "settings_agents_select_effort_hint": {
+    "en": "Tap to choose reasoning effort",
+    "zh-CN": "点击选择推理深度",
+    "ja": "タップして推論の深さを選択"
+  },
+  "settings_agents_no_models": {
+    "en": "No models discovered on this host yet.",
+    "zh-CN": "该主机尚未发现可用模型。",
+    "ja": "このホストでモデルがまだ検出されていません。"
+  },
+  "settings_fleet_relay_input_a11y": {
+    "en": "Fleet relay URL input",
+    "zh-CN": "全局中继地址输入框",
+    "ja": "フリートリレー URL 入力欄"
+  },
+  "settings_host_display_name_a11y": {
+    "en": "Host display name input",
+    "zh-CN": "主机显示名称输入框",
+    "ja": "ホスト表示名入力欄"
+  },
+  "settings_host_direct_endpoint_a11y": {
+    "en": "Direct endpoint URL input",
+    "zh-CN": "直连地址输入框",
+    "ja": "ダイレクト接続先入力欄"
+  },
+  "settings_host_relay_url_a11y": {
+    "en": "Host relay URL input",
+    "zh-CN": "主机中继地址输入框",
+    "ja": "ホストリレー URL 入力欄"
+  },
+  "settings_pairing_uri_input_a11y": {
+    "en": "Pairing URI input",
+    "zh-CN": "配对 URI 输入框",
+    "ja": "ペアリング URI 入力欄"
+  },
+  "settings_sync_link_uri_input_a11y": {
+    "en": "Device link URI input",
+    "zh-CN": "设备关联 URI 输入框",
+    "ja": "デバイスリンク URI 入力欄"
+  },
+  "settings_sync_pat_input_a11y": {
+    "en": "GitHub personal access token input",
+    "zh-CN": "GitHub 个人访问令牌输入框",
+    "ja": "GitHub パーソナルアクセストークン入力欄"
+  },
+  "settings_sync_passphrase_input_a11y": {
+    "en": "Sync vault passphrase input",
+    "zh-CN": "云同步加密口令输入框",
+    "ja": "クラウド同期パスフレーズ入力欄"
+  },
+  "settings_acp_id_input_a11y": {
+    "en": "Custom ACP agent ID input",
+    "zh-CN": "自定义 ACP 代理 ID 输入框",
+    "ja": "カスタム ACP エージェント ID 入力欄"
+  },
+  "settings_acp_name_input_a11y": {
+    "en": "Custom ACP agent name input",
+    "zh-CN": "自定义 ACP 代理名称输入框",
+    "ja": "カスタム ACP エージェント名入力欄"
+  },
+  "settings_acp_cmd_input_a11y": {
+    "en": "Custom ACP command input",
+    "zh-CN": "自定义 ACP 启动命令输入框",
+    "ja": "カスタム ACP コマンド入力欄"
+  },
+  "settings_acp_args_input_a11y": {
+    "en": "Custom ACP arguments input",
+    "zh-CN": "自定义 ACP 启动参数输入框",
+    "ja": "カスタム ACP 引数入力欄"
+  },
+  "settings_rule_pattern_input_a11y": {
+    "en": "Permission rule pattern input",
+    "zh-CN": "权限规则匹配模式输入框",
+    "ja": "権限ルールパターン入力欄"
+  },
+  "settings_rule_tool_kind_a11y": {
+    "en": "Rule tool kind: %s",
+    "zh-CN": "规则工具类型：%s",
+    "ja": "ルールツール種別：%s"
+  },
+  "settings_rule_decision_a11y": {
+    "en": "Rule decision: %s",
+    "zh-CN": "规则动作：%s",
+    "ja": "ルール判定：%s"
+  },
+  "toast_copied_clipboard": {
+    "en": "Copied to clipboard",
+    "zh-CN": "已复制到剪贴板",
+    "ja": "クリップボードにコピーしました"
+  },
+  "toast_copy_failed": {
+    "en": "Failed to copy to clipboard",
+    "zh-CN": "复制到剪贴板失败",
+    "ja": "クリップボードへのコピーに失敗しました"
+  },
+  "toast_test_push_sent": {
+    "en": "Test push sent from host",
+    "zh-CN": "已从主机发送测试通知",
+    "ja": "ホストからテスト通知を送信しました"
+  },
+  "toast_test_push_failed": {
+    "en": "Test push failed",
+    "zh-CN": "测试通知发送失败",
+    "ja": "テスト通知の送信に失敗しました"
+  },
+  "toast_connect_host_first": {
+    "en": "Connect a host first",
+    "zh-CN": "请先连接主机",
+    "ja": "先にホストに接続してください"
+  },
+  "stage_thought_label": {
+    "en": "Thought",
+    "zh-CN": "思考过程",
+    "ja": "思考"
+  },
+  "decision_custom_answer_placeholder": {
+    "en": "Custom answer…",
+    "zh-CN": "输入自定义回答…",
+    "ja": "カスタム回答を入力…"
+  },
+  "stage_pair_first_host_title": {
+    "en": "Pair Your First Host",
+    "zh-CN": "配对你的第一台主机",
+    "ja": "最初のホストをペアリング"
+  },
+  "stage_pair_first_host_body": {
+    "en": "Connect to orbit daemon on your workstation, Linux devbox, or Mac mini over LAN, SSH, or E2EE Noise Relay.",
+    "zh-CN": "通过局域网、SSH 或端到端加密 Noise Relay 连接到工作站、Linux 开发机或 Mac mini 上的 orbit daemon。",
+    "ja": "LAN、SSH、または E2EE Noise Relay 経由でワークステーション、Linux 開発機、Mac mini 上の orbit daemon に接続します。"
+  },
+  "stage_pair_uri_placeholder": {
+    "en": "orbit://pair/...",
+    "zh-CN": "orbit://pair/...",
+    "ja": "orbit://pair/..."
+  },
+  "stage_welcome_prompt": {
+    "en": "What would you like to build?",
+    "zh-CN": "今天想构建什么？",
+    "ja": "何を作りましょうか？"
+  },
+  "diagram_tab_preview": {
+    "en": "Preview",
+    "zh-CN": "预览",
+    "ja": "プレビュー"
+  },
+  "diagram_tab_code": {
+    "en": "Code",
+    "zh-CN": "代码",
+    "ja": "コード"
+  },
+  "diagram_expand_a11y": {
+    "en": "Open full-screen diagram",
+    "zh-CN": "全屏查看图表",
+    "ja": "図を全画面で表示"
+  },
+  "diagram_open_fullscreen": {
+    "en": "View Full Diagram",
+    "zh-CN": "全屏查看图表",
+    "ja": "図を全画面で見る"
+  },
+  "diagram_ready_summary": {
+    "en": "Rendered %1$s · %2$d × %3$d · Tap to inspect",
+    "zh-CN": "已渲染 %1$s · %2$d × %3$d · 点击全屏查看",
+    "ja": "%1$s を生成済み · %2$d × %3$d · タップして拡大"
+  },
+  "diagram_rendering": {
+    "en": "Rendering %s…",
+    "zh-CN": "正在渲染 %s…",
+    "ja": "%s をレンダリング中…"
+  },
+  "diagram_code_view": {
+    "en": "Code view",
+    "zh-CN": "代码视图",
+    "ja": "コード表示"
+  },
+  "diagram_copy_source_a11y": {
+    "en": "Copy diagram source",
+    "zh-CN": "复制图表源码",
+    "ja": "図のソースをコピー"
+  },
+  "toast_clipboard_empty": {
+    "en": "Clipboard is empty",
+    "zh-CN": "剪贴板为空",
+    "ja": "クリップボードは空です"
+  },
+  "toast_no_pair_uri_clipboard": {
+    "en": "No orbit://pair URI found in clipboard",
+    "zh-CN": "剪贴板中未找到 orbit://pair 配对链接",
+    "ja": "クリップボードに orbit://pair URI が見つかりません"
+  },
+  "toast_clipboard_read_failed": {
+    "en": "Unable to read clipboard",
+    "zh-CN": "无法读取剪贴板",
+    "ja": "クリップボードを読み取れません"
+  },
+  "model_picker_thinking": {
+    "en": "Thinking",
+    "zh-CN": "思考深度",
+    "ja": "思考"
+  },
+  "model_picker_refresh_a11y": {
+    "en": "Refresh Model Catalog",
+    "zh-CN": "刷新模型目录",
+    "ja": "モデル一覧を更新"
+  },
+  "automations_title": {
+    "en": "Automations",
+    "zh-CN": "自动化",
+    "ja": "オートメーション"
+  },
+  "automations_refresh_a11y": {
+    "en": "Refresh automations",
+    "zh-CN": "刷新自动化",
+    "ja": "オートメーションを更新"
+  },
+  "automations_create_schedule": {
+    "en": "Create Schedule",
+    "zh-CN": "创建定时任务",
+    "ja": "スケジュールを作成"
+  },
+  "automations_run_in_worktree": {
+    "en": "Run in isolated git worktree",
+    "zh-CN": "在隔离的 Git Worktree 中运行",
+    "ja": "隔離された Git ワークツリーで実行"
+  },
+  "automations_no_run_history": {
+    "en": "No run history recorded yet.",
+    "zh-CN": "暂无运行历史记录。",
+    "ja": "実行履歴はまだありません。"
+  },
+  "automations_winner_badge": {
+    "en": "Winner",
+    "zh-CN": "胜出方案",
+    "ja": "採用"
+  },
+  "automations_ph_schedule_name": {
+    "en": "Schedule name",
+    "zh-CN": "定时任务名称",
+    "ja": "スケジュール名"
+  },
+  "automations_ph_cron": {
+    "en": "Cron (e.g. 0 9 * * *)",
+    "zh-CN": "Cron 表达式（如 0 9 * * *）",
+    "ja": "Cron（例: 0 9 * * *）"
+  },
+  "automations_ph_trigger_prompt": {
+    "en": "Prompt to run on each trigger…",
+    "zh-CN": "每次触发时执行的提示词…",
+    "ja": "トリガーごとに実行するプロンプト…"
+  },
+  "automations_ph_seconds": {
+    "en": "Seconds",
+    "zh-CN": "秒数",
+    "ja": "秒数"
+  },
+  "automations_ph_seconds_example": {
+    "en": "Seconds (e.g. 300)",
+    "zh-CN": "秒数（如 300）",
+    "ja": "秒数（例: 300）"
+  },
+  "automations_ph_timer_prompt": {
+    "en": "Follow-up prompt when timer fires…",
+    "zh-CN": "计时器触发时的后续提示词…",
+    "ja": "タイマー発火時のフォローアッププロンプト…"
+  },
+  "automations_ph_goal_objective": {
+    "en": "Autonomous goal objective…",
+    "zh-CN": "自主目标说明…",
+    "ja": "自律ゴールの目的…"
+  },
+  "automations_ph_verify_cmd": {
+    "en": "Verify command (optional)",
+    "zh-CN": "校验命令（可选）",
+    "ja": "検証コマンド（任意）"
+  },
+  "automations_ph_max": {
+    "en": "Max",
+    "zh-CN": "上限",
+    "ja": "上限"
+  },
+  "automations_ph_monitor_name": {
+    "en": "Monitor name",
+    "zh-CN": "监听任务名称",
+    "ja": "モニター名"
+  },
+  "automations_ph_regex": {
+    "en": "Regex / pattern (optional)",
+    "zh-CN": "正则 / 匹配模式（可选）",
+    "ja": "正規表現 / パターン（任意）"
+  },
+  "automations_ph_workflow_name": {
+    "en": "Workflow name",
+    "zh-CN": "工作流名称",
+    "ja": "ワークフロー名"
+  },
+  "automations_ph_workflow_steps": {
+    "en": "Primary step instructions…",
+    "zh-CN": "主步骤指令…",
+    "ja": "メインステップの指示…"
+  },
+  "side_panel_resize_a11y": {
+    "en": "Resize side panel",
+    "zh-CN": "调整侧边面板宽度",
+    "ja": "サイドパネルの幅を変更"
+  },
+  "side_panel_launchpad_title": {
+    "en": "Open in Side Panel",
+    "zh-CN": "在侧边面板打开",
+    "ja": "サイドパネルで開く"
+  },
+  "side_panel_launchpad_subtitle": {
+    "en": "Each conversation remembers its own open tabs independently.",
+    "zh-CN": "每个会话都会独立记住自己打开的标签页。",
+    "ja": "各会話は開いているタブを個別に記憶します。"
+  },
+  "side_panel_reopen_closed": {
+    "en": "Reopen recently closed tab",
+    "zh-CN": "重新打开最近关闭的标签页",
+    "ja": "最近閉じたタブを再度開く"
+  },
+  "toast_pair_or_select_host_first": {
+    "en": "Pair or select a host first",
+    "zh-CN": "请先配对或选择主机",
+    "ja": "先にホストをペアリングまたは選択してください"
+  },
+  "dir_loading": {
+    "en": "Loading directory…",
+    "zh-CN": "正在加载目录…",
+    "ja": "ディレクトリを読み込み中…"
+  },
+  "dir_git_badge": {
+    "en": "git",
+    "zh-CN": "git",
+    "ja": "git"
+  },
+  "dir_cancel_path_a11y": {
+    "en": "Cancel path input",
+    "zh-CN": "取消路径输入",
+    "ja": "パス入力をキャンセル"
+  },
+  "dir_parent_a11y": {
+    "en": "Parent directory",
+    "zh-CN": "上一级目录",
+    "ja": "親ディレクトリ"
+  },
+  "dir_enter_path_a11y": {
+    "en": "Enter path manually",
+    "zh-CN": "手动输入路径",
+    "ja": "パスを手動入力"
+  },
+  "dir_path_placeholder": {
+    "en": "/path/to/workspace",
+    "zh-CN": "/工作区路径",
+    "ja": "/ワークスペースのパス"
+  },
+  "dir_filter_placeholder": {
+    "en": "Filter folders or repositories…",
+    "zh-CN": "筛选文件夹或仓库…",
+    "ja": "フォルダやリポジトリを絞り込み…"
+  },
+  "git_diff_generated_badge": {
+    "en": "Generated",
+    "zh-CN": "生成文件",
+    "ja": "生成済み"
+  },
+  "git_diff_clean_title": {
+    "en": "Working tree clean",
+    "zh-CN": "工作区干净",
+    "ja": "作業ツリーはクリーンです"
+  },
+  "git_diff_clean_subtitle": {
+    "en": "No unstaged or session changes in the active workspace.",
+    "zh-CN": "当前工作区没有未暂存或会话改动。",
+    "ja": "アクティブなワークスペースに未ステージまたはセッションの変更はありません。"
+  },
+  "git_diff_no_matching_title": {
+    "en": "No matching modified files",
+    "zh-CN": "没有匹配的改动文件",
+    "ja": "一致する変更ファイルがありません"
+  },
+  "git_diff_no_matching_subtitle": {
+    "en": "Clear the filter above to view all modified files.",
+    "zh-CN": "清除上方筛选条件以查看全部改动文件。",
+    "ja": "上のフィルタをクリアしてすべての変更ファイルを表示します。"
+  },
+  "git_diff_refresh_a11y": {
+    "en": "Refresh Git diff",
+    "zh-CN": "刷新 Git 差异",
+    "ja": "Git 差分を更新"
+  },
+  "git_diff_close_a11y": {
+    "en": "Close Git Diff Inspector",
+    "zh-CN": "关闭 Git 差异检查器",
+    "ja": "Git 差分インスペクタを閉じる"
+  },
+  "git_diff_filter_placeholder": {
+    "en": "Filter modified files…",
+    "zh-CN": "筛选改动文件…",
+    "ja": "変更ファイルを絞り込み…"
+  },
+  "terminal_pty_ready": {
+    "en": "orbit shim detached PTY ready",
+    "zh-CN": "orbit shim 托管终端已就绪",
+    "ja": "orbit shim 独立 PTY 準備完了"
+  },
+  "terminal_copy_output_a11y": {
+    "en": "Copy terminal output",
+    "zh-CN": "复制终端输出",
+    "ja": "端末出力をコピー"
+  },
+  "terminal_quote_output_a11y": {
+    "en": "Quote terminal output into composer",
+    "zh-CN": "引用终端输出到输入框",
+    "ja": "端末出力を入力欄に引用"
+  },
+  "terminal_spawn_a11y": {
+    "en": "Spawn new terminal session",
+    "zh-CN": "新建终端会话",
+    "ja": "新しい端末セッションを作成"
+  },
+  "terminal_send_input_a11y": {
+    "en": "Send terminal input",
+    "zh-CN": "发送终端输入",
+    "ja": "端末入力を送信"
+  },
+  "board_empty_hint": {
+    "en": "BOARD.md is empty. Tap Edit to record shared goals, API contracts, or findings for sibling agents.",
+    "zh-CN": "BOARD.md 为空。点击编辑以记录共享目标、接口契约或发现，供协作智能体共享。",
+    "ja": "BOARD.md は空です。編集をタップして共有目標や契約、知見を記録してください。"
+  },
+  "board_no_peers_title": {
+    "en": "No sibling peers in this workspace",
+    "zh-CN": "此工作区暂无协作成员",
+    "ja": "このワークスペースにピアはいません"
+  },
+  "board_no_peers_subtitle": {
+    "en": "Spawn a peer below to collaborate on the same Shared Blackboard.",
+    "zh-CN": "在下方启动新成员，即可在同一共享黑板上协作。",
+    "ja": "下からピアを起動して同じ共有ボードで協働できます。"
+  },
+  "board_sheet_title": {
+    "en": "Shared Blackboard & Peers",
+    "zh-CN": "共享黑板与成员",
+    "ja": "共有ボードとピア"
+  },
+  "board_refresh_a11y": {
+    "en": "Refresh board",
+    "zh-CN": "刷新共享黑板",
+    "ja": "ボードを更新"
+  },
+  "board_editor_placeholder": {
+    "en": "## Goal\n\n## Contracts\n\n## Findings",
+    "zh-CN": "## 目标\n\n## 接口契约\n\n## 关键发现",
+    "ja": "## 目標\n\n## 契約\n\n## 知見"
+  },
+  "board_peer_handle_placeholder": {
+    "en": "Optional @handle (e.g. reviewer)",
+    "zh-CN": "可选 @代号（如 reviewer）",
+    "ja": "任意の @ハンドル（例: reviewer）"
+  },
+  "board_peer_brief_placeholder": {
+    "en": "Task brief for the new peer…",
+    "zh-CN": "给新成员的任务简报…",
+    "ja": "新しいピアへのタスク概要…"
+  },
+  "toast_enter_peer_instructions": {
+    "en": "Enter instructions for the peer",
+    "zh-CN": "请输入给协作成员的任务指令",
+    "ja": "ピアへの指示を入力してください"
+  },
+  "toast_rebase_continued": {
+    "en": "Continued rebase",
+    "zh-CN": "已继续变基",
+    "ja": "リベースを再開しました"
+  },
+  "toast_rebase_aborted": {
+    "en": "Aborted rebase",
+    "zh-CN": "已中止变基",
+    "ja": "リベースを中止しました"
   }
 }

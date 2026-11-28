@@ -100,7 +100,7 @@ export struct OrbitSheetHeader {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Close')
+        .accessibilityText($r('app.string.common_close'))
         .onClick(() => {
           this.onClose();
         })
@@ -126,8 +126,8 @@ export struct OrbitSheetHeader {
 @ComponentV2
 export struct OrbitCopyIconButton {
   @Param @Require content: string;
-  @Param toastLabel: string = 'Copied to clipboard';
-  @Param accessibilityLabel: string = 'Copy';
+  @Param toastLabel: ResourceStr | undefined = undefined;
+  @Param accessibilityLabel: Resource = $r('app.string.action_copy');
   @Param buttonSize: number = OrbitTokens.HIT_COMPACT;
 
   @Local copied: boolean = false;

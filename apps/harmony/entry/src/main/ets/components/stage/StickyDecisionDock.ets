@@ -166,7 +166,7 @@ export struct StickyDecisionDock {
       next.push(key);
       this.selectedMultiOptions = next;
     }
-    this.store.triggerHaptic(8);
+    this.store.triggerHapticPreset('selection');
   }
 
   private permissionTargetPreview(item: OrbitTimelineItemModel): string {
@@ -248,11 +248,11 @@ export struct StickyDecisionDock {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Previous pending decision')
+        .accessibilityText($r('app.string.a11y_prev_decision'))
         .onClick(() => {
           this.activeQueueIndex = (currentIdx - 1 + total) % total;
           this.isPreviewExpanded = false;
-          this.store.triggerHaptic(6);
+          this.store.triggerHaptic('selection');
         })
 
         Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -265,11 +265,11 @@ export struct StickyDecisionDock {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Next pending decision')
+        .accessibilityText($r('app.string.a11y_next_decision'))
         .onClick(() => {
           this.activeQueueIndex = (currentIdx + 1) % total;
           this.isPreviewExpanded = false;
-          this.store.triggerHaptic(6);
+          this.store.triggerHaptic('selection');
         })
       }
       .alignItems(VerticalAlign.Center)
@@ -499,7 +499,7 @@ export struct StickyDecisionDock {
             // Optional "Custom answer…" text input row
             Row({ space: OrbitTokens.SPACE_SM }) {
               TextInput({
-                placeholder: 'Custom answer…',
+                placeholder: $r('app.string.decision_custom_answer_placeholder'),
                 text: this.getCustomAnswer(qItem.requestId, q.id)
               })
                 .attributeModifier(

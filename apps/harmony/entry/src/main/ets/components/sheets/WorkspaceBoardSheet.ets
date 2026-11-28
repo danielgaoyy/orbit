@@ -70,7 +70,7 @@ export struct WorkspaceBoardSheet {
   private beginEditing(): void {
     this.boardDraft = this.store.workspaceBoardContent;
     this.isEditingBoard = true;
-    this.store.triggerHaptic(6);
+    this.store.triggerHapticPreset('selection');
   }
 
   private saveBoardDraft(): void {
@@ -82,7 +82,7 @@ export struct WorkspaceBoardSheet {
   private submitSpawnPeer(): void {
     dismissHarmonyKeyboard(this.getUIContext());
     if (this.peerPromptDraft.trim().length === 0) {
-      this.store.showToast('Enter instructions for the peer', true);
+      this.store.showToastResource($r('app.string.toast_enter_peer_instructions'), true);
       return;
     }
     const ok = this.store.spawnWorkspacePeer(
@@ -160,7 +160,7 @@ export struct WorkspaceBoardSheet {
 
       if (this.isEditingBoard) {
         TextArea({
-          placeholder: '## Goal\n\n## Contracts\n\n## Findings',
+          placeholder: $r('app.string.board_editor_placeholder'),
           text: this.boardDraft
         })
           .fontSize(OrbitTokens.FONT_META_RES)
@@ -179,7 +179,7 @@ export struct WorkspaceBoardSheet {
         Scroll() {
           Column({ space: OrbitTokens.SPACE_SM }) {
             if (this.store.workspaceBoardContent.trim().length === 0) {
-              Text('BOARD.md is empty. Tap Edit to record shared goals, API contracts, or findings for sibling agents.')
+              Text($r('app.string.board_empty_hint'))
                 .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted))
                 .width('100%')
             } else {
@@ -215,9 +215,9 @@ export struct WorkspaceBoardSheet {
       if (this.peerList.length === 0) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_XS }) {
-            Text('No sibling peers in this workspace')
+            Text($r('app.string.board_no_peers_title'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-            Text('Spawn a peer below to collaborate on the same Shared Blackboard.')
+            Text($r('app.string.board_no_peers_subtitle'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
           }
           .width('100%')
@@ -264,7 +264,7 @@ export struct WorkspaceBoardSheet {
 
       ListItem() {
         Column({ space: OrbitTokens.SPACE_SM }) {
-          TextInput({ placeholder: 'Optional @handle (e.g. reviewer)', text: this.peerHandleDraft })
+          TextInput({ placeholder: $r('app.string.board_peer_handle_placeholder'), text: this.peerHandleDraft })
             .attributeModifier(
               orbitInputSubhead(
                 this.store.palette.fgPrimary,
@@ -280,7 +280,7 @@ export struct WorkspaceBoardSheet {
               this.peerHandleDraft = val;
             })
 
-          TextArea({ placeholder: 'Task brief for the new peer…', text: this.peerPromptDraft })
+          TextArea({ placeholder: $r('app.string.board_peer_brief_placeholder'), text: this.peerPromptDraft })
             .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
             .fontColor(this.store.palette.fgPrimary)
             .placeholderColor(this.store.palette.fgMuted)
@@ -364,7 +364,7 @@ export struct WorkspaceBoardSheet {
             .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text('Shared Blackboard & Peers')
+          Text($r('app.string.board_sheet_title'))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
         }
         .alignItems(HorizontalAlign.Start)
@@ -379,10 +379,10 @@ export struct WorkspaceBoardSheet {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Refresh board')
+        .accessibilityText($r('app.string.board_refresh_a11y'))
         .onClick(() => {
           this.store.refreshWorkspaceBoard();
-          this.store.triggerHaptic(6);
+          this.store.triggerHapticPreset('selection');
         })
       }
       .width('100%')
@@ -393,7 +393,7 @@ export struct WorkspaceBoardSheet {
         selectedIndex: this.activeTabIndex,
         onItemClicked: (idx: number) => {
           this.activeTabIndex = idx;
-          this.store.triggerHaptic(6);
+          this.store.triggerHapticPreset('selection');
         },
         itemFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
         itemSelectedFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),

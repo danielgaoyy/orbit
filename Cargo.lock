@@ -2589,10 +2589,12 @@ dependencies = [
  "napi-ohos",
  "orbit-client-core",
  "orbit-crypto",
+ "orbit-daemon",
  "orbit-protocol",
  "orbit-store",
  "serde",
  "serde_json",
+ "tokio",
  "zeroize",
 ]
 

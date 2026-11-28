@@ -85,7 +85,7 @@ export struct RenameWorkspaceSheet {
     }
     if (outcome.ok) {
       this.store.showToastResource($r('app.string.workspace_renamed_toast'), false);
-      this.store.triggerHaptic(10);
+      this.store.triggerHapticPreset('success');
       this.onClose();
     } else {
       this.store.showToastResource(

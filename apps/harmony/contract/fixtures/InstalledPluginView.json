@@ -1,0 +1,34 @@
+{
+  "enabled": true,
+  "manifest": {
+    "author": "Orbit",
+    "capabilities": {
+      "fs_read_globs": [
+        "src/**"
+      ],
+      "hook_events": [
+        "pre_tool_use"
+      ],
+      "http_domains": [],
+      "max_fuel": 1000000,
+      "max_memory_bytes": 1048576
+    },
+    "description": "Checks workspace hygiene",
+    "id": "orbit-lint",
+    "mcp_ops": [
+      {
+        "description": "Run lint check",
+        "name": "lint_check"
+      }
+    ],
+    "name": "Orbit Lint",
+    "ui_slots": [
+      {
+        "slot": "settings_panel",
+        "title": "Lint"
+      }
+    ],
+    "version": "1.0.0",
+    "wasm_entry": "plugin.wasm"
+  }
+}

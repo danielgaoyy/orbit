@@ -9,6 +9,70 @@
       "value": "Orbit"
     },
     {
+      "name": "a11y_access_permissions",
+      "value": "アクセス権限：%s"
+    },
+    {
+      "name": "a11y_attach_media_files",
+      "value": "写真・カメラ・ファイルを添付"
+    },
+    {
+      "name": "a11y_close_side_panel",
+      "value": "サイドパネルを閉じる"
+    },
+    {
+      "name": "a11y_close_tab",
+      "value": "%s を閉じる"
+    },
+    {
+      "name": "a11y_exec_env_local",
+      "value": "実行環境：ローカル"
+    },
+    {
+      "name": "a11y_exec_env_worktree",
+      "value": "実行環境：Worktree"
+    },
+    {
+      "name": "a11y_fast_mode_off",
+      "value": "高速モード：オフ"
+    },
+    {
+      "name": "a11y_fast_mode_on",
+      "value": "高速モード：オン"
+    },
+    {
+      "name": "a11y_next_decision",
+      "value": "次の保留中の確認へ"
+    },
+    {
+      "name": "a11y_open_panel_launchpad",
+      "value": "パネルランチャーを開く"
+    },
+    {
+      "name": "a11y_prev_decision",
+      "value": "前の保留中の確認へ"
+    },
+    {
+      "name": "a11y_queue_prompt",
+      "value": "プロンプトを送信またはキュー追加"
+    },
+    {
+      "name": "a11y_remove_queued_prompt",
+      "value": "キューのプロンプトを削除"
+    },
+    {
+      "name": "a11y_scroll_latest_message",
+      "value": "最新のメッセージへ移動"
+    },
+    {
+      "name": "a11y_scroll_latest_streaming",
+      "value": "最新のストリーミング出力へ移動"
+    },
+    {
+      "name": "a11y_stop_agent",
+      "value": "エージェントを停止"
+    },
+    {
       "name": "action_allow_once",
       "value": "1回のみ許可"
     },
@@ -157,6 +221,10 @@
       "value": "Diff を表示"
     },
     {
+      "name": "automations_create_schedule",
+      "value": "スケジュールを作成"
+    },
+    {
       "name": "automations_goals",
       "value": "ゴール"
     },
@@ -181,6 +249,70 @@
       "value": "新規ワークフロー"
     },
     {
+      "name": "automations_no_run_history",
+      "value": "実行履歴はまだありません。"
+    },
+    {
+      "name": "automations_ph_cron",
+      "value": "Cron（例: 0 9 * * *）"
+    },
+    {
+      "name": "automations_ph_goal_objective",
+      "value": "自律ゴールの目的…"
+    },
+    {
+      "name": "automations_ph_max",
+      "value": "上限"
+    },
+    {
+      "name": "automations_ph_monitor_name",
+      "value": "モニター名"
+    },
+    {
+      "name": "automations_ph_regex",
+      "value": "正規表現 / パターン（任意）"
+    },
+    {
+      "name": "automations_ph_schedule_name",
+      "value": "スケジュール名"
+    },
+    {
+      "name": "automations_ph_seconds",
+      "value": "秒数"
+    },
+    {
+      "name": "automations_ph_seconds_example",
+      "value": "秒数（例: 300）"
+    },
+    {
+      "name": "automations_ph_timer_prompt",
+      "value": "タイマー発火時のフォローアッププロンプト…"
+    },
+    {
+      "name": "automations_ph_trigger_prompt",
+      "value": "トリガーごとに実行するプロンプト…"
+    },
+    {
+      "name": "automations_ph_verify_cmd",
+      "value": "検証コマンド（任意）"
+    },
+    {
+      "name": "automations_ph_workflow_name",
+      "value": "ワークフロー名"
+    },
+    {
+      "name": "automations_ph_workflow_steps",
+      "value": "メインステップの指示…"
+    },
+    {
+      "name": "automations_refresh_a11y",
+      "value": "オートメーションを更新"
+    },
+    {
+      "name": "automations_run_in_worktree",
+      "value": "隔離された Git ワークツリーで実行"
+    },
+    {
       "name": "automations_schedules",
       "value": "スケジュール"
     },
@@ -189,8 +321,16 @@
       "value": "タイマー"
     },
     {
+      "name": "automations_title",
+      "value": "オートメーション"
+    },
+    {
       "name": "automations_verify_now",
       "value": "今すぐ検証"
+    },
+    {
+      "name": "automations_winner_badge",
+      "value": "採用"
     },
     {
       "name": "automations_workflows",
@@ -322,7 +462,11 @@
     },
     {
       "name": "board_editor_placeholder",
-      "value": "## 目標\n\n## 契約"
+      "value": "## 目標\n\n## 契約\n\n## 知見"
+    },
+    {
+      "name": "board_empty_hint",
+      "value": "BOARD.md は空です。編集をタップして共有目標や契約、知見を記録してください。"
     },
     {
       "name": "board_empty_notice",
@@ -345,8 +489,24 @@
       "value": "ホストから初期スナップショットを読み込むと編集できます。"
     },
     {
+      "name": "board_no_peers_subtitle",
+      "value": "下からピアを起動して同じ共有ボードで協働できます。"
+    },
+    {
+      "name": "board_no_peers_title",
+      "value": "このワークスペースにピアはいません"
+    },
+    {
       "name": "board_peer_aliases",
       "value": "旧名 %s"
+    },
+    {
+      "name": "board_peer_brief_placeholder",
+      "value": "新しいピアへのタスク概要…"
+    },
+    {
+      "name": "board_peer_handle_placeholder",
+      "value": "任意の @ハンドル（例: reviewer）"
     },
     {
       "name": "board_peers_tab_count",
@@ -355,6 +515,10 @@
     {
       "name": "board_recent_activity",
       "value": "最近のアクティビティ"
+    },
+    {
+      "name": "board_refresh_a11y",
+      "value": "ボードを更新"
     },
     {
       "name": "board_refresh_aria",
@@ -375,6 +539,10 @@
     {
       "name": "board_saved_toast",
       "value": "BOARD.md を保存しました"
+    },
+    {
+      "name": "board_sheet_title",
+      "value": "共有ボードとピア"
     },
     {
       "name": "board_snapshot_not_loaded",
@@ -869,6 +1037,70 @@
       "value": "SSH"
     },
     {
+      "name": "decision_custom_answer_placeholder",
+      "value": "カスタム回答を入力…"
+    },
+    {
+      "name": "diagram_code_view",
+      "value": "コード表示"
+    },
+    {
+      "name": "diagram_copy_source_a11y",
+      "value": "図のソースをコピー"
+    },
+    {
+      "name": "diagram_expand_a11y",
+      "value": "図を全画面で表示"
+    },
+    {
+      "name": "diagram_open_fullscreen",
+      "value": "図を全画面で見る"
+    },
+    {
+      "name": "diagram_ready_summary",
+      "value": "%1$s を生成済み · %2$d × %3$d · タップして拡大"
+    },
+    {
+      "name": "diagram_rendering",
+      "value": "%s をレンダリング中…"
+    },
+    {
+      "name": "diagram_tab_code",
+      "value": "コード"
+    },
+    {
+      "name": "diagram_tab_preview",
+      "value": "プレビュー"
+    },
+    {
+      "name": "dir_cancel_path_a11y",
+      "value": "パス入力をキャンセル"
+    },
+    {
+      "name": "dir_enter_path_a11y",
+      "value": "パスを手動入力"
+    },
+    {
+      "name": "dir_filter_placeholder",
+      "value": "フォルダやリポジトリを絞り込み…"
+    },
+    {
+      "name": "dir_git_badge",
+      "value": "git"
+    },
+    {
+      "name": "dir_loading",
+      "value": "ディレクトリを読み込み中…"
+    },
+    {
+      "name": "dir_parent_a11y",
+      "value": "親ディレクトリ"
+    },
+    {
+      "name": "dir_path_placeholder",
+      "value": "/ワークスペースのパス"
+    },
+    {
       "name": "export_copy_action",
       "value": "エクスポート結果をコピー"
     },
@@ -1053,6 +1285,38 @@
       "value": "PR を作成"
     },
     {
+      "name": "git_diff_clean_subtitle",
+      "value": "アクティブなワークスペースに未ステージまたはセッションの変更はありません。"
+    },
+    {
+      "name": "git_diff_clean_title",
+      "value": "作業ツリーはクリーンです"
+    },
+    {
+      "name": "git_diff_close_a11y",
+      "value": "Git 差分インスペクタを閉じる"
+    },
+    {
+      "name": "git_diff_filter_placeholder",
+      "value": "変更ファイルを絞り込み…"
+    },
+    {
+      "name": "git_diff_generated_badge",
+      "value": "生成済み"
+    },
+    {
+      "name": "git_diff_no_matching_subtitle",
+      "value": "上のフィルタをクリアしてすべての変更ファイルを表示します。"
+    },
+    {
+      "name": "git_diff_no_matching_title",
+      "value": "一致する変更ファイルがありません"
+    },
+    {
+      "name": "git_diff_refresh_a11y",
+      "value": "Git 差分を更新"
+    },
+    {
       "name": "git_diff_unconfirmed_notice",
       "value": "並列切替または状態更新により Diff の帰属が未確定です。"
     },
@@ -1099,6 +1363,14 @@
     {
       "name": "git_generate_message",
       "value": "AI 生成"
+    },
+    {
+      "name": "git_loading_staged_diff",
+      "value": "ステージ済み差分を読み込み中…"
+    },
+    {
+      "name": "git_loading_unstaged_diff",
+      "value": "未ステージ差分を読み込み中…"
     },
     {
       "name": "git_pr_body_placeholder",
@@ -1173,6 +1445,10 @@
       "value": "すべてステージ"
     },
     {
+      "name": "git_staged_unverified",
+      "value": "このスコープのステージ済み差分を確認できませんでした"
+    },
+    {
       "name": "git_stash_list_title",
       "value": "保存済みスタッシュ"
     },
@@ -1195,6 +1471,10 @@
     {
       "name": "git_unstage_all",
       "value": "すべて解除"
+    },
+    {
+      "name": "git_unstaged_unverified",
+      "value": "このスコープの未ステージ差分を確認できませんでした"
     },
     {
       "name": "git_working_tree_clean_scope",
@@ -1303,6 +1583,14 @@
     {
       "name": "handoff_untracked_conflict",
       "value": "未追跡ファイルの競合は 3-way マージで解決できません"
+    },
+    {
+      "name": "model_picker_refresh_a11y",
+      "value": "モデル一覧を更新"
+    },
+    {
+      "name": "model_picker_thinking",
+      "value": "思考"
     },
     {
       "name": "module_desc",
@@ -1681,8 +1969,972 @@
       "value": "グローバル検索"
     },
     {
+      "name": "settings_about_encryption",
+      "value": "暗号化"
+    },
+    {
+      "name": "settings_about_encryption_value",
+      "value": "Noise NK · E2EE"
+    },
+    {
+      "name": "settings_about_platform",
+      "value": "プラットフォーム"
+    },
+    {
+      "name": "settings_about_platform_value",
+      "value": "HarmonyOS NEXT · ArkUI V2"
+    },
+    {
+      "name": "settings_acp_add_custom",
+      "value": "カスタム ACP エージェントを追加"
+    },
+    {
+      "name": "settings_acp_args_input_a11y",
+      "value": "カスタム ACP 引数入力欄"
+    },
+    {
+      "name": "settings_acp_args_placeholder",
+      "value": "引数（スペース区切り・任意）"
+    },
+    {
+      "name": "settings_acp_cmd_input_a11y",
+      "value": "カスタム ACP コマンド入力欄"
+    },
+    {
+      "name": "settings_acp_cmd_placeholder",
+      "value": "実行コマンド（例：npx）"
+    },
+    {
+      "name": "settings_acp_empty",
+      "value": "このホストに ACP エージェントはありません。"
+    },
+    {
+      "name": "settings_acp_id_input_a11y",
+      "value": "カスタム ACP エージェント ID 入力欄"
+    },
+    {
+      "name": "settings_acp_id_placeholder",
+      "value": "エージェント ID（例：my-acp）"
+    },
+    {
+      "name": "settings_acp_installed",
+      "value": "インストール済み"
+    },
+    {
+      "name": "settings_acp_name_input_a11y",
+      "value": "カスタム ACP エージェント名入力欄"
+    },
+    {
+      "name": "settings_acp_name_placeholder",
+      "value": "表示名"
+    },
+    {
+      "name": "settings_acp_not_installed",
+      "value": "未インストール"
+    },
+    {
+      "name": "settings_acp_registry_section",
+      "value": "ACP レジストリ"
+    },
+    {
+      "name": "settings_acp_test_btn",
+      "value": "テスト"
+    },
+    {
+      "name": "settings_acp_test_ok",
+      "value": "%1$s が %2$d ms で応答しました"
+    },
+    {
+      "name": "settings_agents_defaults_section",
+      "value": "現在のデフォルト"
+    },
+    {
+      "name": "settings_agents_effort_label",
+      "value": "推論レベル"
+    },
+    {
+      "name": "settings_agents_model_count",
+      "value": "%d 件のモデルが利用可能"
+    },
+    {
+      "name": "settings_agents_model_label",
+      "value": "デフォルトモデル"
+    },
+    {
+      "name": "settings_agents_models_subtitle",
+      "value": "プロバイダー・既定モデル・ACP レジストリ"
+    },
+    {
+      "name": "settings_agents_no_catalogs",
+      "value": "ホストに接続して更新するとプロバイダーのモデル一覧を確認できます。"
+    },
+    {
+      "name": "settings_agents_no_models",
+      "value": "このホストでモデルがまだ検出されていません。"
+    },
+    {
+      "name": "settings_agents_provider_label",
+      "value": "デフォルトプロバイダー"
+    },
+    {
+      "name": "settings_agents_providers_section",
+      "value": "ホストのプロバイダー"
+    },
+    {
+      "name": "settings_agents_select_effort_hint",
+      "value": "タップして推論の深さを選択"
+    },
+    {
+      "name": "settings_agents_select_model_hint",
+      "value": "タップしてデフォルトモデルを選択"
+    },
+    {
+      "name": "settings_appearance_a11y_section",
+      "value": "アクセシビリティと表示"
+    },
+    {
+      "name": "settings_appearance_dark",
+      "value": "ダーク"
+    },
+    {
+      "name": "settings_appearance_font_scale_cap",
+      "value": "UI 文字拡大上限"
+    },
+    {
+      "name": "settings_appearance_light",
+      "value": "ライト"
+    },
+    {
+      "name": "settings_appearance_reduced_motion",
+      "value": "視差効果を減らす（システム）"
+    },
+    {
+      "name": "settings_appearance_system",
+      "value": "システム"
+    },
+    {
+      "name": "settings_appearance_theme_hint",
+      "value": "システム・ライト・ダークの3段階から選択できます。旧ダーク設定は自動的にダークへ移行されます。"
+    },
+    {
+      "name": "settings_appearance_theme_section",
+      "value": "テーマモード"
+    },
+    {
+      "name": "settings_apply_relay_fleet",
+      "value": "全ホストへリレーを一括適用"
+    },
+    {
+      "name": "settings_apply_relay_fleet_done",
+      "value": "%d 台のホストのリレー設定を更新しました。"
+    },
+    {
+      "name": "settings_copy_pairing_uri",
+      "value": "ペアリング URI をコピー"
+    },
+    {
+      "name": "settings_direct_endpoint_placeholder",
+      "value": "ws://192.168.1.x:6868/ws"
+    },
+    {
+      "name": "settings_ext_scope_host",
+      "value": "スコープ：ホスト全体"
+    },
+    {
+      "name": "settings_ext_scope_project",
+      "value": "スコープ：ホスト + プロジェクト"
+    },
+    {
+      "name": "settings_ext_scope_toggle_a11y",
+      "value": "ホスト・プロジェクトのスコープ切替"
+    },
+    {
+      "name": "settings_fleet_relay_hint",
+      "value": "すべてのペアリング済みホストへ共通のリレー URL を一括適用します。空欄で解除します。"
+    },
+    {
+      "name": "settings_fleet_relay_input_a11y",
+      "value": "フリートリレー URL 入力欄"
+    },
+    {
+      "name": "settings_fleet_relay_section",
+      "value": "フリートリレー同期"
+    },
+    {
+      "name": "settings_general_default_mode_section",
+      "value": "デフォルト権限モード"
+    },
+    {
+      "name": "settings_general_language_hint",
+      "value": "変更は保存され、対応画面に即時反映されます。"
+    },
+    {
+      "name": "settings_general_language_section",
+      "value": "表示言語"
+    },
+    {
+      "name": "settings_general_send_section",
+      "value": "実行中のデフォルト送信動作"
+    },
+    {
+      "name": "settings_group_about",
+      "value": "このアプリについて"
+    },
+    {
+      "name": "settings_group_agents_safety",
+      "value": "エージェントと安全"
+    },
+    {
+      "name": "settings_group_context_extensions",
+      "value": "コンテキストと拡張"
+    },
+    {
+      "name": "settings_group_fleet_sync",
+      "value": "フリートと同期"
+    },
+    {
+      "name": "settings_group_preferences",
+      "value": "環境設定"
+    },
+    {
+      "name": "settings_guardian_enable",
+      "value": "Guardian 自動承認を有効化"
+    },
+    {
+      "name": "settings_guardian_max_risk",
+      "value": "自動承認の最大リスク"
+    },
+    {
+      "name": "settings_guardian_read_only",
+      "value": "読み取り専用ツールを自動承認"
+    },
+    {
+      "name": "settings_guardian_section",
+      "value": "Guardian ポリシー"
+    },
+    {
+      "name": "settings_guardian_tier2",
+      "value": "Tier-2 AI リスク分類を有効化"
+    },
+    {
+      "name": "settings_guardian_workspace_tests",
+      "value": "ワークスペースのビルドとテストを自動承認"
+    },
+    {
+      "name": "settings_host_connection",
+      "value": "接続設定"
+    },
+    {
+      "name": "settings_host_daemon",
+      "value": "デーモン"
+    },
+    {
+      "name": "settings_host_diagnostics",
+      "value": "診断"
+    },
+    {
+      "name": "settings_host_direct_endpoint",
+      "value": "ダイレクトエンドポイント"
+    },
+    {
+      "name": "settings_host_direct_endpoint_a11y",
+      "value": "ダイレクト接続先入力欄"
+    },
+    {
+      "name": "settings_host_display_name",
+      "value": "表示名"
+    },
+    {
+      "name": "settings_host_display_name_a11y",
+      "value": "ホスト表示名入力欄"
+    },
+    {
+      "name": "settings_host_latency",
+      "value": "レイテンシ"
+    },
+    {
+      "name": "settings_host_not_found",
+      "value": "このホストはペアリング解除されています。"
+    },
+    {
+      "name": "settings_host_pubkey",
+      "value": "公開鍵"
+    },
+    {
+      "name": "settings_host_relay_url",
+      "value": "リレー URL"
+    },
+    {
+      "name": "settings_host_relay_url_a11y",
+      "value": "ホストリレー URL 入力欄"
+    },
+    {
+      "name": "settings_host_route_mode",
+      "value": "ルートモード"
+    },
+    {
+      "name": "settings_hosts_active_badge",
+      "value": "使用中"
+    },
+    {
+      "name": "settings_hosts_count_summary",
+      "value": "%d 台のホストをペアリング済み"
+    },
+    {
+      "name": "settings_hosts_empty",
+      "value": "ペアリング済みのホストはありません。"
+    },
+    {
+      "name": "settings_hosts_paired_section",
+      "value": "ペアリング済みホスト"
+    },
+    {
+      "name": "settings_item_agents_models",
+      "value": "エージェントとモデル"
+    },
+    {
+      "name": "settings_item_appearance",
+      "value": "外観"
+    },
+    {
+      "name": "settings_item_cloud_sync",
+      "value": "クラウド同期"
+    },
+    {
+      "name": "settings_item_general",
+      "value": "一般"
+    },
+    {
+      "name": "settings_item_host_detail",
+      "value": "ホスト詳細とペアリングQR"
+    },
+    {
+      "name": "settings_item_hosts",
+      "value": "ホスト"
+    },
+    {
+      "name": "settings_item_mcp",
+      "value": "MCP サーバー"
+    },
+    {
+      "name": "settings_item_memory",
+      "value": "プロジェクトメモリ"
+    },
+    {
+      "name": "settings_item_notifications",
+      "value": "通知"
+    },
+    {
+      "name": "settings_item_permissions_guardian",
+      "value": "権限と Guardian"
+    },
+    {
+      "name": "settings_item_plugins",
+      "value": "プラグイン"
+    },
+    {
+      "name": "settings_item_sandbox",
+      "value": "サンドボックス"
+    },
+    {
+      "name": "settings_item_skills",
+      "value": "スキル"
+    },
+    {
+      "name": "settings_item_usage_quotas",
+      "value": "使用量とクォータ"
+    },
+    {
+      "name": "settings_lang_en",
+      "value": "English"
+    },
+    {
+      "name": "settings_lang_ja",
+      "value": "日本語"
+    },
+    {
+      "name": "settings_lang_system",
+      "value": "システムに従う"
+    },
+    {
+      "name": "settings_lang_zh",
+      "value": "简体中文"
+    },
+    {
+      "name": "settings_mcp_empty",
+      "value": "このホストに外部 MCP サーバーは設定されていません。"
+    },
+    {
+      "name": "settings_mcp_probe_ok",
+      "value": "%1$d ツール · %2$d ms"
+    },
+    {
+      "name": "settings_mcp_subtitle",
+      "value": "外部 MCP サーバーの一覧と有効/無効切替"
+    },
+    {
+      "name": "settings_memory_confirm_a11y",
+      "value": "プロジェクトメモリを確認済みにする"
+    },
+    {
+      "name": "settings_memory_delete_a11y",
+      "value": "プロジェクトメモリを削除"
+    },
+    {
+      "name": "settings_memory_delete_message",
+      "value": "プロジェクトメモリ「%s」を完全に削除しますか？"
+    },
+    {
+      "name": "settings_memory_delete_title",
+      "value": "プロジェクトメモリを削除しますか？"
+    },
+    {
+      "name": "settings_memory_empty",
+      "value": "このプロジェクトにはまだメモリが記録されていません。"
+    },
+    {
+      "name": "settings_memory_no_workspace",
+      "value": "このホストでプロジェクトを開くか固定するとメモリを確認できます。"
+    },
+    {
+      "name": "settings_memory_status_confirmed",
+      "value": "確認済み"
+    },
+    {
+      "name": "settings_memory_status_hypothesis",
+      "value": "仮説"
+    },
+    {
+      "name": "settings_memory_status_recheck",
+      "value": "再確認が必要"
+    },
+    {
+      "name": "settings_memory_subtitle",
+      "value": "ワークスペースメモリの確認・削除"
+    },
+    {
+      "name": "settings_memory_workspace_label",
+      "value": "ワークスペースディレクトリ"
+    },
+    {
+      "name": "settings_mode_accept_edits",
+      "value": "編集を自動承認"
+    },
+    {
+      "name": "settings_mode_auto",
+      "value": "自動"
+    },
+    {
+      "name": "settings_mode_default",
+      "value": "デフォルト"
+    },
+    {
+      "name": "settings_mode_full_access",
+      "value": "フルアクセス"
+    },
+    {
+      "name": "settings_no_host_selected",
+      "value": "ホスト設定を表示するには先にホストをペアリングまたは選択してください。"
+    },
+    {
+      "name": "settings_pa_memory_capable",
+      "value": "ローカルメモリ対応"
+    },
+    {
+      "name": "settings_pa_mesh_empty",
+      "value": "メッシュピアはまだ構成されていません。"
+    },
+    {
+      "name": "settings_pa_no_hosts",
+      "value": "利用可能な候補ホストがまだ見つかりません。"
+    },
+    {
+      "name": "settings_pa_prereview_assist",
+      "value": "アシスト"
+    },
+    {
+      "name": "settings_pa_prereview_label",
+      "value": "事前審査ポリシー"
+    },
+    {
+      "name": "settings_pa_prereview_medium",
+      "value": "中リスクのみ"
+    },
+    {
+      "name": "settings_pa_row_subtitle",
+      "value": "メッシュピア %d 件"
+    },
+    {
+      "name": "settings_pa_scope_fleet",
+      "value": "フリート全体"
+    },
+    {
+      "name": "settings_pa_scope_label",
+      "value": "オーケストレーション範囲"
+    },
+    {
+      "name": "settings_pa_scope_local",
+      "value": "ローカルホストのみ"
+    },
+    {
+      "name": "settings_pair_host_submit",
+      "value": "ホストをペアリング"
+    },
+    {
+      "name": "settings_pair_new_host",
+      "value": "新しいホストをペアリング"
+    },
+    {
+      "name": "settings_pairing_qr_warning",
+      "value": "この QR コードにはペアリングシークレットが含まれます。信頼できるご自身の Orbit 端末のみに共有してください。"
+    },
+    {
+      "name": "settings_pairing_uri_input_a11y",
+      "value": "ペアリング URI 入力欄"
+    },
+    {
+      "name": "settings_pairing_uri_label",
+      "value": "ペアリング URI"
+    },
+    {
+      "name": "settings_pairing_uri_placeholder",
+      "value": "orbit://pair/…"
+    },
+    {
+      "name": "settings_permissions_subtitle",
+      "value": "既定モード・Guardian ポリシー・ツールルール"
+    },
+    {
+      "name": "settings_plugins_caps_summary",
+      "value": "MCP 操作 %1$d 件 · フック %2$d 件"
+    },
+    {
+      "name": "settings_plugins_empty",
+      "value": "このホストに WASM プラグインはインストールされていません。"
+    },
+    {
+      "name": "settings_plugins_subtitle",
+      "value": "WASM プラグインの確認と有効/無効切替"
+    },
+    {
+      "name": "settings_push_master_switch",
+      "value": "通知を有効にする"
+    },
+    {
+      "name": "settings_push_not_registered",
+      "value": "未登録"
+    },
+    {
+      "name": "settings_push_pref_timers",
+      "value": "スケジュール・条件タイマー発火"
+    },
+    {
+      "name": "settings_push_synced_daemons",
+      "value": "同期済みデーモン"
+    },
+    {
+      "name": "settings_push_token_label",
+      "value": "Push Kit トークン"
+    },
+    {
+      "name": "settings_readonly_badge",
+      "value": "読み取り専用"
+    },
+    {
+      "name": "settings_relay_url_placeholder",
+      "value": "wss://relay.orbit.dev"
+    },
+    {
+      "name": "settings_remove_host",
+      "value": "ホストを削除"
+    },
+    {
+      "name": "settings_remove_host_confirm",
+      "value": "削除"
+    },
+    {
+      "name": "settings_remove_host_message",
+      "value": "このホストで実行中のリモートエージェントセッションは終了されません。"
+    },
+    {
+      "name": "settings_remove_host_title",
+      "value": "%s を削除しますか？"
+    },
+    {
+      "name": "settings_risk_low",
+      "value": "低リスク"
+    },
+    {
+      "name": "settings_risk_medium",
+      "value": "中リスク"
+    },
+    {
+      "name": "settings_route_auto",
+      "value": "自動"
+    },
+    {
+      "name": "settings_route_direct",
+      "value": "ダイレクト"
+    },
+    {
+      "name": "settings_route_relay",
+      "value": "リレー"
+    },
+    {
+      "name": "settings_rule_add_title",
+      "value": "権限ルールを追加"
+    },
+    {
+      "name": "settings_rule_decision_a11y",
+      "value": "ルール判定：%s"
+    },
+    {
+      "name": "settings_rule_delete_message",
+      "value": "「%s」に一致する権限ルールを削除しますか？"
+    },
+    {
+      "name": "settings_rule_delete_title",
+      "value": "権限ルールを削除しますか？"
+    },
+    {
+      "name": "settings_rule_pattern_input_a11y",
+      "value": "権限ルールパターン入力欄"
+    },
+    {
+      "name": "settings_rule_pattern_placeholder",
+      "value": "プレフィックスパターン（例：cargo test）"
+    },
+    {
+      "name": "settings_rule_tool_kind_a11y",
+      "value": "ルールツール種別：%s"
+    },
+    {
+      "name": "settings_rules_empty",
+      "value": "カスタム権限ルールは設定されていません。"
+    },
+    {
+      "name": "settings_rules_section",
+      "value": "ツール権限ルール"
+    },
+    {
+      "name": "settings_sandbox_default_notice",
+      "value": "カスタムサンドボックス設定はなく、ホストの既定隔離ポリシーが適用されています。"
+    },
+    {
+      "name": "settings_sandbox_denied_reads",
+      "value": "読み取り禁止の保護パス"
+    },
+    {
+      "name": "settings_sandbox_mode_label",
+      "value": "隔離モード"
+    },
+    {
+      "name": "settings_sandbox_mode_off",
+      "value": "オフ"
+    },
+    {
+      "name": "settings_sandbox_mode_readonly",
+      "value": "厳格な読み取り専用"
+    },
+    {
+      "name": "settings_sandbox_mode_workspace",
+      "value": "ワークスペース書込のみ"
+    },
+    {
+      "name": "settings_sandbox_network_label",
+      "value": "ネットワークアクセス"
+    },
+    {
+      "name": "settings_sandbox_subtitle",
+      "value": "OS サンドボックスと認証情報保護（閲覧専用）"
+    },
+    {
+      "name": "settings_sandbox_writable_roots",
+      "value": "追加の書き込み許可パス"
+    },
+    {
+      "name": "settings_save_reconnect",
+      "value": "保存して再接続"
+    },
+    {
+      "name": "settings_scan_qr_code",
+      "value": "QR コードをスキャン"
+    },
+    {
+      "name": "settings_search_a11y",
+      "value": "設定を検索"
+    },
+    {
+      "name": "settings_search_clear",
+      "value": "検索をクリア"
+    },
+    {
+      "name": "settings_search_clear_a11y",
+      "value": "設定検索をクリア"
+    },
+    {
+      "name": "settings_search_empty",
+      "value": "一致する設定が見つかりません。"
+    },
+    {
+      "name": "settings_search_placeholder",
+      "value": "設定を検索（日 / 英 / 中 対応）…"
+    },
+    {
+      "name": "settings_send_interrupt",
+      "value": "中断して送信"
+    },
+    {
+      "name": "settings_send_interrupt_desc",
+      "value": "現在のターンを中断して即時送信します（承認待ち中は安全にキューされます）。"
+    },
+    {
+      "name": "settings_send_queue",
+      "value": "キューに追加（推奨）"
+    },
+    {
+      "name": "settings_send_queue_desc",
+      "value": "実行中のターン完了後に順番に送信します。"
+    },
+    {
+      "name": "settings_send_steer",
+      "value": "ステア送信"
+    },
+    {
+      "name": "settings_send_steer_desc",
+      "value": "エージェント実行中に追加指示を送信します（承認待ち中はキューされます）。"
+    },
+    {
+      "name": "settings_share_pairing_desc",
+      "value": "他の信頼できる Orbit クライアントからこのホストへペアリングするための QR コードまたは URI を生成します。"
+    },
+    {
+      "name": "settings_share_pairing_section",
+      "value": "ペアリング URI / QR を共有"
+    },
+    {
+      "name": "settings_show_pairing_qr",
+      "value": "ペアリング QR・URI を表示"
+    },
+    {
+      "name": "settings_skills_empty",
+      "value": "このホストにスキルは見つかりませんでした。"
+    },
+    {
+      "name": "settings_skills_subtitle",
+      "value": "検出された SKILL.md スキルの一覧（閲覧専用）"
+    },
+    {
+      "name": "settings_skills_tokens",
+      "value": "約 %d トークン"
+    },
+    {
+      "name": "settings_state_enabled",
+      "value": "オン"
+    },
+    {
+      "name": "settings_state_off",
+      "value": "オフ"
+    },
+    {
+      "name": "settings_switch_host",
+      "value": "このホストへ切替"
+    },
+    {
+      "name": "settings_sync_auto_sync",
+      "value": "自動同期"
+    },
+    {
+      "name": "settings_sync_connect_github",
+      "value": "GitHub に接続"
+    },
+    {
+      "name": "settings_sync_connected",
+      "value": "接続済み"
+    },
+    {
+      "name": "settings_sync_device_link_desc",
+      "value": "別の Orbit 端末のリンク QR をスキャンしてパスフレーズ入力なしで即座に連携します。"
+    },
+    {
+      "name": "settings_sync_disconnect",
+      "value": "クラウド同期を解除"
+    },
+    {
+      "name": "settings_sync_disconnect_confirm",
+      "value": "解除する"
+    },
+    {
+      "name": "settings_sync_disconnect_message",
+      "value": "暗号化された GitHub Gist ボールトとローカルのホスト設定はそのまま保持されます。"
+    },
+    {
+      "name": "settings_sync_disconnect_title",
+      "value": "クラウド同期を解除しますか？"
+    },
+    {
+      "name": "settings_sync_error",
+      "value": "同期エラー"
+    },
+    {
+      "name": "settings_sync_export_qr_desc",
+      "value": "別の端末からスキャンして E2EE ボールト鍵を安全に引き継ぎます。"
+    },
+    {
+      "name": "settings_sync_fleet_counts",
+      "value": "%1$d ホスト · %2$d プロジェクト"
+    },
+    {
+      "name": "settings_sync_fleet_label",
+      "value": "同期済みフリート"
+    },
+    {
+      "name": "settings_sync_generate",
+      "value": "生成"
+    },
+    {
+      "name": "settings_sync_link_uri_input_a11y",
+      "value": "デバイスリンク URI 入力欄"
+    },
+    {
+      "name": "settings_sync_link_uri_placeholder",
+      "value": "orbit://link/…"
+    },
+    {
+      "name": "settings_sync_locked",
+      "value": "ロック中"
+    },
+    {
+      "name": "settings_sync_not_connected",
+      "value": "未接続"
+    },
+    {
+      "name": "settings_sync_now",
+      "value": "今すぐ同期"
+    },
+    {
+      "name": "settings_sync_passphrase_input_a11y",
+      "value": "クラウド同期パスフレーズ入力欄"
+    },
+    {
+      "name": "settings_sync_passphrase_placeholder",
+      "value": "E2EE パスフレーズを入力"
+    },
+    {
+      "name": "settings_sync_passphrase_title",
+      "value": "ボールトパスフレーズ"
+    },
+    {
+      "name": "settings_sync_pat_desc",
+      "value": "gist スコープが必要です。データはアップロード前にローカルで圧縮・AES-256-GCM 暗号化されます。"
+    },
+    {
+      "name": "settings_sync_pat_input_a11y",
+      "value": "GitHub パーソナルアクセストークン入力欄"
+    },
+    {
+      "name": "settings_sync_pat_placeholder",
+      "value": "ghp_…"
+    },
+    {
+      "name": "settings_sync_pat_title",
+      "value": "GitHub パーソナルアクセストークン"
+    },
+    {
+      "name": "settings_sync_status_label",
+      "value": "ステータス"
+    },
+    {
+      "name": "settings_sync_syncing",
+      "value": "同期中…"
+    },
+    {
+      "name": "settings_sync_unlock",
+      "value": "ロック解除して同期"
+    },
+    {
+      "name": "settings_sync_unlocking",
+      "value": "ロック解除中…"
+    },
+    {
+      "name": "settings_sync_verify_signin",
+      "value": "サインインを確認"
+    },
+    {
+      "name": "settings_target_host_label",
+      "value": "設定対象ホスト"
+    },
+    {
       "name": "settings_upgrade_daemon",
       "value": "デーモンをリモート更新"
+    },
+    {
+      "name": "settings_usage_30d",
+      "value": "30日間"
+    },
+    {
+      "name": "settings_usage_7d",
+      "value": "7日間"
+    },
+    {
+      "name": "settings_usage_by_model",
+      "value": "モデル別内訳"
+    },
+    {
+      "name": "settings_usage_by_project",
+      "value": "プロジェクト別内訳"
+    },
+    {
+      "name": "settings_usage_cache_savings",
+      "value": "キャッシュ節約額"
+    },
+    {
+      "name": "settings_usage_daily",
+      "value": "日別アクティビティ"
+    },
+    {
+      "name": "settings_usage_forecasts",
+      "value": "クォータ消費予測"
+    },
+    {
+      "name": "settings_usage_live_quotas",
+      "value": "プロバイダー別クォータ"
+    },
+    {
+      "name": "settings_usage_no_quotas",
+      "value": "アクティブなレート制限ウィンドウはありません。"
+    },
+    {
+      "name": "settings_usage_subtitle",
+      "value": "トークン履歴・コスト分析・クォータ"
+    },
+    {
+      "name": "settings_usage_summary_section",
+      "value": "期間サマリー"
+    },
+    {
+      "name": "settings_usage_tokens_turns",
+      "value": "トークン・ターン数"
+    },
+    {
+      "name": "settings_usage_total_cost",
+      "value": "推定コスト"
+    },
+    {
+      "name": "side_panel_launchpad_subtitle",
+      "value": "各会話は開いているタブを個別に記憶します。"
+    },
+    {
+      "name": "side_panel_launchpad_title",
+      "value": "サイドパネルで開く"
+    },
+    {
+      "name": "side_panel_reopen_closed",
+      "value": "最近閉じたタブを再度開く"
+    },
+    {
+      "name": "side_panel_resize_a11y",
+      "value": "サイドパネルの幅を変更"
     },
     {
       "name": "side_question_clear",
@@ -2097,8 +3349,28 @@
       "value": "ホストはオフラインです · 再接続時に同期されます"
     },
     {
+      "name": "stage_pair_first_host_body",
+      "value": "LAN、SSH、または E2EE Noise Relay 経由でワークステーション、Linux 開発機、Mac mini 上の orbit daemon に接続します。"
+    },
+    {
+      "name": "stage_pair_first_host_title",
+      "value": "最初のホストをペアリング"
+    },
+    {
+      "name": "stage_pair_uri_placeholder",
+      "value": "orbit://pair/..."
+    },
+    {
       "name": "stage_reconnecting_banner",
       "value": "ホストへ再接続中…"
+    },
+    {
+      "name": "stage_thought_label",
+      "value": "思考"
+    },
+    {
+      "name": "stage_welcome_prompt",
+      "value": "何を作りましょうか？"
     },
     {
       "name": "sync_device_link_qr",
@@ -2157,6 +3429,10 @@
       "value": "ターミナル出力をコピーしました"
     },
     {
+      "name": "terminal_copy_output_a11y",
+      "value": "端末出力をコピー"
+    },
+    {
       "name": "terminal_delta_rev",
       "value": "rev %d"
     },
@@ -2185,12 +3461,28 @@
       "value": "このスロットにアクティブな出力がありません。"
     },
     {
+      "name": "terminal_pty_ready",
+      "value": "orbit shim 独立 PTY 準備完了"
+    },
+    {
+      "name": "terminal_quote_output_a11y",
+      "value": "端末出力を入力欄に引用"
+    },
+    {
       "name": "terminal_raw_placeholder",
       "value": "生のキー入力を送信…"
     },
     {
+      "name": "terminal_send_input_a11y",
+      "value": "端末入力を送信"
+    },
+    {
       "name": "terminal_slot_label",
       "value": "S%d"
+    },
+    {
+      "name": "terminal_spawn_a11y",
+      "value": "新しい端末セッションを作成"
     },
     {
       "name": "terminal_spawn_shell",
@@ -2235,6 +3527,54 @@
     {
       "name": "time_weeksShort",
       "value": "%d週間"
+    },
+    {
+      "name": "toast_clipboard_empty",
+      "value": "クリップボードは空です"
+    },
+    {
+      "name": "toast_clipboard_read_failed",
+      "value": "クリップボードを読み取れません"
+    },
+    {
+      "name": "toast_connect_host_first",
+      "value": "先にホストに接続してください"
+    },
+    {
+      "name": "toast_copied_clipboard",
+      "value": "クリップボードにコピーしました"
+    },
+    {
+      "name": "toast_copy_failed",
+      "value": "クリップボードへのコピーに失敗しました"
+    },
+    {
+      "name": "toast_enter_peer_instructions",
+      "value": "ピアへの指示を入力してください"
+    },
+    {
+      "name": "toast_no_pair_uri_clipboard",
+      "value": "クリップボードに orbit://pair URI が見つかりません"
+    },
+    {
+      "name": "toast_pair_or_select_host_first",
+      "value": "先にホストをペアリングまたは選択してください"
+    },
+    {
+      "name": "toast_rebase_aborted",
+      "value": "リベースを中止しました"
+    },
+    {
+      "name": "toast_rebase_continued",
+      "value": "リベースを再開しました"
+    },
+    {
+      "name": "toast_test_push_failed",
+      "value": "テスト通知の送信に失敗しました"
+    },
+    {
+      "name": "toast_test_push_sent",
+      "value": "ホストからテスト通知を送信しました"
     },
     {
       "name": "topbar_conversationActions",

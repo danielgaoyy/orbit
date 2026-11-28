@@ -9,6 +9,70 @@
       "value": "Orbit"
     },
     {
+      "name": "a11y_access_permissions",
+      "value": "Access permissions: %s"
+    },
+    {
+      "name": "a11y_attach_media_files",
+      "value": "Attach photos, camera, or files"
+    },
+    {
+      "name": "a11y_close_side_panel",
+      "value": "Close side panel"
+    },
+    {
+      "name": "a11y_close_tab",
+      "value": "Close %s"
+    },
+    {
+      "name": "a11y_exec_env_local",
+      "value": "Execution environment: Local"
+    },
+    {
+      "name": "a11y_exec_env_worktree",
+      "value": "Execution environment: Worktree"
+    },
+    {
+      "name": "a11y_fast_mode_off",
+      "value": "Fast mode off"
+    },
+    {
+      "name": "a11y_fast_mode_on",
+      "value": "Fast mode on"
+    },
+    {
+      "name": "a11y_next_decision",
+      "value": "Next pending decision"
+    },
+    {
+      "name": "a11y_open_panel_launchpad",
+      "value": "Open panel launchpad"
+    },
+    {
+      "name": "a11y_prev_decision",
+      "value": "Previous pending decision"
+    },
+    {
+      "name": "a11y_queue_prompt",
+      "value": "Send or queue prompt"
+    },
+    {
+      "name": "a11y_remove_queued_prompt",
+      "value": "Remove queued prompt"
+    },
+    {
+      "name": "a11y_scroll_latest_message",
+      "value": "Scroll to latest message"
+    },
+    {
+      "name": "a11y_scroll_latest_streaming",
+      "value": "Scroll to latest streaming output"
+    },
+    {
+      "name": "a11y_stop_agent",
+      "value": "Stop agent"
+    },
+    {
       "name": "action_allow_once",
       "value": "Allow Once"
     },
@@ -157,6 +221,10 @@
       "value": "View Diff"
     },
     {
+      "name": "automations_create_schedule",
+      "value": "Create Schedule"
+    },
+    {
       "name": "automations_goals",
       "value": "Goals"
     },
@@ -181,6 +249,70 @@
       "value": "New Workflow"
     },
     {
+      "name": "automations_no_run_history",
+      "value": "No run history recorded yet."
+    },
+    {
+      "name": "automations_ph_cron",
+      "value": "Cron (e.g. 0 9 * * *)"
+    },
+    {
+      "name": "automations_ph_goal_objective",
+      "value": "Autonomous goal objective…"
+    },
+    {
+      "name": "automations_ph_max",
+      "value": "Max"
+    },
+    {
+      "name": "automations_ph_monitor_name",
+      "value": "Monitor name"
+    },
+    {
+      "name": "automations_ph_regex",
+      "value": "Regex / pattern (optional)"
+    },
+    {
+      "name": "automations_ph_schedule_name",
+      "value": "Schedule name"
+    },
+    {
+      "name": "automations_ph_seconds",
+      "value": "Seconds"
+    },
+    {
+      "name": "automations_ph_seconds_example",
+      "value": "Seconds (e.g. 300)"
+    },
+    {
+      "name": "automations_ph_timer_prompt",
+      "value": "Follow-up prompt when timer fires…"
+    },
+    {
+      "name": "automations_ph_trigger_prompt",
+      "value": "Prompt to run on each trigger…"
+    },
+    {
+      "name": "automations_ph_verify_cmd",
+      "value": "Verify command (optional)"
+    },
+    {
+      "name": "automations_ph_workflow_name",
+      "value": "Workflow name"
+    },
+    {
+      "name": "automations_ph_workflow_steps",
+      "value": "Primary step instructions…"
+    },
+    {
+      "name": "automations_refresh_a11y",
+      "value": "Refresh automations"
+    },
+    {
+      "name": "automations_run_in_worktree",
+      "value": "Run in isolated git worktree"
+    },
+    {
       "name": "automations_schedules",
       "value": "Schedules"
     },
@@ -189,8 +321,16 @@
       "value": "Timers"
     },
     {
+      "name": "automations_title",
+      "value": "Automations"
+    },
+    {
       "name": "automations_verify_now",
       "value": "Verify Now"
+    },
+    {
+      "name": "automations_winner_badge",
+      "value": "Winner"
     },
     {
       "name": "automations_workflows",
@@ -322,7 +462,11 @@
     },
     {
       "name": "board_editor_placeholder",
-      "value": "## Goal\n\n## Contracts"
+      "value": "## Goal\n\n## Contracts\n\n## Findings"
+    },
+    {
+      "name": "board_empty_hint",
+      "value": "BOARD.md is empty. Tap Edit to record shared goals, API contracts, or findings for sibling agents."
     },
     {
       "name": "board_empty_notice",
@@ -345,8 +489,24 @@
       "value": "Editing unlocks once the initial snapshot loads from the host."
     },
     {
+      "name": "board_no_peers_subtitle",
+      "value": "Spawn a peer below to collaborate on the same Shared Blackboard."
+    },
+    {
+      "name": "board_no_peers_title",
+      "value": "No sibling peers in this workspace"
+    },
+    {
       "name": "board_peer_aliases",
       "value": "aka %s"
+    },
+    {
+      "name": "board_peer_brief_placeholder",
+      "value": "Task brief for the new peer…"
+    },
+    {
+      "name": "board_peer_handle_placeholder",
+      "value": "Optional @handle (e.g. reviewer)"
     },
     {
       "name": "board_peers_tab_count",
@@ -355,6 +515,10 @@
     {
       "name": "board_recent_activity",
       "value": "Recent Activity"
+    },
+    {
+      "name": "board_refresh_a11y",
+      "value": "Refresh board"
     },
     {
       "name": "board_refresh_aria",
@@ -375,6 +539,10 @@
     {
       "name": "board_saved_toast",
       "value": "Saved BOARD.md"
+    },
+    {
+      "name": "board_sheet_title",
+      "value": "Shared Blackboard & Peers"
     },
     {
       "name": "board_snapshot_not_loaded",
@@ -869,6 +1037,70 @@
       "value": "SSH"
     },
     {
+      "name": "decision_custom_answer_placeholder",
+      "value": "Custom answer…"
+    },
+    {
+      "name": "diagram_code_view",
+      "value": "Code view"
+    },
+    {
+      "name": "diagram_copy_source_a11y",
+      "value": "Copy diagram source"
+    },
+    {
+      "name": "diagram_expand_a11y",
+      "value": "Open full-screen diagram"
+    },
+    {
+      "name": "diagram_open_fullscreen",
+      "value": "View Full Diagram"
+    },
+    {
+      "name": "diagram_ready_summary",
+      "value": "Rendered %1$s · %2$d × %3$d · Tap to inspect"
+    },
+    {
+      "name": "diagram_rendering",
+      "value": "Rendering %s…"
+    },
+    {
+      "name": "diagram_tab_code",
+      "value": "Code"
+    },
+    {
+      "name": "diagram_tab_preview",
+      "value": "Preview"
+    },
+    {
+      "name": "dir_cancel_path_a11y",
+      "value": "Cancel path input"
+    },
+    {
+      "name": "dir_enter_path_a11y",
+      "value": "Enter path manually"
+    },
+    {
+      "name": "dir_filter_placeholder",
+      "value": "Filter folders or repositories…"
+    },
+    {
+      "name": "dir_git_badge",
+      "value": "git"
+    },
+    {
+      "name": "dir_loading",
+      "value": "Loading directory…"
+    },
+    {
+      "name": "dir_parent_a11y",
+      "value": "Parent directory"
+    },
+    {
+      "name": "dir_path_placeholder",
+      "value": "/path/to/workspace"
+    },
+    {
       "name": "export_copy_action",
       "value": "Copy Exported Transcript"
     },
@@ -1053,6 +1285,38 @@
       "value": "Create PR"
     },
     {
+      "name": "git_diff_clean_subtitle",
+      "value": "No unstaged or session changes in the active workspace."
+    },
+    {
+      "name": "git_diff_clean_title",
+      "value": "Working tree clean"
+    },
+    {
+      "name": "git_diff_close_a11y",
+      "value": "Close Git Diff Inspector"
+    },
+    {
+      "name": "git_diff_filter_placeholder",
+      "value": "Filter modified files…"
+    },
+    {
+      "name": "git_diff_generated_badge",
+      "value": "Generated"
+    },
+    {
+      "name": "git_diff_no_matching_subtitle",
+      "value": "Clear the filter above to view all modified files."
+    },
+    {
+      "name": "git_diff_no_matching_title",
+      "value": "No matching modified files"
+    },
+    {
+      "name": "git_diff_refresh_a11y",
+      "value": "Refresh Git diff"
+    },
+    {
       "name": "git_diff_unconfirmed_notice",
       "value": "A concurrent mode switch or status-only refresh left diff ownership unconfirmed."
     },
@@ -1099,6 +1363,14 @@
     {
       "name": "git_generate_message",
       "value": "AI Message"
+    },
+    {
+      "name": "git_loading_staged_diff",
+      "value": "Loading staged diff…"
+    },
+    {
+      "name": "git_loading_unstaged_diff",
+      "value": "Loading unstaged diff…"
     },
     {
       "name": "git_pr_body_placeholder",
@@ -1173,6 +1445,10 @@
       "value": "Stage All"
     },
     {
+      "name": "git_staged_unverified",
+      "value": "Staged diff could not be verified for this scope"
+    },
+    {
       "name": "git_stash_list_title",
       "value": "Saved Stashes"
     },
@@ -1195,6 +1471,10 @@
     {
       "name": "git_unstage_all",
       "value": "Unstage All"
+    },
+    {
+      "name": "git_unstaged_unverified",
+      "value": "Unstaged diff could not be verified for this scope"
     },
     {
       "name": "git_working_tree_clean_scope",
@@ -1303,6 +1583,14 @@
     {
       "name": "handoff_untracked_conflict",
       "value": "Untracked file conflict cannot be merged with 3-way markers"
+    },
+    {
+      "name": "model_picker_refresh_a11y",
+      "value": "Refresh Model Catalog"
+    },
+    {
+      "name": "model_picker_thinking",
+      "value": "Thinking"
     },
     {
       "name": "module_desc",
@@ -1681,8 +1969,972 @@
       "value": "Global Search"
     },
     {
+      "name": "settings_about_encryption",
+      "value": "Encryption"
+    },
+    {
+      "name": "settings_about_encryption_value",
+      "value": "Noise NK · E2EE"
+    },
+    {
+      "name": "settings_about_platform",
+      "value": "Platform"
+    },
+    {
+      "name": "settings_about_platform_value",
+      "value": "HarmonyOS NEXT · ArkUI V2"
+    },
+    {
+      "name": "settings_acp_add_custom",
+      "value": "Add Custom ACP Agent"
+    },
+    {
+      "name": "settings_acp_args_input_a11y",
+      "value": "Custom ACP arguments input"
+    },
+    {
+      "name": "settings_acp_args_placeholder",
+      "value": "Arguments (space-separated, optional)"
+    },
+    {
+      "name": "settings_acp_cmd_input_a11y",
+      "value": "Custom ACP command input"
+    },
+    {
+      "name": "settings_acp_cmd_placeholder",
+      "value": "Executable command (e.g. npx)"
+    },
+    {
+      "name": "settings_acp_empty",
+      "value": "No ACP agents reported on this host."
+    },
+    {
+      "name": "settings_acp_id_input_a11y",
+      "value": "Custom ACP agent ID input"
+    },
+    {
+      "name": "settings_acp_id_placeholder",
+      "value": "Agent ID (e.g. my-acp)"
+    },
+    {
+      "name": "settings_acp_installed",
+      "value": "Installed"
+    },
+    {
+      "name": "settings_acp_name_input_a11y",
+      "value": "Custom ACP agent name input"
+    },
+    {
+      "name": "settings_acp_name_placeholder",
+      "value": "Display name"
+    },
+    {
+      "name": "settings_acp_not_installed",
+      "value": "Not installed"
+    },
+    {
+      "name": "settings_acp_registry_section",
+      "value": "ACP Registry"
+    },
+    {
+      "name": "settings_acp_test_btn",
+      "value": "Test"
+    },
+    {
+      "name": "settings_acp_test_ok",
+      "value": "%1$s responded in %2$d ms"
+    },
+    {
+      "name": "settings_agents_defaults_section",
+      "value": "Active Defaults"
+    },
+    {
+      "name": "settings_agents_effort_label",
+      "value": "Reasoning Effort"
+    },
+    {
+      "name": "settings_agents_model_count",
+      "value": "%d models available"
+    },
+    {
+      "name": "settings_agents_model_label",
+      "value": "Default Model"
+    },
+    {
+      "name": "settings_agents_models_subtitle",
+      "value": "Providers, default model & ACP registry"
+    },
+    {
+      "name": "settings_agents_no_catalogs",
+      "value": "Connect to a host and refresh to inspect available provider catalogs."
+    },
+    {
+      "name": "settings_agents_no_models",
+      "value": "No models discovered on this host yet."
+    },
+    {
+      "name": "settings_agents_provider_label",
+      "value": "Default Provider"
+    },
+    {
+      "name": "settings_agents_providers_section",
+      "value": "Providers on Host"
+    },
+    {
+      "name": "settings_agents_select_effort_hint",
+      "value": "Tap to choose reasoning effort"
+    },
+    {
+      "name": "settings_agents_select_model_hint",
+      "value": "Tap to choose default model"
+    },
+    {
+      "name": "settings_appearance_a11y_section",
+      "value": "Accessibility & Display"
+    },
+    {
+      "name": "settings_appearance_dark",
+      "value": "Dark"
+    },
+    {
+      "name": "settings_appearance_font_scale_cap",
+      "value": "Chrome Font Scale Cap"
+    },
+    {
+      "name": "settings_appearance_light",
+      "value": "Light"
+    },
+    {
+      "name": "settings_appearance_reduced_motion",
+      "value": "Reduced Motion (System)"
+    },
+    {
+      "name": "settings_appearance_system",
+      "value": "System"
+    },
+    {
+      "name": "settings_appearance_theme_hint",
+      "value": "Switch between System, Light, and Dark palettes. Legacy dark theme preferences automatically migrate to Dark."
+    },
+    {
+      "name": "settings_appearance_theme_section",
+      "value": "Theme Mode"
+    },
+    {
+      "name": "settings_apply_relay_fleet",
+      "value": "Apply Relay to All Hosts"
+    },
+    {
+      "name": "settings_apply_relay_fleet_done",
+      "value": "Updated relay on %d host(s)."
+    },
+    {
+      "name": "settings_copy_pairing_uri",
+      "value": "Copy Pairing URI"
+    },
+    {
+      "name": "settings_direct_endpoint_placeholder",
+      "value": "ws://192.168.1.x:6868/ws"
+    },
+    {
+      "name": "settings_ext_scope_host",
+      "value": "Scope: Host"
+    },
+    {
+      "name": "settings_ext_scope_project",
+      "value": "Scope: Host + Project"
+    },
+    {
+      "name": "settings_ext_scope_toggle_a11y",
+      "value": "Toggle host or project scope"
+    },
+    {
+      "name": "settings_fleet_relay_hint",
+      "value": "Apply a shared BYOR relay URL across every paired host in one step. Leave blank to clear relay."
+    },
+    {
+      "name": "settings_fleet_relay_input_a11y",
+      "value": "Fleet relay URL input"
+    },
+    {
+      "name": "settings_fleet_relay_section",
+      "value": "Fleet Relay Sync"
+    },
+    {
+      "name": "settings_general_default_mode_section",
+      "value": "Default Permission Mode"
+    },
+    {
+      "name": "settings_general_language_hint",
+      "value": "Changes apply immediately where supported and persist across restarts."
+    },
+    {
+      "name": "settings_general_language_section",
+      "value": "Language"
+    },
+    {
+      "name": "settings_general_send_section",
+      "value": "Default Send Behavior While Running"
+    },
+    {
+      "name": "settings_group_about",
+      "value": "About"
+    },
+    {
+      "name": "settings_group_agents_safety",
+      "value": "Agents & Safety"
+    },
+    {
+      "name": "settings_group_context_extensions",
+      "value": "Context & Extensions"
+    },
+    {
+      "name": "settings_group_fleet_sync",
+      "value": "Fleet & Sync"
+    },
+    {
+      "name": "settings_group_preferences",
+      "value": "Preferences"
+    },
+    {
+      "name": "settings_guardian_enable",
+      "value": "Enable Guardian Auto-Approval"
+    },
+    {
+      "name": "settings_guardian_max_risk",
+      "value": "Max Auto-Approve Risk"
+    },
+    {
+      "name": "settings_guardian_read_only",
+      "value": "Auto-Approve Read-Only Tools"
+    },
+    {
+      "name": "settings_guardian_section",
+      "value": "Guardian Policy"
+    },
+    {
+      "name": "settings_guardian_tier2",
+      "value": "Enable Tier-2 AI Risk Classifier"
+    },
+    {
+      "name": "settings_guardian_workspace_tests",
+      "value": "Auto-Approve Workspace Build & Tests"
+    },
+    {
+      "name": "settings_host_connection",
+      "value": "Connection"
+    },
+    {
+      "name": "settings_host_daemon",
+      "value": "Daemon"
+    },
+    {
+      "name": "settings_host_diagnostics",
+      "value": "Diagnostics"
+    },
+    {
+      "name": "settings_host_direct_endpoint",
+      "value": "Direct Endpoint"
+    },
+    {
+      "name": "settings_host_direct_endpoint_a11y",
+      "value": "Direct endpoint URL input"
+    },
+    {
+      "name": "settings_host_display_name",
+      "value": "Display Name"
+    },
+    {
+      "name": "settings_host_display_name_a11y",
+      "value": "Host display name input"
+    },
+    {
+      "name": "settings_host_latency",
+      "value": "Latency"
+    },
+    {
+      "name": "settings_host_not_found",
+      "value": "Host is no longer paired."
+    },
+    {
+      "name": "settings_host_pubkey",
+      "value": "Public Key"
+    },
+    {
+      "name": "settings_host_relay_url",
+      "value": "Relay URL"
+    },
+    {
+      "name": "settings_host_relay_url_a11y",
+      "value": "Host relay URL input"
+    },
+    {
+      "name": "settings_host_route_mode",
+      "value": "Route Mode"
+    },
+    {
+      "name": "settings_hosts_active_badge",
+      "value": "Active"
+    },
+    {
+      "name": "settings_hosts_count_summary",
+      "value": "%d host(s) paired"
+    },
+    {
+      "name": "settings_hosts_empty",
+      "value": "No hosts paired yet."
+    },
+    {
+      "name": "settings_hosts_paired_section",
+      "value": "Paired Hosts"
+    },
+    {
+      "name": "settings_item_agents_models",
+      "value": "Agents & Models"
+    },
+    {
+      "name": "settings_item_appearance",
+      "value": "Appearance"
+    },
+    {
+      "name": "settings_item_cloud_sync",
+      "value": "Cloud Sync"
+    },
+    {
+      "name": "settings_item_general",
+      "value": "General"
+    },
+    {
+      "name": "settings_item_host_detail",
+      "value": "Host Details & Pairing QR"
+    },
+    {
+      "name": "settings_item_hosts",
+      "value": "Hosts"
+    },
+    {
+      "name": "settings_item_mcp",
+      "value": "MCP Servers"
+    },
+    {
+      "name": "settings_item_memory",
+      "value": "Project Memory"
+    },
+    {
+      "name": "settings_item_notifications",
+      "value": "Notifications"
+    },
+    {
+      "name": "settings_item_permissions_guardian",
+      "value": "Permissions & Guardian"
+    },
+    {
+      "name": "settings_item_plugins",
+      "value": "Plugins"
+    },
+    {
+      "name": "settings_item_sandbox",
+      "value": "Sandbox"
+    },
+    {
+      "name": "settings_item_skills",
+      "value": "Skills"
+    },
+    {
+      "name": "settings_item_usage_quotas",
+      "value": "Usage & Quotas"
+    },
+    {
+      "name": "settings_lang_en",
+      "value": "English"
+    },
+    {
+      "name": "settings_lang_ja",
+      "value": "日本語"
+    },
+    {
+      "name": "settings_lang_system",
+      "value": "Follow System"
+    },
+    {
+      "name": "settings_lang_zh",
+      "value": "简体中文"
+    },
+    {
+      "name": "settings_mcp_empty",
+      "value": "No external MCP servers configured on this host."
+    },
+    {
+      "name": "settings_mcp_probe_ok",
+      "value": "%1$d tool(s) · %2$d ms"
+    },
+    {
+      "name": "settings_mcp_subtitle",
+      "value": "List and toggle external MCP servers"
+    },
+    {
+      "name": "settings_memory_confirm_a11y",
+      "value": "Confirm project memory"
+    },
+    {
+      "name": "settings_memory_delete_a11y",
+      "value": "Delete project memory"
+    },
+    {
+      "name": "settings_memory_delete_message",
+      "value": "Delete \"%s\" permanently from this workspace's project memory?"
+    },
+    {
+      "name": "settings_memory_delete_title",
+      "value": "Delete Project Memory?"
+    },
+    {
+      "name": "settings_memory_empty",
+      "value": "No memories recorded for this project yet."
+    },
+    {
+      "name": "settings_memory_no_workspace",
+      "value": "Open or pin a project on this host to inspect its memories."
+    },
+    {
+      "name": "settings_memory_status_confirmed",
+      "value": "Confirmed"
+    },
+    {
+      "name": "settings_memory_status_hypothesis",
+      "value": "Hypothesis"
+    },
+    {
+      "name": "settings_memory_status_recheck",
+      "value": "Needs Recheck"
+    },
+    {
+      "name": "settings_memory_subtitle",
+      "value": "Inspect, confirm, or delete workspace memories"
+    },
+    {
+      "name": "settings_memory_workspace_label",
+      "value": "Workspace Directory"
+    },
+    {
+      "name": "settings_mode_accept_edits",
+      "value": "Accept Edits"
+    },
+    {
+      "name": "settings_mode_auto",
+      "value": "Auto"
+    },
+    {
+      "name": "settings_mode_default",
+      "value": "Default"
+    },
+    {
+      "name": "settings_mode_full_access",
+      "value": "Full Access"
+    },
+    {
+      "name": "settings_no_host_selected",
+      "value": "Pair or select a host first to view host-scoped settings."
+    },
+    {
+      "name": "settings_pa_memory_capable",
+      "value": "Local Memory Engine"
+    },
+    {
+      "name": "settings_pa_mesh_empty",
+      "value": "No daemon-to-daemon mesh peers configured yet."
+    },
+    {
+      "name": "settings_pa_no_hosts",
+      "value": "No eligible hosts discovered yet."
+    },
+    {
+      "name": "settings_pa_prereview_assist",
+      "value": "Assist"
+    },
+    {
+      "name": "settings_pa_prereview_label",
+      "value": "Pre-Review Policy"
+    },
+    {
+      "name": "settings_pa_prereview_medium",
+      "value": "Medium Risk"
+    },
+    {
+      "name": "settings_pa_row_subtitle",
+      "value": "%d mesh peer(s)"
+    },
+    {
+      "name": "settings_pa_scope_fleet",
+      "value": "Global Fleet"
+    },
+    {
+      "name": "settings_pa_scope_label",
+      "value": "Orchestration Scope"
+    },
+    {
+      "name": "settings_pa_scope_local",
+      "value": "Local Host Only"
+    },
+    {
+      "name": "settings_pair_host_submit",
+      "value": "Pair Host"
+    },
+    {
+      "name": "settings_pair_new_host",
+      "value": "Pair New Host"
+    },
+    {
+      "name": "settings_pairing_qr_warning",
+      "value": "This QR code contains the host pairing secret. Share only with your own trusted Orbit devices."
+    },
+    {
+      "name": "settings_pairing_uri_input_a11y",
+      "value": "Pairing URI input"
+    },
+    {
+      "name": "settings_pairing_uri_label",
+      "value": "Pairing URI"
+    },
+    {
+      "name": "settings_pairing_uri_placeholder",
+      "value": "orbit://pair/…"
+    },
+    {
+      "name": "settings_permissions_subtitle",
+      "value": "Default mode, Guardian policy & tool rules"
+    },
+    {
+      "name": "settings_plugins_caps_summary",
+      "value": "%1$d MCP op(s) · %2$d hook(s)"
+    },
+    {
+      "name": "settings_plugins_empty",
+      "value": "No WASM plugins installed on this host."
+    },
+    {
+      "name": "settings_plugins_subtitle",
+      "value": "Inspect and toggle installed WASM plugins"
+    },
+    {
+      "name": "settings_push_master_switch",
+      "value": "Enable Notifications"
+    },
+    {
+      "name": "settings_push_not_registered",
+      "value": "Not registered"
+    },
+    {
+      "name": "settings_push_pref_timers",
+      "value": "Scheduled & Conditional Timers"
+    },
+    {
+      "name": "settings_push_synced_daemons",
+      "value": "Synced Daemons"
+    },
+    {
+      "name": "settings_push_token_label",
+      "value": "Push Kit Token"
+    },
+    {
+      "name": "settings_readonly_badge",
+      "value": "Read-only"
+    },
+    {
+      "name": "settings_relay_url_placeholder",
+      "value": "wss://relay.orbit.dev"
+    },
+    {
+      "name": "settings_remove_host",
+      "value": "Remove Host"
+    },
+    {
+      "name": "settings_remove_host_confirm",
+      "value": "Remove"
+    },
+    {
+      "name": "settings_remove_host_message",
+      "value": "Running remote agent sessions on this host will not be terminated."
+    },
+    {
+      "name": "settings_remove_host_title",
+      "value": "Remove %s?"
+    },
+    {
+      "name": "settings_risk_low",
+      "value": "Low"
+    },
+    {
+      "name": "settings_risk_medium",
+      "value": "Medium"
+    },
+    {
+      "name": "settings_route_auto",
+      "value": "Auto"
+    },
+    {
+      "name": "settings_route_direct",
+      "value": "Direct"
+    },
+    {
+      "name": "settings_route_relay",
+      "value": "Relay"
+    },
+    {
+      "name": "settings_rule_add_title",
+      "value": "Add Permission Rule"
+    },
+    {
+      "name": "settings_rule_decision_a11y",
+      "value": "Rule decision: %s"
+    },
+    {
+      "name": "settings_rule_delete_message",
+      "value": "Remove permission rule matching \"%s\"?"
+    },
+    {
+      "name": "settings_rule_delete_title",
+      "value": "Delete Permission Rule?"
+    },
+    {
+      "name": "settings_rule_pattern_input_a11y",
+      "value": "Permission rule pattern input"
+    },
+    {
+      "name": "settings_rule_pattern_placeholder",
+      "value": "Prefix pattern (e.g. cargo test)"
+    },
+    {
+      "name": "settings_rule_tool_kind_a11y",
+      "value": "Rule tool kind: %s"
+    },
+    {
+      "name": "settings_rules_empty",
+      "value": "No custom tool permission rules configured."
+    },
+    {
+      "name": "settings_rules_section",
+      "value": "Tool Permission Rules"
+    },
+    {
+      "name": "settings_sandbox_default_notice",
+      "value": "No custom sandbox override is active; host default isolation policy applies."
+    },
+    {
+      "name": "settings_sandbox_denied_reads",
+      "value": "Protected Read-Denied Paths"
+    },
+    {
+      "name": "settings_sandbox_mode_label",
+      "value": "Isolation Mode"
+    },
+    {
+      "name": "settings_sandbox_mode_off",
+      "value": "Off"
+    },
+    {
+      "name": "settings_sandbox_mode_readonly",
+      "value": "Strict Read-Only"
+    },
+    {
+      "name": "settings_sandbox_mode_workspace",
+      "value": "Workspace Write"
+    },
+    {
+      "name": "settings_sandbox_network_label",
+      "value": "Network Access"
+    },
+    {
+      "name": "settings_sandbox_subtitle",
+      "value": "Read-only OS sandbox & credential isolation"
+    },
+    {
+      "name": "settings_sandbox_writable_roots",
+      "value": "Additional Writable Roots"
+    },
+    {
+      "name": "settings_save_reconnect",
+      "value": "Save & Reconnect"
+    },
+    {
+      "name": "settings_scan_qr_code",
+      "value": "Scan QR Code"
+    },
+    {
+      "name": "settings_search_a11y",
+      "value": "Search settings"
+    },
+    {
+      "name": "settings_search_clear",
+      "value": "Clear Search"
+    },
+    {
+      "name": "settings_search_clear_a11y",
+      "value": "Clear settings search"
+    },
+    {
+      "name": "settings_search_empty",
+      "value": "No matching settings found."
+    },
+    {
+      "name": "settings_search_placeholder",
+      "value": "Search settings (EN / 中文 / 日本語)…"
+    },
+    {
+      "name": "settings_send_interrupt",
+      "value": "Interrupt & Send"
+    },
+    {
+      "name": "settings_send_interrupt_desc",
+      "value": "Cancel the current turn and send immediately (pending approvals still queue safely)."
+    },
+    {
+      "name": "settings_send_queue",
+      "value": "Queue (Recommended)"
+    },
+    {
+      "name": "settings_send_queue_desc",
+      "value": "Deliver in order once the active turn finishes."
+    },
+    {
+      "name": "settings_send_steer",
+      "value": "Steer Follow-Up"
+    },
+    {
+      "name": "settings_send_steer_desc",
+      "value": "Send follow-up guidance while the agent is working (pending approvals still queue)."
+    },
+    {
+      "name": "settings_share_pairing_desc",
+      "value": "Generate a pairing QR code or URI so another trusted Orbit client can pair with this host."
+    },
+    {
+      "name": "settings_share_pairing_section",
+      "value": "Share Pairing URI / QR"
+    },
+    {
+      "name": "settings_show_pairing_qr",
+      "value": "Show Pairing QR & URI"
+    },
+    {
+      "name": "settings_skills_empty",
+      "value": "No managed skills discovered on this host."
+    },
+    {
+      "name": "settings_skills_subtitle",
+      "value": "Read-only list of discovered SKILL.md skills"
+    },
+    {
+      "name": "settings_skills_tokens",
+      "value": "~%d tokens"
+    },
+    {
+      "name": "settings_state_enabled",
+      "value": "On"
+    },
+    {
+      "name": "settings_state_off",
+      "value": "Off"
+    },
+    {
+      "name": "settings_switch_host",
+      "value": "Switch to This Host"
+    },
+    {
+      "name": "settings_sync_auto_sync",
+      "value": "Auto-Sync"
+    },
+    {
+      "name": "settings_sync_connect_github",
+      "value": "Connect GitHub"
+    },
+    {
+      "name": "settings_sync_connected",
+      "value": "Connected"
+    },
+    {
+      "name": "settings_sync_device_link_desc",
+      "value": "Link instantaneously from another Orbit device with zero passphrase typing."
+    },
+    {
+      "name": "settings_sync_disconnect",
+      "value": "Disconnect Cloud Sync"
+    },
+    {
+      "name": "settings_sync_disconnect_confirm",
+      "value": "Disconnect"
+    },
+    {
+      "name": "settings_sync_disconnect_message",
+      "value": "Your encrypted GitHub Gist vault remains intact, and local hosts are preserved."
+    },
+    {
+      "name": "settings_sync_disconnect_title",
+      "value": "Disconnect Cloud Sync?"
+    },
+    {
+      "name": "settings_sync_error",
+      "value": "Sync error"
+    },
+    {
+      "name": "settings_sync_export_qr_desc",
+      "value": "Scan from another phone, tablet, or desktop to transfer your E2EE vault key securely."
+    },
+    {
+      "name": "settings_sync_fleet_counts",
+      "value": "%1$d host(s) · %2$d project(s)"
+    },
+    {
+      "name": "settings_sync_fleet_label",
+      "value": "Synced Fleet"
+    },
+    {
+      "name": "settings_sync_generate",
+      "value": "Generate"
+    },
+    {
+      "name": "settings_sync_link_uri_input_a11y",
+      "value": "Device link URI input"
+    },
+    {
+      "name": "settings_sync_link_uri_placeholder",
+      "value": "orbit://link/…"
+    },
+    {
+      "name": "settings_sync_locked",
+      "value": "Locked"
+    },
+    {
+      "name": "settings_sync_not_connected",
+      "value": "Not connected"
+    },
+    {
+      "name": "settings_sync_now",
+      "value": "Sync Now"
+    },
+    {
+      "name": "settings_sync_passphrase_input_a11y",
+      "value": "Sync vault passphrase input"
+    },
+    {
+      "name": "settings_sync_passphrase_placeholder",
+      "value": "Enter E2EE passphrase"
+    },
+    {
+      "name": "settings_sync_passphrase_title",
+      "value": "Vault Passphrase"
+    },
+    {
+      "name": "settings_sync_pat_desc",
+      "value": "Requires gist scope. Vault payloads are compressed and AES-256-GCM encrypted locally before upload."
+    },
+    {
+      "name": "settings_sync_pat_input_a11y",
+      "value": "GitHub personal access token input"
+    },
+    {
+      "name": "settings_sync_pat_placeholder",
+      "value": "ghp_…"
+    },
+    {
+      "name": "settings_sync_pat_title",
+      "value": "GitHub Personal Access Token"
+    },
+    {
+      "name": "settings_sync_status_label",
+      "value": "Status"
+    },
+    {
+      "name": "settings_sync_syncing",
+      "value": "Syncing…"
+    },
+    {
+      "name": "settings_sync_unlock",
+      "value": "Unlock & Sync"
+    },
+    {
+      "name": "settings_sync_unlocking",
+      "value": "Unlocking…"
+    },
+    {
+      "name": "settings_sync_verify_signin",
+      "value": "Verify Sign-In"
+    },
+    {
+      "name": "settings_target_host_label",
+      "value": "Host Scope"
+    },
+    {
       "name": "settings_upgrade_daemon",
       "value": "Upgrade Daemon Over Wire"
+    },
+    {
+      "name": "settings_usage_30d",
+      "value": "30 Days"
+    },
+    {
+      "name": "settings_usage_7d",
+      "value": "7 Days"
+    },
+    {
+      "name": "settings_usage_by_model",
+      "value": "Breakdown by Model"
+    },
+    {
+      "name": "settings_usage_by_project",
+      "value": "Breakdown by Project"
+    },
+    {
+      "name": "settings_usage_cache_savings",
+      "value": "Cache Savings"
+    },
+    {
+      "name": "settings_usage_daily",
+      "value": "Recent Daily Activity"
+    },
+    {
+      "name": "settings_usage_forecasts",
+      "value": "Quota Burn Forecasts"
+    },
+    {
+      "name": "settings_usage_live_quotas",
+      "value": "Live Provider Quotas"
+    },
+    {
+      "name": "settings_usage_no_quotas",
+      "value": "No active rate-limit windows reported yet."
+    },
+    {
+      "name": "settings_usage_subtitle",
+      "value": "Token ledger, cost insights & rate limits"
+    },
+    {
+      "name": "settings_usage_summary_section",
+      "value": "Period Summary"
+    },
+    {
+      "name": "settings_usage_tokens_turns",
+      "value": "Tokens · Turns"
+    },
+    {
+      "name": "settings_usage_total_cost",
+      "value": "Estimated Cost"
+    },
+    {
+      "name": "side_panel_launchpad_subtitle",
+      "value": "Each conversation remembers its own open tabs independently."
+    },
+    {
+      "name": "side_panel_launchpad_title",
+      "value": "Open in Side Panel"
+    },
+    {
+      "name": "side_panel_reopen_closed",
+      "value": "Reopen recently closed tab"
+    },
+    {
+      "name": "side_panel_resize_a11y",
+      "value": "Resize side panel"
     },
     {
       "name": "side_question_clear",
@@ -2097,8 +3349,28 @@
       "value": "Host is offline · Changes will sync when reconnected"
     },
     {
+      "name": "stage_pair_first_host_body",
+      "value": "Connect to orbit daemon on your workstation, Linux devbox, or Mac mini over LAN, SSH, or E2EE Noise Relay."
+    },
+    {
+      "name": "stage_pair_first_host_title",
+      "value": "Pair Your First Host"
+    },
+    {
+      "name": "stage_pair_uri_placeholder",
+      "value": "orbit://pair/..."
+    },
+    {
       "name": "stage_reconnecting_banner",
       "value": "Reconnecting to host…"
+    },
+    {
+      "name": "stage_thought_label",
+      "value": "Thought"
+    },
+    {
+      "name": "stage_welcome_prompt",
+      "value": "What would you like to build?"
     },
     {
       "name": "sync_device_link_qr",
@@ -2157,6 +3429,10 @@
       "value": "Copied terminal output"
     },
     {
+      "name": "terminal_copy_output_a11y",
+      "value": "Copy terminal output"
+    },
+    {
       "name": "terminal_delta_rev",
       "value": "rev %d"
     },
@@ -2185,12 +3461,28 @@
       "value": "No active terminal buffer in this slot."
     },
     {
+      "name": "terminal_pty_ready",
+      "value": "orbit shim detached PTY ready"
+    },
+    {
+      "name": "terminal_quote_output_a11y",
+      "value": "Quote terminal output into composer"
+    },
+    {
       "name": "terminal_raw_placeholder",
       "value": "Type raw keystrokes…"
     },
     {
+      "name": "terminal_send_input_a11y",
+      "value": "Send terminal input"
+    },
+    {
       "name": "terminal_slot_label",
       "value": "S%d"
+    },
+    {
+      "name": "terminal_spawn_a11y",
+      "value": "Spawn new terminal session"
     },
     {
       "name": "terminal_spawn_shell",
@@ -2235,6 +3527,54 @@
     {
       "name": "time_weeksShort",
       "value": "%dw"
+    },
+    {
+      "name": "toast_clipboard_empty",
+      "value": "Clipboard is empty"
+    },
+    {
+      "name": "toast_clipboard_read_failed",
+      "value": "Unable to read clipboard"
+    },
+    {
+      "name": "toast_connect_host_first",
+      "value": "Connect a host first"
+    },
+    {
+      "name": "toast_copied_clipboard",
+      "value": "Copied to clipboard"
+    },
+    {
+      "name": "toast_copy_failed",
+      "value": "Failed to copy to clipboard"
+    },
+    {
+      "name": "toast_enter_peer_instructions",
+      "value": "Enter instructions for the peer"
+    },
+    {
+      "name": "toast_no_pair_uri_clipboard",
+      "value": "No orbit://pair URI found in clipboard"
+    },
+    {
+      "name": "toast_pair_or_select_host_first",
+      "value": "Pair or select a host first"
+    },
+    {
+      "name": "toast_rebase_aborted",
+      "value": "Aborted rebase"
+    },
+    {
+      "name": "toast_rebase_continued",
+      "value": "Continued rebase"
+    },
+    {
+      "name": "toast_test_push_failed",
+      "value": "Test push failed"
+    },
+    {
+      "name": "toast_test_push_sent",
+      "value": "Test push sent from host"
     },
     {
       "name": "topbar_conversationActions",

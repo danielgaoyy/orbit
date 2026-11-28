@@ -11,7 +11,7 @@ import {
 } from '../../model/OrbitTypes';
 import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
-import { OrbitSidebarRow } from '../../model/stores/OrbitFleetStore';
+import { OrbitFleetStore, OrbitSidebarRow } from '../../model/stores/OrbitFleetStore';
 import {
   OrbitTokens,
   orbitButtonSubhead,
@@ -35,10 +35,14 @@ import {
   compactTimeSpecToResource,
   resolveRelativeTimeSpec
 } from '../personal-agent/PersonalAgentBriefingModel';
+import { OrbitPullRefreshController } from '../settings/OrbitSettingsNavModel';
 
 @ComponentV2
 export struct FleetSidebar {
   private readonly store: OrbitHarmonyStore = orbitRuntime();
+  @Local private fleetStore: OrbitFleetStore = orbitRuntime().fleetStore;
+  private readonly pullRefreshCtrl: OrbitPullRefreshController = new OrbitPullRefreshController();
+  @Local private isRefreshing: boolean = false;
   private disposed: boolean = false;
 
   aboutToAppear(): void {
@@ -47,6 +51,26 @@ export struct FleetSidebar {
 
   aboutToDisappear(): void {
     this.disposed = true;
+    this.pullRefreshCtrl.unmount();
+    this.isRefreshing = false;
+  }
+
+  @Monitor('fleetStore.selectedHostId')
+  onSelectedHostChanged(_mon: IMonitor): void {
+    if (this.pullRefreshCtrl.onScopeChanged(this.fleetStore.selectedHostId || '__fleet__')) {
+      this.isRefreshing = false;
+    }
+  }
+
+  private handlePullRefresh(): void {
+    const scope = this.store.selectedHostId || '__fleet__';
+    void this.pullRefreshCtrl.run(
+      scope,
+      (): Promise<void> => this.store.pullRefreshFleetAsync(),
+      (refreshing: boolean): void => {
+        this.isRefreshing = refreshing;
+      }
+    );
   }
 
   private isOriginHostStillActive(originHostId: string, originHostEpoch: number): boolean {
@@ -147,7 +171,7 @@ export struct FleetSidebar {
     }
     if (outcome.ok) {
       this.store.showToastResource($r('app.string.workspace_archived_toast'), false);
-      this.store.triggerHaptic(10);
+      this.store.triggerHapticPreset('success');
     } else {
       this.store.showToastResource(
         outcome.errorDetail.length > 0
@@ -171,7 +195,7 @@ export struct FleetSidebar {
     }
     if (outcome.ok) {
       this.store.showToastResource($r('app.string.workspace_restored_toast'), false);
-      this.store.triggerHaptic(10);
+      this.store.triggerHapticPreset('success');
     } else {
       this.store.showToastResource(
         outcome.errorDetail.length > 0
@@ -281,7 +305,7 @@ export struct FleetSidebar {
               .labelFontColor(this.store.palette.fgMuted)
               .onClick(() => {
                 this.store.selectHost(host.host_id);
-                this.store.triggerHaptic(8);
+                this.store.triggerHapticPreset('selection');
               })
           },
           (host: HostCardDto): string => `host_menu_${host.host_id}`
@@ -1088,22 +1112,29 @@ export struct FleetSidebar {
       } else {
         this.renderPersonalAgentEntry()
 
-        List() {
-          Repeat<OrbitSidebarRow>(this.store.fleetStore.sidebarRows)
-            .each((ri: RepeatItem<OrbitSidebarRow>) => {
-              this.renderVirtualizedRow(ri.item)
-            })
-            .key((row: OrbitSidebarRow): string => row.key)
-            .virtualScroll({ totalCount: this.store.fleetStore.sidebarRows.length })
+        Refresh({ refreshing: $$this.isRefreshing }) {
+          List() {
+            Repeat<OrbitSidebarRow>(this.store.fleetStore.sidebarRows)
+              .each((ri: RepeatItem<OrbitSidebarRow>) => {
+                this.renderVirtualizedRow(ri.item)
+              })
+              .key((row: OrbitSidebarRow): string => row.key)
+              .virtualScroll({ totalCount: this.store.fleetStore.sidebarRows.length })
+          }
+          .cachedCount(5)
+          .width('100%')
+          .height('100%')
+          .scrollBar(BarState.Auto)
+          .edgeEffect(EdgeEffect.Spring)
+          .padding({ bottom: OrbitTokens.SPACE_SM })
+          .onScrollStart(() => {
+            dismissHarmonyKeyboard(this.getUIContext());
+          })
         }
-        .cachedCount(5)
         .width('100%')
         .layoutWeight(1)
-        .scrollBar(BarState.Auto)
-        .edgeEffect(EdgeEffect.Spring)
-        .padding({ bottom: OrbitTokens.SPACE_SM })
-        .onScrollStart(() => {
-          dismissHarmonyKeyboard(this.getUIContext());
+        .onRefreshing(() => {
+          this.handlePullRefresh();
         })
       }
 

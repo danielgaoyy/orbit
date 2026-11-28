@@ -171,7 +171,7 @@ export struct DirectoryBrowserSheet {
     if (target.trim().length > 0) {
       this.filterQuery = '';
       this.store.browseDirectory(target);
-      this.store.triggerHaptic(6);
+      this.store.triggerHapticPreset('selection');
     }
   }
 
@@ -187,7 +187,7 @@ export struct DirectoryBrowserSheet {
                 .fontColor([this.store.palette.fgMuted])
 
               TextInput({
-                placeholder: '/path/to/workspace',
+                placeholder: $r('app.string.dir_path_placeholder'),
                 text: this.manualPathInput
               })
                 .attributeModifier(
@@ -227,7 +227,7 @@ export struct DirectoryBrowserSheet {
               .height(OrbitTokens.HIT_COMPACT)
               .padding(0)
               .backgroundColor(Color.Transparent)
-              .accessibilityText('Cancel path input')
+              .accessibilityText($r('app.string.dir_cancel_path_a11y'))
               .onClick(() => {
                 dismissHarmonyKeyboard(this.getUIContext());
                 this.isEditingPath = false;
@@ -252,11 +252,11 @@ export struct DirectoryBrowserSheet {
                 .height(OrbitTokens.HIT_COMPACT)
                 .padding(0)
                 .backgroundColor(this.store.palette.listCard)
-                .accessibilityText('Parent directory')
+                .accessibilityText($r('app.string.dir_parent_a11y'))
                 .onClick(() => {
                   this.filterQuery = '';
                   this.store.browseDirectory(this.parentPath);
-                  this.store.triggerHaptic(6);
+                  this.store.triggerHapticPreset('selection');
                 })
               }
 
@@ -288,7 +288,7 @@ export struct DirectoryBrowserSheet {
                             if (idx < this.breadcrumbs.length - 1) {
                               this.filterQuery = '';
                               this.store.browseDirectory(seg.targetPath);
-                              this.store.triggerHaptic(6);
+                              this.store.triggerHapticPreset('selection');
                             }
                           })
                       }
@@ -313,18 +313,18 @@ export struct DirectoryBrowserSheet {
               .height(OrbitTokens.HIT_COMPACT)
               .padding(0)
               .backgroundColor(this.store.palette.listCard)
-              .accessibilityText('Enter path manually')
+              .accessibilityText($r('app.string.dir_enter_path_a11y'))
               .onClick(() => {
                 this.manualPathInput = this.currentPath;
                 this.isEditingPath = true;
-                this.store.triggerHaptic(6);
+                this.store.triggerHapticPreset('selection');
               })
             }
             .width('100%')
             .alignItems(VerticalAlign.Center)
           }
 
-          Search({ value: this.filterQuery, placeholder: 'Filter folders or repositories…' })
+          Search({ value: this.filterQuery, placeholder: $r('app.string.dir_filter_placeholder') })
             .width('100%')
             .height(OrbitTokens.HIT_COMPACT)
             .backgroundColor(this.store.palette.listCard)
@@ -359,7 +359,7 @@ export struct DirectoryBrowserSheet {
                     .width(18)
                     .height(18)
                     .color(this.store.palette.iconSecondary)
-                  Text('Loading directory…')
+                  Text($r('app.string.dir_loading'))
                     .attributeModifier(orbitTextSubhead(this.store.palette.fgSecondary))
                 }
                 .width('100%')
@@ -411,7 +411,7 @@ export struct DirectoryBrowserSheet {
                           .flexShrink(1)
 
                         if (ri.item.is_git_repo) {
-                          Text('git')
+                          Text($r('app.string.dir_git_badge'))
                             .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
                             .padding({ left: 6, right: 6, top: 1, bottom: 1 })
                             .borderRadius(OrbitTokens.RADIUS_SM)
@@ -435,7 +435,7 @@ export struct DirectoryBrowserSheet {
                       dismissHarmonyKeyboard(this.getUIContext());
                       this.filterQuery = '';
                       this.store.browseDirectory(ri.item.path);
-                      this.store.triggerHaptic(6);
+                      this.store.triggerHapticPreset('selection');
                     })
                   }
                 })

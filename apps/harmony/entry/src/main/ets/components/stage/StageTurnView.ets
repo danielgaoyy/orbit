@@ -27,6 +27,7 @@ import {
   orbitTextSubhead,
   resolveSemanticFileSymbol
 } from '../../theme/OrbitTokens';
+import { OrbitTheme } from '../../theme/OrbitTheme';
 import { OrbitCopyIconButton } from '../common/OrbitCommonControls';
 import { RichMarkdownView } from './RichMarkdownView';
 
@@ -161,10 +162,13 @@ struct StepItemRow {
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
   private toggleExpanded(): void {
-    this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-      this.item.detailExpanded = !this.item.detailExpanded;
-    });
-    this.store.triggerHaptic(6);
+    this.getUIContext().animateTo(
+      { duration: OrbitTheme.resolveDuration(180, this.store.shellStore.reducedMotion), curve: Curve.EaseInOut },
+      () => {
+        this.item.detailExpanded = !this.item.detailExpanded;
+      }
+    );
+    this.store.triggerHaptic('selection');
   }
 
   private hasStepDiffFiles(): boolean {
@@ -283,7 +287,7 @@ struct StepItemRow {
             SymbolGlyph($r('sys.symbol.wand_and_stars'))
               .fontSize(13)
               .fontColor([this.store.palette.fgMuted])
-            Text('Thought')
+            Text($r('app.string.stage_thought_label'))
               .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
             SymbolGlyph(
               this.item.detailExpanded
@@ -553,8 +557,7 @@ struct StepItemRow {
           Blank()
           OrbitCopyIconButton({
             content: this.buildFullStepSnippet(desc),
-            toastLabel: 'Copied step detail',
-            accessibilityLabel: 'Copy step detail',
+            accessibilityLabel: $r('app.string.action_copy'),
             buttonSize: OrbitTokens.HIT_COMPACT
           })
         }
@@ -782,9 +785,12 @@ export struct StageTurnView {
             .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
             .padding({ left: 0, right: OrbitTokens.SPACE_SM })
             .onClick(() => {
-              this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-                this.userPromptExpanded = !this.userPromptExpanded;
-              });
+              this.getUIContext().animateTo(
+                { duration: OrbitTheme.resolveDuration(180, this.store.shellStore.reducedMotion), curve: Curve.EaseInOut },
+                () => {
+                  this.userPromptExpanded = !this.userPromptExpanded;
+                }
+              );
             })
         }
       }
@@ -891,7 +897,7 @@ export struct StageTurnView {
             .attributeModifier(
               orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
             )
-            .height(28)
+            .constraintSize({ minHeight: 28 })
             .padding({ left: 10, right: 10 })
             .onClick(() => {
               this.store.interruptAndContinueCurrentAgent();
@@ -923,7 +929,7 @@ export struct StageTurnView {
             .attributeModifier(
               orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
             )
-            .height(28)
+            .constraintSize({ minHeight: 28 })
             .padding({ left: 10, right: 10 })
             .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
             .onClick(() => {
@@ -934,8 +940,7 @@ export struct StageTurnView {
         if (this.turn.terminalReply !== null && this.extractReplyText(this.turn.terminalReply).length > 0) {
           OrbitCopyIconButton({
             content: this.extractReplyText(this.turn.terminalReply),
-            toastLabel: 'Copied reply to clipboard',
-            accessibilityLabel: 'Copy response',
+            accessibilityLabel: $r('app.string.action_copy'),
             buttonSize: OrbitTokens.HIT_COMPACT
           })
         }
@@ -999,10 +1004,13 @@ export struct StageTurnView {
         .constraintSize({ minHeight: 38 })
         .alignItems(VerticalAlign.Center)
         .onClick(() => {
-          this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-            this.turn.stepsExpanded = !this.turn.stepsExpanded;
-          });
-          this.store.triggerHaptic(8);
+          this.getUIContext().animateTo(
+            { duration: OrbitTheme.resolveDuration(180, this.store.shellStore.reducedMotion), curve: Curve.EaseInOut },
+            () => {
+              this.turn.stepsExpanded = !this.turn.stepsExpanded;
+            }
+          );
+          this.store.triggerHaptic('selection');
         })
 
         if (this.turn.stepsExpanded) {
@@ -1074,10 +1082,13 @@ export struct StageTurnView {
               .constraintSize({ minHeight: 38 })
               .alignItems(VerticalAlign.Center)
               .onClick(() => {
-                this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
-                  seg.stepsExpanded = !seg.stepsExpanded;
-                });
-                this.store.triggerHaptic(8);
+                this.getUIContext().animateTo(
+                  { duration: OrbitTheme.resolveDuration(180, this.store.shellStore.reducedMotion), curve: Curve.EaseInOut },
+                  () => {
+                    seg.stepsExpanded = !seg.stepsExpanded;
+                  }
+                );
+                this.store.triggerHaptic('selection');
               })
 
               if (seg.stepsExpanded || (seg.items.length < 5 && (seg.isRunning || !seg.hasFollowingContent))) {
@@ -1199,9 +1210,12 @@ export struct StageTurnView {
           if (this.turn.turnDiffs.length === 1) {
             this.store.openGitInspector(this.turn.turnDiffs[0].path);
           } else {
-            this.getUIContext().animateTo({ duration: 160, curve: Curve.EaseInOut }, () => {
-              this.turn.changesExpanded = !this.turn.changesExpanded;
-            });
+            this.getUIContext().animateTo(
+              { duration: OrbitTheme.resolveDuration(160, this.store.shellStore.reducedMotion), curve: Curve.EaseInOut },
+              () => {
+                this.turn.changesExpanded = !this.turn.changesExpanded;
+              }
+            );
           }
         })
 

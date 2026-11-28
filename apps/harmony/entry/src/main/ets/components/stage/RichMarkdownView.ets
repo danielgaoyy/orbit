@@ -504,13 +504,12 @@ export struct CodeHighlightBox {
         .accessibilityText(this.showLineNumbers ? 'Hide line numbers' : 'Show line numbers')
         .onClick(() => {
           this.showLineNumbers = !this.showLineNumbers;
-          this.store.triggerHaptic(6);
+          this.store.triggerHapticPreset('selection');
         })
 
         OrbitCopyIconButton({
           content: this.rawCode,
-          toastLabel: 'Copied code block',
-          accessibilityLabel: 'Copy code',
+          accessibilityLabel: $r('app.string.action_copy'),
           buttonSize: OrbitTokens.HIT_COMPACT
         })
       }

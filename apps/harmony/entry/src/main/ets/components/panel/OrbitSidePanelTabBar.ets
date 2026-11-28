@@ -92,6 +92,7 @@ export struct OrbitSidePanelTabBar {
                         this.activeTabId === tab.tabId ? FontWeight.Medium : FontWeight.Normal
                       )
                     )
+                    .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                     .constraintSize({ maxWidth: 118 })
@@ -114,15 +115,15 @@ export struct OrbitSidePanelTabBar {
                     .height(20)
                     .padding(0)
                     .backgroundColor(Color.Transparent)
-                    .accessibilityText(`Close ${tab.title}`)
+                    .accessibilityText($r('app.string.a11y_close_tab', tab.title))
                     .onClick(() => {
                       this.store.sidePanelStore.close(tab.tabId);
-                      this.store.triggerHaptic(6);
+                      this.store.triggerHaptic('selection');
                     })
                   }
                 }
-                .height(30)
-                .padding({ left: 9, right: tab.closable ? 4 : 9 })
+                .constraintSize({ minHeight: 30 })
+                .padding({ left: 9, right: tab.closable ? 4 : 9, top: 4, bottom: 4 })
                 .borderRadius(OrbitTokens.RADIUS_XL)
                 .backgroundColor(
                   this.activeTabId === tab.tabId
@@ -138,7 +139,7 @@ export struct OrbitSidePanelTabBar {
                 .alignItems(VerticalAlign.Center)
                 .onClick(() => {
                   this.store.sidePanelStore.activate(tab.tabId);
-                  this.store.triggerHaptic(6);
+                  this.store.triggerHaptic('selection');
                 })
               },
               (tab: OrbitSidePanelTab): string => tab.tabId
@@ -162,10 +163,10 @@ export struct OrbitSidePanelTabBar {
                 ? this.store.palette.accentPrimaryFill
                 : this.store.palette.subtleSurface
             )
-            .accessibilityText('Open panel launchpad')
+            .accessibilityText($r('app.string.a11y_open_panel_launchpad'))
             .onClick(() => {
               this.store.sidePanelStore.openLaunchpad();
-              this.store.triggerHaptic(6);
+              this.store.triggerHaptic('selection');
             })
           }
           .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_XS })
@@ -174,7 +175,7 @@ export struct OrbitSidePanelTabBar {
         .scrollable(ScrollDirection.Horizontal)
         .scrollBar(BarState.Off)
         .layoutWeight(1)
-        .height(40)
+        .constraintSize({ minHeight: 40 })
 
         Button({ type: ButtonType.Circle, stateEffect: true }) {
           SymbolGlyph($r('sys.symbol.xmark'))
@@ -187,13 +188,13 @@ export struct OrbitSidePanelTabBar {
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
         .margin({ right: OrbitTokens.SPACE_SM })
-        .accessibilityText('Close side panel')
+        .accessibilityText($r('app.string.a11y_close_side_panel'))
         .onClick(() => {
           this.onClosePanel();
         })
       }
       .width('100%')
-      .height(this.isCompactSheet ? 48 : 44)
+      .constraintSize({ minHeight: this.isCompactSheet ? 48 : 44 })
       .alignItems(VerticalAlign.Center)
       .backgroundColor(this.store.palette.recessed)
 

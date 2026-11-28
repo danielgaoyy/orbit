@@ -544,7 +544,7 @@ export struct OmniComposer {
                 .height(36)
                 .padding(0)
                 .backgroundColor(Color.Transparent)
-                .accessibilityText('Remove queued prompt')
+                .accessibilityText($r('app.string.a11y_remove_queued_prompt'))
                 .onClick(() => {
                   this.store.removeQueuedPrompt(qItem.id);
                 })
@@ -815,9 +815,12 @@ export struct OmniComposer {
         .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
         .alignItems(VerticalAlign.Center)
         .onClick(() => {
-          this.getUIContext().animateTo({ duration: OrbitTokens.DUR_UI, curve: Curve.FastOutSlowIn }, () => {
-            this.planShelfExpanded = !this.planShelfExpanded;
-          });
+          this.getUIContext().animateTo(
+            OrbitTheme.resolveMotion(OrbitTheme.MOTION_UI, this.store.shellStore.reducedMotion),
+            () => {
+              this.planShelfExpanded = !this.planShelfExpanded;
+            }
+          );
         })
 
         if (this.planShelfExpanded) {
@@ -1007,7 +1010,7 @@ export struct OmniComposer {
           .height(OrbitTokens.HIT_COMPACT)
           .padding(0)
           .backgroundColor(Color.Transparent)
-          .accessibilityText('Attach photos, camera, or files')
+          .accessibilityText($r('app.string.a11y_attach_media_files'))
           .bindMenu(this.renderPlusAttachmentMenu())
 
           // Model + Effort Trigger with Fixed-Width Ghost Anchor for Stable Popover Alignment
@@ -1056,15 +1059,14 @@ export struct OmniComposer {
               }
               .alignItems(VerticalAlign.Center)
             }
-            .height(OrbitTokens.HIT_COMPACT)
-            .constraintSize({ maxWidth: '100%' })
+            .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT, maxWidth: '100%' })
             .padding({ left: 2, right: 8 })
             .borderRadius(OrbitTokens.RADIUS_MD)
             .backgroundColor(Color.Transparent)
             .accessibilityText(`Model: ${this.store.currentModelPillLabel()}`)
             .onClick(() => {
               dismissHarmonyKeyboard(this.getUIContext());
-              this.store.triggerHaptic(6);
+              this.store.triggerHaptic('selection');
               this.store.showModelPickerSheet = !this.store.showModelPickerSheet;
               if (
                 this.store.showModelPickerSheet &&
@@ -1074,7 +1076,7 @@ export struct OmniComposer {
               }
             })
           }
-          .height(OrbitTokens.HIT_COMPACT)
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
           .layoutWeight(1)
 
           // Fast Mode Toggle Button
@@ -1096,7 +1098,11 @@ export struct OmniComposer {
               ? this.store.palette.accentPrimarySoft
               : Color.Transparent
           )
-          .accessibilityText(this.store.composerFastMode ? 'Fast Mode on' : 'Fast Mode off')
+          .accessibilityText(
+            this.store.composerFastMode
+              ? $r('app.string.a11y_fast_mode_on')
+              : $r('app.string.a11y_fast_mode_off')
+          )
           .onClick(() => {
             this.store.toggleFastMode();
           })
@@ -1115,7 +1121,12 @@ export struct OmniComposer {
           .height(OrbitTokens.HIT_COMPACT)
           .padding(0)
           .backgroundColor(Color.Transparent)
-          .accessibilityText(`Access Permissions: ${formatModeLabel(normalizeModeSlug(this.store.composerMode))}`)
+          .accessibilityText(
+            $r(
+              'app.string.a11y_access_permissions',
+              formatModeLabel(normalizeModeSlug(this.store.composerMode))
+            )
+          )
           .bindMenu(this.renderPermissionModeMenu())
 
           // SINGLE Stationary Right Action Circle (Codex-Style Voice: empty+idle -> Mic, text/attachment -> Send)
@@ -1144,12 +1155,13 @@ export struct OmniComposer {
                       .fontColor([this.store.palette.statusDanger])
                     Text($r('app.string.action_stop'))
                       .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium))
+                      .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
                   }
                 }
-                .height(OrbitTokens.HIT_COMPACT)
+                .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
                 .padding({ left: 8, right: 8 })
                 .backgroundColor(Color.Transparent)
-                .accessibilityText('Stop agent')
+                .accessibilityText($r('app.string.a11y_stop_agent'))
                 .onClick(() => {
                   this.store.interruptCurrentAgent();
                 })
@@ -1164,9 +1176,9 @@ export struct OmniComposer {
                 .height(OrbitTokens.HIT_COMPACT)
                 .padding(0)
                 .backgroundColor(this.store.palette.accentPrimaryFill)
-                .accessibilityText('Queue prompt')
+                .accessibilityText($r('app.string.a11y_queue_prompt'))
                 .onClick(() => {
-                  this.store.enqueueCurrentDraft();
+                  this.store.submitComposerPrompt();
                 })
               }
             } else {
@@ -1181,7 +1193,7 @@ export struct OmniComposer {
               .height(OrbitTokens.HIT_COMPACT)
               .padding(0)
               .backgroundColor(this.store.palette.subtleSurface)
-              .accessibilityText('Stop agent')
+              .accessibilityText($r('app.string.a11y_stop_agent'))
               .onClick(() => {
                 this.store.interruptCurrentAgent();
               })

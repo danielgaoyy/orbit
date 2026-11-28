@@ -10,14 +10,43 @@ ENFORCED_ETS_PATHS=(
   "apps/harmony/entry/src/main/ets/components/shell"
   "apps/harmony/entry/src/main/ets/components/personal-agent"
   "apps/harmony/entry/src/main/ets/components/common/OrbitAgentListItem.ets"
+  "apps/harmony/entry/src/main/ets/components/common/OrbitCommonControls.ets"
   "apps/harmony/entry/src/main/ets/components/common/OrbitSubagentAvatar.ets"
-  "apps/harmony/entry/src/main/ets/components/sheets/WorktreeHandoffSheet.ets"
-  "apps/harmony/entry/src/main/ets/components/sheets/WorkspaceScriptsSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/composer/ModelPickerSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/composer/OmniComposer.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/AutomationsSheet.ets"
   "apps/harmony/entry/src/main/ets/components/sheets/CreateWorkspaceV2Sheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/DirectoryBrowserSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/GitDiffSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/HostSettingsSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/OrbitTerminalView.ets"
   "apps/harmony/entry/src/main/ets/components/sheets/RenameWorkspaceSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/WorkspaceBoardSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/WorkspaceScriptsSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/sheets/WorktreeHandoffSheet.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedAutomationsTab.ets"
   "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedGitAndFilesTabs.ets"
   "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedTerminalAndBoardTabs.ets"
   "apps/harmony/entry/src/main/ets/components/panel/OrbitScopedToolTabs.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitSidePanelContainer.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitSidePanelLaunchpad.ets"
+  "apps/harmony/entry/src/main/ets/components/panel/OrbitSidePanelTabBar.ets"
+  "apps/harmony/entry/src/main/ets/components/stage/DiagramBlockView.ets"
+  "apps/harmony/entry/src/main/ets/components/stage/PlanReviewCard.ets"
+  "apps/harmony/entry/src/main/ets/components/stage/RichMarkdownView.ets"
+  "apps/harmony/entry/src/main/ets/components/stage/StageTurnView.ets"
+  "apps/harmony/entry/src/main/ets/components/stage/StickyDecisionDock.ets"
+  "apps/harmony/entry/src/main/ets/components/stage/StreamStage.ets"
+  "apps/harmony/entry/src/main/ets/components/settings"
+  "apps/harmony/entry/src/main/ets/model/OrbitCoreBridge.ets"
+  "apps/harmony/entry/src/main/ets/model/OrbitDeviceBridge.ets"
+  "apps/harmony/entry/src/main/ets/model/OrbitHarmonyStore.ets"
+  "apps/harmony/entry/src/main/ets/model/OrbitPreferences.ets"
+  "apps/harmony/entry/src/main/ets/model/OrbitTypes.ets"
+  "apps/harmony/entry/src/main/ets/model/OrbitWindowTheme.ets"
+  "apps/harmony/entry/src/main/ets/model/stores/OrbitFleetStore.ets"
+  "apps/harmony/entry/src/main/ets/theme/OrbitTheme.ets"
+  "apps/harmony/entry/src/main/ets/theme/OrbitTokens.ets"
 )
 
 SCAN_ALL="0"
@@ -336,6 +365,7 @@ const BARE_LITERAL_PATTERNS = [
   { kind: 'accessibilityText', re: /\.accessibilityText\s*\(\s*(['"])((?:\\.|(?!\1)[^\\\n])*)\1\s*[,)]/g },
   { kind: 'Label', re: /\bLabel\s*\(\s*(['"])((?:\\.|(?!\1)[^\\\n])*)\1\s*[,)]/g },
   { kind: 'placeholder', re: /\bplaceholder\s*:\s*(['"])((?:\\.|(?!\1)[^\\\n])*)\1/g },
+  { kind: 'showToast', re: /\bshowToast\s*\(\s*(['"])((?:\\.|(?!\1)[^\\\n])*)\1\s*[,)]/g, skipLegacyStore: true },
 ];
 
 for (const absFile of etsFiles) {
@@ -345,6 +375,37 @@ for (const absFile of etsFiles) {
   const cleaned = stripCommentsPreservingLayout(rawSource);
 
   for (const pat of BARE_LITERAL_PATTERNS) {
+    if (pat.skipLegacyStore && relFile === 'apps/harmony/entry/src/main/ets/model/OrbitHarmonyStore.ets') {
+      // PR-6 clipboard, test-push & ALL `*Scoped` store entrypoints must strictly avoid bare English showToast literals.
+      const methodDeclRe = /\n  public (?:async )?([A-Za-z0-9_]+)\s*\(/g;
+      const checkedNames = new Set([
+        'copyToClipboard',
+        'pasteAuthorizedPairingUri',
+        'sendTestPushNotification',
+      ]);
+      const spans = [];
+      let dm;
+      while ((dm = methodDeclRe.exec(cleaned)) !== null) {
+        spans.push({ name: dm[1], start: dm.index });
+      }
+      for (let si = 0; si < spans.length; si++) {
+        const { name, start } = spans[si];
+        if (!checkedNames.has(name) && !name.endsWith('Scoped')) continue;
+        const end = si + 1 < spans.length ? spans[si + 1].start : cleaned.length;
+        const snippet = cleaned.slice(start, end);
+        pat.re.lastIndex = 0;
+        let sm;
+        while ((sm = pat.re.exec(snippet)) !== null) {
+          const lit = sm[2].trim();
+          if (!/[A-Za-z]{3,}/.test(lit) || BARE_LITERAL_WHITELIST.has(lit)) continue;
+          const startLine = lineNumberAtOffset(cleaned, start + sm.index);
+          errors.push(
+            `Bare literal in ${relFile}:${startLine} (${pat.kind} in ${name}): ${JSON.stringify(sm[2])} (use showToastResource($r('app.string.*')))`
+          );
+        }
+      }
+      continue;
+    }
     pat.re.lastIndex = 0;
     let match;
     while ((match = pat.re.exec(cleaned)) !== null) {

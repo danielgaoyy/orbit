@@ -126,16 +126,19 @@ export struct PlanReviewCard {
           { type: ButtonType.Capsule, stateEffect: true }
         )
           .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
-          .height(OrbitTokens.HIT_COMPACT)
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
           .padding({ left: 10, right: 10 })
           .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
           .onClick(() => {
-            this.getUIContext().animateTo(OrbitTheme.MOTION_UI, () => {
-              if (!this.isEditingPlan && this.editedMarkdown.length === 0) {
-                this.editedMarkdown = pending.plan_markdown;
+            this.getUIContext().animateTo(
+              OrbitTheme.resolveMotion(OrbitTheme.MOTION_UI, this.store.shellStore.reducedMotion),
+              () => {
+                if (!this.isEditingPlan && this.editedMarkdown.length === 0) {
+                  this.editedMarkdown = pending.plan_markdown;
+                }
+                this.isEditingPlan = !this.isEditingPlan;
               }
-              this.isEditingPlan = !this.isEditingPlan;
-            });
+            );
           })
       }
       .width('100%')

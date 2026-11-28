@@ -15495,8 +15495,7 @@ impl OrbitAppCore {
     }
 
     fn normalize_managed_skills_cwd(cwd: Option<&str>) -> Option<String> {
-        cwd.map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "~")
+        cwd.filter(|s| !s.trim().is_empty() && *s != "~")
             .map(ToString::to_string)
     }
 

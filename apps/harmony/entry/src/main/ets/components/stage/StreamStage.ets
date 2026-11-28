@@ -9,6 +9,7 @@ import {
   formatCompactTopBarConnectionLabel
 } from '../../model/OrbitTypes';
 import { OrbitStageTurnModel } from '../../model/viewmodels/OrbitStageModels';
+import { OrbitFleetStore } from '../../model/stores/OrbitFleetStore';
 import { OrbitStageStore } from '../../model/stores/OrbitStageStore';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
@@ -44,6 +45,7 @@ import {
   assignSubagentCharacters
 } from '../common/OrbitSubagentAvatar';
 import { StageTurnView } from './StageTurnView';
+import { OrbitPullRefreshController } from '../settings/OrbitSettingsNavModel';
 
 interface StageCrewAvatarSeed extends OrbitAvatarSeedKeyed {
   readonly key: string;
@@ -60,12 +62,16 @@ export struct StreamStage {
 
   @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
   @Local private stageStore: OrbitStageStore = OrbitHarmonyStore.getInstance().stageStore;
+  @Local private fleetStore: OrbitFleetStore = OrbitHarmonyStore.getInstance().fleetStore;
   private listScroller: Scroller = new Scroller();
+  private readonly pullRefreshCtrl: OrbitPullRefreshController = new OrbitPullRefreshController();
   private isAutoAnchoringResize: boolean = false;
   private refreshTimerId: number = -1;
   private resizeTimerId: number = -1;
 
   aboutToDisappear(): void {
+    this.pullRefreshCtrl.unmount();
+    this.isRefreshing = false;
     if (this.refreshTimerId !== -1) {
       clearTimeout(this.refreshTimerId);
       this.refreshTimerId = -1;
@@ -125,15 +131,14 @@ export struct StreamStage {
   }
 
   private handlePullRefresh(): void {
-    this.isRefreshing = true;
-    this.store.pullRefreshStage();
-    if (this.refreshTimerId !== -1) {
-      clearTimeout(this.refreshTimerId);
-    }
-    this.refreshTimerId = setTimeout(() => {
-      this.isRefreshing = false;
-      this.refreshTimerId = -1;
-    }, 450);
+    const scope = `${this.store.selectedHostId}::${this.store.selectedAgentId}`;
+    void this.pullRefreshCtrl.run(
+      scope,
+      (): Promise<void> => this.store.pullRefreshStageAsync(),
+      (refreshing: boolean): void => {
+        this.isRefreshing = refreshing;
+      }
+    );
   }
 
   @Monitor('stageStore.activeRevision')
@@ -145,8 +150,12 @@ export struct StreamStage {
     }
   }
 
-  @Monitor('store.selectedAgentId')
+  @Monitor('store.selectedAgentId', 'fleetStore.selectedHostId')
   onSelectedAgentChanged(_mon: IMonitor): void {
+    const scope = `${this.fleetStore.selectedHostId}::${this.store.selectedAgentId}`;
+    if (this.pullRefreshCtrl.onScopeChanged(scope)) {
+      this.isRefreshing = false;
+    }
     this.firstVisibleIndex = 0;
     this.lastVisibleIndex = Math.max(0, this.store.stageTurns.length - 1);
     this.atBottomEdge = true;
@@ -279,7 +288,7 @@ export struct StreamStage {
         .attributeModifier(
           orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.listCard)
         )
-        .height(30)
+        .constraintSize({ minHeight: 30 })
         .padding({ left: 10, right: 10 })
         .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.borderDefault })
         .onClick(() => {
@@ -379,7 +388,7 @@ export struct StreamStage {
             }
             .alignItems(VerticalAlign.Center)
           }
-          .height(28)
+          .constraintSize({ minHeight: 28 })
           .padding({ left: 8, right: 10 })
           .backgroundColor(this.store.palette.accentPrimarySoft)
           .onClick(() => {
@@ -491,11 +500,9 @@ export struct StreamStage {
       Blank()
 
       Column({ space: OrbitTokens.SPACE_SM }) {
-        Text('Pair Your First Host')
+        Text($r('app.string.stage_pair_first_host_title'))
           .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
-        Text(
-          'Connect to orbit daemon on your workstation, Linux devbox, or Mac mini over LAN, SSH, or E2EE Noise Relay.'
-        )
+        Text($r('app.string.stage_pair_first_host_body'))
           .attributeModifier(orbitTextBody(this.store.palette.fgSecondary))
           .textAlign(TextAlign.Center)
       }
@@ -503,19 +510,20 @@ export struct StreamStage {
       .width('100%')
 
       Column({ space: OrbitTokens.SPACE_MD }) {
-        Button('Scan QR Code')
+        Button($r('app.string.settings_scan_qr_code'))
           .attributeModifier(
             orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
           )
           .width('100%')
-          .height(OrbitTokens.HIT_MIN)
+          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
           .borderRadius(OrbitTokens.RADIUS_MD)
+          .accessibilityText($r('app.string.settings_scan_qr_code'))
           .onClick(() => {
             this.store.scanQrAndPair(this.getUIContext().getHostContext());
           })
 
         Row({ space: OrbitTokens.SPACE_SM }) {
-          TextInput({ placeholder: 'orbit://pair/...', text: this.manualPairUri })
+          TextInput({ placeholder: $r('app.string.stage_pair_uri_placeholder'), text: this.manualPairUri })
             .attributeModifier(
               orbitInputMono(
                 this.store.palette.fgPrimary,
@@ -523,22 +531,24 @@ export struct StreamStage {
                 this.store.palette.code
               )
             )
-            .height(OrbitTokens.HIT_MIN)
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
             .borderRadius(OrbitTokens.RADIUS_MD)
             .border({
               width: OrbitTokens.HAIRLINE,
               color: this.store.palette.hairline
             })
             .layoutWeight(1)
+            .accessibilityText($r('app.string.settings_pairing_uri_input_a11y'))
             .onChange((val: string) => {
               this.manualPairUri = val;
             })
 
-          Button('Pair Host')
+          Button($r('app.string.settings_pair_host_submit'))
             .attributeModifier(
               orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
             )
-            .height(OrbitTokens.HIT_MIN)
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .accessibilityText($r('app.string.settings_pair_host_submit'))
             .borderRadius(OrbitTokens.RADIUS_MD)
             .onClick(() => {
               dismissHarmonyKeyboard(this.getUIContext());
@@ -638,7 +648,7 @@ export struct StreamStage {
               .labelFontColor(this.store.palette.fgMuted)
               .onClick(() => {
                 this.store.selectHost(host.host_id);
-                this.store.triggerHaptic(8);
+                this.store.triggerHapticPreset('selection');
               })
           },
           (host: HostCardDto) => `stage_host_${host.host_id}`
@@ -687,7 +697,7 @@ export struct StreamStage {
     Column({ space: 0 }) {
       Blank()
 
-      Text('What would you like to build?')
+      Text($r('app.string.stage_welcome_prompt'))
         .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
         .textAlign(TextAlign.Center)
         .maxLines(2)
@@ -715,7 +725,7 @@ export struct StreamStage {
           }
           .alignItems(VerticalAlign.Center)
         }
-        .height(OrbitTokens.HIT_COMPACT)
+        .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
         .padding({ left: 14, right: 12 })
         .margin({ left: 4, right: 4, top: 4, bottom: 4 })
         .backgroundColor(this.store.palette.subtleSurface)
@@ -741,7 +751,7 @@ export struct StreamStage {
             }
             .alignItems(VerticalAlign.Center)
           }
-          .height(OrbitTokens.HIT_COMPACT)
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
           .padding({ left: 14, right: 12 })
           .margin({ left: 4, right: 4, top: 4, bottom: 4 })
           .backgroundColor(this.store.palette.subtleSurface)
@@ -768,11 +778,15 @@ export struct StreamStage {
             }
             .alignItems(VerticalAlign.Center)
           }
-          .height(OrbitTokens.HIT_COMPACT)
+          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
           .padding({ left: 14, right: 12 })
           .margin({ left: 4, right: 4, top: 4, bottom: 4 })
           .backgroundColor(this.store.palette.subtleSurface)
-          .accessibilityText(`Execution environment: ${this.store.draftUseWorktree ? 'Worktree' : 'Local'}`)
+          .accessibilityText(
+            this.store.draftUseWorktree
+              ? $r('app.string.a11y_exec_env_worktree')
+              : $r('app.string.a11y_exec_env_local')
+          )
           .bindMenu(this.renderExecutionModeMenu())
         }
       }
@@ -887,7 +901,7 @@ export struct StreamStage {
                         .attributeModifier(
                           orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
                         )
-                        .height(34)
+                        .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
                         .padding({ left: 14, right: 14 })
                         .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
                         .onClick(() => {
@@ -1002,8 +1016,8 @@ export struct StreamStage {
             )
             .accessibilityText(
               this.store.isActiveAgentRunning()
-                ? 'Scroll to latest streaming output'
-                : 'Scroll to latest message'
+                ? $r('app.string.a11y_scroll_latest_streaming')
+                : $r('app.string.a11y_scroll_latest_message')
             )
             .onClick(() => {
               const lastIdx = this.lastListItemIndex();
@@ -1011,7 +1025,7 @@ export struct StreamStage {
               this.lastVisibleIndex = lastIdx;
               this.listScroller.scrollToIndex(lastIdx, true, ScrollAlign.END);
               this.listScroller.scrollEdge(Edge.Bottom);
-              this.store.triggerHaptic(8);
+              this.store.triggerHaptic('selection');
             })
           }
           .margin({ bottom: OrbitTokens.SPACE_SM })

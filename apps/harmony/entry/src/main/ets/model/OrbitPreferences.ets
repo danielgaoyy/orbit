@@ -9,9 +9,12 @@ import {
 } from './stores/OrbitSidePanelStore';
 import { OrbitShellWidthStorage } from './stores/OrbitShellStore';
 import { PushPreferencesDto } from './OrbitTypes';
+import { orbitNormalizeThemeMode } from './OrbitWindowTheme';
 
 const PREFS_NAME: string = 'orbit_harmony_prefs';
 const KEY_THEME_MODE: string = 'orbit.harmony.v2.theme_mode';
+const KEY_APP_LANGUAGE: string = 'orbit.harmony.v2.app_language';
+const KEY_ACTIVE_TURN_SEND_BEHAVIOR: string = 'orbit.harmony.v2.active_turn_send_behavior';
 const KEY_PINNED_THREADS: string = 'orbit.harmony.v2.pinned_threads_json';
 const KEY_MIGRATED_THREAD_PREFS_V1: string = 'orbit.harmony.v2.migrated_thread_prefs';
 const KEY_DRAFT_PREFS: string = 'orbit.harmony.v2.draft_prefs';
@@ -21,6 +24,19 @@ const KEY_SIDEBAR_WIDTH_VP: string = 'orbit.harmony.v2.sidebar_width_vp';
 const KEY_SIDE_PANEL_WIDTH_VP: string = 'orbit.harmony.v2.panel_width_vp';
 const KEY_PUSH_PREFS_BY_HOST: string = 'orbit.harmony.v2.push_prefs_by_host_json';
 const KEY_PA_LAST_VISIT_MAP: string = 'orbit.harmony.v2.pa_last_visit_map_json';
+const KEY_HOST_DEFAULT_AGENT_PREFS: string = 'orbit.harmony.v2.host_default_agent_prefs_json';
+
+export interface OrbitHostDefaultAgentPrefs {
+  provider: string;
+  model: string;
+  effort: string;
+}
+
+export interface OrbitKeyValuePrefsBackend {
+  getStringSync(key: string, defaultValue: string): string;
+  putStringSync(key: string, value: string): void;
+  flushAsync(): Promise<void>;
+}
 
 export interface OrbitDraftPrefs {
   provider: string;
@@ -36,7 +52,10 @@ function generateAnonymousDeviceId(): string {
   let filled = false;
   try {
     if (canIUse('SystemCapability.Security.CryptoFramework.Rand')) {
-      const blob = cryptoFramework.createRandom().generateRandomSync(12);
+      // @SuppressWarnings syscap
+      const rand = cryptoFramework.createRandom();
+      // @SuppressWarnings syscap
+      const blob = rand.generateRandomSync(12);
       if (blob.data.length === 12) {
         for (let i = 0; i < 12; i++) {
           bytes[i] = blob.data[i];
@@ -61,6 +80,7 @@ function generateAnonymousDeviceId(): string {
 
 export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellWidthStorage {
   private prefs: preferences.Preferences | null = null;
+  private testBackend: OrbitKeyValuePrefsBackend | null = null;
 
   public init(context: common.Context): void {
     if (this.prefs !== null) {
@@ -70,6 +90,51 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
       this.prefs = preferences.getPreferencesSync(context, { name: PREFS_NAME });
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to initialize preferences', err as Object);
+    }
+  }
+
+  public bindTestBackend(backend: OrbitKeyValuePrefsBackend | null): void {
+    this.testBackend = backend;
+  }
+
+  private hasStorage(): boolean {
+    return this.testBackend !== null || this.prefs !== null;
+  }
+
+  private readStringSync(key: string, defaultValue: string): string {
+    if (this.testBackend !== null) {
+      return this.testBackend.getStringSync(key, defaultValue);
+    }
+    if (this.prefs === null) {
+      return defaultValue;
+    }
+    try {
+      const raw = this.prefs.getSync(key, defaultValue);
+      return typeof raw === 'string' ? raw : defaultValue;
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', `Failed to read ${key}`, err as Object);
+      return defaultValue;
+    }
+  }
+
+  private writeStringSync(key: string, value: string, label: string): void {
+    if (this.testBackend !== null) {
+      this.testBackend.putStringSync(key, value);
+      this.testBackend.flushAsync().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', `Failed to flush ${label}`, err);
+      });
+      return;
+    }
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      this.prefs.putSync(key, value);
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', `Failed to flush ${label}`, err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', `Failed to save ${label}`, err as Object);
     }
   }
 
@@ -217,8 +282,12 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
     }
     try {
       const raw = this.prefs.getSync(KEY_THEME_MODE, 'system');
-      if (raw === 'light' || raw === 'dark' || raw === 'system') {
-        return raw;
+      if (typeof raw === 'string') {
+        const normalized = orbitNormalizeThemeMode(raw);
+        if (normalized !== raw) {
+          this.setThemeMode(normalized);
+        }
+        return normalized;
       }
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to read theme mode', err as Object);
@@ -227,7 +296,7 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
   }
 
   public setThemeMode(mode: string): void {
-    const normalized = (mode === 'light' || mode === 'dark') ? mode : 'system';
+    const normalized = orbitNormalizeThemeMode(mode);
     if (this.prefs === null) {
       return;
     }
@@ -238,6 +307,66 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
       });
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to save theme mode', err as Object);
+    }
+  }
+
+  public getAppLanguage(): string {
+    if (this.prefs === null) {
+      return 'system';
+    }
+    try {
+      const raw = this.prefs.getSync(KEY_APP_LANGUAGE, 'system');
+      if (raw === 'en' || raw === 'zh_CN' || raw === 'ja_JP' || raw === 'system') {
+        return raw;
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read app language', err as Object);
+    }
+    return 'system';
+  }
+
+  public setAppLanguage(lang: string): void {
+    const normalized = (lang === 'en' || lang === 'zh_CN' || lang === 'ja_JP') ? lang : 'system';
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_APP_LANGUAGE, normalized);
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush app language', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save app language', err as Object);
+    }
+  }
+
+  public getActiveTurnSendBehavior(): string {
+    if (this.prefs === null) {
+      return 'queue';
+    }
+    try {
+      const raw = this.prefs.getSync(KEY_ACTIVE_TURN_SEND_BEHAVIOR, 'queue');
+      if (raw === 'queue' || raw === 'steer' || raw === 'interrupt') {
+        return raw;
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read active turn send behavior', err as Object);
+    }
+    return 'queue';
+  }
+
+  public setActiveTurnSendBehavior(behavior: string): void {
+    const normalized = (behavior === 'steer' || behavior === 'interrupt') ? behavior : 'queue';
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_ACTIVE_TURN_SEND_BEHAVIOR, normalized);
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush active turn send behavior', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save active turn send behavior', err as Object);
     }
   }
 
@@ -312,10 +441,10 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
   }
 
   public loadDraftPrefs(legacyFilePath: string): OrbitDraftPrefs | null {
-    if (this.prefs !== null) {
+    if (this.hasStorage()) {
       try {
-        const stored = this.prefs.getSync(KEY_DRAFT_PREFS, '');
-        if (typeof stored === 'string' && stored.length > 0) {
+        const stored = this.readStringSync(KEY_DRAFT_PREFS, '');
+        if (stored.length > 0) {
           return this.parseDraftPrefsText(stored);
         }
       } catch (err) {
@@ -341,7 +470,7 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
   }
 
   public saveDraftPrefs(draft: OrbitDraftPrefs): void {
-    if (this.prefs === null) {
+    if (!this.hasStorage()) {
       return;
     }
     try {
@@ -353,12 +482,58 @@ export class OrbitPreferencesStore implements OrbitSidePanelStorage, OrbitShellW
         `sidebarProjectSort=${draft.sidebarProjectSort}`,
         `sidebarThreadFilter=${draft.sidebarThreadFilter}`
       ].join('\n');
-      this.prefs.putSync(KEY_DRAFT_PREFS, payload);
-      this.prefs.flush().catch((err: Object) => {
-        orbitLogWarn('OrbitPrefs', 'Failed to flush draft prefs', err);
-      });
+      this.writeStringSync(KEY_DRAFT_PREFS, payload, 'draft prefs');
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to save draft prefs', err as Object);
+    }
+  }
+
+  public getHostDefaultAgentPrefsMap(): Record<string, OrbitHostDefaultAgentPrefs> {
+    if (!this.hasStorage()) {
+      return {};
+    }
+    try {
+      const raw = this.readStringSync(KEY_HOST_DEFAULT_AGENT_PREFS, '');
+      if (raw.trim().length === 0) {
+        return {};
+      }
+      const parsed = JSON.parse(raw) as Record<string, OrbitHostDefaultAgentPrefs>;
+      return parsed !== null && typeof parsed === 'object' ? parsed : {};
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read host default agent prefs map', err as Object);
+      return {};
+    }
+  }
+
+  public getHostDefaultAgentPrefs(hostId: string): OrbitHostDefaultAgentPrefs | null {
+    const scopeKey = hostId.trim().length > 0 ? hostId.trim() : '__default__';
+    const map = this.getHostDefaultAgentPrefsMap();
+    const entry = map[scopeKey];
+    if (entry === undefined || entry === null) {
+      return null;
+    }
+    return {
+      provider: typeof entry.provider === 'string' ? entry.provider.trim() : '',
+      model: typeof entry.model === 'string' ? entry.model.trim() : '',
+      effort: typeof entry.effort === 'string' ? entry.effort.trim() : ''
+    };
+  }
+
+  public saveHostDefaultAgentPrefs(hostId: string, next: OrbitHostDefaultAgentPrefs): void {
+    const scopeKey = hostId.trim().length > 0 ? hostId.trim() : '__default__';
+    if (!this.hasStorage()) {
+      return;
+    }
+    try {
+      const map = this.getHostDefaultAgentPrefsMap();
+      map[scopeKey] = {
+        provider: next.provider.trim(),
+        model: next.model.trim(),
+        effort: next.effort.trim()
+      };
+      this.writeStringSync(KEY_HOST_DEFAULT_AGENT_PREFS, JSON.stringify(map), 'host default agent prefs');
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save host default agent prefs', err as Object);
     }
   }
 

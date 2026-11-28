@@ -1,0 +1,49 @@
+{
+  "by_model": [
+    {
+      "cache_read_tokens": 48000,
+      "cost_usd": 1.42,
+      "input_tokens": 120000,
+      "model": "claude-sonnet-4",
+      "output_tokens": 24000,
+      "provider": "claude",
+      "turns": 14
+    }
+  ],
+  "by_project": [
+    {
+      "cost_usd": 1.42,
+      "total_tokens": 144000,
+      "turns": 14,
+      "workspace_cwd": "/repo"
+    }
+  ],
+  "daily": [
+    {
+      "cache_read_tokens": 48000,
+      "cost_usd": 1.42,
+      "date": "2026-11-28",
+      "input_tokens": 120000,
+      "output_tokens": 24000,
+      "turns": 14
+    }
+  ],
+  "days": 7,
+  "forecasts": [
+    {
+      "burn_rate_pct_per_hour": 4.2,
+      "estimated_depletion_secs": 58000,
+      "likely_to_exhaust_before_reset": false,
+      "provider": "claude",
+      "remaining_percent": 68.5,
+      "resets_in_secs": 10800,
+      "window_label": "5h"
+    }
+  ],
+  "total_cache_read_tokens": 48000,
+  "total_cache_savings_usd": 0.35,
+  "total_cost_usd": 1.42,
+  "total_input_tokens": 120000,
+  "total_output_tokens": 24000,
+  "total_turns": 14
+}

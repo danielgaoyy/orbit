@@ -659,36 +659,12 @@ pub fn filter_shareable_endpoints(endpoints: &[String]) -> Vec<String> {
     out
 }
 
-fn extract_endpoint_host(endpoint: &str) -> String {
-    let lower = endpoint.trim().to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("ws://")
-        .or_else(|| lower.strip_prefix("wss://"))
-        .or_else(|| lower.strip_prefix("http://"))
-        .or_else(|| lower.strip_prefix("https://"))
-        .unwrap_or(&lower);
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.starts_with('[') {
-        authority
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .to_string()
-    } else {
-        authority.split(':').next().unwrap_or("").to_string()
-    }
-}
-
 pub fn is_loopback_endpoint(endpoint: &str) -> bool {
-    let host = extract_endpoint_host(endpoint);
-    matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
-        || host.starts_with("127.")
+    orbit_crypto::is_loopback_ws_endpoint(endpoint)
 }
 
 pub fn is_tun_benchmark_endpoint(endpoint: &str) -> bool {
-    let host = extract_endpoint_host(endpoint);
-    host.starts_with("198.18.") || host.starts_with("198.19.")
+    orbit_crypto::is_tun_benchmark_endpoint(endpoint)
 }
 
 pub fn synced_host_from_local(rec: &LocalHostSyncRecord) -> SyncedHostEntry {

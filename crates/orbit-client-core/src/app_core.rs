@@ -103,8 +103,8 @@ use crate::render::{
 };
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
-    ClientCoreError, ClientInboundEvent, HostSessionHandle, connect_smart_with_fallback_relays,
-    connect_via_peer_bridge,
+    ClientCoreError, ClientInboundEvent, HostSessionHandle,
+    connect_smart_with_fallback_relays_and_progress, connect_via_peer_bridge,
 };
 
 const CLOUD_AUTO_SYNC_URGENT_DEBOUNCE_MS: u64 = 1_500;
@@ -1060,6 +1060,9 @@ struct HostMemoryState {
     ssh_heal_attempted: bool,
     pending_relay_override: bool,
     connecting_in_flight: bool,
+    connect_attempt_gen: u64,
+    connect_started_at: Option<std::time::Instant>,
+    connect_abort: Option<tokio::task::AbortHandle>,
     reconnect_scheduled: bool,
     session_gen: u64,
     available_providers: Vec<ProviderKind>,
@@ -1354,6 +1357,9 @@ impl HostMemoryState {
             ssh_heal_attempted: false,
             pending_relay_override: false,
             connecting_in_flight: false,
+            connect_attempt_gen: 0,
+            connect_started_at: None,
+            connect_abort: None,
             reconnect_scheduled: false,
             session_gen: 0,
             available_providers: vec![
@@ -2310,20 +2316,21 @@ impl OrbitAppCore {
                     .as_ref()
                     .is_some_and(|(id, pubkey)| *id == h.host_id && *pubkey == h.daemon_pubkey_b64);
                 let route_mode = HostRouteMode::from_opt_str(h.meta.route_mode.as_deref());
-                let direct_endpoints = if should_strip_remote_loopback(
+                let strip_loopback = should_strip_remote_loopback(
                     is_saved_local,
                     h.meta.ssh_alias.as_deref(),
                     route_mode,
                     h.relay_url.as_deref(),
                     &h.direct_endpoints,
-                ) {
-                    h.direct_endpoints
-                        .into_iter()
-                        .filter(|ep| !is_loopback_endpoint(ep))
-                        .collect()
-                } else {
-                    h.direct_endpoints
-                };
+                );
+                let direct_endpoints: Vec<String> = h
+                    .direct_endpoints
+                    .into_iter()
+                    .filter(|ep| {
+                        !orbit_crypto::is_tun_benchmark_endpoint(ep)
+                            && (!strip_loopback || !is_loopback_endpoint(ep))
+                    })
+                    .collect();
                 let bridge_host_ids = h.meta.bridge_host_ids;
                 let profile = SavedHostProfile {
                     host_id: h.host_id.clone(),
@@ -2373,7 +2380,11 @@ impl OrbitAppCore {
             && let Ok(offer) = PairingOffer::from_qr_uri(&uri)
         {
             let local_port = extract_ws_port(&offer.direct_endpoints).unwrap_or(6868);
-            let mut endpoints = offer.direct_endpoints;
+            let mut endpoints: Vec<String> = offer
+                .direct_endpoints
+                .into_iter()
+                .filter(|ep| !orbit_crypto::is_tun_benchmark_endpoint(ep))
+                .collect();
             let loopback = format!("ws://127.0.0.1:{local_port}/ws");
             if !endpoints.contains(&loopback) {
                 endpoints.insert(0, loopback);
@@ -5480,7 +5491,11 @@ impl OrbitAppCore {
                 .unwrap_or(HostRouteMode::Auto);
             let custom_direct_endpoint =
                 prev.and_then(|h| h.profile.custom_direct_endpoint.clone());
-            let mut direct_endpoints = offer.direct_endpoints;
+            let mut direct_endpoints: Vec<String> = offer
+                .direct_endpoints
+                .into_iter()
+                .filter(|ep| !orbit_crypto::is_tun_benchmark_endpoint(ep))
+                .collect();
             if is_local_daemon {
                 let loopback = format!("ws://127.0.0.1:{remote_port}/ws");
                 if !direct_endpoints.contains(&loopback) {
@@ -5524,6 +5539,12 @@ impl OrbitAppCore {
             let entry = guard
                 .entry(offer.host_id.clone())
                 .or_insert_with(|| HostMemoryState::new(profile.clone()));
+            if let Some(abort) = entry.connect_abort.take() {
+                abort.abort();
+            }
+            entry.connect_attempt_gen = entry.connect_attempt_gen.wrapping_add(1);
+            entry.connecting_in_flight = false;
+            entry.connect_started_at = None;
             entry.profile = profile;
             entry.is_local = is_local_daemon;
             entry.ssh_heal_attempted = false;
@@ -5585,6 +5606,9 @@ impl OrbitAppCore {
                 .write()
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
             if let Some(mut removed) = guard.remove(host_id) {
+                if let Some(abort) = removed.connect_abort.take() {
+                    abort.abort();
+                }
                 fail_pending_host_requests(&mut removed, "Host removed before request completed");
             }
         }
@@ -5632,8 +5656,14 @@ impl OrbitAppCore {
             if reconnect {
                 // Tear down active transport immediately when reconfiguring route mode / endpoints
                 // so a DirectOnly switch never lingers on a previously dialed Relay session.
+                if let Some(abort) = h.connect_abort.take() {
+                    abort.abort();
+                }
+                h.connect_attempt_gen = h.connect_attempt_gen.wrapping_add(1);
                 h.session = None;
                 h.connecting_in_flight = false;
+                h.connect_started_at = None;
+                h.reconnect_scheduled = false;
                 h.profile.state = if matches!(h.profile.route_mode, HostRouteMode::DirectOnly) {
                     HostConnectionState::ConnectingDirect
                 } else {
@@ -5691,7 +5721,7 @@ impl OrbitAppCore {
             host_id: host_id.to_string(),
         });
         if reconnect {
-            self.connect_host_async(host_id.to_string());
+            self.connect_host_async_with_options(host_id.to_string(), true);
         }
         self.schedule_cloud_auto_sync(false);
         Ok(card)
@@ -5794,7 +5824,7 @@ impl OrbitAppCore {
                 host_id: host_id.clone(),
             });
             if should_reconnect {
-                self.connect_host_async(host_id);
+                self.connect_host_async_with_options(host_id, true);
             }
         }
         for host_id in online_hosts_to_mesh {
@@ -5816,15 +5846,182 @@ impl OrbitAppCore {
         }
         self.schedule_cloud_auto_sync(true);
     }
+}
 
+fn has_usable_direct_endpoints(profile: &SavedHostProfile) -> bool {
+    profile
+        .custom_direct_endpoint
+        .as_deref()
+        .is_some_and(|ep| !ep.trim().is_empty())
+        || profile
+            .direct_endpoints
+            .iter()
+            .any(|ep| !ep.trim().is_empty() && !orbit_crypto::is_tun_benchmark_endpoint(ep))
+}
+
+fn initial_connecting_state(profile: &SavedHostProfile) -> HostConnectionState {
+    if matches!(profile.route_mode, HostRouteMode::RelayOnly)
+        || (!has_usable_direct_endpoints(profile)
+            && profile
+                .ssh_alias
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty()))
+    {
+        HostConnectionState::ConnectingRelay
+    } else {
+        HostConnectionState::ConnectingDirect
+    }
+}
+
+fn reconcile_welcome_direct_endpoints(
+    current: &[String],
+    welcome_endpoints: &[String],
+    is_local: bool,
+    connected_direct: bool,
+) -> Vec<String> {
+    let normalized_welcome: Vec<String> = welcome_endpoints
+        .iter()
+        .map(|ep| orbit_crypto::normalize_ws_endpoint(ep))
+        .filter(|ep| !ep.is_empty() && !orbit_crypto::is_tun_benchmark_endpoint(ep))
+        .collect();
+    let fresh_shareable = filter_shareable_endpoints(&normalized_welcome);
+
+    let keep_loopback = is_local || connected_direct;
+    let mut updated = Vec::new();
+    if !fresh_shareable.is_empty() {
+        if keep_loopback {
+            for ep in current {
+                if is_loopback_endpoint(ep) && !updated.contains(ep) {
+                    updated.push(ep.clone());
+                }
+            }
+        }
+        for ep in fresh_shareable {
+            if !updated.contains(&ep) {
+                updated.push(ep);
+            }
+        }
+        for ep in filter_shareable_endpoints(current) {
+            if !updated.contains(&ep) {
+                updated.push(ep);
+            }
+        }
+    } else if !normalized_welcome.is_empty()
+        && normalized_welcome.iter().all(|ep| is_loopback_endpoint(ep))
+    {
+        if is_local {
+            for ep in normalized_welcome {
+                if !updated.contains(&ep) {
+                    updated.push(ep);
+                }
+            }
+        } else if connected_direct {
+            for ep in current {
+                if is_loopback_endpoint(ep) && !updated.contains(ep) {
+                    updated.push(ep.clone());
+                }
+            }
+        }
+    } else {
+        for ep in current {
+            if !orbit_crypto::is_tun_benchmark_endpoint(ep) && !updated.contains(ep) {
+                updated.push(ep.clone());
+            }
+        }
+    }
+    updated
+}
+
+struct ConnectAttemptGuard {
+    core: Arc<OrbitAppCore>,
+    host_id: String,
+    attempt_gen: u64,
+    active: bool,
+}
+
+impl ConnectAttemptGuard {
+    fn defuse(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ConnectAttemptGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut guard) = self.core.hosts.write()
+            && let Some(h) = guard.get_mut(&self.host_id)
+            && h.connect_attempt_gen == self.attempt_gen
+        {
+            h.connecting_in_flight = false;
+            h.connect_started_at = None;
+            h.connect_abort = None;
+            if h.session.is_none() {
+                h.profile.state = HostConnectionState::Disconnected;
+            }
+        }
+    }
+}
+
+impl OrbitAppCore {
     pub fn connect_host_async(self: &Arc<Self>, host_id: String) {
-        let core = Arc::clone(self);
-        self.runtime.spawn(async move {
-            core.connect_host_task(&host_id).await;
-        });
+        self.connect_host_async_with_options(host_id, false);
     }
 
-    async fn connect_host_task(self: &Arc<Self>, host_id: &str) {
+    pub fn reconnect_host_async(self: &Arc<Self>, host_id: String) {
+        self.connect_host_async_with_options(host_id, true);
+    }
+
+    fn connect_host_async_with_options(self: &Arc<Self>, host_id: String, force_preempt: bool) {
+        let started = {
+            let Ok(mut guard) = self.hosts.write() else {
+                return;
+            };
+            let Some(h) = guard.get_mut(&host_id) else {
+                return;
+            };
+            if h.connecting_in_flight {
+                let stale = h
+                    .connect_started_at
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(35));
+                if !force_preempt && !stale {
+                    return;
+                }
+                if let Some(abort) = h.connect_abort.take() {
+                    abort.abort();
+                }
+                h.connecting_in_flight = false;
+                h.connect_started_at = None;
+            }
+            h.connect_attempt_gen = h.connect_attempt_gen.wrapping_add(1);
+            let attempt_gen = h.connect_attempt_gen;
+            h.connecting_in_flight = true;
+            h.connect_started_at = Some(std::time::Instant::now());
+            h.reconnect_scheduled = false;
+            h.profile.state = initial_connecting_state(&h.profile);
+            h.last_error = None;
+            h.session = None;
+            let core = Arc::clone(self);
+            let owned_id = host_id.clone();
+            let join = self.runtime.spawn(async move {
+                core.connect_host_task(&owned_id, attempt_gen).await;
+            });
+            h.connect_abort = Some(join.abort_handle());
+            true
+        };
+        if started {
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
+        }
+    }
+
+    async fn connect_host_task(self: &Arc<Self>, host_id: &str, attempt_gen: u64) {
+        let mut attempt_guard = ConnectAttemptGuard {
+            core: Arc::clone(self),
+            host_id: host_id.to_string(),
+            attempt_gen,
+            active: true,
+        };
         let (profile, is_local_host, has_online_bridge) = {
             let Ok(mut guard) = self.hosts.write() else {
                 return;
@@ -5833,21 +6030,13 @@ impl OrbitAppCore {
                 .iter()
                 .any(|(hid, h)| hid.as_str() != host_id && h.session.is_some());
             let Some(h) = guard.get_mut(host_id) else {
+                attempt_guard.defuse();
                 return;
             };
-            if h.connecting_in_flight {
+            if h.connect_attempt_gen != attempt_gen {
+                attempt_guard.defuse();
                 return;
             }
-            h.connecting_in_flight = true;
-            h.profile.state = if matches!(h.profile.route_mode, HostRouteMode::RelayOnly)
-                || (h.profile.direct_endpoints.is_empty() && h.profile.ssh_alias.is_none())
-            {
-                HostConnectionState::ConnectingRelay
-            } else {
-                HostConnectionState::ConnectingDirect
-            };
-            h.last_error = None;
-            h.session = None;
             h.board_cas_supported = false;
             h.caught_up_agents.clear();
             h.timeline_loading_older.clear();
@@ -5872,7 +6061,6 @@ impl OrbitAppCore {
             fail_pending_host_requests(h, "Host reconnecting before request completed");
             (h.profile.clone(), h.is_local, online_bridge)
         };
-        self.emit(|revision| CoreNotification::FleetChanged { revision });
 
         let fallback_relays: Vec<String> =
             if !is_local_host && profile.route_mode != HostRouteMode::DirectOnly {
@@ -5896,89 +6084,124 @@ impl OrbitAppCore {
                 Vec::new()
             };
 
-        let connect_res = if !is_local_host
-            && profile.route_mode != HostRouteMode::DirectOnly
-            && has_online_bridge
-        {
-            let smart_fut = connect_smart_with_fallback_relays(
-                &profile,
-                &fallback_relays,
-                Some(self.store.clone()),
-            );
-            tokio::pin!(smart_fut);
-            let mut smart_err_early = None;
-            let race_winner = tokio::select! {
-                res = &mut smart_fut => match res {
-                    Ok(handle) => Some(Ok(handle)),
-                    Err(err) => {
-                        smart_err_early = Some(err);
-                        None
-                    }
-                },
-                _ = tokio::time::sleep(Duration::from_millis(600)) => None,
-            };
-            if let Some(winner) = race_winner {
-                winner
-            } else if let Some(early_err) = smart_err_early {
-                if early_err.is_auth_error() {
-                    Err(early_err)
-                } else if let Some(bridged) = self
-                    .try_connect_host_via_peer_bridges(host_id, &profile)
-                    .await
-                {
-                    Ok(bridged)
-                } else {
-                    Err(early_err)
-                }
-            } else {
-                let bridge_fut = self.try_connect_host_via_peer_bridges(host_id, &profile);
-                tokio::pin!(bridge_fut);
-                tokio::select! {
-                    res = &mut smart_fut => match res {
-                        Ok(handle) => Ok(handle),
-                        Err(err) if !err.is_auth_error() => {
-                            if let Some(bridged) = bridge_fut.await {
-                                Ok(bridged)
-                            } else {
-                                Err(err)
-                            }
-                        }
-                        Err(err) => Err(err),
-                    },
-                    maybe_bridged = &mut bridge_fut => {
-                        if let Some(bridged) = maybe_bridged {
-                            Ok(bridged)
-                        } else {
-                            smart_fut.await
-                        }
-                    }
-                }
-            }
-        } else {
-            match connect_smart_with_fallback_relays(
-                &profile,
-                &fallback_relays,
-                Some(self.store.clone()),
-            )
-            .await
+        let phase_core = Arc::clone(self);
+        let phase_host_id = host_id.to_string();
+        let on_phase = move |next_state: HostConnectionState| {
+            let changed = if let Ok(mut guard) = phase_core.hosts.write()
+                && let Some(h) = guard.get_mut(&phase_host_id)
+                && h.connect_attempt_gen == attempt_gen
+                && h.connecting_in_flight
+                && h.profile.state != next_state
             {
-                Ok(handle) => Ok(handle),
-                Err(smart_err)
-                    if !smart_err.is_auth_error()
-                        && profile.route_mode != HostRouteMode::DirectOnly =>
-                {
-                    if let Some(bridged) = self
+                h.profile.state = next_state;
+                true
+            } else {
+                false
+            };
+            if changed {
+                phase_core.emit(|revision| CoreNotification::FleetChanged { revision });
+                phase_core.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: phase_host_id.clone(),
+                });
+            }
+        };
+
+        let connect_fut = async {
+            if !is_local_host
+                && profile.route_mode != HostRouteMode::DirectOnly
+                && has_online_bridge
+            {
+                let smart_fut = connect_smart_with_fallback_relays_and_progress(
+                    &profile,
+                    &fallback_relays,
+                    Some(self.store.clone()),
+                    &on_phase,
+                );
+                tokio::pin!(smart_fut);
+                let mut smart_err_early = None;
+                let race_winner = tokio::select! {
+                    res = &mut smart_fut => match res {
+                        Ok(handle) => Some(Ok(handle)),
+                        Err(err) => {
+                            smart_err_early = Some(err);
+                            None
+                        }
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(600)) => None,
+                };
+                if let Some(winner) = race_winner {
+                    winner
+                } else if let Some(early_err) = smart_err_early {
+                    if early_err.is_auth_error() {
+                        Err(early_err)
+                    } else if let Some(bridged) = self
                         .try_connect_host_via_peer_bridges(host_id, &profile)
                         .await
                     {
                         Ok(bridged)
                     } else {
-                        Err(smart_err)
+                        Err(early_err)
+                    }
+                } else {
+                    let bridge_fut = self.try_connect_host_via_peer_bridges(host_id, &profile);
+                    tokio::pin!(bridge_fut);
+                    tokio::select! {
+                        res = &mut smart_fut => match res {
+                            Ok(handle) => Ok(handle),
+                            Err(err) if !err.is_auth_error() => {
+                                if let Some(bridged) = bridge_fut.await {
+                                    Ok(bridged)
+                                } else {
+                                    Err(err)
+                                }
+                            }
+                            Err(err) => Err(err),
+                        },
+                        maybe_bridged = &mut bridge_fut => {
+                            if let Some(bridged) = maybe_bridged {
+                                Ok(bridged)
+                            } else {
+                                smart_fut.await
+                            }
+                        }
                     }
                 }
-                Err(smart_err) => Err(smart_err),
+            } else {
+                match connect_smart_with_fallback_relays_and_progress(
+                    &profile,
+                    &fallback_relays,
+                    Some(self.store.clone()),
+                    &on_phase,
+                )
+                .await
+                {
+                    Ok(handle) => Ok(handle),
+                    Err(smart_err)
+                        if !smart_err.is_auth_error()
+                            && profile.route_mode != HostRouteMode::DirectOnly =>
+                    {
+                        if let Some(bridged) = self
+                            .try_connect_host_via_peer_bridges(host_id, &profile)
+                            .await
+                        {
+                            Ok(bridged)
+                        } else {
+                            Err(smart_err)
+                        }
+                    }
+                    Err(smart_err) => Err(smart_err),
+                }
             }
         };
+
+        let connect_res = tokio::time::timeout(Duration::from_secs(30), connect_fut)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ClientCoreError::Handshake(
+                    "host connection attempt timed out".into(),
+                ))
+            });
 
         match connect_res {
             Ok(handle) => {
@@ -5995,9 +6218,17 @@ impl OrbitAppCore {
                         return;
                     };
                     let Some(h) = guard.get_mut(host_id) else {
+                        attempt_guard.defuse();
                         return;
                     };
+                    if h.connect_attempt_gen != attempt_gen {
+                        attempt_guard.defuse();
+                        return;
+                    }
+                    attempt_guard.defuse();
                     h.connecting_in_flight = false;
+                    h.connect_started_at = None;
+                    h.connect_abort = None;
                     h.reconnect_scheduled = false;
                     h.reconnect_attempt = 0;
                     h.ssh_heal_attempted = false;
@@ -6367,7 +6598,14 @@ impl OrbitAppCore {
                 if let Ok(mut guard) = self.hosts.write()
                     && let Some(h) = guard.get_mut(host_id)
                 {
+                    if h.connect_attempt_gen != attempt_gen {
+                        attempt_guard.defuse();
+                        return;
+                    }
+                    attempt_guard.defuse();
                     h.connecting_in_flight = false;
+                    h.connect_started_at = None;
+                    h.connect_abort = None;
                     h.profile.state = HostConnectionState::Disconnected;
                     h.via_ssh_tunnel = false;
                     h.last_error = Some(err.to_string());
@@ -6452,7 +6690,11 @@ impl OrbitAppCore {
                                 && let Some(h) = guard.get_mut(&owned_id)
                             {
                                 h.profile.remote_daemon_port = new_port;
-                                h.profile.direct_endpoints = offer.direct_endpoints;
+                                h.profile.direct_endpoints = offer
+                                    .direct_endpoints
+                                    .into_iter()
+                                    .filter(|ep| !orbit_crypto::is_tun_benchmark_endpoint(ep))
+                                    .collect();
                                 h.profile.daemon_pubkey_b64 = offer.daemon_pubkey_b64;
                                 if !offer.pairing_secret.trim().is_empty()
                                     && h.profile.pairing_secret != offer.pairing_secret
@@ -6558,12 +6800,13 @@ impl OrbitAppCore {
                     h.reconnect_scheduled = false;
                     Some(
                         h.profile.state == HostConnectionState::Disconnected
+                            && h.session.is_none()
                             && !h.connecting_in_flight,
                     )
                 })
                 .unwrap_or(false);
             if still_disconnected {
-                core.connect_host_task(&host_id).await;
+                core.connect_host_async_with_options(host_id, false);
             }
         });
     }
@@ -6649,11 +6892,16 @@ impl OrbitAppCore {
                             adopted_modern_relay = Some(daemon_relay);
                         }
                     }
-                    for ep in filter_shareable_endpoints(&host.direct_endpoints) {
-                        if !state.profile.direct_endpoints.contains(&ep) {
-                            state.profile.direct_endpoints.push(ep);
-                            adopted_daemon_relay = true;
-                        }
+                    let reconciled_endpoints = reconcile_welcome_direct_endpoints(
+                        &state.profile.direct_endpoints,
+                        &host.direct_endpoints,
+                        state.is_local,
+                        state.profile.state == HostConnectionState::OnlineDirect
+                            || state.via_ssh_tunnel,
+                    );
+                    if reconciled_endpoints != state.profile.direct_endpoints {
+                        state.profile.direct_endpoints = reconciled_endpoints;
+                        adopted_daemon_relay = true;
                     }
                     host_to_persist = Some(state.to_stored_host());
                     notify_fleet = true;
@@ -15018,12 +15266,9 @@ impl OrbitAppCore {
                 {
                     endpoints.insert(0, custom.clone());
                 }
-                // Strip loopback-only endpoints when syncing across different machines so
-                // remote daemons never dial a local process on `127.0.0.1`.
-                let non_loopback: Vec<String> = endpoints
-                    .into_iter()
-                    .filter(|ep| !is_loopback_endpoint(ep))
-                    .collect();
+                // Strip loopback and TUN benchmark fake-IP endpoints when syncing across
+                // different machines so remote daemons never dial `127.0.0.1` or `198.18.*`.
+                let non_loopback = filter_shareable_endpoints(&endpoints);
                 let pairing_secret = if h.is_local {
                     crate::desktop_ops::read_local_daemon_pairing_secret()
                         .filter(|s| !s.trim().is_empty())
@@ -17552,14 +17797,28 @@ impl OrbitAppCore {
 
     // --- Mobile App & Network Lifecycle Hooks (iOS / Android / HarmonyOS) ---
 
-    /// Invoked when a mobile client returns to foreground:
-    /// - Resets `reconnect_attempt = 0` and immediately reconnects disconnected hosts.
-    /// - Sends a fresh `Ping` + `ListWorkspaces` + `ListAgents` (plus active timeline catch-ups)
-    ///   on connected hosts so suspended mobile sockets immediately detect staleness or catch up.
-    pub fn on_app_foreground(self: &Arc<Self>) {
-        type ConnectedRefresh = (String, HostSessionHandle, Vec<(String, u64)>);
+    async fn wait_inbound_liveness(
+        rx: &mut tokio::sync::broadcast::Receiver<ClientInboundEvent>,
+        timeout: Duration,
+    ) -> bool {
+        matches!(
+            tokio::time::timeout(timeout, rx.recv()).await,
+            Ok(
+                Ok(ClientInboundEvent::Wire(_) | ClientInboundEvent::Terminal(_))
+                    | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+            )
+        )
+    }
 
-        let mut disconnected_ids: Vec<String> = Vec::new();
+    /// Invoked when a mobile client returns to foreground:
+    /// - Resets `reconnect_attempt = 0` and immediately reconnects disconnected hosts (preempting stalled dials).
+    /// - Sends a fresh `Ping` + `ListWorkspaces` + `ListAgents` (plus active timeline catch-ups)
+    ///   on connected hosts and verifies remote inbound liveness within 4s so suspended mobile
+    ///   sockets immediately detect staleness or catch up.
+    pub fn on_app_foreground(self: &Arc<Self>) {
+        type ConnectedRefresh = (String, HostSessionHandle, u64, bool, Vec<(String, u64)>);
+
+        let mut reconnect_ids: Vec<(String, bool)> = Vec::new();
         let mut connected: Vec<ConnectedRefresh> = Vec::new();
 
         if let Ok(mut guard) = self.hosts.write() {
@@ -17577,42 +17836,49 @@ impl OrbitAppCore {
                         })
                         .collect();
                     for (aid, since_seq) in &resubs {
-                        if *since_seq == 0 {
-                            h.pending_tail_catchups.insert(aid.clone());
-                        }
-                    }
-                    for (aid, since_seq) in &resubs {
                         h.caught_up_agents.remove(aid);
                         if *since_seq == 0 {
                             h.pending_tail_catchups.insert(aid.clone());
                         }
                     }
-                    connected.push((host_id.clone(), handle.clone(), resubs));
+                    connected.push((
+                        host_id.clone(),
+                        handle.clone(),
+                        h.session_gen,
+                        h.is_local,
+                        resubs,
+                    ));
                 } else {
                     h.reconnect_attempt = 0;
                     h.ssh_heal_attempted = false;
                     if !h.connecting_in_flight {
-                        disconnected_ids.push(host_id.clone());
+                        reconnect_ids.push((host_id.clone(), false));
+                    } else if h
+                        .connect_started_at
+                        .is_some_and(|t| t.elapsed() >= Duration::from_secs(5))
+                    {
+                        reconnect_ids.push((host_id.clone(), true));
                     }
                 }
             }
         }
 
-        for host_id in disconnected_ids {
-            self.connect_host_async(host_id);
+        for (host_id, force_preempt) in reconnect_ids {
+            self.connect_host_async_with_options(host_id, force_preempt);
         }
 
-        for (host_id, handle, resubs) in connected {
+        for (host_id, handle, conn_gen, is_local, resubs) in connected {
             self.flush_host_outbox(&host_id);
             let core = Arc::clone(self);
             self.runtime.spawn(async move {
+                let mut rx = handle.subscribe();
                 let ping_res = handle
                     .send_wire(WireMessage::Ping {
                         ts_ms: unix_ms_now(),
                     })
                     .await;
                 if ping_res.is_err() {
-                    core.handle_unexpected_disconnect(&host_id, None);
+                    core.handle_unexpected_disconnect(&host_id, Some(conn_gen));
                     return;
                 }
                 let _ = handle
@@ -17646,6 +17912,10 @@ impl OrbitAppCore {
                         })
                         .await;
                 }
+                if !is_local && !Self::wait_inbound_liveness(&mut rx, Duration::from_secs(4)).await
+                {
+                    core.handle_unexpected_disconnect(&host_id, Some(conn_gen));
+                }
             });
         }
         self.schedule_cloud_auto_sync(true);
@@ -17659,11 +17929,12 @@ impl OrbitAppCore {
 
     /// Invoked when mobile network reachability changes (e.g. Wi-Fi <-> Cellular):
     /// - Resets `reconnect_attempt = 0` across all hosts.
-    /// - Connects disconnected hosts immediately and sends an immediate `Ping` on connected hosts
-    ///   so dead LAN sockets flip to E2EE Relay fast.
+    /// - Preempts any stalled in-flight connection attempts and reconnects disconnected hosts.
+    /// - Verifies connected non-local hosts with a `Ping` + 4s inbound liveness check so
+    ///   half-open LAN/TUN sockets flip to E2EE Relay promptly.
     pub fn on_network_changed(self: &Arc<Self>) {
-        let mut disconnected_ids: Vec<String> = Vec::new();
-        let mut connected: Vec<(String, HostSessionHandle)> = Vec::new();
+        let mut reconnect_ids: Vec<String> = Vec::new();
+        let mut connected: Vec<(String, HostSessionHandle, u64, bool)> = Vec::new();
 
         if let Ok(mut guard) = self.hosts.write() {
             for (host_id, h) in guard.iter_mut() {
@@ -17672,20 +17943,21 @@ impl OrbitAppCore {
                 if let Some(ref handle) = h.session
                     && h.profile.state != HostConnectionState::Disconnected
                 {
-                    connected.push((host_id.clone(), handle.clone()));
-                } else if !h.connecting_in_flight {
-                    disconnected_ids.push(host_id.clone());
+                    connected.push((host_id.clone(), handle.clone(), h.session_gen, h.is_local));
+                } else {
+                    reconnect_ids.push(host_id.clone());
                 }
             }
         }
 
-        for host_id in disconnected_ids {
-            self.connect_host_async(host_id);
+        for host_id in reconnect_ids {
+            self.connect_host_async_with_options(host_id, true);
         }
 
-        for (host_id, handle) in connected {
+        for (host_id, handle, conn_gen, is_local) in connected {
             let core = Arc::clone(self);
             self.runtime.spawn(async move {
+                let mut rx = handle.subscribe();
                 if handle
                     .send_wire(WireMessage::Ping {
                         ts_ms: unix_ms_now(),
@@ -17693,7 +17965,14 @@ impl OrbitAppCore {
                     .await
                     .is_err()
                 {
-                    core.handle_unexpected_disconnect(&host_id, None);
+                    core.handle_unexpected_disconnect(&host_id, Some(conn_gen));
+                    return;
+                }
+                if is_local {
+                    return;
+                }
+                if !Self::wait_inbound_liveness(&mut rx, Duration::from_secs(4)).await {
+                    core.handle_unexpected_disconnect(&host_id, Some(conn_gen));
                 }
             });
         }
@@ -46627,5 +46906,271 @@ mod tests {
         assert!(crate::viewmodel::git_cache_paths_equivalent(
             "C:\\", "C:/", None
         ));
+    }
+
+    #[test]
+    fn welcome_reconcile_cleans_tun_and_stale_endpoints_and_respects_loopback_mode() {
+        // 1. Direct unit checks on `reconcile_welcome_direct_endpoints`
+        assert_eq!(
+            reconcile_welcome_direct_endpoints(
+                &[
+                    "ws://198.18.0.1:6868/ws".into(),
+                    "ws://192.168.50.50:6868/ws".into(),
+                ],
+                &["ws://127.0.0.1:6868/ws".into()],
+                false,
+                false,
+            ),
+            Vec::<String>::new(),
+            "remote loopback-only daemon must clear stale LAN/TUN endpoints"
+        );
+        assert_eq!(
+            reconcile_welcome_direct_endpoints(
+                &[
+                    "ws://127.0.0.1:6868/ws".into(),
+                    "ws://198.18.0.1:6868/ws".into(),
+                ],
+                &["ws://127.0.0.1:16868/ws".into()],
+                true,
+                false,
+            ),
+            vec!["ws://127.0.0.1:16868/ws".to_string()],
+            "local daemon must retain/update loopback while excluding TUN IPs"
+        );
+        assert_eq!(
+            reconcile_welcome_direct_endpoints(
+                &[
+                    "ws://127.0.0.1:6868/ws".into(),
+                    "ws://192.168.50.10:6868/ws".into(),
+                ],
+                &["ws://127.0.0.1:6868/ws".into()],
+                false,
+                true,
+            ),
+            vec!["ws://127.0.0.1:6868/ws".to_string()],
+            "SSH / OnlineDirect remote host keeps its loopback tunnel endpoint"
+        );
+        assert_eq!(
+            reconcile_welcome_direct_endpoints(
+                &[
+                    "ws://198.18.0.1:6868/ws".into(),
+                    "ws://192.168.50.10:6868/ws".into(),
+                ],
+                &[
+                    "ws://198.18.0.1:6868/ws".into(),
+                    "ws://192.168.50.99:6868/ws".into(),
+                ],
+                false,
+                false,
+            ),
+            vec![
+                "ws://192.168.50.99:6868/ws".to_string(),
+                "ws://192.168.50.10:6868/ws".to_string(),
+            ],
+            "fresh shareable endpoints are prioritized first while preserving shareable peers and dropping TUN fake IPs"
+        );
+
+        // 2. End-to-end `OrbitAppCore::handle_inbound_wire(Welcome)` + `sync_fleet_connected_hosts`
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        let closed_relay = core.runtime.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let a = l.local_addr().expect("addr");
+            drop(l);
+            a
+        });
+        let kp1 = orbit_crypto::HostIdentityKeypair::generate().expect("kp1");
+        let h1_id = kp1.host_id().expect("id1");
+        let offer1 = orbit_crypto::PairingOffer {
+            host_id: h1_id.clone(),
+            hostname: "spark-host".into(),
+            daemon_pubkey_b64: kp1.public_key_b64.clone(),
+            direct_endpoints: vec![
+                "ws://198.18.0.1:6868/ws".into(),
+                "ws://192.168.1.99:6868/ws".into(),
+            ],
+            relay_url: Some(format!("ws://{closed_relay}")),
+            pairing_secret: "secret-welcome-reconcile-1".into(),
+        };
+        core.pair_host(&offer1.to_qr_uri().expect("uri1"))
+            .expect("pair h1");
+        let stored_after_pair = core
+            .store
+            .list_client_hosts()
+            .expect("list")
+            .into_iter()
+            .find(|h| h.host_id == h1_id)
+            .expect("stored h1");
+        assert_eq!(
+            stored_after_pair.direct_endpoints,
+            vec!["ws://192.168.1.99:6868/ws".to_string()],
+            "pair_host must strip 198.18.* immediately"
+        );
+
+        core.handle_inbound_wire(
+            &h1_id,
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: h1_id.clone(),
+                    hostname: "spark-host".into(),
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    public_key_b64: kp1.public_key_b64,
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.11.11".into(),
+                    available_providers: vec![],
+                    relay_url: Some(format!("ws://{closed_relay}")),
+                    direct_endpoints: vec![
+                        "ws://127.0.0.1:6868/ws".into(),
+                        "ws://198.18.0.1:6868/ws".into(),
+                    ],
+                    board_cas_supported: false,
+                },
+            },
+        );
+        let stored_after_welcome = core
+            .store
+            .list_client_hosts()
+            .expect("list")
+            .into_iter()
+            .find(|h| h.host_id == h1_id)
+            .expect("stored h1");
+        assert!(
+            stored_after_welcome.direct_endpoints.is_empty(),
+            "remote loopback-only Welcome must clear stale LAN/TUN endpoints in SQLite, got {:?}",
+            stored_after_welcome.direct_endpoints
+        );
+
+        let kp2 = orbit_crypto::HostIdentityKeypair::generate().expect("kp2");
+        let h2_id = kp2.host_id().expect("id2");
+        let offer2 = orbit_crypto::PairingOffer {
+            host_id: h2_id.clone(),
+            hostname: "peer-host".into(),
+            daemon_pubkey_b64: kp2.public_key_b64,
+            direct_endpoints: vec![
+                "ws://127.0.0.1:6868/ws".into(),
+                "ws://198.18.0.1:6868/ws".into(),
+                "ws://192.168.50.54:6868/ws".into(),
+            ],
+            relay_url: Some(format!("ws://{closed_relay}")),
+            pairing_secret: "secret-welcome-reconcile-2".into(),
+        };
+        core.pair_host(&offer2.to_qr_uri().expect("uri2"))
+            .expect("pair h2");
+
+        let (session_h1, mut out_h1) = HostSessionHandle::new_test_channel();
+        {
+            let mut guard = core.hosts.write().expect("hosts");
+            let state1 = guard.get_mut(&h1_id).expect("h1 state");
+            state1.session = Some(session_h1);
+            state1.profile.state = HostConnectionState::OnlineRelay;
+        }
+        let synced = core.sync_fleet_connected_hosts(&h1_id);
+        assert_eq!(synced, 1);
+
+        let synced_offer = core.runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(Some(payload)) =
+                    tokio::time::timeout(Duration::from_millis(100), out_h1.recv()).await
+                {
+                    let wire = match payload {
+                        crate::OutboundPayload::Wire(w)
+                        | crate::OutboundPayload::ConfirmedWire(w, _) => w,
+                        crate::OutboundPayload::Terminal(_) => continue,
+                    };
+                    if let WireMessage::AddConnectedHost { pairing_uri, .. } = wire {
+                        return Some(
+                            orbit_crypto::PairingOffer::from_qr_uri(&pairing_uri)
+                                .expect("decode offer"),
+                        );
+                    }
+                }
+            }
+            None
+        });
+        let synced_offer = synced_offer.expect("AddConnectedHost must be emitted");
+        assert_eq!(
+            synced_offer.direct_endpoints,
+            vec!["ws://192.168.50.54:6868/ws".to_string()],
+            "mesh sync must strip both loopback and 198.18.* endpoints"
+        );
+    }
+
+    #[test]
+    fn connect_host_preempts_stalled_handshake_on_reconnect_and_network_change() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        let (bh_addr, bh_task) = core.runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind blackhole");
+            let addr = listener.local_addr().expect("addr");
+            let task = tokio::spawn(async move {
+                let mut kept = Vec::new();
+                while let Ok((sock, _)) = listener.accept().await {
+                    kept.push(sock);
+                }
+            });
+            (addr, task)
+        });
+
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let host_id = kp.host_id().expect("id");
+        let offer = orbit_crypto::PairingOffer {
+            host_id: host_id.clone(),
+            hostname: "blackhole-spark".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: vec!["ws://198.18.0.1:6868/ws".into()],
+            relay_url: Some(format!("ws://{bh_addr}")),
+            pairing_secret: "secret-preemption-test-1234".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let wait_gen = |min_gen: u64| -> (u64, HostConnectionState) {
+            for _ in 0..50 {
+                if let Ok(guard) = core.hosts.read()
+                    && let Some(h) = guard.get(&host_id)
+                    && h.connect_attempt_gen >= min_gen
+                    && h.connecting_in_flight
+                {
+                    return (h.connect_attempt_gen, h.profile.state);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("timed out waiting for connect_attempt_gen >= {min_gen}");
+        };
+
+        let (gen1, state1) = wait_gen(1);
+        assert_eq!(state1, HostConnectionState::ConnectingRelay);
+
+        core.reconnect_host_async(host_id.clone());
+        let (gen2, state2) = wait_gen(gen1 + 1);
+        assert_eq!(state2, HostConnectionState::ConnectingRelay);
+
+        core.update_host_config(
+            &host_id,
+            None,
+            Some(HostRouteMode::RelayOnly),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("update_host_config");
+        let (gen3, state3) = wait_gen(gen2 + 1);
+        assert_eq!(state3, HostConnectionState::ConnectingRelay);
+
+        core.on_network_changed();
+        let (gen4, state4) = wait_gen(gen3 + 1);
+        assert_eq!(state4, HostConnectionState::ConnectingRelay);
+        assert!(gen1 < gen2 && gen2 < gen3 && gen3 < gen4);
+
+        core.remove_host(&host_id).expect("remove host");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(core.host_detail(&host_id).is_none());
+        bh_task.abort();
     }
 }

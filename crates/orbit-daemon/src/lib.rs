@@ -409,6 +409,88 @@ impl DaemonPersistedConfig {
     }
 }
 
+fn is_ignored_lan_iface(iface: &str) -> bool {
+    let clean = iface
+        .trim()
+        .trim_end_matches(':')
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(clean.as_str(), "lo" | "lo0") || clean.contains("clash") || clean.contains("mihomo")
+    {
+        return true;
+    }
+    if let Some(suffix) = clean.strip_prefix("ap")
+        && (suffix.is_empty() || suffix.chars().all(|c| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    [
+        "docker", "br-", "virbr", "veth", "cni", "flannel", "cali", "kube", "podman", "incusbr",
+        "lxdbr", "mpqemubr", "vmnet", "bridge", "anpi", "awdl", "llw", "gif", "stf",
+    ]
+    .iter()
+    .any(|prefix| clean.starts_with(prefix))
+}
+
+fn is_usable_lan_ipv4(ip: &str) -> bool {
+    let Ok(addr) = ip.trim().parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let octets = addr.octets();
+    let is_tun_fake_ip = octets[0] == 198 && matches!(octets[1], 18 | 19);
+    !addr.is_loopback()
+        && !addr.is_link_local()
+        && !addr.is_unspecified()
+        && !addr.is_multicast()
+        && !addr.is_broadcast()
+        && !is_tun_fake_ip
+}
+
+fn parse_linux_ip_addr_ipv4s(text: &str) -> Vec<String> {
+    let mut ips = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let iface = parts[1];
+            if is_ignored_lan_iface(iface) {
+                continue;
+            }
+            if let Some(ip_cidr) = parts.iter().skip(2).find(|p| p.contains('/'))
+                && let Some(ip) = ip_cidr.split('/').next()
+                && is_usable_lan_ipv4(ip)
+                && !ips.iter().any(|existing| existing == ip)
+            {
+                ips.push(ip.to_string());
+            }
+        }
+    }
+    ips
+}
+
+fn parse_macos_ifconfig_ipv4s(text: &str) -> Vec<String> {
+    let mut ips = Vec::new();
+    let mut current_iface: Option<&str> = None;
+    for line in text.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            current_iface = line.split(':').next().map(str::trim);
+        }
+        let trimmed = line.trim();
+        if current_iface.is_some_and(is_ignored_lan_iface) {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("inet ")
+            && let Some(ip) = rest.split_whitespace().next()
+            && is_usable_lan_ipv4(ip)
+            && !ips.iter().any(|existing| existing == ip)
+        {
+            ips.push(ip.to_string());
+        }
+    }
+    ips
+}
+
 /// Auto-discover non-loopback LAN / Tailscale IPv4 WebSocket endpoints on the current host.
 pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
     let mut ips = Vec::new();
@@ -417,10 +499,9 @@ pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
         && sock.connect("8.8.8.8:80").is_ok()
         && let Ok(local) = sock.local_addr()
-        && !local.ip().is_loopback()
     {
         let ip = local.ip().to_string();
-        if !ip.starts_with("198.18.") && !ip.starts_with("198.19.") && !ip.starts_with("169.254.") {
+        if is_usable_lan_ipv4(&ip) {
             ips.push(ip);
         }
     }
@@ -432,39 +513,18 @@ pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
         && out.status.success()
     {
         let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let iface = parts[1];
-                if iface == "lo" || iface.starts_with("docker") || iface.starts_with("br-") {
-                    continue;
-                }
-                if let Some(ip_cidr) = parts.iter().skip(2).find(|p| p.contains('/'))
-                    && let Some(ip) = ip_cidr.split('/').next()
-                    && !ip.starts_with("127.")
-                    && !ip.starts_with("198.18.")
-                    && !ip.starts_with("198.19.")
-                    && !ips.contains(&ip.to_string())
-                {
-                    ips.push(ip.to_string());
-                }
+        for ip in parse_linux_ip_addr_ipv4s(&text) {
+            if !ips.contains(&ip) {
+                ips.push(ip);
             }
         }
     } else if let Ok(out) = std::process::Command::new("ifconfig").output()
         && out.status.success()
     {
         let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("inet ")
-                && let Some(ip) = rest.split_whitespace().next()
-                && !ip.starts_with("127.")
-                && !ip.starts_with("169.254.")
-                && !ip.starts_with("198.18.")
-                && !ip.starts_with("198.19.")
-                && !ips.contains(&ip.to_string())
-            {
-                ips.push(ip.to_string());
+        for ip in parse_macos_ifconfig_ipv4s(&text) {
+            if !ips.contains(&ip) {
+                ips.push(ip);
             }
         }
     }
@@ -475,6 +535,20 @@ pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
         ips.into_iter()
             .map(|ip| format!("ws://{ip}:{port}/ws"))
             .collect()
+    }
+}
+
+/// Compute the direct WebSocket endpoints a daemon listening on `addr` should advertise.
+/// Loopback-only (`127.0.0.1` / `::1`) or explicit-IP binds advertise only that bound address;
+/// wildcard binds (`0.0.0.0` / `::`) enumerate usable LAN and Tailscale interfaces.
+pub fn advertised_direct_endpoints_for_listen(addr: SocketAddr) -> Vec<String> {
+    let port = addr.port();
+    if addr.ip().is_unspecified() {
+        discover_lan_ws_endpoints(port)
+    } else if addr.ip().is_ipv6() {
+        vec![format!("ws://[{}]:{port}/ws", addr.ip())]
+    } else {
+        vec![format!("ws://{}:{port}/ws", addr.ip())]
     }
 }
 
@@ -499,6 +573,7 @@ pub struct DaemonRuntime {
     pub pairing_secret_rotated_tx: broadcast::Sender<()>,
     pub mcp_token: String,
     pub listen_port: Arc<RwLock<u16>>,
+    pub listen_addr: Arc<RwLock<Option<SocketAddr>>>,
     pub orch_config: Arc<RwLock<OrchestrationConfig>>,
     pub delivery: Arc<AgentMessageDelivery>,
     pub finish_subs: Arc<FinishSubscriptionManager>,
@@ -678,6 +753,7 @@ impl DaemonRuntime {
         let listen_port = Arc::new(RwLock::new(
             persisted.listen_addr.map(|a| a.port()).unwrap_or(0),
         ));
+        let listen_addr = Arc::new(RwLock::new(persisted.listen_addr));
         let keep_awake_enabled = persisted.orchestration.keep_awake_while_running;
         let orch_config = Arc::new(RwLock::new(persisted.orchestration));
 
@@ -814,7 +890,9 @@ impl DaemonRuntime {
         .map_err(|e| anyhow::anyhow!("provider discovery task failed: {e}"))?;
 
         let persisted_relay = persisted.relay_url.clone();
-        let advertised_port = persisted.listen_addr.map(|a| a.port()).unwrap_or(6868);
+        let advertised_listen = persisted
+            .listen_addr
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 6868)));
         let host_info = HostInfo {
             host_id,
             hostname: host_display_name,
@@ -825,7 +903,7 @@ impl DaemonRuntime {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             available_providers,
             relay_url: persisted_relay.clone(),
-            direct_endpoints: discover_lan_ws_endpoints(advertised_port),
+            direct_endpoints: advertised_direct_endpoints_for_listen(advertised_listen),
             board_cas_supported: true,
         };
 
@@ -909,6 +987,7 @@ impl DaemonRuntime {
             pairing_secret_rotated_tx,
             mcp_token,
             listen_port,
+            listen_addr,
             orch_config,
             delivery,
             finish_subs,
@@ -942,6 +1021,7 @@ impl DaemonRuntime {
     /// Record the active bound TCP socket address and activate all background orchestration loops.
     pub async fn activate_server(self: &Arc<Self>, bound_addr: SocketAddr) {
         *self.listen_port.write().await = bound_addr.port();
+        *self.listen_addr.write().await = Some(bound_addr);
         write_live_addr_files(&self.home_dir, bound_addr);
 
         // 1. Reattach surviving shims now that the MCP server port is known
@@ -1117,9 +1197,18 @@ impl DaemonRuntime {
     pub async fn effective_host_info(&self) -> HostInfo {
         let mut info = self.host_info.clone();
         info.relay_url = self.relay_url.read().await.clone();
-        let live_port = *self.listen_port.read().await;
-        if live_port > 0 {
-            info.direct_endpoints = discover_lan_ws_endpoints(live_port);
+        if let Some(bound) = *self.listen_addr.read().await
+            && bound.port() > 0
+        {
+            info.direct_endpoints = advertised_direct_endpoints_for_listen(bound);
+        } else {
+            let live_port = *self.listen_port.read().await;
+            if live_port > 0 {
+                info.direct_endpoints = advertised_direct_endpoints_for_listen(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    live_port,
+                )));
+            }
         }
         info
     }
@@ -13573,5 +13662,102 @@ mod self_upgrade_tests {
         assert!(staged_plain_diff.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lan_endpoint_parsers_and_listen_addr_advertisement_respect_bind_scope() {
+        let linux_out = "\
+1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.168.50.50/24 brd 192.168.50.255 scope global eth0\\       valid_lft forever preferred_lft forever
+3: docker0    inet 172.17.0.1/16 scope global docker0\\       valid_lft forever preferred_lft forever
+4: br-abc123    inet 172.18.0.1/16 scope global br-abc123\\       valid_lft forever preferred_lft forever
+5: virbr0    inet 10.77.0.1/24 scope global virbr0\\       valid_lft forever preferred_lft forever
+6: cni0    inet 10.244.0.1/24 scope global cni0\\       valid_lft forever preferred_lft forever
+7: flannel.1    inet 10.244.1.0/32 scope global flannel.1\\       valid_lft forever preferred_lft forever
+8: podman0    inet 10.88.0.1/16 scope global podman0\\       valid_lft forever preferred_lft forever
+9: incusbr0    inet 10.77.1.1/24 scope global incusbr0\\       valid_lft forever preferred_lft forever
+10: lxdbr0    inet 10.99.0.1/24 scope global lxdbr0\\       valid_lft forever preferred_lft forever
+11: veth9a1b@if2    inet 169.254.1.2/16 scope link veth9a1b\\       valid_lft forever preferred_lft forever
+12: tailscale0    inet 100.102.176.111/32 scope global tailscale0\\       valid_lft forever preferred_lft forever
+13: mihomo    inet 198.18.0.1/15 scope global mihomo\\       valid_lft forever preferred_lft forever
+";
+        assert_eq!(
+            parse_linux_ip_addr_ipv4s(linux_out),
+            vec!["192.168.50.50", "100.102.176.111"]
+        );
+
+        let macos_out = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.139.1 netmask 0xffffff00
+vmnet8: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.215.1 netmask 0xffffff00
+anpi0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 169.254.10.20 netmask 0xffff0000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.50.54 netmask 0xffffff00 broadcast 192.168.50.255
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+\tinet 198.18.0.1 --> 198.18.0.1 netmask 0xffff0000
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+\tinet 100.118.124.110 --> 100.118.124.110 netmask 0xffffffff
+";
+        assert_eq!(
+            parse_macos_ifconfig_ipv4s(macos_out),
+            vec!["192.168.50.54", "100.118.124.110"]
+        );
+
+        assert_eq!(
+            advertised_direct_endpoints_for_listen(SocketAddr::from(([127, 0, 0, 1], 6868))),
+            vec!["ws://127.0.0.1:6868/ws".to_string()]
+        );
+        assert_eq!(
+            advertised_direct_endpoints_for_listen(SocketAddr::from((
+                [0, 0, 0, 0, 0, 0, 0, 1],
+                6868
+            ))),
+            vec!["ws://[::1]:6868/ws".to_string()]
+        );
+        assert_eq!(
+            advertised_direct_endpoints_for_listen(SocketAddr::from(([192, 168, 50, 50], 6869))),
+            vec!["ws://192.168.50.50:6869/ws".to_string()]
+        );
+        let wildcard =
+            advertised_direct_endpoints_for_listen(SocketAddr::from(([0, 0, 0, 0], 6868)));
+        assert!(!wildcard.is_empty());
+        assert!(
+            wildcard
+                .iter()
+                .all(|ep| !orbit_crypto::is_tun_benchmark_endpoint(ep))
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_host_info_advertises_loopback_only_when_bound_to_loopback() {
+        let home_loop =
+            std::env::temp_dir().join(format!("orbit_ehi_loop_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&home_loop).expect("mkdir");
+        let rt = DaemonRuntime::bootstrap(&home_loop)
+            .await
+            .expect("bootstrap");
+        rt.activate_server(SocketAddr::from(([127, 0, 0, 1], 16868)))
+            .await;
+        let info_loop = rt.effective_host_info().await;
+        assert_eq!(
+            info_loop.direct_endpoints,
+            vec!["ws://127.0.0.1:16868/ws".to_string()]
+        );
+
+        rt.activate_server(SocketAddr::from(([0, 0, 0, 0], 16869)))
+            .await;
+        let info_any = rt.effective_host_info().await;
+        assert!(!info_any.direct_endpoints.is_empty());
+        assert!(
+            info_any
+                .direct_endpoints
+                .iter()
+                .all(|ep| ep.ends_with(":16869/ws") && !orbit_crypto::is_tun_benchmark_endpoint(ep))
+        );
+        let _ = std::fs::remove_dir_all(&home_loop);
     }
 }

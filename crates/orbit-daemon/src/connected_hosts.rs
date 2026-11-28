@@ -145,7 +145,7 @@ impl ConnectedHostsManager {
                 .direct_endpoints
                 .into_iter()
                 .map(|ep| orbit_crypto::normalize_ws_endpoint(&ep))
-                .filter(|ep| !ep.is_empty())
+                .filter(|ep| !ep.is_empty() && !orbit_crypto::is_tun_benchmark_endpoint(ep))
                 .collect();
             ex.relay_url = offer.relay_url;
             ex.pairing_secret = offer.pairing_secret;
@@ -170,7 +170,7 @@ impl ConnectedHostsManager {
                     .direct_endpoints
                     .into_iter()
                     .map(|ep| orbit_crypto::normalize_ws_endpoint(&ep))
-                    .filter(|ep| !ep.is_empty())
+                    .filter(|ep| !ep.is_empty() && !orbit_crypto::is_tun_benchmark_endpoint(ep))
                     .collect(),
                 relay_url: offer.relay_url,
                 pairing_secret: offer.pairing_secret,
@@ -423,12 +423,15 @@ impl ConnectedHostsManager {
                     )
                     .await;
 
-                    // Keepalive ping loop + inbound frame demuxer
+                    // Keepalive ping loop + inbound frame demuxer + liveness watchdog
+                    const MESH_INBOUND_LIVENESS_TIMEOUT: Duration = Duration::from_secs(50);
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+                    let mut last_inbound = tokio::time::Instant::now();
                     loop {
                         tokio::select! {
                             maybe_msg = rx.recv() => {
                                 let Some(msg) = maybe_msg else { break; };
+                                last_inbound = tokio::time::Instant::now();
                                 if let Some(req_id) = extract_response_request_id(&msg)
                                     && let Some(waiter) = pending_rpcs.lock().await.remove(&req_id)
                                 {
@@ -456,6 +459,14 @@ impl ConnectedHostsManager {
                                 if tx.send(WireMessage::Ping { ts_ms }).await.is_err() {
                                     break;
                                 }
+                            }
+                            _ = tokio::time::sleep_until(last_inbound + MESH_INBOUND_LIVENESS_TIMEOUT) => {
+                                warn!(
+                                    reg_id = %row.registration_id,
+                                    remote_host = %remote_host_id,
+                                    "Daemon-to-Daemon fleet mesh link timed out without inbound traffic; reconnecting"
+                                );
+                                break;
                             }
                         }
                     }
@@ -741,6 +752,21 @@ fn direct_ws_to_e2ee_url(ep: &str) -> String {
     orbit_crypto::normalize_e2ee_ws_endpoint(ep)
 }
 
+fn prepare_direct_peer_endpoints(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(raw.len());
+    for ep in raw {
+        let norm = orbit_crypto::normalize_ws_endpoint(ep);
+        if norm.is_empty() || orbit_crypto::is_tun_benchmark_endpoint(&norm) {
+            continue;
+        }
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    out.sort_by_key(|ep| orbit_crypto::direct_endpoint_priority_tier(ep));
+    out
+}
+
 /// Dial an upstream peer's raw Noise_NK E2EE WebSocket stream (used by Peer-Bridged tunneling)
 /// via LAN direct endpoints (`/ws/e2ee`), intranet/configured Relay, or ephemeral SSH tunnel.
 pub(crate) async fn connect_peer_e2ee_ws(
@@ -751,19 +777,48 @@ pub(crate) async fn connect_peer_e2ee_ws(
     ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
 
-    // 1. Direct LAN / intranet `/ws/e2ee`
-    for ep in &row.direct_endpoints {
-        let e2ee_url = direct_ws_to_e2ee_url(ep);
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            connect_async_with_config(&e2ee_url, Some(ws_cfg), false),
-        )
-        .await
-        {
-            Ok(Ok((ws, _))) => return Ok((RelayWsStream::Direct(Box::new(ws)), None)),
-            Ok(Err(e)) => last_err = e.into(),
-            Err(_) => last_err = anyhow::anyhow!("timeout connecting to peer {e2ee_url}"),
+    // 1. Direct LAN / intranet `/ws/e2ee` (Happy-Eyeballs concurrent race capped at 2.2s so
+    //    stale/blackhole endpoints never exhaust the client's 10s PeerBridgeOpen timeout)
+    let direct_endpoints = prepare_direct_peer_endpoints(&row.direct_endpoints);
+    if !direct_endpoints.is_empty() {
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, ep) in direct_endpoints.into_iter().enumerate() {
+            let e2ee_url = direct_ws_to_e2ee_url(&ep);
+            let stagger_ms = (idx as u64) * 60;
+            set.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+                }
+                match tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    connect_async_with_config(&e2ee_url, Some(ws_cfg), false),
+                )
+                .await
+                {
+                    Ok(Ok((ws, _))) => Ok(ws),
+                    Ok(Err(e)) => Err(anyhow::Error::from(e)),
+                    Err(_) => Err(anyhow::anyhow!("timeout connecting to peer {e2ee_url}")),
+                }
+            });
         }
+
+        let direct_deadline = tokio::time::Instant::now() + Duration::from_millis(2200);
+        loop {
+            match tokio::time::timeout_at(direct_deadline, set.join_next()).await {
+                Ok(Some(Ok(Ok(ws)))) => {
+                    set.abort_all();
+                    return Ok((RelayWsStream::Direct(Box::new(ws)), None));
+                }
+                Ok(Some(Ok(Err(e)))) => last_err = e,
+                Ok(Some(Err(_))) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    last_err = anyhow::anyhow!("timed out probing peer direct /ws/e2ee endpoints");
+                    break;
+                }
+            }
+        }
+        set.abort_all();
     }
 
     // 2. Relay endpoint reachable by this bridge host
@@ -822,23 +877,57 @@ async fn connect_to_peer_daemon(
 )> {
     let mut last_err = anyhow::anyhow!("no reachable endpoints");
 
-    // 1. Direct WebSocket endpoints (only explicitly registered endpoints with stored Bearer secret)
-    for ep in &row.direct_endpoints {
-        match connect_direct_peer(ep, &row.pairing_secret, self_host_id, None).await {
-            Ok((info, tx, rx)) => {
-                if let Some(ref pinned) = row.host_id
-                    && pinned != &info.host_id
-                {
-                    last_err = anyhow::anyhow!(
-                        "direct endpoint `{ep}` belongs to `{}` instead of pinned `{pinned}`",
-                        info.host_id
-                    );
-                    continue;
+    // 1. Direct WebSocket endpoints (Happy-Eyeballs concurrent racing capped at 2.5s)
+    let direct_endpoints = prepare_direct_peer_endpoints(&row.direct_endpoints);
+    if !direct_endpoints.is_empty() {
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, ep) in direct_endpoints.into_iter().enumerate() {
+            let secret = row.pairing_secret.clone();
+            let self_id = self_host_id.to_string();
+            let stagger_ms = (idx as u64) * 60;
+            set.spawn(async move {
+                if stagger_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
                 }
-                return Ok((info, tx, rx));
-            }
-            Err(e) => last_err = e,
+                let res = match tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    connect_direct_peer(&ep, &secret, &self_id, None),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!("timeout connecting direct peer `{ep}`")),
+                };
+                (ep, res)
+            });
         }
+
+        let direct_deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+        loop {
+            match tokio::time::timeout_at(direct_deadline, set.join_next()).await {
+                Ok(Some(Ok((ep, Ok((info, tx, rx)))))) => {
+                    if let Some(ref pinned) = row.host_id
+                        && pinned != &info.host_id
+                    {
+                        last_err = anyhow::anyhow!(
+                            "direct endpoint `{ep}` belongs to `{}` instead of pinned `{pinned}`",
+                            info.host_id
+                        );
+                        continue;
+                    }
+                    set.abort_all();
+                    return Ok((info, tx, rx));
+                }
+                Ok(Some(Ok((_, Err(e))))) => last_err = e,
+                Ok(Some(Err(_))) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    last_err = anyhow::anyhow!("timed out probing peer direct endpoints");
+                    break;
+                }
+            }
+        }
+        set.abort_all();
     }
 
     // 2. Noise NKpsk0 E2EE Relay fallback (supports `ws://`, `wss://`, and zero-port `ssh+relay://`)
@@ -917,8 +1006,11 @@ async fn connect_direct_peer(
         protocol_version: PROTOCOL_VERSION,
         supports_zstd: true,
     };
-    sink.send(TungMsg::Text(serde_json::to_string(&hello)?.into()))
-        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sink.send(TungMsg::Text(serde_json::to_string(&hello)?.into())),
+    )
+    .await??;
 
     let host_info = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(Ok(msg)) = stream.next().await {
@@ -956,19 +1048,29 @@ async fn connect_direct_peer(
     });
 
     tokio::spawn(async move {
-        while let Some(Ok(msg)) = stream.next().await {
-            let decoded = match msg {
-                TungMsg::Text(t) => serde_json::from_str::<WireMessage>(&t).ok(),
-                TungMsg::Binary(b) if !b.is_empty() && b[0] == DIRECT_BIN_ZSTD_WIRE => {
-                    WireMessage::decode_zstd(&b[1..]).ok()
+        loop {
+            tokio::select! {
+                _ = in_tx.closed() => break,
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(msg)) => {
+                            let decoded = match msg {
+                                TungMsg::Text(t) => serde_json::from_str::<WireMessage>(&t).ok(),
+                                TungMsg::Binary(b) if !b.is_empty() && b[0] == DIRECT_BIN_ZSTD_WIRE => {
+                                    WireMessage::decode_zstd(&b[1..]).ok()
+                                }
+                                TungMsg::Close(_) => break,
+                                _ => None,
+                            };
+                            if let Some(wire) = decoded
+                                && in_tx.send(wire).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(Err(_)) | None => break,
+                    }
                 }
-                TungMsg::Close(_) => break,
-                _ => None,
-            };
-            if let Some(wire) = decoded
-                && in_tx.send(wire).await.is_err()
-            {
-                break;
             }
         }
     });
@@ -997,7 +1099,12 @@ async fn connect_relay_peer(
     let ws = connector.open_ws(&path).await?;
     let (mut sink, mut stream) = ws.split();
 
-    sink.send(TungMsg::Binary(msg1.into())).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(TungMsg::Binary(msg1.into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending Noise msg1"))??;
 
     let msg2 = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(item) = stream.next().await {
@@ -1035,7 +1142,12 @@ async fn connect_relay_peer(
     };
     let plain = hello.encode_e2ee(true)?;
     let ct = chan.lock().await.seal_record(&plain)?;
-    sink.send(TungMsg::Binary(ct.into())).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sink.send(TungMsg::Binary(ct.into())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out sending E2EE Hello"))??;
 
     let host_info = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(Ok(m)) = stream.next().await {
@@ -1072,18 +1184,23 @@ async fn connect_relay_peer(
     });
 
     tokio::spawn(async move {
-        while let Some(Ok(m)) = stream.next().await {
-            match m {
-                TungMsg::Binary(ct) => {
-                    if let Ok(p) = chan.lock().await.open_record(&ct)
-                        && let Ok(wire) = WireMessage::decode_e2ee(&p)
-                        && in_tx.send(wire).await.is_err()
-                    {
-                        break;
+        loop {
+            tokio::select! {
+                _ = in_tx.closed() => break,
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(TungMsg::Binary(ct))) => {
+                            if let Ok(p) = chan.lock().await.open_record(&ct)
+                                && let Ok(wire) = WireMessage::decode_e2ee(&p)
+                                && in_tx.send(wire).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(Ok(TungMsg::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
                     }
                 }
-                TungMsg::Close(_) => break,
-                _ => {}
             }
         }
     });
@@ -1517,6 +1634,27 @@ mod tests {
                 runs: vec![run],
             }),
             Some(req_id)
+        );
+    }
+
+    #[test]
+    fn prepare_direct_peer_endpoints_filters_tun_benchmark_and_orders_tiers() {
+        let prepared = prepare_direct_peer_endpoints(&[
+            "ws://198.18.0.1:6868/ws".into(),
+            "192.168.139.5:6868".into(),
+            "ws://192.168.50.50:6868/ws".into(),
+            "ws://198.19.10.1:6868/ws".into(),
+            "127.0.0.1:6868".into(),
+            "ws://192.168.50.50:6868/ws".into(),
+            "".into(),
+        ]);
+        assert_eq!(
+            prepared,
+            vec![
+                "ws://127.0.0.1:6868/ws",
+                "ws://192.168.50.50:6868/ws",
+                "ws://192.168.139.5:6868/ws",
+            ]
         );
     }
 }

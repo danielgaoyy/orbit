@@ -67,9 +67,11 @@
 
 ## 4. 非局域网（Off-LAN）Relay 长连接与多机同步
 
-- **传输层与心跳**（`crates/orbit-relay-transport` / `crates/orbit-client-core` / `crates/orbit-daemon`）：
+- **传输层、超时与保活探测**（`crates/orbit-relay-transport` / `crates/orbit-client-core` / `crates/orbit-daemon`）：
   - 远程流量经 `Noise_NKpsk0_25519_ChaChaPoly_SHA256`（序言 `orbit-relay-e2ee/2`）端到端加密，控制信道采用 `Noise_NK` Proof-of-Possession（`orbit-relay-pop/1`）防伪造顶号。
-  - 客户端与 Relay 间保持可控心跳探测与重连（20s/65s 窗口）并在非桌面端（iOS/Android/HarmonyOS）提供无阻塞路由切换与 `401` 鉴权失效恢复。
+  - **严格建连超时与抢占式重连**：`RelayConnector::open_ws` 默认 12s WebSocket 握手超时，Direct WebSocket 握手 10s 超时，`OrbitAppCore` 单次主机建连加装 30s 外层兜底并通过代数令牌（`connect_attempt_gen`）与 `AbortHandle` 支持用户在 `Reconnect`、路由切换或网络变化时立即抢占正在挂起的半开握手；`ConnectingDirect` / `ConnectingRelay` 阶段实时同步到 UI。
+  - **Happy-Eyeballs 并发探测与地址清洗**：客户端 Direct 与 Daemon 机群网格（`ConnectedHostsManager`）探测会自动剔除自动发现的 TUN benchmark 假 IP（`198.18.0.0/15`）及容器/虚拟网桥接口（`virbr*`/`incusbr*`/`cni*`/`vmnet*`/`tun*`），仅在绑定非 loopback 地址时广播 LAN 地址，并对候选端点以 60ms 交错并发竞速（Direct 总体窗口 2.2s–2.5s），避免单个失效网卡阻滞回退 Relay。
+  - **入向保活看门狗与网络切换**：客户端会话（Direct/Relay/Peer-Bridge E2EE）维持 `10s Ping / 35s 入向帧超时` 看门狗，Daemon 机群网格维持 `15s Ping / 50s 入向超时`；`on_network_changed` 会直接抢占非在线建连任务并对已连远程会话执行 `Ping + 4s 响应` 校验，静默半开连接立即断开重连。
 - **跨主机 Relay 配置传播**：
   - 通过 `WireMessage::ConfigureHostRelay` 与 `apply_relay_to_fleet` 同步各主机的 Relay 地址并写入云端加密 Vault，使脱离局域网的移动端无需回到 Mac 旁也能与已配置机群重建连接。
   - **必跑验证**：改动连接池、Relay 配置分发或移动网络切换逻辑必跑 `pitfall_04`。

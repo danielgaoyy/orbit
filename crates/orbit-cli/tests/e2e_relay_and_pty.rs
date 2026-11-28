@@ -1419,3 +1419,397 @@ async fn e2e_peer_bridge_connects_lan_isolated_host_with_full_e2ee() {
     let _ = std::fs::remove_dir_all(&temp_home_a);
     let _ = std::fs::remove_dir_all(&temp_home_x);
 }
+
+#[tokio::test]
+async fn peer_bridge_and_mesh_converge_rapidly_with_blackhole_and_tun_endpoints() {
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home_a = base_tmp.join(format!("orb_pbbh_a_{short_id}"));
+    let temp_home_b = base_tmp.join(format!("orb_pbbh_b_{short_id}"));
+    std::fs::create_dir_all(&temp_home_a).expect("mkdir bridge A");
+    std::fs::create_dir_all(&temp_home_b).expect("mkdir target B");
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay probe");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let fleet_token = "fl_e2e_bh_bridge_token_888".to_string();
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(HashSet::new()),
+        fleet_token: Some(fleet_token.clone()),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let relay_url = format!("ws://{relay_addr}?ft={fleet_token}");
+
+    let (_daemon_a_addr, rt_a) =
+        spawn_embedded_daemon(temp_home_a.clone(), Some(relay_url.clone()))
+            .await
+            .expect("spawn bridge daemon A");
+    let (_daemon_b_addr, rt_b) =
+        spawn_embedded_daemon(temp_home_b.clone(), Some(relay_url.clone()))
+            .await
+            .expect("spawn target daemon B");
+
+    // Ensure both daemons have completed Relay PoP registration before timing fallback.
+    let mut bridge_session = None;
+    for _ in 0..40 {
+        if let Ok(sess) = connect_via_relay(
+            &relay_url,
+            &rt_a.keypair.public_key_b64,
+            &rt_a.pairing_secret,
+            None,
+        )
+        .await
+        {
+            bridge_session = Some(sess);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let bridge_session = bridge_session.expect("connect to bridge daemon A over relay");
+
+    let mut target_ready = false;
+    for _ in 0..40 {
+        if let Ok(sess) = connect_via_relay(
+            &relay_url,
+            &rt_b.keypair.public_key_b64,
+            &rt_b.pairing_secret,
+            None,
+        )
+        .await
+        {
+            drop(sess);
+            target_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(target_ready, "target daemon B must register on Relay");
+
+    // Spawn 5 local blackhole TCP listeners that accept TCP and never complete WebSocket upgrade.
+    let mut blackhole_tasks = Vec::new();
+    let mut poisoned_endpoints = vec!["ws://198.18.0.1:6868/ws".to_string()];
+    for _ in 0..5 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let addr = listener.local_addr().expect("bh addr");
+        poisoned_endpoints.push(format!("ws://{addr}/ws"));
+        blackhole_tasks.push(tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                kept.push(sock);
+            }
+        }));
+    }
+
+    let b_host_id = rt_b.keypair.host_id().expect("host_id B");
+    let poisoned_offer = orbit_crypto::PairingOffer {
+        host_id: b_host_id.clone(),
+        hostname: "poisoned-target-b".into(),
+        daemon_pubkey_b64: rt_b.keypair.public_key_b64.clone(),
+        direct_endpoints: poisoned_endpoints,
+        relay_url: Some(relay_url.clone()),
+        pairing_secret: rt_b.pairing_secret.clone(),
+    };
+    let poisoned_uri = poisoned_offer.to_qr_uri().expect("poisoned uri");
+
+    let add_req = Uuid::new_v4();
+    let added = bridge_session
+        .request(
+            WireMessage::AddConnectedHost {
+                request_id: add_req,
+                label: Some("poisoned-target-b".into()),
+                pairing_uri: poisoned_uri,
+                ssh_alias: None,
+                remote_daemon_port: None,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::ConnectedHostAdded { request_id, .. } if *request_id == add_req),
+        )
+        .await
+        .expect("register target daemon B on bridge daemon A");
+    assert!(matches!(added, WireMessage::ConnectedHostAdded { .. }));
+
+    // 1. Peer-Bridge with 5 blackhole endpoints + 198.18.0.1 must fall back to Relay in < 5s.
+    let pb_start = std::time::Instant::now();
+    let tunneled_b = orbit_client_core::connect_via_peer_bridge(
+        &bridge_session,
+        &b_host_id,
+        &rt_b.keypair.public_key_b64,
+        &rt_b.pairing_secret,
+        None,
+    )
+    .await
+    .expect("Peer-Bridge must fall back past blackhole/TUN endpoints onto Relay");
+    assert!(
+        pb_start.elapsed() < Duration::from_secs(5),
+        "Peer-Bridge took {:?} (expected < 5s)",
+        pb_start.elapsed()
+    );
+
+    let pong = tunneled_b
+        .request(
+            WireMessage::Ping { ts_ms: 424_242 },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::Pong { ts_ms: 424_242 }),
+        )
+        .await
+        .expect("Ping/Pong across blackhole-resilient Peer-Bridge");
+    assert!(matches!(pong, WireMessage::Pong { ts_ms: 424_242 }));
+
+    let ws_req = Uuid::new_v4();
+    let ws_snap = tunneled_b
+        .request(
+            WireMessage::ListWorkspaces {
+                request_id: ws_req,
+                include_archived: false,
+                include_background: false,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::WorkspacesSnapshot { request_id, .. } if *request_id == ws_req),
+        )
+        .await
+        .expect("ListWorkspaces across blackhole-resilient Peer-Bridge");
+    assert!(matches!(ws_snap, WireMessage::WorkspacesSnapshot { .. }));
+
+    // 2. Daemon Mesh ConnectedHostsManager must also converge to Online via Relay in < 6s.
+    let mesh_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let mut mesh_online = false;
+    while tokio::time::Instant::now() < mesh_deadline {
+        let req_id = Uuid::new_v4();
+        if let Ok(WireMessage::ConnectedHostsSnapshot { hosts, .. }) = bridge_session
+            .request(
+                WireMessage::ListConnectedHosts { request_id: req_id },
+                Duration::from_secs(2),
+                |w| {
+                    matches!(
+                        w,
+                        WireMessage::ConnectedHostsSnapshot { request_id, .. } if *request_id == req_id
+                    )
+                },
+            )
+            .await
+            && hosts.iter().any(|h| {
+                h.host_id.as_deref() == Some(b_host_id.as_str())
+                    && h.status == orbit_protocol::ConnectedHostStatus::Online
+            })
+        {
+            mesh_online = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        mesh_online,
+        "ConnectedHostsManager must converge target B to Online within 6s despite 5 blackhole + TUN endpoints"
+    );
+
+    drop(tunneled_b);
+    drop(bridge_session);
+    for t in blackhole_tasks {
+        t.abort();
+    }
+    drop(rt_a);
+    drop(rt_b);
+    relay_handle.abort();
+    let _ = std::fs::remove_dir_all(&temp_home_a);
+    let _ = std::fs::remove_dir_all(&temp_home_b);
+}
+
+#[tokio::test]
+async fn app_core_full_chain_direct_relay_preemption_and_network_recovery() {
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_app_chain_{short_id}"));
+    std::fs::create_dir_all(&temp_home).expect("mkdir daemon home");
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay probe");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let fleet_token = "fl_app_core_chain_token_777".to_string();
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(HashSet::new()),
+        fleet_token: Some(fleet_token.clone()),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let relay_url = format!("ws://{relay_addr}?ft={fleet_token}");
+
+    let (daemon_addr, rt) = spawn_embedded_daemon(temp_home.clone(), Some(relay_url.clone()))
+        .await
+        .expect("spawn daemon");
+    let daemon_ws = format!("ws://{daemon_addr}/ws");
+    let host_id = rt.keypair.host_id().expect("host_id");
+
+    // Ensure daemon has registered on Relay before timing OrbitAppCore convergence.
+    let mut ready = false;
+    for _ in 0..40 {
+        if let Ok(sess) = connect_via_relay(
+            &relay_url,
+            &rt.keypair.public_key_b64,
+            &rt.pairing_secret,
+            None,
+        )
+        .await
+        {
+            drop(sess);
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "daemon must register on Relay");
+
+    let bh_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blackhole");
+    let bh_addr = bh_listener.local_addr().expect("bh addr");
+    let bh_task = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        while let Ok((sock, _)) = bh_listener.accept().await {
+            kept.push(sock);
+        }
+    });
+
+    let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind closed");
+    let closed_addr = closed_listener.local_addr().expect("closed addr");
+    drop(closed_listener);
+
+    let core = tokio::task::spawn_blocking(|| {
+        OrbitAppCore::open_in_memory_with_discovery(false).expect("open core")
+    })
+    .await
+    .expect("spawn_blocking open");
+
+    // 1. Pair with poisoned 198.18.0.1 direct endpoint + blackhole Relay URL; Auto skips 198.18.*
+    //    and stalls in ConnectingRelay against blackhole Relay.
+    let initial_offer = orbit_crypto::PairingOffer {
+        host_id: host_id.clone(),
+        hostname: "spark-test".into(),
+        daemon_pubkey_b64: rt.keypair.public_key_b64.clone(),
+        direct_endpoints: vec!["ws://198.18.0.1:6868/ws".into()],
+        relay_url: Some(format!("ws://{bh_addr}")),
+        pairing_secret: rt.pairing_secret.clone(),
+    };
+    core.pair_host(&initial_offer.to_qr_uri().expect("uri"))
+        .expect("pair host");
+
+    let wait_state = |expected: HostConnectionState, timeout: Duration| {
+        let core_ref = Arc::clone(&core);
+        let hid = host_id.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            while tokio::time::Instant::now() < deadline {
+                if let Some(d) = core_ref.host_detail(&hid)
+                    && d.host.connection_state == expected
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            false
+        }
+    };
+
+    assert!(
+        wait_state(HostConnectionState::ConnectingRelay, Duration::from_secs(2)).await,
+        "Auto with only 198.18.* direct endpoint + blackhole relay must enter ConnectingRelay promptly"
+    );
+
+    // 2. Preempt stalled blackhole Relay handshake by configuring the live Relay URL.
+    core.update_host_config(
+        &host_id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(relay_url.clone()),
+        true,
+    )
+    .expect("update_host_config to live relay");
+    assert!(
+        wait_state(HostConnectionState::OnlineRelay, Duration::from_secs(5)).await,
+        "preemptive reconnect onto live Relay must reach OnlineRelay within 5s"
+    );
+
+    // Welcome from loopback-only embedded daemon must leave remote client `direct_endpoints` empty (no 198.18.*, no 127.0.0.1).
+    let detail_relay = core.host_detail(&host_id).expect("detail");
+    assert!(
+        detail_relay.host.direct_endpoints.is_empty(),
+        "remote Welcome from loopback-bound daemon must clean 198.18.* without leaking 127.0.0.1, got {:?}",
+        detail_relay.host.direct_endpoints
+    );
+
+    // 3. Network change on healthy live Relay session sends Ping, verifies Pong, and keeps OnlineRelay.
+    core.on_network_changed();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let detail_after_net = core.host_detail(&host_id).expect("detail after net change");
+    assert_eq!(
+        detail_after_net.host.connection_state,
+        HostConnectionState::OnlineRelay
+    );
+
+    // 4. Switch to DirectOnly with live custom direct endpoint -> OnlineDirect.
+    core.update_host_config(
+        &host_id,
+        None,
+        Some(HostRouteMode::DirectOnly),
+        None,
+        None,
+        Some(daemon_ws),
+        None,
+        true,
+    )
+    .expect("switch to DirectOnly live");
+    assert!(
+        wait_state(HostConnectionState::OnlineDirect, Duration::from_secs(5)).await,
+        "DirectOnly with live daemon endpoint must reach OnlineDirect within 5s"
+    );
+
+    // 5. Switch to DirectOnly with closed endpoint (even though Relay is live) -> Disconnected (never falls back to Relay).
+    core.update_host_config(
+        &host_id,
+        None,
+        Some(HostRouteMode::DirectOnly),
+        None,
+        None,
+        Some(format!("ws://{closed_addr}/ws")),
+        None,
+        true,
+    )
+    .expect("switch to DirectOnly closed");
+    assert!(
+        wait_state(HostConnectionState::Disconnected, Duration::from_secs(5)).await,
+        "DirectOnly with unreachable endpoint must fail closed to Disconnected without Relay fallback"
+    );
+
+    let _ = tokio::task::spawn_blocking(move || drop(core)).await;
+    bh_task.abort();
+    drop(rt);
+    relay_handle.abort();
+    let _ = std::fs::remove_dir_all(&temp_home);
+}

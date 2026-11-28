@@ -135,7 +135,7 @@ impl OhosCoreFacade {
     }
 
     pub fn connect_host(&self, host_id: &str) {
-        self.inner.connect_host_async(host_id.to_string());
+        self.inner.reconnect_host_async(host_id.to_string());
     }
 
     pub fn refresh_host(&self, host_id: &str) {

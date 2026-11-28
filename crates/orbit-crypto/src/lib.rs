@@ -355,6 +355,59 @@ pub fn normalize_e2ee_ws_endpoint(raw: &str) -> String {
     }
 }
 
+/// Extract the lowercased host component (without scheme, port, brackets, or path)
+/// from a `ws://`, `wss://`, `http://`, `https://`, or bare `host:port` endpoint string.
+pub fn extract_ws_endpoint_host(endpoint: &str) -> String {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("ws://")
+        .or_else(|| lower.strip_prefix("wss://"))
+        .or_else(|| lower.strip_prefix("http://"))
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        after_bracket.split(']').next().unwrap_or("").to_string()
+    } else if authority.matches(':').count() > 1 {
+        authority.to_string()
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    }
+}
+
+/// Return `true` when `endpoint` targets a local loopback or unspecified address.
+pub fn is_loopback_ws_endpoint(endpoint: &str) -> bool {
+    let host = extract_ws_endpoint_host(endpoint);
+    matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
+        || host.starts_with("127.")
+}
+
+/// Return `true` when `endpoint` belongs to the RFC 2544 / proxy TUN fake-IP benchmark
+/// range (`198.18.0.0/15`), which commonly accepts TCP SYN then blackholes WebSocket traffic.
+pub fn is_tun_benchmark_endpoint(endpoint: &str) -> bool {
+    let host = extract_ws_endpoint_host(endpoint);
+    host.starts_with("198.18.") || host.starts_with("198.19.")
+}
+
+/// Classify a direct endpoint into dialing priority tiers (`0` = loopback, `1` = LAN/Tailscale,
+/// `2` = local VM/bridge subnet, `3` = TUN fake-IP benchmark range).
+pub fn direct_endpoint_priority_tier(endpoint: &str) -> u8 {
+    let host = extract_ws_endpoint_host(endpoint);
+    if matches!(
+        host.as_str(),
+        "127.0.0.1" | "10.0.2.2" | "localhost" | "::1"
+    ) || host.starts_with("127.")
+    {
+        0
+    } else if host.starts_with("198.18.") || host.starts_with("198.19.") {
+        3
+    } else if host.starts_with("192.168.139.") || host.starts_with("192.168.215.") {
+        2
+    } else {
+        1
+    }
+}
+
 impl PairingOffer {
     pub fn to_qr_uri(&self) -> Result<String, CryptoError> {
         let json = serde_json::to_vec(self)?;
@@ -915,5 +968,52 @@ mod tests {
         assert!(!constant_time_eq(b"secret-token-123", b"secret-token-12"));
         assert!(!constant_time_eq(b"short", b"longer-value"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn ws_endpoint_classification_and_priority_tiers() {
+        assert_eq!(extract_ws_endpoint_host("WS://[::1]:6868/ws"), "::1");
+        assert_eq!(
+            extract_ws_endpoint_host("http://198.18.0.1:6868/ws"),
+            "198.18.0.1"
+        );
+        assert_eq!(
+            extract_ws_endpoint_host("192.168.50.50:6868"),
+            "192.168.50.50"
+        );
+
+        assert!(is_loopback_ws_endpoint("ws://127.0.0.1:6868/ws"));
+        assert!(is_loopback_ws_endpoint("ws://127.0.1.1:6868/ws"));
+        assert!(is_loopback_ws_endpoint("http://localhost:6868"));
+        assert!(is_loopback_ws_endpoint("ws://[::1]:6868/ws"));
+        assert!(is_loopback_ws_endpoint("::1"));
+        assert!(is_loopback_ws_endpoint("ws://0.0.0.0:6868/ws"));
+        assert!(!is_loopback_ws_endpoint("ws://192.168.50.50:6868/ws"));
+
+        assert!(is_tun_benchmark_endpoint("ws://198.18.0.1:6868/ws"));
+        assert!(is_tun_benchmark_endpoint("198.19.255.1:6868"));
+        assert!(!is_tun_benchmark_endpoint("ws://198.20.0.1:6868/ws"));
+        assert!(!is_tun_benchmark_endpoint("ws://100.102.176.111:6868/ws"));
+
+        assert_eq!(direct_endpoint_priority_tier("ws://127.0.0.1:6868/ws"), 0);
+        assert_eq!(direct_endpoint_priority_tier("ws://10.0.2.2:6868/ws"), 0);
+        assert_eq!(
+            direct_endpoint_priority_tier("ws://192.168.50.50:6868/ws"),
+            1
+        );
+        assert_eq!(
+            direct_endpoint_priority_tier("ws://100.102.176.111:6868/ws"),
+            1
+        );
+        assert_eq!(
+            direct_endpoint_priority_tier("ws://192.168.139.1:6868/ws"),
+            2
+        );
+        assert_eq!(
+            direct_endpoint_priority_tier("ws://192.168.215.2:6868/ws"),
+            2
+        );
+        assert_eq!(direct_endpoint_priority_tier("ws://198.18.0.1:6868/ws"), 3);
+        assert_eq!(direct_endpoint_priority_tier("ws://198.19.1.1:6868/ws"), 3);
     }
 }

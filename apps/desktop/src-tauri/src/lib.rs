@@ -834,7 +834,7 @@ fn list_directory(state: State<'_, DesktopAppState>, host_id: String, path: Opti
 
 #[tauri::command]
 fn connect_host(state: State<'_, DesktopAppState>, host_id: String) {
-    state.core.connect_host_async(host_id);
+    state.core.reconnect_host_async(host_id);
 }
 
 #[tauri::command]

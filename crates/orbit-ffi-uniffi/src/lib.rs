@@ -5719,7 +5719,7 @@ impl OrbitMobileCore {
     }
 
     pub fn connect_host(&self, host_id: String) {
-        self.inner.connect_host_async(host_id);
+        self.inner.reconnect_host_async(host_id);
     }
 
     pub fn refresh_host(&self, host_id: String) {

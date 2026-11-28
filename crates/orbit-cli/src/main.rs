@@ -23,7 +23,7 @@ use orbit_client_core::{
 };
 use orbit_crypto::PairingOffer;
 use orbit_daemon::{
-    DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints,
+    DaemonConfig, DaemonPersistedConfig, DaemonRuntime, advertised_direct_endpoints_for_listen,
     run_daemon_until_with_web,
 };
 use orbit_protocol::{
@@ -2547,13 +2547,7 @@ async fn wait_for_trycloudflare_host(log_path: &std::path::Path) -> anyhow::Resu
 }
 
 pub(crate) fn advertised_direct_endpoints(bind_ip: std::net::IpAddr, port: u16) -> Vec<String> {
-    if bind_ip.is_unspecified() {
-        discover_lan_ws_endpoints(port)
-    } else if bind_ip.is_ipv6() {
-        vec![format!("ws://[{bind_ip}]:{port}/ws")]
-    } else {
-        vec![format!("ws://{bind_ip}:{port}/ws")]
-    }
+    advertised_direct_endpoints_for_listen(SocketAddr::new(bind_ip, port))
 }
 
 /// Extract `(host, port)` from a plain `ws://` URL (`127.0.0.1`, `localhost`, `[::1]`, or explicit IP).

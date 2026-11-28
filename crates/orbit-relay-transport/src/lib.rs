@@ -39,6 +39,7 @@ use tokio_tungstenite::{
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_RELAY_PORT: u16 = 7878;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const RELAY_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Max WebSocket frame/message size (48 MiB) so 25 MiB base64/E2EE payloads never drop sessions.
 pub const MAX_RELAY_TRANSPORT_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
 /// Tight WebSocket frame/message cap (64 KiB) for Relay control sockets (`/v1/daemon/control`).
@@ -86,6 +87,8 @@ pub enum RelayTransportError {
     SshAuthFailed,
     #[error("SSH connection timed out")]
     Timeout,
+    #[error("relay WebSocket connection timed out")]
+    WsTimeout,
     #[error("websocket error: {0}")]
     WebSocket(Box<WsError>),
 }
@@ -1046,6 +1049,21 @@ impl RelayConnector {
         path_and_query: &str,
         max_frame_bytes: usize,
     ) -> Result<RelayWsStream, RelayTransportError> {
+        self.open_ws_with_limit_and_timeout(
+            path_and_query,
+            max_frame_bytes,
+            RELAY_WS_CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Open a WebSocket stream to `path_and_query` with explicit frame cap and handshake timeout.
+    pub async fn open_ws_with_limit_and_timeout(
+        &self,
+        path_and_query: &str,
+        max_frame_bytes: usize,
+        connect_timeout: Duration,
+    ) -> Result<RelayWsStream, RelayTransportError> {
         let suffix = if path_and_query.starts_with('/') {
             path_and_query.to_string()
         } else {
@@ -1066,7 +1084,12 @@ impl RelayConnector {
                     })?;
                     req.headers_mut().insert("Authorization", hdr);
                 }
-                let (ws, _) = connect_async_with_config(req, Some(ws_cfg), false).await?;
+                let (ws, _) = tokio::time::timeout(
+                    connect_timeout,
+                    connect_async_with_config(req, Some(ws_cfg), false),
+                )
+                .await
+                .map_err(|_| RelayTransportError::WsTimeout)??;
                 Ok(RelayWsStream::Direct(Box::new(ws)))
             }
             Self::Ssh {
@@ -1083,7 +1106,12 @@ impl RelayConnector {
                     })?;
                     req.headers_mut().insert("Authorization", hdr);
                 }
-                let (ws, _) = client_async_with_config(req, guard, Some(ws_cfg)).await?;
+                let (ws, _) = tokio::time::timeout(
+                    connect_timeout,
+                    client_async_with_config(req, guard, Some(ws_cfg)),
+                )
+                .await
+                .map_err(|_| RelayTransportError::WsTimeout)??;
                 Ok(RelayWsStream::Ssh(Box::new(ws)))
             }
         }
@@ -1139,30 +1167,35 @@ pub async fn http_get_over_ssh_relay(
         "GET {suffix} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{auth_header}Connection: close\r\n\r\n",
         spec.relay_port
     );
-    channel.write_all(req.as_bytes()).await.map_err(|e| {
-        RelayTransportError::InvalidUrl(format!("SSH HTTP probe write failed: {e}"))
-    })?;
-    channel.flush().await.map_err(|e| {
-        RelayTransportError::InvalidUrl(format!("SSH HTTP probe flush failed: {e}"))
-    })?;
+    let resp = tokio::time::timeout(SSH_CONNECT_TIMEOUT, async {
+        channel.write_all(req.as_bytes()).await.map_err(|e| {
+            RelayTransportError::InvalidUrl(format!("SSH HTTP probe write failed: {e}"))
+        })?;
+        channel.flush().await.map_err(|e| {
+            RelayTransportError::InvalidUrl(format!("SSH HTTP probe flush failed: {e}"))
+        })?;
 
-    let mut resp = Vec::with_capacity(512);
-    let mut chunk = [0u8; 512];
-    const MAX_PROBE_RESPONSE_BYTES: usize = 4096;
-    while resp.len() < MAX_PROBE_RESPONSE_BYTES {
-        match channel.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let take = n.min(MAX_PROBE_RESPONSE_BYTES - resp.len());
-                resp.extend_from_slice(&chunk[..take]);
-            }
-            Err(e) => {
-                return Err(RelayTransportError::InvalidUrl(format!(
-                    "SSH HTTP probe read failed: {e}"
-                )));
+        let mut resp = Vec::with_capacity(512);
+        let mut chunk = [0u8; 512];
+        const MAX_PROBE_RESPONSE_BYTES: usize = 4096;
+        while resp.len() < MAX_PROBE_RESPONSE_BYTES {
+            match channel.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let take = n.min(MAX_PROBE_RESPONSE_BYTES - resp.len());
+                    resp.extend_from_slice(&chunk[..take]);
+                }
+                Err(e) => {
+                    return Err(RelayTransportError::InvalidUrl(format!(
+                        "SSH HTTP probe read failed: {e}"
+                    )));
+                }
             }
         }
-    }
+        Ok(resp)
+    })
+    .await
+    .map_err(|_| RelayTransportError::Timeout)??;
 
     let text = String::from_utf8_lossy(&resp);
     let status_line = text.lines().next().ok_or_else(|| {
@@ -2054,5 +2087,41 @@ mod tests {
         let redacted = redact_relay_url(&normalized);
         assert!(!redacted.contains(secret));
         assert!(redacted.contains("ft=<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn open_ws_times_out_promptly_on_blackhole_tcp_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let connector = RelayConnector::connect(&format!("ws://{addr}"))
+            .await
+            .expect("build connector");
+        let start = std::time::Instant::now();
+        let err = connector
+            .open_ws_with_limit_and_timeout(
+                "/v1/client/testpk",
+                MAX_RELAY_TRANSPORT_WS_FRAME_BYTES,
+                Duration::from_millis(200),
+            )
+            .await
+            .err()
+            .expect("blackhole listener must time out");
+        assert!(
+            matches!(err, RelayTransportError::WsTimeout),
+            "expected WsTimeout, got {err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "timeout must return promptly, took {:?}",
+            start.elapsed()
+        );
+        accept_task.abort();
     }
 }

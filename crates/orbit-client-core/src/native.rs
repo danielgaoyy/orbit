@@ -31,6 +31,10 @@ pub use orbit_protocol::{E2EE_FRAME_TERMINAL, E2EE_FRAME_WIRE, E2EE_FRAME_WIRE_J
 /// `0x00` = Zstd-compressed `WireMessage`, `0x01..=0x04` = `TerminalBinaryFrame` opcodes!
 pub const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 
+const DIRECT_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SESSION_PING_INTERVAL: Duration = Duration::from_secs(10);
+const SESSION_LIVENESS_TIMEOUT: Duration = Duration::from_secs(35);
+
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientInboundEvent {
@@ -469,11 +473,40 @@ async fn connect_direct_with_host_id(
     replica: Option<Arc<OrbitStore>>,
     ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_direct_with_host_id_and_timeouts(
+        host_id,
+        ws_url,
+        pairing_secret,
+        replica,
+        ssh_tunnel,
+        DIRECT_WS_CONNECT_TIMEOUT,
+        SESSION_PING_INTERVAL,
+        SESSION_LIVENESS_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_direct_with_host_id_and_timeouts(
+    host_id: &str,
+    ws_url: &str,
+    pairing_secret: &str,
+    replica: Option<Arc<OrbitStore>>,
+    ssh_tunnel: Option<Arc<SshTunnelGuard>>,
+    connect_timeout: Duration,
+    ping_interval: Duration,
+    liveness_timeout: Duration,
+) -> Result<HostSessionHandle, ClientCoreError> {
     let req = build_authenticated_ws_request(ws_url, pairing_secret)?;
     let mut ws_cfg = WebSocketConfig::default();
     ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
     ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
-    let (ws_stream, _) = connect_async_with_config(req, Some(ws_cfg), false).await?;
+    let (ws_stream, _) = tokio::time::timeout(
+        connect_timeout,
+        connect_async_with_config(req, Some(ws_cfg), false),
+    )
+    .await
+    .map_err(|_| ClientCoreError::Handshake("direct WebSocket connection timed out".into()))??;
     let (mut sink, mut stream) = ws_stream.split();
 
     let hello = WireMessage::Hello {
@@ -483,7 +516,12 @@ async fn connect_direct_with_host_id(
         supports_zstd: true,
     };
     let hello_json = serde_json::to_string(&hello).map_err(orbit_protocol::ProtocolError::from)?;
-    sink.send(Message::Text(hello_json.into())).await?;
+    tokio::time::timeout(
+        Duration::from_millis(2500),
+        sink.send(Message::Text(hello_json.into())),
+    )
+    .await
+    .map_err(|_| ClientCoreError::Handshake("timed out sending daemon Hello".into()))??;
 
     // Verify `WireMessage::Welcome` BEFORE syncing any state so two users sharing a machine
     // can NEVER cross-connect or contaminate each other's local session replica!
@@ -534,63 +572,86 @@ async fn connect_direct_with_host_id(
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
     let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(4096);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // 10s WebSocket Ping keepalive so SSH tunnels & NAT routers never drop idle sessions
     let ping_tx = out_tx.clone();
+    let mut ping_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let _ = ping_tx
             .send(OutboundPayload::Wire(WireMessage::Ping {
                 ts_ms: unix_ms_now(),
             }))
             .await;
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(ping_interval);
         interval.tick().await;
         loop {
-            interval.tick().await;
-            if ping_tx
-                .send(OutboundPayload::Wire(WireMessage::Ping {
-                    ts_ms: unix_ms_now(),
-                }))
-                .await
-                .is_err()
-            {
-                break;
+            tokio::select! {
+                res = ping_shutdown.changed() => {
+                    if res.is_err() || *ping_shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if ping_tx
+                        .send(OutboundPayload::Wire(WireMessage::Ping {
+                            ts_ms: unix_ms_now(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });
 
     let write_events = events_tx.clone();
     let tunnel_keep_writer = ssh_tunnel.clone();
+    let writer_shutdown_tx = shutdown_tx.clone();
+    let mut writer_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let _hold = tunnel_keep_writer;
-        while let Some(item) = out_rx.recv().await {
-            let (data, receipt) = item.into_parts();
-            let ws_msg = match data {
-                OutboundFrame::Wire(w) => match w.encode_zstd(3) {
-                    Ok(z) => {
-                        let mut framed = Vec::with_capacity(1 + z.len());
-                        framed.push(DIRECT_BIN_ZSTD_WIRE);
-                        framed.extend_from_slice(&z);
-                        Message::Binary(framed.into())
+        loop {
+            tokio::select! {
+                res = writer_shutdown_rx.changed() => {
+                    if res.is_err() || *writer_shutdown_rx.borrow() {
+                        break;
                     }
-                    Err(_) => {
-                        if let Some(receipt) = receipt {
-                            let _ = receipt.send(Err(OutboxSendError::EncodeFailed));
-                        }
-                        continue;
-                    }
-                },
-                OutboundFrame::Terminal(t) => Message::Binary(t.encode().into()),
-            };
-            if sink.send(ws_msg).await.is_err() {
-                if let Some(receipt) = receipt {
-                    let _ = receipt.send(Err(OutboxSendError::TransportFailed));
                 }
-                let _ = write_events.send(ClientInboundEvent::Disconnected);
-                break;
-            }
-            if let Some(receipt) = receipt {
-                let _ = receipt.send(Ok(()));
+                maybe_item = out_rx.recv() => {
+                    let Some(item) = maybe_item else { break; };
+                    let (data, receipt) = item.into_parts();
+                    let ws_msg = match data {
+                        OutboundFrame::Wire(w) => match w.encode_zstd(3) {
+                            Ok(z) => {
+                                let mut framed = Vec::with_capacity(1 + z.len());
+                                framed.push(DIRECT_BIN_ZSTD_WIRE);
+                                framed.extend_from_slice(&z);
+                                Message::Binary(framed.into())
+                            }
+                            Err(_) => {
+                                if let Some(receipt) = receipt {
+                                    let _ = receipt.send(Err(OutboxSendError::EncodeFailed));
+                                }
+                                continue;
+                            }
+                        },
+                        OutboundFrame::Terminal(t) => Message::Binary(t.encode().into()),
+                    };
+                    if sink.send(ws_msg).await.is_err() {
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                        }
+                        let _ = writer_shutdown_tx.send(true);
+                        let _ = write_events.send(ClientInboundEvent::Disconnected);
+                        break;
+                    }
+                    if let Some(receipt) = receipt {
+                        let _ = receipt.send(Ok(()));
+                    }
+                }
             }
         }
     });
@@ -598,38 +659,60 @@ async fn connect_direct_with_host_id(
     let events_in = events_tx.clone();
     let owned_host_id = host_id.to_string();
     let tunnel_keep_reader = ssh_tunnel.clone();
+    let reader_shutdown_tx = shutdown_tx;
+    let mut reader_shutdown_rx = shutdown_rx;
     tokio::spawn(async move {
         let _hold = tunnel_keep_reader;
-        while let Some(Ok(msg)) = stream.next().await {
-            match msg {
-                Message::Text(txt) => match serde_json::from_str::<WireMessage>(&txt) {
-                    Ok(wire) => {
-                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
-                        let _ = events_in.send(ClientInboundEvent::Wire(wire));
-                    }
-                    Err(err) => {
-                        tracing::warn!(host_id = %owned_host_id, error = %err, bytes = txt.len(), "failed to decode direct JSON wire message");
-                    }
-                },
-                Message::Binary(bin) if !bin.is_empty() => {
-                    if bin[0] == DIRECT_BIN_ZSTD_WIRE {
-                        match WireMessage::decode_zstd(&bin[1..]) {
-                            Ok(wire) => {
-                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
-                                let _ = events_in.send(ClientInboundEvent::Wire(wire));
-                            }
-                            Err(err) => {
-                                tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = bin.len(), "failed to decode direct zstd wire message");
-                            }
-                        }
-                    } else if let Ok(term) = TerminalBinaryFrame::decode(&bin) {
-                        let _ = events_in.send(ClientInboundEvent::Terminal(term));
+        loop {
+            tokio::select! {
+                res = reader_shutdown_rx.changed() => {
+                    if res.is_err() || *reader_shutdown_rx.borrow() {
+                        break;
                     }
                 }
-                Message::Close(_) => break,
-                _ => {}
+                timed = tokio::time::timeout(liveness_timeout, stream.next()) => {
+                    match timed {
+                        Ok(Some(Ok(msg))) => match msg {
+                            Message::Text(txt) => match serde_json::from_str::<WireMessage>(&txt) {
+                                Ok(wire) => {
+                                    sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
+                                    let _ = events_in.send(ClientInboundEvent::Wire(wire));
+                                }
+                                Err(err) => {
+                                    tracing::warn!(host_id = %owned_host_id, error = %err, bytes = txt.len(), "failed to decode direct JSON wire message");
+                                }
+                            },
+                            Message::Binary(bin) if !bin.is_empty() => {
+                                if bin[0] == DIRECT_BIN_ZSTD_WIRE {
+                                    match WireMessage::decode_zstd(&bin[1..]) {
+                                        Ok(wire) => {
+                                            sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
+                                            let _ = events_in.send(ClientInboundEvent::Wire(wire));
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = bin.len(), "failed to decode direct zstd wire message");
+                                        }
+                                    }
+                                } else if let Ok(term) = TerminalBinaryFrame::decode(&bin) {
+                                    let _ = events_in.send(ClientInboundEvent::Terminal(term));
+                                }
+                            }
+                            Message::Close(_) => break,
+                            _ => {}
+                        },
+                        Ok(Some(Err(_))) | Ok(None) => break,
+                        Err(_) => {
+                            tracing::warn!(
+                                host_id = %owned_host_id,
+                                "direct WebSocket session liveness timeout; disconnecting"
+                            );
+                            break;
+                        }
+                    }
+                }
             }
         }
+        let _ = reader_shutdown_tx.send(true);
         let _ = events_in.send(ClientInboundEvent::Disconnected);
     });
 
@@ -668,6 +751,27 @@ async fn connect_via_relay_with_host_id(
     pairing_secret: &str,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_via_relay_with_timeouts(
+        host_id,
+        relay_base_url,
+        daemon_pubkey_b64,
+        pairing_secret,
+        replica,
+        SESSION_PING_INTERVAL,
+        SESSION_LIVENESS_TIMEOUT,
+    )
+    .await
+}
+
+async fn connect_via_relay_with_timeouts(
+    host_id: &str,
+    relay_base_url: &str,
+    daemon_pubkey_b64: &str,
+    pairing_secret: &str,
+    replica: Option<Arc<OrbitStore>>,
+    ping_interval: Duration,
+    liveness_timeout: Duration,
+) -> Result<HostSessionHandle, ClientCoreError> {
     // Reject empty or malformed pairing_secret fail-closed BEFORE dialing the relay.
     let _ = orbit_crypto::derive_e2ee_psk(pairing_secret).map_err(|_| {
         ClientCoreError::Unauthorized(
@@ -702,9 +806,8 @@ async fn connect_via_relay_with_host_id(
         })?;
     let (mut sink, mut stream) = ws_stream.split();
 
-    sink.send(Message::Binary(msg1.into())).await?;
-
     let msg2 = tokio::time::timeout(Duration::from_secs(10), async {
+        sink.send(Message::Binary(msg1.into())).await?;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(Message::Binary(b)) => return Ok(b),
@@ -750,30 +853,44 @@ async fn connect_via_relay_with_host_id(
 
     let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<CiphertextWrite>(256);
     let (ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let writer_shutdown_tx = shutdown_tx.clone();
+    let mut writer_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
-        let mut close_tx = Some(close_tx);
-        while let Some((ct, receipt)) = ct_out_rx.recv().await {
-            if sink.send(Message::Binary(ct.into())).await.is_err() {
-                if let Some(receipt) = receipt {
-                    let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+        loop {
+            tokio::select! {
+                res = writer_shutdown_rx.changed() => {
+                    if res.is_err() || *writer_shutdown_rx.borrow() {
+                        break;
+                    }
                 }
-                if let Some(tx) = close_tx.take() {
-                    let _ = tx.send(());
+                maybe_ct = ct_out_rx.recv() => {
+                    let Some((ct, receipt)) = maybe_ct else { break; };
+                    if sink.send(Message::Binary(ct.into())).await.is_err() {
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                        }
+                        let _ = writer_shutdown_tx.send(true);
+                        break;
+                    }
+                    if let Some(receipt) = receipt {
+                        let _ = receipt.send(Ok(()));
+                    }
                 }
-                break;
-            }
-            if let Some(receipt) = receipt {
-                let _ = receipt.send(Ok(()));
             }
         }
     });
 
+    let mut reader_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = &mut close_rx => break,
+                res = reader_shutdown_rx.changed() => {
+                    if res.is_err() || *reader_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
                 maybe_msg = stream.next() => {
                     match maybe_msg {
                         Some(Ok(Message::Binary(ct))) => {
@@ -789,7 +906,19 @@ async fn connect_via_relay_with_host_id(
         }
     });
 
-    complete_e2ee_session_tasks(host_id, write_chan, ct_out_tx, ct_in_rx, replica, None).await
+    complete_e2ee_session_tasks(
+        host_id,
+        write_chan,
+        ct_out_tx,
+        ct_in_rx,
+        replica,
+        None,
+        shutdown_tx,
+        shutdown_rx,
+        ping_interval,
+        liveness_timeout,
+    )
+    .await
 }
 
 /// Connect to a remote LAN-isolated Daemon by tunneling end-to-end encrypted (`Noise_NKpsk0`)
@@ -916,29 +1045,38 @@ pub async fn connect_via_peer_bridge(
 
     let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<CiphertextWrite>(256);
     let (ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let writer_bridge = bridge_session.clone();
+    let writer_shutdown_tx = shutdown_tx.clone();
+    let mut writer_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
-        let mut close_tx = Some(close_tx);
-        while let Some((ct, receipt)) = ct_out_rx.recv().await {
-            if let Err(err) = writer_bridge
-                .send_wire_confirmed(WireMessage::PeerBridgeData {
-                    bridge_id,
-                    payload_b64: STANDARD.encode(&ct),
-                })
-                .await
-            {
-                if let Some(receipt) = receipt {
-                    let _ = receipt.send(Err(err));
+        loop {
+            tokio::select! {
+                res = writer_shutdown_rx.changed() => {
+                    if res.is_err() || *writer_shutdown_rx.borrow() {
+                        break;
+                    }
                 }
-                if let Some(tx) = close_tx.take() {
-                    let _ = tx.send(());
+                maybe_ct = ct_out_rx.recv() => {
+                    let Some((ct, receipt)) = maybe_ct else { break; };
+                    if let Err(err) = writer_bridge
+                        .send_wire_confirmed(WireMessage::PeerBridgeData {
+                            bridge_id,
+                            payload_b64: STANDARD.encode(&ct),
+                        })
+                        .await
+                    {
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Err(err));
+                        }
+                        let _ = writer_shutdown_tx.send(true);
+                        break;
+                    }
+                    if let Some(receipt) = receipt {
+                        let _ = receipt.send(Ok(()));
+                    }
                 }
-                break;
-            }
-            if let Some(receipt) = receipt {
-                let _ = receipt.send(Ok(()));
             }
         }
         let _ = writer_bridge
@@ -949,10 +1087,15 @@ pub async fn connect_via_peer_bridge(
             .await;
     });
 
+    let mut reader_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = &mut close_rx => break,
+                res = reader_shutdown_rx.changed() => {
+                    if res.is_err() || *reader_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
                 ev = bridge_events.recv() => {
                     match ev {
                         Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeData {
@@ -986,10 +1129,15 @@ pub async fn connect_via_peer_bridge(
         ct_in_rx,
         replica,
         Some(bridge_session.clone()),
+        shutdown_tx,
+        shutdown_rx,
+        SESSION_PING_INTERVAL,
+        SESSION_LIVENESS_TIMEOUT,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_e2ee_session_tasks(
     host_id: &str,
     write_chan: SecureChannel,
@@ -997,6 +1145,10 @@ async fn complete_e2ee_session_tasks(
     mut ct_in_rx: mpsc::Receiver<Vec<u8>>,
     replica: Option<Arc<OrbitStore>>,
     hold_bridge_session: Option<HostSessionHandle>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ping_interval: Duration,
+    liveness_timeout: Duration,
 ) -> Result<HostSessionHandle, ClientCoreError> {
     let shared_chan = Arc::new(tokio::sync::Mutex::new(write_chan));
 
@@ -1019,62 +1171,85 @@ async fn complete_e2ee_session_tasks(
     let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(4096);
 
     let ping_tx = out_tx.clone();
+    let mut ping_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let _ = ping_tx
             .send(OutboundPayload::Wire(WireMessage::Ping {
                 ts_ms: unix_ms_now(),
             }))
             .await;
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(ping_interval);
         interval.tick().await;
         loop {
-            interval.tick().await;
-            if ping_tx
-                .send(OutboundPayload::Wire(WireMessage::Ping {
-                    ts_ms: unix_ms_now(),
-                }))
-                .await
-                .is_err()
-            {
-                break;
+            tokio::select! {
+                res = ping_shutdown.changed() => {
+                    if res.is_err() || *ping_shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if ping_tx
+                        .send(OutboundPayload::Wire(WireMessage::Ping {
+                            ts_ms: unix_ms_now(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });
 
     let write_events = events_tx.clone();
     let chan_writer = shared_chan.clone();
+    let writer_shutdown_tx = shutdown_tx.clone();
+    let mut writer_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let _keep_bridge = hold_bridge_session;
-        while let Some(item) = out_rx.recv().await {
-            let (data, receipt) = item.into_parts();
-            let plain = match data {
-                OutboundFrame::Wire(w) => match w.encode_e2ee(true) {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        if let Some(receipt) = receipt {
-                            let _ = receipt.send(Err(OutboxSendError::EncodeFailed));
-                        }
-                        continue;
+        loop {
+            tokio::select! {
+                res = writer_shutdown_rx.changed() => {
+                    if res.is_err() || *writer_shutdown_rx.borrow() {
+                        break;
                     }
-                },
-                OutboundFrame::Terminal(t) => {
-                    let enc = t.encode();
-                    let mut p = Vec::with_capacity(1 + enc.len());
-                    p.push(E2EE_FRAME_TERMINAL);
-                    p.extend_from_slice(&enc);
-                    p
                 }
-            };
-            let Ok(ct) = chan_writer.lock().await.seal_record(&plain) else {
-                if let Some(receipt) = receipt {
-                    let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                maybe_item = out_rx.recv() => {
+                    let Some(item) = maybe_item else { break; };
+                    let (data, receipt) = item.into_parts();
+                    let plain = match data {
+                        OutboundFrame::Wire(w) => match w.encode_e2ee(true) {
+                            Ok(frame) => frame,
+                            Err(_) => {
+                                if let Some(receipt) = receipt {
+                                    let _ = receipt.send(Err(OutboxSendError::EncodeFailed));
+                                }
+                                continue;
+                            }
+                        },
+                        OutboundFrame::Terminal(t) => {
+                            let enc = t.encode();
+                            let mut p = Vec::with_capacity(1 + enc.len());
+                            p.push(E2EE_FRAME_TERMINAL);
+                            p.extend_from_slice(&enc);
+                            p
+                        }
+                    };
+                    let Ok(ct) = chan_writer.lock().await.seal_record(&plain) else {
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                        }
+                        let _ = writer_shutdown_tx.send(true);
+                        let _ = write_events.send(ClientInboundEvent::Disconnected);
+                        break;
+                    };
+                    if ct_out_tx.send((ct, receipt)).await.is_err() {
+                        let _ = writer_shutdown_tx.send(true);
+                        let _ = write_events.send(ClientInboundEvent::Disconnected);
+                        break;
+                    }
                 }
-                let _ = write_events.send(ClientInboundEvent::Disconnected);
-                break;
-            };
-            if ct_out_tx.send((ct, receipt)).await.is_err() {
-                let _ = write_events.send(ClientInboundEvent::Disconnected);
-                break;
             }
         }
     });
@@ -1082,32 +1257,58 @@ async fn complete_e2ee_session_tasks(
     let events_in = events_tx.clone();
     let chan_reader = shared_chan;
     let owned_host_id = host_id.to_string();
+    let reader_shutdown_tx = shutdown_tx;
+    let mut reader_shutdown_rx = shutdown_rx;
     tokio::spawn(async move {
-        while let Some(ct) = ct_in_rx.recv().await {
-            let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
-                break;
-            };
-            if plain.is_empty() {
-                continue;
-            }
-            match plain[0] {
-                E2EE_FRAME_WIRE | E2EE_FRAME_WIRE_JSON => match WireMessage::decode_e2ee(&plain) {
-                    Ok(wire) => {
-                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
-                        let _ = events_in.send(ClientInboundEvent::Wire(wire));
-                    }
-                    Err(err) => {
-                        tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = plain.len(), "failed to decode E2EE wire message");
-                    }
-                },
-                E2EE_FRAME_TERMINAL => {
-                    if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..]) {
-                        let _ = events_in.send(ClientInboundEvent::Terminal(term));
+        loop {
+            tokio::select! {
+                res = reader_shutdown_rx.changed() => {
+                    if res.is_err() || *reader_shutdown_rx.borrow() {
+                        break;
                     }
                 }
-                _ => {}
+                timed = tokio::time::timeout(liveness_timeout, ct_in_rx.recv()) => {
+                    match timed {
+                        Ok(Some(ct)) => {
+                            let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
+                                break;
+                            };
+                            if plain.is_empty() {
+                                continue;
+                            }
+                            match plain[0] {
+                                E2EE_FRAME_WIRE | E2EE_FRAME_WIRE_JSON => {
+                                    match WireMessage::decode_e2ee(&plain) {
+                                        Ok(wire) => {
+                                            sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
+                                            let _ = events_in.send(ClientInboundEvent::Wire(wire));
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = plain.len(), "failed to decode E2EE wire message");
+                                        }
+                                    }
+                                }
+                                E2EE_FRAME_TERMINAL => {
+                                    if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..]) {
+                                        let _ = events_in.send(ClientInboundEvent::Terminal(term));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            tracing::warn!(
+                                host_id = %owned_host_id,
+                                "E2EE session liveness timeout; disconnecting"
+                            );
+                            break;
+                        }
+                    }
+                }
             }
         }
+        let _ = reader_shutdown_tx.send(true);
         let _ = events_in.send(ClientInboundEvent::Disconnected);
     });
 
@@ -1178,24 +1379,7 @@ async fn try_connect_ssh_tunnel(
 }
 
 fn endpoint_priority_tier(ep: &str) -> u8 {
-    let authority = ep
-        .trim()
-        .strip_prefix("ws://")
-        .or_else(|| ep.strip_prefix("wss://"))
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("");
-    let host = authority.split(':').next().unwrap_or("");
-    if host == "127.0.0.1" || host == "10.0.2.2" || host.eq_ignore_ascii_case("localhost") {
-        0
-    } else if host.starts_with("198.18.") || host.starts_with("198.19.") {
-        // RFC 2544 / Clash / Surge fake-IP TUN interfaces often accept TCP SYN then blackhole WS handshakes
-        3
-    } else if host.starts_with("192.168.139.") || host.starts_with("192.168.215.") {
-        // Common local VM / bridge virtual subnets
-        2
-    } else {
-        1
-    }
+    orbit_crypto::direct_endpoint_priority_tier(ep)
 }
 
 fn has_custom_direct_endpoint(profile: &SavedHostProfile) -> bool {
@@ -1212,19 +1396,23 @@ async fn try_connect_direct_endpoints(
     let has_custom = has_custom_direct_endpoint(profile);
     // Only dial explicitly paired/configured direct endpoints for this host — never speculatively
     // probe unconfigured local/emulator addresses with this host's Bearer credential!
-    let mut raw_endpoints: Vec<String> = Vec::new();
+    // Auto-discovered TUN benchmark fake-IP addresses (`198.18.0.0/15`) are skipped unless explicitly
+    // configured via `custom_direct_endpoint`.
+    let mut endpoints: Vec<String> = Vec::with_capacity(profile.direct_endpoints.len() + 1);
     if let Some(ref custom) = profile.custom_direct_endpoint
         && !custom.trim().is_empty()
     {
-        raw_endpoints.push(custom.trim().to_string());
+        let ep = orbit_crypto::normalize_ws_endpoint(custom);
+        if !ep.is_empty() {
+            endpoints.push(ep);
+        }
     }
-    raw_endpoints.extend(profile.direct_endpoints.iter().cloned());
-
-    // Deduplicate (and normalize bare `host:port` endpoints) while preserving order
-    let mut endpoints: Vec<String> = Vec::with_capacity(raw_endpoints.len());
-    for raw_ep in raw_endpoints {
-        let ep = orbit_crypto::normalize_ws_endpoint(&raw_ep);
-        if !ep.is_empty() && !endpoints.contains(&ep) {
+    for raw_ep in &profile.direct_endpoints {
+        let ep = orbit_crypto::normalize_ws_endpoint(raw_ep);
+        if !ep.is_empty()
+            && !orbit_crypto::is_tun_benchmark_endpoint(&ep)
+            && !endpoints.contains(&ep)
+        {
             endpoints.push(ep);
         }
     }
@@ -1235,7 +1423,8 @@ async fn try_connect_direct_endpoints(
         return Err(ClientCoreError::Unreachable);
     }
 
-    // Happy-Eyeballs concurrent racing (60ms stagger) so dead TUN/VM adapters never block LAN Wi-Fi
+    // Happy-Eyeballs concurrent racing (60ms stagger, 2.2s overall cap) so dead TUN/VM adapters
+    // never stall LAN Wi-Fi or delay Relay fallback
     let mut set = tokio::task::JoinSet::new();
     for (idx, ep) in endpoints.into_iter().enumerate() {
         let host_id = profile.host_id.clone();
@@ -1256,19 +1445,25 @@ async fn try_connect_direct_endpoints(
 
     let mut mismatch_err = None;
     let mut auth_err = None;
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(Ok(handle))) => {
+    let race_deadline = tokio::time::Instant::now() + Duration::from_millis(2200);
+    loop {
+        match tokio::time::timeout_at(race_deadline, set.join_next()).await {
+            Ok(Some(Ok(Ok(Ok(handle))))) => {
                 set.abort_all();
                 return Ok(handle);
             }
-            Ok(Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. }))) => {
+            Ok(Some(Ok(Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. }))))) => {
                 mismatch_err = Some(e);
             }
-            Ok(Ok(Err(e))) if e.is_auth_error() => {
+            Ok(Some(Ok(Ok(Err(e))))) if e.is_auth_error() => {
                 auth_err = Some(e);
             }
-            _ => {}
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                set.abort_all();
+                break;
+            }
         }
     }
     Err(mismatch_err
@@ -1350,15 +1545,27 @@ async fn try_connect_relay_candidates(
     Err(first_err.unwrap_or(ClientCoreError::Unreachable))
 }
 
-async fn connect_auto(
+async fn connect_auto<F>(
     profile: &SavedHostProfile,
     fallback_relays: &[String],
     replica: Option<Arc<OrbitStore>>,
     has_ssh: bool,
-) -> Result<HostSessionHandle, ClientCoreError> {
+    on_phase: &F,
+) -> Result<HostSessionHandle, ClientCoreError>
+where
+    F: Fn(HostConnectionState) + Send + Sync,
+{
     let mut last_ssh_err = None;
     let mut auth_err = None;
     let mut mismatch_err = None;
+    let has_usable_direct = has_custom_direct_endpoint(profile)
+        || profile
+            .direct_endpoints
+            .iter()
+            .any(|ep| !ep.trim().is_empty() && !orbit_crypto::is_tun_benchmark_endpoint(ep));
+    if has_usable_direct || has_ssh {
+        on_phase(HostConnectionState::ConnectingDirect);
+    }
     if has_ssh && !has_custom_direct_endpoint(profile) {
         match try_connect_ssh_tunnel(profile, replica.clone()).await {
             Ok(h) => return Ok(h),
@@ -1377,13 +1584,15 @@ async fn connect_auto(
             Err(_) => {}
         }
     } else {
-        match try_connect_direct_endpoints(profile, replica.clone()).await {
-            Ok(h) => return Ok(h),
-            Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
-                mismatch_err = Some(e);
+        if has_usable_direct {
+            match try_connect_direct_endpoints(profile, replica.clone()).await {
+                Ok(h) => return Ok(h),
+                Err(e @ ClientCoreError::HostIdentityMismatch { .. }) => {
+                    mismatch_err = Some(e);
+                }
+                Err(e) if e.is_auth_error() => auth_err = Some(e),
+                Err(_) => {}
             }
-            Err(e) if e.is_auth_error() => auth_err = Some(e),
-            Err(_) => {}
         }
         if has_ssh {
             match try_connect_ssh_tunnel(profile, replica.clone()).await {
@@ -1398,6 +1607,7 @@ async fn connect_auto(
     }
 
     if !build_relay_candidates(profile.relay_url.as_deref(), fallback_relays).is_empty() {
+        on_phase(HostConnectionState::ConnectingRelay);
         match try_connect_relay_candidates(profile, fallback_relays, replica).await {
             Ok(h) => return Ok(h),
             Err(e) if e.is_auth_error() => return Err(e),
@@ -1411,14 +1621,17 @@ async fn connect_auto(
         .unwrap_or(ClientCoreError::Unreachable))
 }
 
-/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`),
-/// racing or falling back across additional modern account-wide `fallback_relays` when a host's
-/// cached `relay_url` is unset or a dead legacy `ssh+relay://` endpoint.
-pub async fn connect_smart_with_fallback_relays(
+/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`)
+/// with live phase notifications as connection fallback progresses from Direct/SSH to Relay.
+pub async fn connect_smart_with_fallback_relays_and_progress<F>(
     profile: &SavedHostProfile,
     fallback_relays: &[String],
     replica: Option<Arc<OrbitStore>>,
-) -> Result<HostSessionHandle, ClientCoreError> {
+    on_phase: F,
+) -> Result<HostSessionHandle, ClientCoreError>
+where
+    F: Fn(HostConnectionState) + Send + Sync,
+{
     let desktop_ssh_supported = cfg!(any(target_os = "macos", target_os = "linux"));
     let has_ssh = desktop_ssh_supported
         && profile
@@ -1430,23 +1643,41 @@ pub async fn connect_smart_with_fallback_relays(
     match profile.route_mode {
         HostRouteMode::SshTunnel => {
             if desktop_ssh_supported {
+                on_phase(HostConnectionState::ConnectingDirect);
                 try_connect_ssh_tunnel(profile, replica).await
             } else {
-                connect_auto(profile, fallback_relays, replica, false).await
+                connect_auto(profile, fallback_relays, replica, false, &on_phase).await
             }
         }
-        HostRouteMode::DirectOnly => try_connect_direct_endpoints(profile, replica).await,
+        HostRouteMode::DirectOnly => {
+            on_phase(HostConnectionState::ConnectingDirect);
+            try_connect_direct_endpoints(profile, replica).await
+        }
         HostRouteMode::RelayOnly => {
             if build_relay_candidates(profile.relay_url.as_deref(), fallback_relays).is_empty() {
                 Err(ClientCoreError::Handshake(
                     "No E2EE relay URL configured".into(),
                 ))
             } else {
+                on_phase(HostConnectionState::ConnectingRelay);
                 try_connect_relay_candidates(profile, fallback_relays, replica).await
             }
         }
-        HostRouteMode::Auto => connect_auto(profile, fallback_relays, replica, has_ssh).await,
+        HostRouteMode::Auto => {
+            connect_auto(profile, fallback_relays, replica, has_ssh, &on_phase).await
+        }
     }
+}
+
+/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`),
+/// racing or falling back across additional modern account-wide `fallback_relays` when a host's
+/// cached `relay_url` is unset or a dead legacy `ssh+relay://` endpoint.
+pub async fn connect_smart_with_fallback_relays(
+    profile: &SavedHostProfile,
+    fallback_relays: &[String],
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_smart_with_fallback_relays_and_progress(profile, fallback_relays, replica, |_| {}).await
 }
 
 /// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):
@@ -1901,6 +2132,329 @@ mod direct_auth_tests {
             "Auto mode must preserve auth error rather than returning Unreachable, got {err:?}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_and_e2ee_liveness_watchdogs_disconnect_silent_sessions_and_stay_alive_on_pong()
+    {
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keygen");
+        let host_id = kp.host_id().expect("host_id");
+        let secret = orbit_crypto::generate_pairing_secret();
+
+        // 1. Direct WS session with a silent server must trip the inbound liveness watchdog.
+        let silent_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let silent_addr = silent_listener.local_addr().expect("addr");
+        let silent_hid = host_id.clone();
+        let silent_pk = kp.public_key_b64.clone();
+        let silent_srv = tokio::spawn(async move {
+            let (sock, _) = silent_listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(sock)
+                .await
+                .expect("accept ws");
+            while let Some(Ok(msg)) = ws.next().await {
+                let is_hello = match &msg {
+                    Message::Text(t) => matches!(
+                        serde_json::from_str::<WireMessage>(t),
+                        Ok(WireMessage::Hello { .. })
+                    ),
+                    Message::Binary(b) if !b.is_empty() && b[0] == DIRECT_BIN_ZSTD_WIRE => {
+                        matches!(
+                            WireMessage::decode_zstd(&b[1..]),
+                            Ok(WireMessage::Hello { .. })
+                        )
+                    }
+                    _ => false,
+                };
+                if is_hello {
+                    let welcome = WireMessage::Welcome {
+                        host: HostInfo {
+                            host_id: silent_hid.clone(),
+                            hostname: "silent-direct".into(),
+                            os: "linux".into(),
+                            arch: "x86_64".into(),
+                            public_key_b64: silent_pk.clone(),
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_version: "0.11.11".into(),
+                            available_providers: vec![],
+                            relay_url: None,
+                            direct_endpoints: vec![],
+                            board_cas_supported: false,
+                        },
+                    };
+                    let json = serde_json::to_string(&welcome).expect("welcome json");
+                    ws.send(Message::Text(json.into()))
+                        .await
+                        .expect("send welcome");
+                    // Stay silent forever without replying to Pings.
+                    futures_util::future::pending::<()>().await;
+                }
+            }
+        });
+
+        let handle = connect_direct_with_host_id_and_timeouts(
+            &host_id,
+            &format!("ws://{silent_addr}/ws"),
+            &secret,
+            None,
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(80),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("connect direct to silent server");
+        let mut rx = handle.subscribe();
+        let disconnected = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ClientInboundEvent::Disconnected)
+                    | Err(broadcast::error::RecvError::Closed) => return true,
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            disconnected,
+            "silent Direct WS session must disconnect cleanly"
+        );
+        silent_srv.abort();
+
+        // 2. Direct WS session receiving Pong replies must stay alive past liveness_timeout.
+        let pong_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pong listener");
+        let pong_addr = pong_listener.local_addr().expect("addr");
+        let pong_hid = host_id.clone();
+        let pong_pk = kp.public_key_b64.clone();
+        let pong_srv = tokio::spawn(async move {
+            let (sock, _) = pong_listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(sock)
+                .await
+                .expect("accept ws");
+            while let Some(Ok(msg)) = ws.next().await {
+                let decoded = match &msg {
+                    Message::Text(t) => serde_json::from_str::<WireMessage>(t).ok(),
+                    Message::Binary(b) if !b.is_empty() && b[0] == DIRECT_BIN_ZSTD_WIRE => {
+                        WireMessage::decode_zstd(&b[1..]).ok()
+                    }
+                    _ => None,
+                };
+                match decoded {
+                    Some(WireMessage::Hello { .. }) => {
+                        let welcome = WireMessage::Welcome {
+                            host: HostInfo {
+                                host_id: pong_hid.clone(),
+                                hostname: "pong-direct".into(),
+                                os: "linux".into(),
+                                arch: "x86_64".into(),
+                                public_key_b64: pong_pk.clone(),
+                                protocol_version: PROTOCOL_VERSION,
+                                daemon_version: "0.11.11".into(),
+                                available_providers: vec![],
+                                relay_url: None,
+                                direct_endpoints: vec![],
+                                board_cas_supported: false,
+                            },
+                        };
+                        let json = serde_json::to_string(&welcome).expect("welcome json");
+                        ws.send(Message::Text(json.into()))
+                            .await
+                            .expect("send welcome");
+                    }
+                    Some(WireMessage::Ping { ts_ms }) => {
+                        let pong =
+                            serde_json::to_string(&WireMessage::Pong { ts_ms }).expect("pong json");
+                        if ws.send(Message::Text(pong.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let alive_handle = connect_direct_with_host_id_and_timeouts(
+            &host_id,
+            &format!("ws://{pong_addr}/ws"),
+            &secret,
+            None,
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(70),
+            Duration::from_millis(320),
+        )
+        .await
+        .expect("connect direct to pong server");
+        let mut alive_rx = alive_handle.subscribe();
+        let mut saw_pong = false;
+        let mut saw_disconnect = false;
+        let check_until = tokio::time::Instant::now() + Duration::from_millis(600);
+        while tokio::time::Instant::now() < check_until {
+            match tokio::time::timeout(Duration::from_millis(120), alive_rx.recv()).await {
+                Ok(Ok(ClientInboundEvent::Wire(WireMessage::Pong { .. }))) => saw_pong = true,
+                Ok(Ok(ClientInboundEvent::Disconnected))
+                | Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    saw_disconnect = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_pong, "Pong keepalive reply must arrive");
+        assert!(
+            !saw_disconnect,
+            "Direct WS session actively receiving Pongs must remain alive"
+        );
+        drop(alive_handle);
+        pong_srv.abort();
+
+        // 3. E2EE session task watchdog must trigger Disconnected + watch shutdown when silent.
+        let pub_bytes = kp.public_bytes().expect("pub");
+        let priv_bytes = kp.private_bytes().expect("priv");
+        let (client_hs, msg1) =
+            ClientHandshake::new(&pub_bytes, &secret).expect("client handshake");
+        let (_daemon_chan, msg2) =
+            orbit_crypto::DaemonHandshake::accept(&priv_bytes, &secret, &msg1)
+                .expect("daemon accept");
+        let write_chan = client_hs.finalize(&msg2).expect("finalize");
+        let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<CiphertextWrite>(16);
+        let (_ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut watch_rx = shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            while let Some((_ct, receipt)) = ct_out_rx.recv().await {
+                if let Some(r) = receipt {
+                    let _ = r.send(Ok(()));
+                }
+            }
+        });
+
+        let e2ee_handle = complete_e2ee_session_tasks(
+            &host_id,
+            write_chan,
+            ct_out_tx,
+            ct_in_rx,
+            None,
+            None,
+            shutdown_tx,
+            shutdown_rx,
+            Duration::from_millis(60),
+            Duration::from_millis(220),
+        )
+        .await
+        .expect("complete e2ee tasks");
+        let mut e2ee_rx = e2ee_handle.subscribe();
+        let e2ee_disc = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match e2ee_rx.recv().await {
+                    Ok(ClientInboundEvent::Disconnected)
+                    | Err(broadcast::error::RecvError::Closed) => return true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(e2ee_disc, "silent E2EE session must disconnect cleanly");
+        let _ = watch_rx.changed().await;
+        assert!(
+            *watch_rx.borrow(),
+            "E2EE liveness watchdog must signal shutdown watch channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_smart_skips_tun_benchmark_endpoints_and_reports_phase_transitions() {
+        let closed_direct_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_direct_addr = closed_direct_listener.local_addr().expect("addr");
+        drop(closed_direct_listener);
+
+        let closed_relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_relay_addr = closed_relay_listener.local_addr().expect("addr");
+        drop(closed_relay_listener);
+
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keygen");
+        let host_id = kp.host_id().expect("host_id");
+
+        // 1. With both a TUN fake-IP and a non-TUN unreachable endpoint, Auto emits ConnectingDirect -> ConnectingRelay.
+        let profile_with_direct = SavedHostProfile {
+            host_id: host_id.clone(),
+            hostname: "phase-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: closed_direct_addr.port(),
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: kp.public_key_b64.clone(),
+            direct_endpoints: vec![
+                "ws://198.18.0.1:6868/ws".into(),
+                format!("ws://{closed_direct_addr}/ws"),
+            ],
+            relay_url: Some(format!("ws://{closed_relay_addr}")),
+            pairing_secret: "secret-phase-test-123456".into(),
+            pairing_secret_updated_at_ms: 1,
+            state: HostConnectionState::Disconnected,
+        };
+        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let phases_cb = Arc::clone(&phases);
+        let start = std::time::Instant::now();
+        let err = connect_smart_with_fallback_relays_and_progress(
+            &profile_with_direct,
+            &[],
+            None,
+            move |phase| phases_cb.lock().expect("lock").push(phase),
+        )
+        .await
+        .err()
+        .expect("unreachable closed ports must fail");
+        assert!(!err.is_auth_error());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "closed endpoints + closed relay must fail fast without TUN hang"
+        );
+        assert_eq!(
+            *phases.lock().expect("lock"),
+            vec![
+                HostConnectionState::ConnectingDirect,
+                HostConnectionState::ConnectingRelay,
+            ]
+        );
+
+        // 2. When direct_endpoints only contains 198.18.* / 198.19.* TUN IPs, ConnectingDirect is skipped completely.
+        let profile_tun_only = SavedHostProfile {
+            direct_endpoints: vec![
+                "ws://198.18.0.1:6868/ws".into(),
+                "ws://198.19.10.2:6868/ws".into(),
+            ],
+            ..profile_with_direct
+        };
+        let tun_phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tun_phases_cb = Arc::clone(&tun_phases);
+        let tun_start = std::time::Instant::now();
+        let _ = connect_smart_with_fallback_relays_and_progress(
+            &profile_tun_only,
+            &[],
+            None,
+            move |phase| tun_phases_cb.lock().expect("lock").push(phase),
+        )
+        .await
+        .err()
+        .expect("closed relay must fail");
+        assert!(tun_start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            *tun_phases.lock().expect("lock"),
+            vec![HostConnectionState::ConnectingRelay]
+        );
     }
 }
 

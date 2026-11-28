@@ -570,13 +570,12 @@ fn save_skills_state(orbit_home: &Path, state: &SkillsStateFile) -> Result<(), S
 }
 
 fn validate_project_cwd(cwd: &str, user_home: &Path) -> Result<PathBuf, SkillManagerError> {
-    let trimmed = cwd.trim();
-    if trimmed.is_empty() || trimmed == "~" {
+    if cwd.trim().is_empty() || cwd == "~" {
         return Err(SkillManagerError::InvalidInput(
             "project-scoped skills require an active workspace cwd".to_string(),
         ));
     }
-    let cwd_path = PathBuf::from(trimmed);
+    let cwd_path = PathBuf::from(cwd);
     let canonical_cwd = canonicalize_workspace_root(&cwd_path).map_err(|msg| {
         if msg.contains("Refusing") || msg.contains("forbidden") {
             SkillManagerError::PermissionDenied(msg)
@@ -595,8 +594,8 @@ fn validate_project_cwd(cwd: &str, user_home: &Path) -> Result<PathBuf, SkillMan
 }
 
 fn resolve_optional_cwd(cwd: Option<&str>, user_home: &Path) -> Option<PathBuf> {
-    let raw = cwd?.trim();
-    if raw.is_empty() || raw == "~" {
+    let raw = cwd?;
+    if raw.trim().is_empty() || raw == "~" {
         return None;
     }
     validate_project_cwd(raw, user_home).ok()

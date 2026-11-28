@@ -12,12 +12,17 @@ use orbit_client_core::viewmodel::{
     FleetOverviewView, HostDetailView, TimelineItemView, project_git_review_for_mode,
 };
 use orbit_protocol::{
-    AgentMessageDeliveryStatus, AgentMessageKind, BackgroundTaskInfo, GuardianAssessment,
-    GuardianDecision, GuardianRiskLevel, PermissionCheckpointRef, PlanApprovalPayload,
-    QuestionItem, ToolCallDetail, ToolCallStatus, WorkspaceScriptInfo, WorkspaceScriptKind,
-    WorkspaceScriptStatus,
+    AgentMessageDeliveryStatus, AgentMessageKind, BackgroundTaskInfo, ExternalMcpServerRecord,
+    GuardianAssessment, GuardianDecision, GuardianRiskLevel, InstalledPluginView,
+    ManagedSkillRecord, McpProbeResult, McpServerScope, McpToolSummary, McpTransportKind,
+    MemoryCategory, MemoryStatus, OrbitPluginCapabilities, OrbitPluginManifest, OrbitPluginMcpOp,
+    OrbitPluginUiSlot, OrbitPluginUiSlotDecl, PermissionCheckpointRef, PlanApprovalPayload,
+    ProjectMemoryItem, QuestionItem, QuotaDepletionForecast, SandboxPolicy, SkillSource,
+    ToolCallDetail, ToolCallStatus, UsageDailyPoint, UsageInsightsSnapshot, UsageModelBreakdown,
+    UsageProjectBreakdown, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
 };
 use serde_json::{Value, to_value};
+use std::collections::BTreeMap;
 use std::error::Error;
 
 const HOST: &str = "replay-host";
@@ -308,6 +313,159 @@ pub(super) fn contracts() -> Result<Vec<(String, Value)>, Box<dyn Error>> {
             to_value(project_git_review_for_mode(
                 1, HOST, "/repo", None, "", None, false, 0,
             ))?,
+        ),
+        (
+            "UsageInsightsSnapshotView".into(),
+            to_value(UsageInsightsSnapshot {
+                days: 7,
+                total_cost_usd: 1.42,
+                total_cache_savings_usd: 0.35,
+                total_input_tokens: 120_000,
+                total_output_tokens: 24_000,
+                total_cache_read_tokens: 48_000,
+                total_turns: 14,
+                daily: vec![UsageDailyPoint {
+                    date: "2026-11-28".into(),
+                    input_tokens: 120_000,
+                    output_tokens: 24_000,
+                    cache_read_tokens: 48_000,
+                    cost_usd: 1.42,
+                    turns: 14,
+                }],
+                by_model: vec![UsageModelBreakdown {
+                    provider: "claude".into(),
+                    model: "claude-sonnet-4".into(),
+                    input_tokens: 120_000,
+                    output_tokens: 24_000,
+                    cache_read_tokens: 48_000,
+                    cost_usd: 1.42,
+                    turns: 14,
+                }],
+                by_project: vec![UsageProjectBreakdown {
+                    workspace_cwd: "/repo".into(),
+                    cost_usd: 1.42,
+                    total_tokens: 144_000,
+                    turns: 14,
+                }],
+                forecasts: vec![QuotaDepletionForecast {
+                    provider: "claude".into(),
+                    window_label: "5h".into(),
+                    remaining_percent: 68.5,
+                    burn_rate_pct_per_hour: 4.2,
+                    estimated_depletion_secs: Some(58_000),
+                    resets_in_secs: Some(10_800),
+                    likely_to_exhaust_before_reset: false,
+                }],
+            })?,
+        ),
+        (
+            "ExternalMcpServerRecordView".into(),
+            to_value(ExternalMcpServerRecord {
+                id: "orbit_user:filesystem".into(),
+                name: "filesystem".into(),
+                scope: McpServerScope::OrbitUser,
+                transport: McpTransportKind::Stdio {
+                    command: "npx".into(),
+                    args: vec![
+                        "-y".into(),
+                        "@modelcontextprotocol/server-filesystem".into(),
+                    ],
+                },
+                env_keys: vec!["API_TOKEN".into()],
+                masked_env: BTreeMap::from([("API_TOKEN".into(), "••••••".into())]),
+                masked_headers: BTreeMap::new(),
+                enabled: true,
+                editable: true,
+                source_path: "~/.orbit/mcp.json".into(),
+                last_probe: Some(McpProbeResult {
+                    ok: true,
+                    server_name: Some("filesystem".into()),
+                    server_version: Some("1.0.0".into()),
+                    protocol_version: Some("2025-03-26".into()),
+                    tools: vec![McpToolSummary {
+                        name: "read_file".into(),
+                        description: "Read workspace file".into(),
+                    }],
+                    latency_ms: 42,
+                    error: None,
+                    probed_at_ms: 1_760_000_000_000,
+                }),
+            })?,
+        ),
+        (
+            "ManagedSkillRecordView".into(),
+            to_value(ManagedSkillRecord {
+                id: "orbit_user:review".into(),
+                slug: "review".into(),
+                name: "Code Review".into(),
+                description: "Inspect pull request diffs".into(),
+                source: SkillSource::OrbitUser,
+                path: "~/.orbit/skills/review/SKILL.md".into(),
+                enabled: true,
+                editable: true,
+                triggers: vec!["review".into()],
+                allowed_tools: vec!["Read".into()],
+                has_scripts: false,
+                has_references: true,
+                approx_tokens: 420,
+                updated_at_ms: 1_760_000_000_000,
+                argument_hint: Some("[pr-number]".into()),
+                is_command: false,
+            })?,
+        ),
+        (
+            "ProjectMemoryItemView".into(),
+            to_value(ProjectMemoryItem {
+                id: "mem-1".into(),
+                workspace_root: "/repo".into(),
+                title: "Use Orbit tokens".into(),
+                content: "Always route colors through $r('app.color.*').".into(),
+                category: MemoryCategory::Convention,
+                status: MemoryStatus::Confirmed,
+                confidence: 0.95,
+                file_paths: vec!["apps/harmony/AGENTS.md".into()],
+                tags: vec!["harmony".into()],
+                source_provider: Some("claude".into()),
+                source_agent_id: Some("ag-1".into()),
+                source_path: None,
+                access_count: 3,
+                created_at_ms: 1_760_000_000_000,
+                updated_at_ms: 1_760_000_001_000,
+                last_accessed_ms: 1_760_000_002_000,
+            })?,
+        ),
+        (
+            "InstalledPluginView".into(),
+            to_value(InstalledPluginView {
+                manifest: OrbitPluginManifest {
+                    id: "orbit-lint".into(),
+                    name: "Orbit Lint".into(),
+                    version: "1.0.0".into(),
+                    description: "Checks workspace hygiene".into(),
+                    author: Some("Orbit".into()),
+                    wasm_entry: "plugin.wasm".into(),
+                    capabilities: OrbitPluginCapabilities {
+                        fs_read_globs: vec!["src/**".into()],
+                        http_domains: vec![],
+                        hook_events: vec!["pre_tool_use".into()],
+                        max_fuel: Some(1_000_000),
+                        max_memory_bytes: Some(1_048_576),
+                    },
+                    mcp_ops: vec![OrbitPluginMcpOp {
+                        name: "lint_check".into(),
+                        description: "Run lint check".into(),
+                    }],
+                    ui_slots: vec![OrbitPluginUiSlotDecl {
+                        slot: OrbitPluginUiSlot::SettingsPanel,
+                        title: "Lint".into(),
+                    }],
+                },
+                enabled: true,
+            })?,
+        ),
+        (
+            "SandboxPolicyView".into(),
+            to_value(SandboxPolicy::default())?,
         ),
     ];
     for item in timeline_examples() {

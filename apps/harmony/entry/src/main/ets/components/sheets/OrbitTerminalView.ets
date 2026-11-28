@@ -322,14 +322,14 @@ export struct OrbitTerminalView {
     if (this.store.terminalRawMode) {
       if (info.insertValue.length > 0) {
         this.store.sendTerminalRawUtf8(info.insertValue);
-        this.store.triggerHaptic(4);
+        this.store.triggerHapticPreset('selection');
       }
       return false;
     }
     if (this.store.ctrlSticky || this.store.altSticky) {
       if (info.insertValue.length === 1) {
         this.store.sendTerminalRawUtf8(info.insertValue);
-        this.store.triggerHaptic(6);
+        this.store.triggerHapticPreset('selection');
         return false;
       }
       this.store.ctrlSticky = false;
@@ -364,7 +364,7 @@ export struct OrbitTerminalView {
   private submitShellInput(): void {
     if (this.store.terminalRawMode) {
       this.store.sendTerminalRawBytes(new Uint8Array([0x0D]));
-      this.store.triggerHaptic(6);
+      this.store.triggerHapticPreset('selection');
       return;
     }
     if (this.store.ctrlSticky || this.store.altSticky) {
@@ -389,12 +389,12 @@ export struct OrbitTerminalView {
   private handleDevKeyTap(item: DevKeyItem): void {
     if (item.id === 'ctrl') {
       this.store.ctrlSticky = !this.store.ctrlSticky;
-      this.store.triggerHaptic(8);
+      this.store.triggerHapticPreset('selection');
       return;
     }
     if (item.id === 'alt') {
       this.store.altSticky = !this.store.altSticky;
-      this.store.triggerHaptic(8);
+      this.store.triggerHapticPreset('selection');
       return;
     }
     if (item.id === 'bksp') {
@@ -402,7 +402,7 @@ export struct OrbitTerminalView {
     } else {
       this.store.sendTerminalRawUtf8(item.sequence);
     }
-    this.store.triggerHaptic(6);
+    this.store.triggerHapticPreset('selection');
   }
 
   @Builder
@@ -428,7 +428,7 @@ export struct OrbitTerminalView {
         .onClick(() => {
           this.store.terminalRawMode = !this.store.terminalRawMode;
           this.shellInput = '';
-          this.store.triggerHaptic(8);
+          this.store.triggerHapticPreset('selection');
         })
 
       Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -449,7 +449,7 @@ export struct OrbitTerminalView {
           ? this.store.palette.statusDirectSoft
           : this.store.palette.subtleSurface
       )
-      .accessibilityText('Copy terminal output')
+      .accessibilityText($r('app.string.terminal_copy_output_a11y'))
       .onClick(() => {
         this.store.copyTerminalSnapshot();
         this.copiedFeedback = true;
@@ -468,7 +468,7 @@ export struct OrbitTerminalView {
         )
         .height(OrbitTokens.HIT_COMPACT)
         .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-        .accessibilityText('Quote terminal output into composer')
+        .accessibilityText($r('app.string.terminal_quote_output_a11y'))
         .onClick(() => {
           dismissHarmonyKeyboard(this.getUIContext());
           this.store.quoteTerminalIntoComposer();
@@ -484,7 +484,7 @@ export struct OrbitTerminalView {
       .height(OrbitTokens.HIT_COMPACT)
       .padding(0)
       .backgroundColor(this.store.palette.subtleSurface)
-      .accessibilityText('Spawn new terminal session')
+      .accessibilityText($r('app.string.terminal_spawn_a11y'))
       .onClick(() => {
         this.store.startNewTerminal();
       })
@@ -561,7 +561,7 @@ export struct OrbitTerminalView {
           if (this.store.terminalRows.length === 0) {
             Column({ space: OrbitTokens.SPACE_SM }) {
               Blank()
-              Text('orbit shim detached PTY ready')
+              Text($r('app.string.terminal_pty_ready'))
                 .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
               Button($r('app.string.terminal_spawn_shell'))
                 .attributeModifier(
@@ -738,7 +738,7 @@ export struct OrbitTerminalView {
           .height(OrbitTokens.HIT_MIN)
           .padding(0)
           .backgroundColor(this.store.palette.accentPrimaryFill)
-          .accessibilityText('Send terminal input')
+          .accessibilityText($r('app.string.terminal_send_input_a11y'))
           .onClick(() => {
             this.submitShellInput();
           })

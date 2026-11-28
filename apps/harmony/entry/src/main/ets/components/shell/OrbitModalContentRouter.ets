@@ -14,8 +14,7 @@ import { ArchivedSessionsSheet } from '../sheets/ArchivedSessionsSheet';
 import { DirectoryBrowserSheet } from '../sheets/DirectoryBrowserSheet';
 import { ExportTranscriptSheet } from '../sheets/ExportTranscriptSheet';
 import { GlobalSearchSheet } from '../sheets/GlobalSearchSheet';
-import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
-import { PersonalRouterMeshSheet } from '../sheets/PersonalRouterMeshSheet';
+import { OrbitSettingsRoot } from '../settings/OrbitSettingsRoot';
 import { WorktreeHandoffSheet } from '../sheets/WorktreeHandoffSheet';
 import { WorkspaceScriptsSheet } from '../sheets/WorkspaceScriptsSheet';
 import { CreateWorkspaceV2Sheet } from '../sheets/CreateWorkspaceV2Sheet';
@@ -157,8 +156,7 @@ struct OrbitDiagramViewerContent {
         if (this.diagramSource.length > 0) {
           OrbitCopyIconButton({
             content: this.diagramSource,
-            toastLabel: 'Copied diagram source',
-            accessibilityLabel: 'Copy diagram source',
+            accessibilityLabel: $r('app.string.diagram_copy_source_a11y'),
             buttonSize: OrbitTokens.HIT_COMPACT
           })
         }
@@ -266,11 +264,10 @@ export struct OrbitModalContentRouter {
         .width('100%')
         .height('100%')
       } else if (this.route.kind === 'host_settings') {
-        if (this.route.initialPath === 'router_mesh') {
-          PersonalRouterMeshSheet()
-        } else {
-          HostSettingsSheet()
-        }
+        OrbitSettingsRoot({
+          initialDestination: this.route.initialPath ?? '',
+          initialHostId: this.route.hostId ?? ''
+        })
       } else if (this.route.kind === 'global_search') {
         GlobalSearchSheet()
       } else if (this.route.kind === 'archived') {

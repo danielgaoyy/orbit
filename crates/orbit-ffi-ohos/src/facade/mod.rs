@@ -6,7 +6,9 @@ mod fleet;
 mod git_terminal;
 #[cfg(test)]
 pub(crate) use git_terminal::validate_ohos_git_discard_path;
+mod memory_cwd_cache;
 mod settings;
+mod settings_ext;
 mod stage;
 
 use orbit_client_core::app_core::OrbitAppCore;
@@ -14,7 +16,7 @@ use orbit_client_core::composer::ClientPlatform;
 use orbit_client_core::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 use orbit_protocol::{PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 struct OhosThreadWaker(std::thread::Thread);
@@ -130,6 +132,7 @@ pub struct OhosCoreFacade {
     #[cfg(feature = "perf-hooks")]
     pub(crate) replay: Arc<std::sync::Mutex<crate::replay::Replay>>,
     pub(crate) inner: Arc<OrbitAppCore>,
+    pub(crate) memory_cwd_by_host_and_id: Arc<Mutex<settings_ext::BoundedMemoryCwdCache>>,
 }
 
 impl OhosCoreFacade {
@@ -138,6 +141,9 @@ impl OhosCoreFacade {
             inner,
             #[cfg(feature = "perf-hooks")]
             replay: Default::default(),
+            memory_cwd_by_host_and_id: Arc::new(Mutex::new(
+                settings_ext::BoundedMemoryCwdCache::default(),
+            )),
         }
     }
 

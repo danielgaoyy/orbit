@@ -12,6 +12,8 @@ mod napi;
 mod replay;
 #[cfg(test)]
 mod tests_pr5;
+#[cfg(test)]
+mod tests_pr6;
 
 pub use facade::OhosCoreFacade;
 

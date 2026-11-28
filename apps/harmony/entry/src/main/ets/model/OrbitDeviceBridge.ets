@@ -1,6 +1,7 @@
 import { common, Want, wantAgent } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { fileIo } from '@kit.CoreFileKit';
+import { i18n } from '@kit.LocalizationKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { pushService } from '@kit.PushKit';
 import { scanBarcode, scanCore } from '@kit.ScanKit';
@@ -28,30 +29,214 @@ export interface ScanQrOutcome {
   errorMessage: string;
 }
 
-export function triggerNativeHaptic(durationMs: number = 10): void {
-  if (!canIUse('SystemCapability.Sensors.MiscDevice')) {
-    return;
-  }
-  try {
-    const presetId = durationMs >= 14 ? 'haptic.effect.hard' : 'haptic.effect.soft';
-    if (vibrator.isSupportEffectSync(presetId)) {
-      vibrator.startVibration(
-        { type: 'preset', effectId: presetId, count: 1 },
-        { id: 0, usage: 'touch' }
-      ).catch((err: Object) => {
-        orbitLogWarn('OrbitHaptic', 'Preset haptic failed', err);
-      });
-      return;
+export type OrbitHapticPreset = 'selection' | 'action' | 'success' | 'warning';
+
+export interface OrbitNativeHapticDriver {
+  isAvailable: () => boolean;
+  isSupportEffectSync: (effectId: string) => boolean;
+  startPresetVibration: (effectId: string) => Promise<void>;
+  startTimeVibration: (durationMs: number) => Promise<void>;
+}
+
+const FALLBACK_HAPTIC_DURATION_MS: number = 10;
+
+export function normalizeOrbitHapticPreset(
+  presetOrMs: OrbitHapticPreset | number = 'selection'
+): OrbitHapticPreset {
+  if (typeof presetOrMs === 'string') {
+    if (
+      presetOrMs === 'selection' ||
+      presetOrMs === 'action' ||
+      presetOrMs === 'success' ||
+      presetOrMs === 'warning'
+    ) {
+      return presetOrMs;
     }
-    vibrator.startVibration(
-      { type: 'time', duration: Math.max(5, Math.min(durationMs, 30)) },
-      { id: 0, usage: 'touch' }
-    ).catch((err: Object) => {
-      orbitLogWarn('OrbitHaptic', 'Time haptic failed', err);
+    return 'selection';
+  }
+  if (presetOrMs >= 16) {
+    return 'warning';
+  }
+  if (presetOrMs >= 12) {
+    return 'success';
+  }
+  if (presetOrMs >= 9) {
+    return 'action';
+  }
+  return 'selection';
+}
+
+export function resolveNativeHapticEffectId(preset: OrbitHapticPreset): string {
+  if (preset === 'success') {
+    return 'haptic.notice.success';
+  }
+  if (preset === 'warning') {
+    return 'haptic.notice.warning';
+  }
+  if (preset === 'action') {
+    return 'haptic.effect.soft';
+  }
+  return 'haptic.effect.soft';
+}
+
+function triggerTimeFallback(driver: OrbitNativeHapticDriver): void {
+  try {
+    driver.startTimeVibration(FALLBACK_HAPTIC_DURATION_MS).catch((err: Object) => {
+      orbitLogWarn('OrbitHaptic', 'Fallback time haptic failed', err);
     });
   } catch (err) {
-    orbitLogWarn('OrbitHaptic', 'Haptic unavailable', err as Object);
+    orbitLogWarn('OrbitHaptic', 'Fallback time haptic unavailable', err as Object);
   }
+}
+
+export function triggerNativeHapticWithDriver(
+  presetOrMs: OrbitHapticPreset | number,
+  driver: OrbitNativeHapticDriver
+): void {
+  let available = false;
+  try {
+    available = driver.isAvailable();
+  } catch (_err) {
+    available = false;
+  }
+  if (!available) {
+    return;
+  }
+  const preset = normalizeOrbitHapticPreset(presetOrMs);
+  const effectId = resolveNativeHapticEffectId(preset);
+  let supported = false;
+  try {
+    supported = driver.isSupportEffectSync(effectId);
+  } catch (err) {
+    orbitLogWarn('OrbitHaptic', 'Preset haptic support probe failed; falling back to 10ms time vibration', err as Object);
+    supported = false;
+  }
+  if (supported) {
+    try {
+      driver.startPresetVibration(effectId).catch((err: Object) => {
+        orbitLogWarn('OrbitHaptic', 'Preset haptic failed; falling back to 10ms time vibration', err);
+        triggerTimeFallback(driver);
+      });
+      return;
+    } catch (err) {
+      orbitLogWarn('OrbitHaptic', 'Preset haptic threw synchronously; falling back to 10ms time vibration', err as Object);
+    }
+  }
+  triggerTimeFallback(driver);
+}
+
+const DEFAULT_NATIVE_HAPTIC_DRIVER: OrbitNativeHapticDriver = {
+  isAvailable: (): boolean => canIUse('SystemCapability.Sensors.MiscDevice'),
+  isSupportEffectSync: (effectId: string): boolean => vibrator.isSupportEffectSync(effectId),
+  startPresetVibration: (effectId: string): Promise<void> =>
+    vibrator.startVibration(
+      { type: 'preset', effectId: effectId, count: 1 },
+      { id: 0, usage: 'touch' }
+    ),
+  startTimeVibration: (durationMs: number): Promise<void> =>
+    vibrator.startVibration(
+      { type: 'time', duration: durationMs },
+      { id: 0, usage: 'touch' }
+    )
+};
+
+export function triggerNativeHaptic(presetOrMs: OrbitHapticPreset | number = 'selection'): void {
+  triggerNativeHapticWithDriver(presetOrMs, DEFAULT_NATIVE_HAPTIC_DRIVER);
+}
+
+export function normalizeOrbitAppLanguage(lang: string): string {
+  const clean = lang.trim();
+  if (clean === 'en' || clean === 'zh_CN' || clean === 'ja_JP') {
+    return clean;
+  }
+  const lower = clean.toLowerCase();
+  if (lower.startsWith('zh')) {
+    return 'zh_CN';
+  }
+  if (lower.startsWith('ja')) {
+    return 'ja_JP';
+  }
+  if (lower.startsWith('en')) {
+    return 'en';
+  }
+  return 'system';
+}
+
+export function resolveEffectiveOrbitLanguage(
+  appLanguage: string,
+  systemLanguageOverride?: string
+): 'en' | 'zh_CN' | 'ja_JP' {
+  const pref = normalizeOrbitAppLanguage(appLanguage);
+  if (pref === 'en' || pref === 'zh_CN' || pref === 'ja_JP') {
+    return pref;
+  }
+  let rawSystem = '';
+  if (systemLanguageOverride !== undefined) {
+    rawSystem = systemLanguageOverride.trim();
+  } else {
+    try {
+      if (canIUse('SystemCapability.Global.I18n')) {
+        rawSystem = i18n.System.getSystemLanguage();
+      }
+    } catch (_err) {
+      rawSystem = '';
+    }
+  }
+  const sysNorm = normalizeOrbitAppLanguage(rawSystem);
+  if (sysNorm === 'zh_CN' || sysNorm === 'ja_JP') {
+    return sysNorm;
+  }
+  return 'en';
+}
+
+export function mapOrbitAppLanguageToBcp47(lang: string): string {
+  const normalized = normalizeOrbitAppLanguage(lang);
+  if (normalized === 'en') {
+    return 'en-US';
+  }
+  if (normalized === 'zh_CN') {
+    return 'zh-Hans';
+  }
+  if (normalized === 'ja_JP') {
+    return 'ja-JP';
+  }
+  return 'default';
+}
+
+export function applyNativeAppLanguage(
+  lang: string,
+  appContext: common.ApplicationContext | null
+): boolean {
+  const normalized = normalizeOrbitAppLanguage(lang);
+  const bcp47 = mapOrbitAppLanguageToBcp47(normalized);
+  let applied = false;
+  try {
+    if (canIUse('SystemCapability.Global.I18n')) {
+      i18n.System.setAppPreferredLanguage(bcp47);
+      applied = true;
+    }
+  } catch (err) {
+    orbitLogWarn('OrbitI18n', 'setAppPreferredLanguage failed', err as Object);
+  }
+  if (appContext !== null) {
+    try {
+      if (normalized === 'system') {
+        const sysLang = canIUse('SystemCapability.Global.I18n')
+          ? i18n.System.getSystemLanguage()
+          : '';
+        if (sysLang.length > 0) {
+          appContext.setLanguage(sysLang);
+          applied = true;
+        }
+      } else {
+        appContext.setLanguage(bcp47);
+        applied = true;
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitI18n', 'ApplicationContext.setLanguage failed', err as Object);
+    }
+  }
+  return applied;
 }
 
 export function writeClipboardText(text: string): boolean {
@@ -68,6 +253,9 @@ export function writeClipboardText(text: string): boolean {
 export async function readAuthorizedClipboardText(): Promise<string> {
   try {
     const pb = pasteboard.getSystemPasteboard();
+    // Exclusively invoked inside HarmonyOS PasteButton PasteButtonOnClickResult.SUCCESS
+    // (one-shot security-control authorization without requiring restricted READ_PASTEBOARD ACL).
+    // @SuppressWarnings permission
     const data = await pb.getData();
     return data.getPrimaryText().trim();
   } catch (err) {
@@ -77,14 +265,6 @@ export async function readAuthorizedClipboardText(): Promise<string> {
 }
 
 export async function scanPairingQrCode(context: common.Context | undefined): Promise<ScanQrOutcome> {
-  if (!canIUse('SystemCapability.Multimedia.Scan.ScanBarcode') ||
-    !canIUse('SystemCapability.Multimedia.Scan.Core')) {
-    return {
-      uri: '',
-      cancelled: false,
-      errorMessage: 'Camera QR scanning is not available on this device. Paste an orbit://pair URI instead.'
-    };
-  }
   if (context === undefined) {
     return {
       uri: '',
@@ -92,26 +272,35 @@ export async function scanPairingQrCode(context: common.Context | undefined): Pr
       errorMessage: 'Scanner requires an active ability context.'
     };
   }
-  try {
-    const result = await scanBarcode.startScanForResult(context, {
-      scanTypes: [scanCore.ScanType.QR_CODE],
-      enableMultiMode: false,
-      enableAlbum: true
-    });
-    const text = result.originalValue?.trim() ?? '';
-    return { uri: text, cancelled: false, errorMessage: '' };
-  } catch (err) {
-    const code = (err as Record<string, Object>)['code'];
-    if (typeof code === 'number' && code === SCAN_USER_CANCEL_CODE) {
-      return { uri: '', cancelled: true, errorMessage: '' };
+  if (canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
+    if (canIUse('SystemCapability.Multimedia.Scan.Core')) {
+      try {
+        const result = await scanBarcode.startScanForResult(context, {
+          scanTypes: [scanCore.ScanType.QR_CODE],
+          enableMultiMode: false,
+          enableAlbum: true
+        });
+        const text = result.originalValue?.trim() ?? '';
+        return { uri: text, cancelled: false, errorMessage: '' };
+      } catch (err) {
+        const code = (err as Record<string, Object>)['code'];
+        if (typeof code === 'number' && code === SCAN_USER_CANCEL_CODE) {
+          return { uri: '', cancelled: true, errorMessage: '' };
+        }
+        orbitLogWarn('OrbitScan', 'ScanKit failed', err as Object);
+        return {
+          uri: '',
+          cancelled: false,
+          errorMessage: 'QR scan did not complete. You can paste an orbit://pair URI in Settings.'
+        };
+      }
     }
-    orbitLogWarn('OrbitScan', 'ScanKit failed', err as Object);
-    return {
-      uri: '',
-      cancelled: false,
-      errorMessage: 'QR scan did not complete. You can paste an orbit://pair URI in Settings.'
-    };
   }
+  return {
+    uri: '',
+    cancelled: false,
+    errorMessage: 'Camera QR scanning is not available on this device. Paste an orbit://pair URI instead.'
+  };
 }
 
 export function inferFilenameFromUri(uri: string, fallbackName: string): string {
@@ -192,6 +381,8 @@ export async function readUriBytesAsync(
       mimeType: resolvedMime,
       bytes: bytes
     };
+  } catch (err) {
+    throw err as Error;
   } finally {
     if (file !== null) {
       try {

@@ -689,7 +689,7 @@ export struct OrbitScopedAutomationsTabView {
       if (this.showScheduleForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_XS }) {
-            TextInput({ placeholder: 'Schedule name', text: this.draftSchedName })
+            TextInput({ placeholder: $r('app.string.automations_ph_schedule_name'), text: this.draftSchedName })
               .attributeModifier(
                 orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
               )
@@ -707,7 +707,7 @@ export struct OrbitScopedAutomationsTabView {
                 this.markFormEdited('schedule');
               })
 
-            TextInput({ placeholder: 'Cron (e.g. 0 9 * * *)', text: this.draftSchedCron })
+            TextInput({ placeholder: $r('app.string.automations_ph_cron'), text: this.draftSchedCron })
               .attributeModifier(
                 orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
               )
@@ -750,7 +750,7 @@ export struct OrbitScopedAutomationsTabView {
             }
             .width('100%')
 
-            TextArea({ placeholder: 'Prompt to run on each trigger…', text: this.draftSchedPrompt })
+            TextArea({ placeholder: $r('app.string.automations_ph_trigger_prompt'), text: this.draftSchedPrompt })
               .fontSize(OrbitTokens.FONT_META)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -770,7 +770,7 @@ export struct OrbitScopedAutomationsTabView {
               })
 
             Row() {
-              Text('Run in isolated git worktree')
+              Text($r('app.string.automations_run_in_worktree'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
                 .layoutWeight(1)
               Toggle({ type: ToggleType.Switch, isOn: this.draftSchedWorktree })
@@ -895,7 +895,7 @@ export struct OrbitScopedAutomationsTabView {
                 if (this.expandedScheduleRunsId === sched.schedule_id) {
                   Column({ space: 4 }) {
                     if (this.expandedScheduleRuns.length === 0) {
-                      Text('No run history recorded yet.')
+                      Text($r('app.string.automations_no_run_history'))
                         .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
                     } else {
                       ForEach(
@@ -969,7 +969,7 @@ export struct OrbitScopedAutomationsTabView {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_XS }) {
             Row({ space: OrbitTokens.SPACE_XS }) {
-              TextInput({ placeholder: 'Seconds', text: this.draftTimerSecs })
+              TextInput({ placeholder: $r('app.string.automations_ph_seconds'), text: this.draftTimerSecs })
                 .type(InputType.Number)
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
@@ -1001,7 +1001,7 @@ export struct OrbitScopedAutomationsTabView {
             }
             .width('100%')
 
-            TextArea({ placeholder: 'Follow-up prompt when timer fires…', text: this.draftTimerPrompt })
+            TextArea({ placeholder: $r('app.string.automations_ph_timer_prompt'), text: this.draftTimerPrompt })
               .fontSize(OrbitTokens.FONT_META)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -1132,7 +1132,7 @@ export struct OrbitScopedAutomationsTabView {
       if (this.showGoalForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_XS }) {
-            TextArea({ placeholder: 'Autonomous goal objective…', text: this.draftGoalObjective })
+            TextArea({ placeholder: $r('app.string.automations_ph_goal_objective'), text: this.draftGoalObjective })
               .fontSize(OrbitTokens.FONT_META)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -1152,7 +1152,7 @@ export struct OrbitScopedAutomationsTabView {
               })
 
             Row({ space: OrbitTokens.SPACE_XS }) {
-              TextInput({ placeholder: 'Verify command (optional)', text: this.draftGoalVerifyCmd })
+              TextInput({ placeholder: $r('app.string.automations_ph_verify_cmd'), text: this.draftGoalVerifyCmd })
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
                 )
@@ -1169,7 +1169,7 @@ export struct OrbitScopedAutomationsTabView {
                   this.draftGoalVerifyCmd = v;
                   this.markFormEdited('goal');
                 })
-              TextInput({ placeholder: 'Max', text: this.draftGoalMaxIter })
+              TextInput({ placeholder: $r('app.string.automations_ph_max'), text: this.draftGoalMaxIter })
                 .type(InputType.Number)
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
@@ -1339,7 +1339,7 @@ export struct OrbitScopedAutomationsTabView {
       if (this.showMonitorForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_XS }) {
-            TextInput({ placeholder: 'Monitor name', text: this.draftMonitorName })
+            TextInput({ placeholder: $r('app.string.automations_ph_monitor_name'), text: this.draftMonitorName })
               .attributeModifier(
                 orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
               )
@@ -1424,7 +1424,7 @@ export struct OrbitScopedAutomationsTabView {
               })
 
             if (this.draftMonitorKind !== 'http_health') {
-              TextInput({ placeholder: 'Regex / pattern (optional)', text: this.draftMonitorPattern })
+              TextInput({ placeholder: $r('app.string.automations_ph_regex'), text: this.draftMonitorPattern })
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
                 )
@@ -1548,7 +1548,7 @@ export struct OrbitScopedAutomationsTabView {
       if (this.showWorkflowForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_XS }) {
-            TextInput({ placeholder: 'Workflow name', text: this.draftWorkflowName })
+            TextInput({ placeholder: $r('app.string.automations_ph_workflow_name'), text: this.draftWorkflowName })
               .attributeModifier(
                 orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
               )
@@ -1566,7 +1566,7 @@ export struct OrbitScopedAutomationsTabView {
                 this.markFormEdited('workflow');
               })
 
-            TextArea({ placeholder: 'Primary step instructions…', text: this.draftWorkflowPrompt })
+            TextArea({ placeholder: $r('app.string.automations_ph_workflow_steps'), text: this.draftWorkflowPrompt })
               .fontSize(OrbitTokens.FONT_META)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -1685,7 +1685,7 @@ export struct OrbitScopedAutomationsTabView {
     Column({ space: OrbitTokens.SPACE_SM }) {
       Row({ space: OrbitTokens.SPACE_SM }) {
         Column({ space: 2 }) {
-          Text('Automations')
+          Text($r('app.string.automations_title'))
             .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
           Text(
             `${this.data.schedules.length} sched · ${this.data.timers.length} timer · ${this.data.goals.length} goal · ${this.data.monitors.length} mon · ${this.data.workflows.length} wf`
@@ -1713,7 +1713,7 @@ export struct OrbitScopedAutomationsTabView {
         .height(30)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Refresh automations')
+        .accessibilityText($r('app.string.automations_refresh_a11y'))
         .onClick(() => {
           void this.refresh();
         })
@@ -1743,7 +1743,7 @@ export struct OrbitScopedAutomationsTabView {
                 .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
                 .onClick(() => {
                   this.activeTabIndex = tSpec.idx;
-                  this.store.triggerHaptic(6);
+                  this.store.triggerHapticPreset('selection');
                 })
             },
             (tSpec: ScopedAutomationTabSpec): string => `sa_tab_${tSpec.idx}`

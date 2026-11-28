@@ -53,7 +53,7 @@ struct OrbitCompactSheetPanelContent {
         isCompactSheet: true,
         onClosePanel: () => {
           this.store.sidePanelStore.dismissPanel();
-          this.store.triggerHaptic(6);
+          this.store.triggerHapticPreset('selection');
         }
       })
 
@@ -147,7 +147,7 @@ export struct OrbitSidePanelContainer {
         isCompactSheet: isCompactSheet,
         onClosePanel: () => {
           this.store.sidePanelStore.dismissPanel();
-          this.store.triggerHaptic(6);
+          this.store.triggerHapticPreset('selection');
         }
       })
 
@@ -240,7 +240,7 @@ export struct OrbitSidePanelContainer {
         .width(6)
         .height('100%')
         .backgroundColor(Color.Transparent)
-        .accessibilityText('Resize side panel')
+        .accessibilityText($r('app.string.side_panel_resize_a11y'))
         .gesture(
           PanGesture({ direction: PanDirection.Horizontal, distance: 2 })
             .onActionStart(() => {

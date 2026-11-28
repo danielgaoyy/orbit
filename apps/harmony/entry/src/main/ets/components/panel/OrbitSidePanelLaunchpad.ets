@@ -69,7 +69,7 @@ export struct OrbitSidePanelLaunchpad {
 
   private launchTile(tile: OrbitLaunchpadTile): void {
     if (this.boundHostId.length === 0) {
-      this.store.showToast('Pair or select a host first', true);
+      this.store.showToastResource($r('app.string.toast_pair_or_select_host_first'), true);
       return;
     }
     const scopeKey = this.store.sidePanelStore.scopeKeyFor(this.boundHostId, this.boundAgentId);
@@ -98,16 +98,16 @@ export struct OrbitSidePanelLaunchpad {
       terminalSlot: tile.kind === 'terminal' ? 1 : null
     };
     this.store.sidePanelStore.openTab(tab, { source: 'user', activate: true });
-    this.store.triggerHaptic(8);
+    this.store.triggerHapticPreset('selection');
   }
 
   build() {
     Scroll() {
       Column({ space: OrbitTokens.SPACE_MD }) {
         Column({ space: 2 }) {
-          Text('Open in Side Panel')
+          Text($r('app.string.side_panel_launchpad_title'))
             .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
-          Text('Each conversation remembers its own open tabs independently.')
+          Text($r('app.string.side_panel_launchpad_subtitle'))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
         }
         .width('100%')
@@ -161,7 +161,7 @@ export struct OrbitSidePanelLaunchpad {
               SymbolGlyph($r('sys.symbol.arrow_counterclockwise'))
                 .fontSize(15)
                 .fontColor([this.store.palette.iconSecondary])
-              Text('Reopen recently closed tab')
+              Text($r('app.string.side_panel_reopen_closed'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
                 .layoutWeight(1)
             }
@@ -175,7 +175,7 @@ export struct OrbitSidePanelLaunchpad {
           .backgroundColor(this.store.palette.subtleSurface)
           .onClick(() => {
             this.store.sidePanelStore.reopenLast();
-            this.store.triggerHaptic(8);
+            this.store.triggerHapticPreset('selection');
           })
         }
       }

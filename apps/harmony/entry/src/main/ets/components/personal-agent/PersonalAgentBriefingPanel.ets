@@ -10,6 +10,8 @@ import {
 } from '../../model/OrbitTypes';
 import { orbitRuntime } from '../../model/OrbitRuntime';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { OrbitFleetStore } from '../../model/stores/OrbitFleetStore';
+import { OrbitPersonalAgentStore } from '../../model/stores/OrbitPersonalAgentStore';
 import { OrbitTheme } from '../../theme/OrbitTheme';
 import {
   OrbitTokens,
@@ -46,6 +48,7 @@ import {
   selectConfirmedArchivableWorkers,
   snapshotBatchApprovalTargets
 } from './PersonalAgentBriefingModel';
+import { OrbitPullRefreshController } from '../settings/OrbitSettingsNavModel';
 
 const DEFAULT_VISIBLE_WORKERS: number = 5;
 const DEFAULT_VISIBLE_WAITING: number = 3;
@@ -77,6 +80,9 @@ export struct PersonalAgentBriefingPanel {
   @Local private batchApproving: boolean = false;
 
   private readonly store: OrbitHarmonyStore = orbitRuntime();
+  @Local private fleetStore: OrbitFleetStore = orbitRuntime().fleetStore;
+  @Local private personalAgentStore: OrbitPersonalAgentStore = orbitRuntime().personalAgentStore;
+  private readonly pullRefreshCtrl: OrbitPullRefreshController = new OrbitPullRefreshController();
   private refreshTimerId: number = -1;
 
   aboutToAppear(): void {
@@ -93,9 +99,19 @@ export struct PersonalAgentBriefingPanel {
   aboutToDisappear(): void {
     // Presentation container unmount (e.g., resizing 1023 <-> 1024 vp while staying in the same PA)
     // MUST ONLY clean up local component timers and NEVER overwrite `sinceLastVisitMs`.
+    this.pullRefreshCtrl.unmount();
+    this.isRefreshing = false;
     if (this.refreshTimerId !== -1) {
       clearTimeout(this.refreshTimerId);
       this.refreshTimerId = -1;
+    }
+  }
+
+  @Monitor('fleetStore.selectedHostId', 'personalAgentStore.primaryRouterHostId')
+  onBriefingScopeChanged(_mon: IMonitor): void {
+    const scope = `${this.fleetStore.selectedHostId}::${this.personalAgentStore.primaryRouterHostId}`;
+    if (this.pullRefreshCtrl.onScopeChanged(scope)) {
+      this.isRefreshing = false;
     }
   }
 
@@ -314,20 +330,24 @@ export struct PersonalAgentBriefingPanel {
   }
 
   private handleRefresh(): void {
-    this.isRefreshing = true;
-    this.store.reloadFleetAsync();
-    this.store.refreshPersonalAgentBriefing(true);
+    const scope = `${this.store.selectedHostId}::${this.store.primaryRouterHostId}`;
     const pa = this.personalAgentRef;
-    if (pa !== null) {
-      this.store.refreshPersonalAgentActivity(pa.hostId, 50, null, true);
-    }
-    if (this.refreshTimerId !== -1) {
-      clearTimeout(this.refreshTimerId);
-    }
-    this.refreshTimerId = setTimeout((): void => {
-      this.isRefreshing = false;
-      this.refreshTimerId = -1;
-    }, 450);
+    this.store.triggerHaptic('selection');
+    void this.pullRefreshCtrl.run(
+      scope,
+      async (): Promise<void> => {
+        this.store.refreshPersonalAgentBriefing(true);
+        if (pa !== null) {
+          this.store.refreshPersonalAgentActivity(pa.hostId, 50, null, true);
+        } else if (this.store.primaryRouterHostId.length > 0) {
+          this.store.refreshPersonalAgentActivity(this.store.primaryRouterHostId, 50, null, true);
+        }
+        await this.store.pullRefreshFleetAsync();
+      },
+      (refreshing: boolean): void => {
+        this.isRefreshing = refreshing;
+      }
+    );
   }
 
   private confirmBatchApprove(): void {

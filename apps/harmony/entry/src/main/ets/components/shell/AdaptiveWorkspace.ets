@@ -943,12 +943,13 @@ export struct AdaptiveWorkspace {
                     .fontColor([this.store.palette.accentPrimary])
                   Text($r('app.string.handoff_capsule'))
                     .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
+                    .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
                     .maxLines(1)
                 }
                 .alignItems(VerticalAlign.Center)
               }
-              .height(30)
-              .padding({ left: 9, right: 9 })
+              .constraintSize({ minHeight: 30 })
+              .padding({ left: 9, right: 9, top: 4, bottom: 4 })
               .backgroundColor(this.store.palette.accentPrimarySoft)
               .accessibilityText($r('app.string.handoff_title'))
               .onClick(() => {
@@ -997,7 +998,7 @@ export struct AdaptiveWorkspace {
             .onClick(() => {
               dismissHarmonyKeyboard(this.getUIContext());
               this.store.sidePanelStore.togglePanel();
-              this.store.triggerHaptic(8);
+              this.store.triggerHapticPreset('selection');
             })
           }
 

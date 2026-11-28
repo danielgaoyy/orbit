@@ -1,0 +1,37 @@
+{
+  "editable": true,
+  "enabled": true,
+  "env_keys": [
+    "API_TOKEN"
+  ],
+  "id": "orbit_user:filesystem",
+  "last_probe": {
+    "latency_ms": 42,
+    "ok": true,
+    "probed_at_ms": 1760000000000,
+    "protocol_version": "2025-03-26",
+    "server_name": "filesystem",
+    "server_version": "1.0.0",
+    "tools": [
+      {
+        "description": "Read workspace file",
+        "name": "read_file"
+      }
+    ]
+  },
+  "masked_env": {
+    "API_TOKEN": "••••••"
+  },
+  "masked_headers": {},
+  "name": "filesystem",
+  "scope": "orbit_user",
+  "source_path": "~/.orbit/mcp.json",
+  "transport": {
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem"
+    ],
+    "command": "npx",
+    "kind": "stdio"
+  }
+}

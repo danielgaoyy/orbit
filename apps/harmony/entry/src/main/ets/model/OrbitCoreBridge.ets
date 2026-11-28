@@ -126,6 +126,16 @@ export class OrbitCoreBridge
     }
   }
 
+  private traceNumberSync(name: string, fn: () => number): number {
+    const metric = `ffi.${name}`;
+    OrbitPerfProbe.begin(metric);
+    try {
+      return fn();
+    } finally {
+      OrbitPerfProbe.end(metric, 0);
+    }
+  }
+
   private async traceJsonAsync(name: string, fn: () => Promise<string>): Promise<string> {
     const metric = `ffi.${name}`;
     OrbitPerfProbe.begin(metric);
@@ -1454,6 +1464,163 @@ export class OrbitCoreBridge
   public startTerminalSlot(hostId: string, cwd: string, cols: number, rows: number, slot: number): void {
     this.traceVoidSync('startTerminalSlot', cwd.length, (): void => {
       this.core.startTerminalSlot(hostId, cwd, cols, rows, slot);
+    });
+  }
+
+  // PR-6 Settings, Fleet Relay, Guardian, Permission Rules, ACP Registry & Tier-2 Extensions
+
+  public applyRelayToFleet(rawRelayUrl: string): number {
+    return this.traceNumberSync('applyRelayToFleet', (): number => {
+      return this.core.applyRelayToFleet(rawRelayUrl);
+    });
+  }
+
+  public exportHostPairingUri(hostId: string): string {
+    return this.traceJsonSync('exportHostPairingUri', (): string => {
+      return this.core.exportHostPairingUri(hostId);
+    });
+  }
+
+  public async getUsageInsightsJson(hostId: string, days: number): Promise<string> {
+    return await this.traceJsonAsync('getUsageInsightsJson', async (): Promise<string> => {
+      return await this.core.getUsageInsightsJson(hostId, days);
+    });
+  }
+
+  public async listExternalMcpServersJson(hostId: string, cwd?: string | null): Promise<string> {
+    return await this.traceJsonAsync('listExternalMcpServersJson', async (): Promise<string> => {
+      return await this.core.listExternalMcpServersJson(hostId, cwd);
+    });
+  }
+
+  public async toggleExternalMcpServerJson(
+    hostId: string,
+    serverId: string,
+    enabled: boolean,
+    cwd?: string | null
+  ): Promise<void> {
+    await this.traceVoidAsync('toggleExternalMcpServerJson', async (): Promise<void> => {
+      await this.core.toggleExternalMcpServerJson(hostId, serverId, enabled, cwd);
+    });
+  }
+
+  public async listManagedSkillsJson(hostId: string, cwd?: string | null): Promise<string> {
+    return await this.traceJsonAsync('listManagedSkillsJson', async (): Promise<string> => {
+      return await this.core.listManagedSkillsJson(hostId, cwd);
+    });
+  }
+
+  public async listProjectMemoriesJson(hostId: string, cwd: string, limit: number): Promise<string> {
+    return await this.traceJsonAsync('listProjectMemoriesJson', async (): Promise<string> => {
+      return await this.core.listProjectMemoriesJson(hostId, cwd, limit);
+    });
+  }
+
+  public async confirmProjectMemoryJson(
+    hostId: string,
+    memoryId: string,
+    cwd?: string | null
+  ): Promise<void> {
+    await this.traceVoidAsync('confirmProjectMemoryJson', async (): Promise<void> => {
+      await this.core.confirmProjectMemoryJson(hostId, memoryId, cwd);
+    });
+  }
+
+  public async deleteProjectMemoryJson(
+    hostId: string,
+    memoryId: string,
+    cwd?: string | null
+  ): Promise<void> {
+    await this.traceVoidAsync('deleteProjectMemoryJson', async (): Promise<void> => {
+      await this.core.deleteProjectMemoryJson(hostId, memoryId, cwd);
+    });
+  }
+
+  public async listPluginsJson(hostId: string): Promise<string> {
+    return await this.traceJsonAsync('listPluginsJson', async (): Promise<string> => {
+      return await this.core.listPluginsJson(hostId);
+    });
+  }
+
+  public async setPluginEnabledJson(hostId: string, pluginId: string, enabled: boolean): Promise<void> {
+    await this.traceVoidAsync('setPluginEnabledJson', async (): Promise<void> => {
+      await this.core.setPluginEnabledJson(hostId, pluginId, enabled);
+    });
+  }
+
+  public async getSandboxConfigJson(hostId: string): Promise<string> {
+    return await this.traceJsonAsync('getSandboxConfigJson', async (): Promise<string> => {
+      return await this.core.getSandboxConfigJson(hostId);
+    });
+  }
+
+  public async getGuardianConfigJson(hostId: string): Promise<string> {
+    return await this.traceJsonAsync('getGuardianConfigJson', async (): Promise<string> => {
+      return await this.core.getGuardianConfigJson(hostId);
+    });
+  }
+
+  public async updateGuardianConfigJson(hostId: string, configJson: string): Promise<string> {
+    return await this.traceJsonAsync('updateGuardianConfigJson', async (): Promise<string> => {
+      return await this.core.updateGuardianConfigJson(hostId, configJson);
+    });
+  }
+
+  public async listPermissionRulesJson(hostId: string, projectCwd?: string | null): Promise<string> {
+    return await this.traceJsonAsync('listPermissionRulesJson', async (): Promise<string> => {
+      return await this.core.listPermissionRulesJson(hostId, projectCwd);
+    });
+  }
+
+  public async upsertPermissionRuleJson(hostId: string, ruleJson: string): Promise<string> {
+    return await this.traceJsonAsync('upsertPermissionRuleJson', async (): Promise<string> => {
+      return await this.core.upsertPermissionRuleJson(hostId, ruleJson);
+    });
+  }
+
+  public async deletePermissionRuleJson(hostId: string, ruleId: string): Promise<string> {
+    return await this.traceJsonAsync('deletePermissionRuleJson', async (): Promise<string> => {
+      return await this.core.deletePermissionRuleJson(hostId, ruleId);
+    });
+  }
+
+  public listAcpAgentsJson(hostId: string): string {
+    return this.traceJsonSync('listAcpAgentsJson', (): string => {
+      return this.core.listAcpAgentsJson(hostId);
+    });
+  }
+
+  public refreshAcpAgents(hostId: string): void {
+    this.traceVoidSync('refreshAcpAgents', hostId.length, (): void => {
+      this.core.refreshAcpAgents(hostId);
+    });
+  }
+
+  public async refreshAcpRegistryJson(hostId: string, registryUrl?: string | null): Promise<string> {
+    return await this.traceJsonAsync('refreshAcpRegistryJson', async (): Promise<string> => {
+      return await this.core.refreshAcpRegistryJson(hostId, registryUrl);
+    });
+  }
+
+  public async testAcpAgentJson(
+    hostId: string,
+    agentId: string,
+    cwd?: string | null
+  ): Promise<string> {
+    return await this.traceJsonAsync('testAcpAgentJson', async (): Promise<string> => {
+      return await this.core.testAcpAgentJson(hostId, agentId, cwd);
+    });
+  }
+
+  public async upsertCustomAcpAgentJson(hostId: string, specJson: string): Promise<string> {
+    return await this.traceJsonAsync('upsertCustomAcpAgentJson', async (): Promise<string> => {
+      return await this.core.upsertCustomAcpAgentJson(hostId, specJson);
+    });
+  }
+
+  public async deleteCustomAcpAgentJson(hostId: string, agentId: string): Promise<string> {
+    return await this.traceJsonAsync('deleteCustomAcpAgentJson', async (): Promise<string> => {
+      return await this.core.deleteCustomAcpAgentJson(hostId, agentId);
     });
   }
 }

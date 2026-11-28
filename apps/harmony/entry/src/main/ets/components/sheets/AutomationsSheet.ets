@@ -207,7 +207,7 @@ export struct AutomationsSheet {
             .padding({ left: 12, right: 12 })
             .onClick(() => {
               this.showCreateForm = !this.showCreateForm;
-              this.store.triggerHaptic(6);
+              this.store.triggerHapticPreset('selection');
             })
         }
         .width('100%')
@@ -217,10 +217,10 @@ export struct AutomationsSheet {
       if (this.showCreateForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_SM }) {
-            Text('Create Schedule')
+            Text($r('app.string.automations_create_schedule'))
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
 
-            TextInput({ placeholder: 'Schedule name', text: this.draftName })
+            TextInput({ placeholder: $r('app.string.automations_ph_schedule_name'), text: this.draftName })
               .attributeModifier(
                 orbitInputSubhead(
                   this.store.palette.fgPrimary,
@@ -236,7 +236,7 @@ export struct AutomationsSheet {
                 this.draftName = val;
               })
 
-            TextInput({ placeholder: 'Cron (e.g. 0 9 * * *)', text: this.draftCron })
+            TextInput({ placeholder: $r('app.string.automations_ph_cron'), text: this.draftCron })
               .attributeModifier(
                 orbitInputMono(
                   this.store.palette.fgPrimary,
@@ -276,7 +276,7 @@ export struct AutomationsSheet {
             }
             .width('100%')
 
-            TextArea({ placeholder: 'Prompt to run on each trigger…', text: this.draftPrompt })
+            TextArea({ placeholder: $r('app.string.automations_ph_trigger_prompt'), text: this.draftPrompt })
               .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -289,7 +289,7 @@ export struct AutomationsSheet {
               })
 
             Row() {
-              Text('Run in isolated git worktree')
+              Text($r('app.string.automations_run_in_worktree'))
                 .attributeModifier(orbitTextSubhead(this.store.palette.fgSecondary))
                 .layoutWeight(1)
               Toggle({ type: ToggleType.Switch, isOn: this.draftWorktree })
@@ -434,7 +434,7 @@ export struct AutomationsSheet {
                 if (this.expandedScheduleRunsId === sched.schedule_id) {
                   Column({ space: 4 }) {
                     if ((this.store.scheduleRunsById[sched.schedule_id] ?? []).length === 0) {
-                      Text('No run history recorded yet.')
+                      Text($r('app.string.automations_no_run_history'))
                         .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
                     } else {
                       ForEach(
@@ -515,7 +515,7 @@ export struct AutomationsSheet {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_SM }) {
             Row({ space: OrbitTokens.SPACE_SM }) {
-              TextInput({ placeholder: 'Seconds (e.g. 300)', text: this.draftTimerSecs })
+              TextInput({ placeholder: $r('app.string.automations_ph_seconds_example'), text: this.draftTimerSecs })
                 .type(InputType.Number)
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
@@ -539,7 +539,7 @@ export struct AutomationsSheet {
             }
             .width('100%')
 
-            TextArea({ placeholder: 'Follow-up prompt when timer fires…', text: this.draftTimerPrompt })
+            TextArea({ placeholder: $r('app.string.automations_ph_timer_prompt'), text: this.draftTimerPrompt })
               .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -683,7 +683,7 @@ export struct AutomationsSheet {
       if (this.showGoalForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_SM }) {
-            TextArea({ placeholder: 'Autonomous goal objective…', text: this.draftGoalObjective })
+            TextArea({ placeholder: $r('app.string.automations_ph_goal_objective'), text: this.draftGoalObjective })
               .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -696,7 +696,7 @@ export struct AutomationsSheet {
               })
 
             Row({ space: OrbitTokens.SPACE_SM }) {
-              TextInput({ placeholder: 'Verify command (optional)', text: this.draftGoalVerifyCmd })
+              TextInput({ placeholder: $r('app.string.automations_ph_verify_cmd'), text: this.draftGoalVerifyCmd })
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
                 )
@@ -706,7 +706,7 @@ export struct AutomationsSheet {
                 .onChange((v: string) => {
                   this.draftGoalVerifyCmd = v;
                 })
-              TextInput({ placeholder: 'Max', text: this.draftGoalMaxIter })
+              TextInput({ placeholder: $r('app.string.automations_ph_max'), text: this.draftGoalMaxIter })
                 .type(InputType.Number)
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
@@ -914,7 +914,7 @@ export struct AutomationsSheet {
       if (this.showMonitorForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_SM }) {
-            TextInput({ placeholder: 'Monitor name', text: this.draftMonitorName })
+            TextInput({ placeholder: $r('app.string.automations_ph_monitor_name'), text: this.draftMonitorName })
               .attributeModifier(
                 orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
               )
@@ -982,7 +982,7 @@ export struct AutomationsSheet {
               })
 
             if (this.draftMonitorKind !== 'http_health') {
-              TextInput({ placeholder: 'Regex / pattern (optional)', text: this.draftMonitorPattern })
+              TextInput({ placeholder: $r('app.string.automations_ph_regex'), text: this.draftMonitorPattern })
                 .attributeModifier(
                   orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
                 )
@@ -1118,7 +1118,7 @@ export struct AutomationsSheet {
       if (this.showWorkflowForm) {
         ListItem() {
           Column({ space: OrbitTokens.SPACE_SM }) {
-            TextInput({ placeholder: 'Workflow name', text: this.draftWorkflowName })
+            TextInput({ placeholder: $r('app.string.automations_ph_workflow_name'), text: this.draftWorkflowName })
               .attributeModifier(
                 orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
               )
@@ -1129,7 +1129,7 @@ export struct AutomationsSheet {
                 this.draftWorkflowName = v;
               })
 
-            TextArea({ placeholder: 'Primary step instructions…', text: this.draftWorkflowPrompt })
+            TextArea({ placeholder: $r('app.string.automations_ph_workflow_steps'), text: this.draftWorkflowPrompt })
               .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
               .fontColor(this.store.palette.fgPrimary)
               .placeholderColor(this.store.palette.fgMuted)
@@ -1216,7 +1216,7 @@ export struct AutomationsSheet {
                             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
 
                           if (step.is_winner) {
-                            Text('Winner')
+                            Text($r('app.string.automations_winner_badge'))
                               .attributeModifier(orbitTextMeta(this.store.palette.statusDirect, FontWeight.Medium))
                           }
                         }
@@ -1265,7 +1265,7 @@ export struct AutomationsSheet {
   build() {
     Column({ space: OrbitTokens.SPACE_MD }) {
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Text('Automations')
+        Text($r('app.string.automations_title'))
           .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
           .layoutWeight(1)
 
@@ -1285,10 +1285,10 @@ export struct AutomationsSheet {
         .height(OrbitTokens.HIT_COMPACT)
         .padding(0)
         .backgroundColor(this.store.palette.subtleSurface)
-        .accessibilityText('Refresh automations')
+        .accessibilityText($r('app.string.automations_refresh_a11y'))
         .onClick(() => {
           this.store.refreshAutomations();
-          this.store.triggerHaptic(6);
+          this.store.triggerHapticPreset('selection');
         })
       }
       .width('100%')
@@ -1315,7 +1315,7 @@ export struct AutomationsSheet {
                 .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
                 .onClick(() => {
                   this.activeTabIndex = tab.idx;
-                  this.store.triggerHaptic(6);
+                  this.store.triggerHapticPreset('selection');
                 })
             },
             (tab: OrbitAutomationTabItem): string => `auto_tab_${tab.idx}`

@@ -46,6 +46,8 @@ const views = [
   'AgentStageDelta', 'StageTurn', 'FleetOverview', 'HostDetail',
   'FleetSidebar', 'PersonalAgentBriefing', 'TerminalScreen',
   'TerminalScreenDelta', 'HighlightedCode', 'GitReview',
+  'UsageInsightsSnapshot', 'ExternalMcpServerRecord', 'ManagedSkillRecord',
+  'ProjectMemoryItem', 'InstalledPlugin', 'SandboxPolicy',
 ];
 const variants = [
   'user_prompt', 'assistant_thinking', 'assistant_message', 'tool_call',

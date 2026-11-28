@@ -3709,3 +3709,210 @@ export function resolveAuthoritativeProjectWorkspaces(
   }
   return out;
 }
+
+// --- PR-6 Settings & Tier-2 Extensions DTOs ---
+
+export interface UsageDailyPointDto {
+  date: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  turns: number;
+}
+
+export interface UsageModelBreakdownDto {
+  provider: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  turns: number;
+}
+
+export interface UsageProjectBreakdownDto {
+  workspace_cwd: string;
+  cost_usd: number;
+  total_tokens: number;
+  turns: number;
+}
+
+export interface QuotaDepletionForecastDto {
+  provider: string;
+  window_label: string;
+  remaining_percent: number;
+  burn_rate_pct_per_hour: number;
+  estimated_depletion_secs?: number | null;
+  resets_in_secs?: number | null;
+  likely_to_exhaust_before_reset: boolean;
+}
+
+export interface UsageInsightsSnapshotDto {
+  days: number;
+  total_cost_usd: number;
+  total_cache_savings_usd: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_turns: number;
+  daily: UsageDailyPointDto[];
+  by_model: UsageModelBreakdownDto[];
+  by_project: UsageProjectBreakdownDto[];
+  forecasts: QuotaDepletionForecastDto[];
+}
+
+export interface McpTransportKindDto {
+  kind: string; // 'stdio' | 'streamable_http'
+  command?: string;
+  args?: string[];
+  url?: string;
+  header_keys?: string[];
+}
+
+export interface McpToolSummaryDto {
+  name: string;
+  description: string;
+}
+
+export interface McpProbeResultDto {
+  ok: boolean;
+  server_name?: string | null;
+  server_version?: string | null;
+  protocol_version?: string | null;
+  tools: McpToolSummaryDto[];
+  latency_ms: number;
+  error?: string | null;
+  probed_at_ms: number;
+}
+
+export interface ExternalMcpServerRecordDto {
+  id: string;
+  name: string;
+  scope: string;
+  transport: McpTransportKindDto;
+  env_keys: string[];
+  masked_env: Record<string, string>;
+  masked_headers: Record<string, string>;
+  enabled: boolean;
+  editable: boolean;
+  source_path: string;
+  last_probe?: McpProbeResultDto | null;
+}
+
+export interface ProjectMemoryItemDto {
+  id: string;
+  workspace_root: string;
+  title: string;
+  content: string;
+  category: string; // 'architecture' | 'convention' | 'debugging' | 'workflow' | 'decision' | 'preference'
+  status: string; // 'hypothesis' | 'confirmed' | 'needs_revalidation'
+  confidence: number;
+  file_paths: string[];
+  tags: string[];
+  source_provider?: string | null;
+  source_agent_id?: string | null;
+  source_path?: string | null;
+  access_count: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_accessed_ms: number;
+}
+
+export interface OrbitPluginCapabilitiesDto {
+  fs_read_globs: string[];
+  http_domains: string[];
+  hook_events: string[];
+  max_fuel?: number | null;
+  max_memory_bytes?: number | null;
+}
+
+export interface OrbitPluginMcpOpDto {
+  name: string;
+  description: string;
+}
+
+export interface OrbitPluginUiSlotDeclDto {
+  slot: string;
+  title: string;
+}
+
+export interface OrbitPluginManifestDto {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  author?: string | null;
+  wasm_entry: string;
+  capabilities: OrbitPluginCapabilitiesDto;
+  mcp_ops: OrbitPluginMcpOpDto[];
+  ui_slots: OrbitPluginUiSlotDeclDto[];
+}
+
+export interface InstalledPluginDto {
+  manifest: OrbitPluginManifestDto;
+  enabled: boolean;
+}
+
+export interface SandboxPolicyDto {
+  mode: string; // 'off' | 'workspace_write' | 'strict_read_only'
+  writable_roots: string[];
+  denied_read_paths: string[];
+  allow_network: boolean;
+  allowed_domains: string[];
+  denied_domains: string[];
+}
+
+export interface GuardianPolicyConfigDto {
+  enabled: boolean;
+  auto_approve_max_risk: string; // 'low' | 'medium' | 'high' | 'critical'
+  use_ai_classifier_for_medium: boolean;
+  classifier_timeout_ms: number;
+  allow_read_only_tools: boolean;
+  allow_workspace_tests: boolean;
+  blocked_command_patterns: string[];
+  trusted_command_prefixes: string[];
+  llm_tier2_enabled: boolean;
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  llm_timeout_ms: number;
+}
+
+export interface PermissionRuleRecordDto {
+  id: string;
+  scope_kind: string; // 'host' | 'project'
+  project_cwd?: string | null;
+  provider?: string | null;
+  tool_kind: string; // 'any' | 'shell_command' | 'file_write' | 'mcp_tool' | 'network' | 'subagent'
+  pattern_kind: string; // 'prefix' | 'exact' | 'glob' | 'regex'
+  pattern: string;
+  decision: string; // 'allow' | 'deny' | 'ask'
+  source: string;
+  note?: string | null;
+  created_at: string;
+  last_matched_at?: string | null;
+  match_count: number;
+}
+
+export interface UpsertPermissionRuleInputDto {
+  id?: string | null;
+  scope_kind: string;
+  project_cwd?: string | null;
+  provider?: string | null;
+  tool_kind: string;
+  pattern_kind: string;
+  pattern: string;
+  decision: string;
+  source: string;
+  note?: string | null;
+}
+
+export interface AcpAgentTestResultDto {
+  agent_id: string;
+  ok: boolean;
+  latency_ms?: number | null;
+  protocol_version?: string | null;
+  server_name?: string | null;
+  server_version?: string | null;
+  error?: string | null;
+}

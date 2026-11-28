@@ -553,7 +553,11 @@ export class OrbitFleetStore {
   }
 
   public getCachedHostDetail(hostId: string): HostDetailDto | null {
-    const found = this.hostDetailById.get(hostId);
+    const clean = hostId.trim();
+    if (clean.length === 0) {
+      return null;
+    }
+    const found = this.hostDetailById.get(clean);
     return found !== undefined ? found : null;
   }
 

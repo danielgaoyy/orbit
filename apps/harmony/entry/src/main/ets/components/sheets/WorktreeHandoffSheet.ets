@@ -164,7 +164,7 @@ export struct WorktreeHandoffSheet {
       if (res.ok && res.data !== null) {
         this.outcome = res.data;
         this.store.showToastResource(this.localizedOutcomeResource(res.data), false);
-        this.store.triggerHaptic(12);
+        this.store.triggerHapticPreset('success');
       } else {
         this.store.showToastResource(
           res.errorDetail.length > 0

@@ -1,0 +1,17 @@
+{
+  "allow_network": false,
+  "allowed_domains": [],
+  "denied_domains": [],
+  "denied_read_paths": [
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.kube",
+    "~/.orbit/pairing-secret",
+    "~/.orbit/daemon.json",
+    "~/.orbit/config.json",
+    "~/.orbit/host-keypair.json"
+  ],
+  "mode": "workspace_write",
+  "writable_roots": []
+}
